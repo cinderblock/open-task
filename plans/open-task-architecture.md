@@ -216,9 +216,12 @@ goes." Same for a future headless/remote mode.
 - [ ] ~~Research report: Rust GUI landscape 2026~~ — agent rate-limited, not produced.
 - [x] Cargo workspace + crate skeletons (`ot-model`, `ot-probe`, `ot-core`, `ot-app` real;
       `ot-paint`, `ot-ui`, `ot-record`, `ot-update` placeholders).
-- [x] CI: `ci.yml` (fmt, clippy, test, headless smoke on 4 targets) and `release.yml`
-      (6 targets, zip/tar.gz, SHA256SUMS, GitHub release on `v*` tag). **Unverified until
-      pushed** — no remote exists yet.
+- [x] CI: `ci.yml` (fmt, clippy, test, build, headless smoke on 4 targets). **Verified
+      green on all jobs** at `2bd71c3` (run 36193617770, 2026-09-25), after three fixes:
+      dead-code lint on non-Windows, the GUI-launch hang, and GNU `timeout` on macOS.
+- [ ] `release.yml` (6 targets, zip/tar.gz, SHA256SUMS, GitHub release on `v*` tag).
+      **Unverified until a tag is pushed.** Recommend a `v0.0.1` pre-release tag once the
+      first Performance view lands, to shake the workflow out early.
 - [x] Windows probe: processes (CPU%, WS, private, disk I/O, threads, handles, parent,
       start time), per-core CPU with P/E-core classes, memory (total/avail/cached/commit).
 - [x] `ot-core`: sampler thread, `ArcSwap` snapshot slot, `Ring<T>` history buffer.
