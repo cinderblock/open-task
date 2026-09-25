@@ -44,6 +44,22 @@ pub struct Theme {
     /// Gap between top-level regions.
     pub gap: f32,
     pub card_radius: f32,
+
+    /// Tree mode: horizontal indent per depth level.
+    pub indent: f32,
+    /// Tree mode: width of the expand/collapse box that precedes every name, at
+    /// every level, so names at one depth line up whether or not they have children.
+    pub expander_w: f32,
+    /// Indent guides in tree mode. The active color marks the selected row's sibling
+    /// block, so the eye can follow the selection to its parent.
+    pub tree_guide: Color,
+    pub tree_guide_active: Color,
+
+    /// Toolbar strip between the cards and the table.
+    pub toolbar_h: f32,
+    /// Segmented-control fills.
+    pub button_hover: Color,
+    pub button_active: Color,
 }
 
 impl Theme {
@@ -76,6 +92,13 @@ impl Theme {
             pad: 8.0,
             gap: 8.0,
             card_radius: 6.0,
+            indent: 16.0,
+            expander_w: 16.0,
+            tree_guide: Color::rgba(1.0, 1.0, 1.0, 0.10),
+            tree_guide_active: Color::hex(0x60_CD_FF).with_alpha(0.55),
+            toolbar_h: 30.0,
+            button_hover: Color::rgba(1.0, 1.0, 1.0, 0.06),
+            button_active: Color::hex(0x60_CD_FF).with_alpha(0.22),
         }
     }
 
@@ -108,6 +131,13 @@ impl Theme {
             pad: 8.0,
             gap: 8.0,
             card_radius: 6.0,
+            indent: 16.0,
+            expander_w: 16.0,
+            tree_guide: Color::rgba(0.0, 0.0, 0.0, 0.10),
+            tree_guide_active: Color::hex(0x00_5F_B8).with_alpha(0.5),
+            toolbar_h: 30.0,
+            button_hover: Color::rgba(0.0, 0.0, 0.0, 0.05),
+            button_active: Color::hex(0x00_5F_B8).with_alpha(0.16),
         }
     }
 }

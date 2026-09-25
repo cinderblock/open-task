@@ -20,6 +20,8 @@ mod window;
 use ot_core::SamplerConfig;
 use ot_probe::SystemProbe;
 
+pub use ot_ui::ViewMode;
+
 /// Which theme to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemePreference {
@@ -46,6 +48,8 @@ impl ThemePreference {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ShellOptions {
     pub theme: ThemePreference,
+    /// How the process table starts out; Ctrl+T switches at runtime.
+    pub view: ViewMode,
 }
 
 /// Why the shell could not run.

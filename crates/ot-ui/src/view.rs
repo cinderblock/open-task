@@ -1,17 +1,16 @@
-//! The root view: summary cards on top, process table below.
+//! The root view: summary cards on top, a toolbar, and the process table below.
 
-use std::cmp::Ordering;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ot_core::{Snapshot, Timeline};
 use ot_model::cpu::CoreKind;
-use ot_model::process::ProcessSample;
-use ot_model::ProcessKey;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
 
 use crate::format;
+use crate::process_rows::{col, columns, ProcessRows, ProcessTree};
 use crate::sparkline::{self, SparkStyle};
-use crate::table::{Column, Hit, RowId, RowSource, Table};
+use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +27,49 @@ pub enum Key {
     PageDown,
     Home,
     End,
+    /// In tree mode: collapse the selected row, or move to its parent.
+    Left,
+    /// In tree mode: expand the selected row, or move to its first child.
+    Right,
+}
+
+/// How the process table is arranged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// One flat list sorted by the active column.
+    #[default]
+    List,
+    /// Parent-child hierarchy; siblings sorted by the active column.
+    Tree,
+}
+
+impl ViewMode {
+    /// Parse a command-line value. Unknown values fall back to `List`.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "tree" => Self::Tree,
+            _ => Self::List,
+        }
+    }
+
+    #[must_use]
+    pub fn other(self) -> Self {
+        match self {
+            Self::List => Self::Tree,
+            Self::Tree => Self::List,
+        }
+    }
+}
+
+/// A semantic action, as a menu item or accelerator would issue it. The shell maps
+/// keys to these; the meaning lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// Switch between list and tree, keeping and revealing the selection.
+    ToggleView,
+    /// Show a particular mode. Asking for the current one re-reveals the selection.
+    SetView(ViewMode),
 }
 
 /// Input from the shell, in DIPs.
@@ -50,113 +92,97 @@ pub enum UiEvent {
         lines: f32,
     },
     Key(Key),
+    Command(Command),
 }
 
 const HISTORY_POINTS: usize = 600;
 const CARD_H: f32 = 96.0;
 
-/// Process table columns, in display order. Indices are used by [`ProcessRows`].
-mod col {
-    pub const NAME: usize = 0;
-    pub const PID: usize = 1;
-    pub const CPU: usize = 2;
-    pub const MEMORY: usize = 3;
-    pub const WORKING_SET: usize = 4;
-    pub const DISK_READ: usize = 5;
-    pub const DISK_WRITE: usize = 6;
-    pub const THREADS: usize = 7;
-    pub const HANDLES: usize = 8;
+/// The strip between the cards and the table: the List/Tree switch, the selected
+/// process's ancestry, and the process count.
+#[derive(Debug, Default)]
+struct Toolbar {
+    /// Segment rectangles from the last paint, in [`SEGMENTS`] order.
+    segments: [Rect; 2],
+    hover: Option<usize>,
+    chain: Vec<u32>,
 }
 
-fn columns() -> Vec<Column> {
-    vec![
-        Column::text("Name", 240.0),
-        Column::number("PID", 70.0),
-        Column::number("CPU %", 70.0),
-        Column::number("Memory", 95.0),
-        Column::number("Working set", 95.0),
-        Column::number("Disk read", 95.0),
-        Column::number("Disk write", 95.0),
-        Column::number("Threads", 70.0),
-        Column::number("Handles", 75.0),
-    ]
-}
+const SEGMENTS: [(ViewMode, &str); 2] = [(ViewMode::List, "List"), (ViewMode::Tree, "Tree")];
+const SEGMENT_W: f32 = 60.0;
+const COUNT_W: f32 = 120.0;
 
-/// Adapts a snapshot's process list to the table.
-struct ProcessRows<'a> {
-    procs: &'a [ProcessSample],
-    interval_secs: f32,
-    mem_total: f32,
-}
-
-fn row_id(key: ProcessKey) -> RowId {
-    RowId(u64::from(key.pid) ^ key.birth.0.rotate_left(32))
-}
-
-impl RowSource for ProcessRows<'_> {
-    fn len(&self) -> usize {
-        self.procs.len()
+impl Toolbar {
+    fn segment_at(&self, p: Point) -> Option<usize> {
+        self.segments.iter().position(|r| r.contains(p))
     }
 
-    fn id(&self, row: usize) -> RowId {
-        row_id(self.procs[row].key())
-    }
-
-    fn cell(&self, row: usize, col: usize, out: &mut String) {
-        let p = &self.procs[row];
-        match col {
-            col::NAME => {
-                out.clear();
-                out.push_str(p.name());
+    fn paint(
+        &mut self,
+        dl: &mut DisplayList,
+        rect: Rect,
+        table: &Table,
+        rows: &ProcessRows<'_>,
+        theme: &Theme,
+        buf: &mut String,
+    ) {
+        let current = if table.tree() {
+            ViewMode::Tree
+        } else {
+            ViewMode::List
+        };
+        let group = Rect::new(rect.x, rect.y + 2.0, SEGMENT_W * 2.0, rect.h - 4.0);
+        dl.fill_round_rect(group, theme.card_radius, theme.surface);
+        dl.stroke_rect(group, theme.surface_border, 1.0);
+        for (i, (mode, label)) in SEGMENTS.iter().enumerate() {
+            let r = Rect::new(group.x + SEGMENT_W * i as f32, group.y, SEGMENT_W, group.h);
+            self.segments[i] = r;
+            let active = *mode == current;
+            let fill = if active {
+                Some(theme.button_active)
+            } else if self.hover == Some(i) {
+                Some(theme.button_hover)
+            } else {
+                None
+            };
+            if let Some(c) = fill {
+                dl.fill_round_rect(r.inset(2.0, 2.0), theme.card_radius - 1.0, c);
             }
-            col::PID => format::count(out, p.key().pid),
-            col::CPU => format::percent(out, p.cpu.get()),
-            col::MEMORY => format::bytes(out, p.private_bytes),
-            col::WORKING_SET => format::bytes(out, p.working_set),
-            col::DISK_READ => format::rate(out, p.disk_read, self.interval_secs),
-            col::DISK_WRITE => format::rate(out, p.disk_write, self.interval_secs),
-            col::THREADS => format::count(out, p.threads),
-            col::HANDLES => format::count(out, p.handles),
-            _ => out.clear(),
+            let color = if active { theme.text } else { theme.text_dim };
+            dl.text(
+                label,
+                r,
+                theme.header,
+                color,
+                HAlign::Center,
+                VAlign::Middle,
+                false,
+            );
         }
-    }
 
-    fn heat(&self, row: usize, col: usize) -> Option<f32> {
-        let p = &self.procs[row];
-        match col {
-            col::CPU => Some((p.cpu.get() / 100.0).min(1.0)),
-            col::MEMORY if self.mem_total > 0.0 => {
-                // Memory heat is relative to a tenth of RAM: one process holding 10% of
-                // the machine is fully hot.
-                Some((p.private_bytes.get() as f32 / (self.mem_total * 0.1)).min(1.0))
-            }
-            _ => None,
+        // Right edge: how many processes the table lists.
+        let (_, after_group) = rect.split_left(group.w + theme.pad);
+        let (crumb, count) = after_group.split_left((after_group.w - COUNT_W).max(0.0));
+        buf.clear();
+        let _ = write!(buf, "{} processes", rows.listed());
+        dl.text(
+            buf,
+            count,
+            theme.small,
+            theme.text_dim,
+            HAlign::Right,
+            VAlign::Middle,
+            true,
+        );
+
+        // Between: where the selected process sits in the hierarchy. The same text in
+        // both modes is what ties the sorted list to the tree.
+        buf.clear();
+        match table.selected.and_then(|id| rows.row_of(id)) {
+            Some(row) => rows.ancestry(row, buf, &mut self.chain),
+            None => buf.push_str("Ctrl+T switches between list and tree"),
         }
-    }
-
-    fn visible(&self, row: usize) -> bool {
-        // PID 0 is the kernel's idle accounting, not a process. Its "CPU" is the
-        // machine's idle time, which would otherwise pin it to the top of every sort.
-        self.procs[row].key().pid != 0
-    }
-
-    fn compare(&self, a: usize, b: usize, col: usize) -> Ordering {
-        let (a, b) = (&self.procs[a], &self.procs[b]);
-        match col {
-            col::NAME => a
-                .name()
-                .to_ascii_lowercase()
-                .cmp(&b.name().to_ascii_lowercase()),
-            col::PID => a.key().pid.cmp(&b.key().pid),
-            col::CPU => a.cpu.get().total_cmp(&b.cpu.get()),
-            col::MEMORY => a.private_bytes.cmp(&b.private_bytes),
-            col::WORKING_SET => a.working_set.cmp(&b.working_set),
-            col::DISK_READ => a.disk_read.cmp(&b.disk_read),
-            col::DISK_WRITE => a.disk_write.cmp(&b.disk_write),
-            col::THREADS => a.threads.cmp(&b.threads),
-            col::HANDLES => a.handles.cmp(&b.handles),
-            _ => Ordering::Equal,
-        }
+        dl.label(buf, crumb, theme.small, theme.text_dim);
     }
 }
 
@@ -167,7 +193,9 @@ pub struct App {
     backdrop: bool,
     size: Size,
     table: Table,
+    toolbar: Toolbar,
     snap: Arc<Snapshot>,
+    tree: ProcessTree,
     timeline: Timeline,
     buf: String,
     scratch: Vec<Point>,
@@ -181,7 +209,9 @@ impl App {
             backdrop: false,
             size: Size::new(800.0, 600.0),
             table: Table::new(columns(), col::CPU),
+            toolbar: Toolbar::default(),
             snap: Arc::new(Snapshot::default()),
+            tree: ProcessTree::default(),
             timeline: Timeline::new(HISTORY_POINTS),
             buf: String::with_capacity(64),
             scratch: Vec::with_capacity(HISTORY_POINTS),
@@ -203,12 +233,28 @@ impl App {
         self.theme = theme;
     }
 
+    #[must_use]
+    pub fn view(&self) -> ViewMode {
+        if self.table.tree() {
+            ViewMode::Tree
+        } else {
+            ViewMode::List
+        }
+    }
+
+    /// Switch the process table's arrangement, keeping the selection in view.
+    pub fn set_view(&mut self, mode: ViewMode) {
+        let rows = rows_of(&self.snap, &self.tree);
+        apply_view(&mut self.table, mode, &rows, &self.theme);
+    }
+
     /// Offer the newest snapshot. Returns true if it was new and a repaint is due.
     pub fn set_snapshot(&mut self, snap: Arc<Snapshot>) -> bool {
         if snap.is_empty() || (!self.snap.is_empty() && snap.tick == self.snap.tick) {
             return false;
         }
         self.timeline.observe(&snap);
+        self.tree.rebuild(&snap.processes);
         self.snap = snap;
         self.table.invalidate_order();
         true
@@ -216,55 +262,76 @@ impl App {
 
     /// Handle input. Returns true if a repaint is needed.
     pub fn handle(&mut self, ev: UiEvent) -> bool {
-        let rows = rows_of(&self.snap);
+        let rows = rows_of(&self.snap, &self.tree);
+        let theme = &self.theme;
         match ev {
             UiEvent::Resize(s) => {
                 self.size = s;
                 true
             }
             UiEvent::MouseMove(p) => {
-                let hover = match self.table.hit(p, &self.theme) {
-                    Hit::Row(i) => Some(i),
+                let hover = match self.table.hit(p, theme) {
+                    Hit::Row(i) | Hit::Expander(i) => Some(i),
                     _ => None,
                 };
-                if hover == self.table.hover {
-                    false
-                } else {
-                    self.table.hover = hover;
-                    true
-                }
+                let segment = self.toolbar.segment_at(p);
+                let changed = hover != self.table.hover || segment != self.toolbar.hover;
+                self.table.hover = hover;
+                self.toolbar.hover = segment;
+                changed
             }
-            UiEvent::MouseLeave => self.table.hover.take().is_some(),
+            UiEvent::MouseLeave => {
+                let row = self.table.hover.take().is_some();
+                let segment = self.toolbar.hover.take().is_some();
+                row || segment
+            }
             UiEvent::MouseDown {
                 at,
                 button: MouseButton::Left,
-            } => match self.table.hit(at, &self.theme) {
-                Hit::Header(c) => {
-                    self.table.set_sort(c);
-                    true
+            } => {
+                if let Some(i) = self.toolbar.segment_at(at) {
+                    apply_view(&mut self.table, SEGMENTS[i].0, &rows, theme);
+                    return true;
                 }
-                Hit::Row(pos) => {
-                    self.table.selected = self.table.row_at(pos).map(|r| rows.id(r));
-                    true
+                match self.table.hit(at, theme) {
+                    Hit::Header(c) => {
+                        self.table.set_sort(c);
+                        true
+                    }
+                    Hit::Expander(pos) => self.table.toggle_expanded(pos, &rows),
+                    Hit::Row(pos) => {
+                        self.table.selected = self.table.row_at(pos).map(|r| rows.id(r));
+                        true
+                    }
+                    Hit::Nothing => false,
                 }
-                Hit::Nothing => false,
-            },
+            }
             UiEvent::MouseDown { .. } | UiEvent::MouseUp { .. } => false,
             UiEvent::Wheel { lines, .. } => {
                 self.table.scroll_lines(lines * 3.0);
                 true
             }
             UiEvent::Key(k) => {
-                let page = isize::try_from(self.table.rows_visible(&self.theme).max(1))
-                    .unwrap_or(isize::MAX);
+                let page =
+                    isize::try_from(self.table.rows_visible(theme).max(1)).unwrap_or(isize::MAX);
                 match k {
-                    Key::Up => self.table.move_selection(&rows, -1, &self.theme),
-                    Key::Down => self.table.move_selection(&rows, 1, &self.theme),
-                    Key::PageUp => self.table.move_selection(&rows, -page, &self.theme),
-                    Key::PageDown => self.table.move_selection(&rows, page, &self.theme),
-                    Key::Home => self.table.select_end(&rows, true, &self.theme),
-                    Key::End => self.table.select_end(&rows, false, &self.theme),
+                    Key::Up => self.table.move_selection(&rows, -1, theme),
+                    Key::Down => self.table.move_selection(&rows, 1, theme),
+                    Key::PageUp => self.table.move_selection(&rows, -page, theme),
+                    Key::PageDown => self.table.move_selection(&rows, page, theme),
+                    Key::Home => self.table.select_end(&rows, true, theme),
+                    Key::End => self.table.select_end(&rows, false, theme),
+                    Key::Left => return self.table.collapse_or_parent(&rows, theme),
+                    Key::Right => return self.table.expand_or_child(&rows, theme),
                 }
+                true
+            }
+            UiEvent::Command(c) => {
+                let mode = match c {
+                    Command::ToggleView => self.view().other(),
+                    Command::SetView(m) => m,
+                };
+                apply_view(&mut self.table, mode, &rows, theme);
                 true
             }
         }
@@ -282,7 +349,9 @@ impl App {
 
         let full = Rect::from_size(self.size).inset(theme.gap, theme.gap);
         let (cards, rest) = full.split_top(CARD_H);
-        let (_, table_rect) = rest.split_top(theme.gap);
+        let (_, rest) = rest.split_top(theme.gap);
+        let (toolbar, rest) = rest.split_top(theme.toolbar_h);
+        let (_, table_rect) = rest.split_top(theme.gap * 0.5);
 
         let (cpu_card, mem_card) = cards.split_left((cards.w - theme.gap) * 0.5);
         let (_, mem_card) = mem_card.split_left(theme.gap);
@@ -307,8 +376,13 @@ impl App {
             &mut self.scratch,
         );
 
+        let rows = rows_of(&snap, &self.tree);
+        // The table first: the toolbar reads its state, and the order must be
+        // current before the ancestry lookup.
         self.table
-            .paint(dl, table_rect, &rows_of(&snap), theme, &mut self.buf);
+            .paint(dl, table_rect, &rows, theme, &mut self.buf);
+        self.toolbar
+            .paint(dl, toolbar, &self.table, &rows, theme, &mut self.buf);
     }
 
     fn card_frame(dl: &mut DisplayList, rect: Rect, theme: &Theme) -> Rect {
@@ -355,10 +429,8 @@ impl App {
             .filter(|c| c.kind == CoreKind::Efficiency)
             .count();
         if p > 0 || e > 0 {
-            use std::fmt::Write as _;
             let _ = write!(buf, "{p} P + {e} E cores");
         } else if n > 0 {
-            use std::fmt::Write as _;
             let _ = write!(buf, "{n} logical cores");
         }
         dl.label(buf, sub, theme.small, theme.text_dim);
@@ -405,7 +477,6 @@ impl App {
 
         buf.clear();
         if m.total.get() > 0 {
-            use std::fmt::Write as _;
             let pct = m.in_use().get() as f64 / m.total.get() as f64 * 100.0;
             let _ = write!(buf, "{pct:.0}% in use");
         }
@@ -428,9 +499,21 @@ impl App {
     }
 }
 
-fn rows_of(snap: &Snapshot) -> ProcessRows<'_> {
+/// Put the table in `mode`. Asking for the mode it is already in re-reveals the
+/// selection, which doubles as a "where is it?" jump.
+fn apply_view(table: &mut Table, mode: ViewMode, rows: &ProcessRows<'_>, theme: &Theme) {
+    let tree = mode == ViewMode::Tree;
+    if table.tree() == tree {
+        table.reveal_selected(rows, theme);
+    } else {
+        table.set_tree(tree, rows, theme);
+    }
+}
+
+fn rows_of<'a>(snap: &'a Snapshot, tree: &'a ProcessTree) -> ProcessRows<'a> {
     ProcessRows {
         procs: &snap.processes,
+        tree,
         interval_secs: interval_secs(snap),
         mem_total: snap.memory.total.get() as f32,
     }
@@ -454,36 +537,12 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ot_model::process::{Integrity, ProcessStatic};
-    use ot_model::{Bytes, Percent, Tick};
+    use crate::process_rows::row_id;
+    use crate::process_rows::tests::proc;
+    use ot_model::process::ProcessSample;
+    use ot_model::{ProcessKey, Tick};
+    use ot_paint::DrawCmd;
     use std::time::{Duration, SystemTime};
-
-    fn proc(pid: u32, cpu: f32) -> ProcessSample {
-        ProcessSample {
-            statics: Arc::new(ProcessStatic {
-                key: ProcessKey::new(pid, 1),
-                parent: None,
-                name: format!("p{pid}.exe"),
-                image_path: None,
-                command_line: None,
-                user: None,
-                integrity: Integrity::Unknown,
-                started_unix_ms: None,
-            }),
-            cpu: Percent(cpu),
-            working_set: Bytes(1),
-            private_bytes: Bytes(1),
-            disk_read: Bytes(0),
-            disk_write: Bytes(0),
-            net_rx: Bytes(0),
-            net_tx: Bytes(0),
-            threads: 1,
-            handles: 1,
-            power: None,
-            gpu: None,
-            suspended: false,
-        }
-    }
 
     fn snapshot(tick: u64, procs: Vec<ProcessSample>) -> Arc<Snapshot> {
         Arc::new(Snapshot {
@@ -493,6 +552,70 @@ mod tests {
             processes: procs,
             ..Default::default()
         })
+    }
+
+    fn id(pid: u32) -> crate::table::RowId {
+        row_id(ProcessKey::new(pid, 1))
+    }
+
+    /// Idle(0) ─ 4 ─ 10 ─ 11
+    ///              └─ 12 ─ 13
+    /// 20 (orphan)
+    fn family() -> Arc<Snapshot> {
+        snapshot(
+            1,
+            vec![
+                proc(0, None, 900.0),
+                proc(4, Some(0), 1.0),
+                proc(10, Some(4), 2.0),
+                proc(11, Some(10), 30.0),
+                proc(12, Some(4), 5.0),
+                proc(13, Some(12), 3.0),
+                proc(20, Some(99), 10.0),
+            ],
+        )
+    }
+
+    fn painted_strings(app: &mut App) -> Vec<String> {
+        let mut dl = DisplayList::new();
+        app.paint(&mut dl);
+        assert_eq!(dl.clip_depth(), 0);
+        dl.cmds()
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text(t) => Some(dl.str(t.text).to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Names in the order the table paints them. Only the table body is clipped, so
+    /// text inside a clip is a table cell and not, say, the toolbar's breadcrumb.
+    fn painted_names(app: &mut App) -> Vec<String> {
+        let mut dl = DisplayList::new();
+        app.paint(&mut dl);
+        let mut depth = 0;
+        let mut names = Vec::new();
+        for c in dl.cmds() {
+            match c {
+                DrawCmd::PushClip(_) => depth += 1,
+                DrawCmd::PopClip => depth -= 1,
+                DrawCmd::Text(t) if depth > 0 => {
+                    let s = dl.str(t.text);
+                    if s.starts_with('p') && s.contains(".exe") {
+                        names.push(s.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    fn ready(app: &mut App) {
+        app.handle(UiEvent::Resize(Size::new(900.0, 700.0)));
+        let mut dl = DisplayList::new();
+        app.paint(&mut dl);
     }
 
     #[test]
@@ -507,7 +630,7 @@ mod tests {
     #[test]
     fn new_snapshot_requests_repaint_once() {
         let mut app = App::default();
-        let s = snapshot(1, vec![proc(1, 10.0), proc(2, 90.0)]);
+        let s = snapshot(1, vec![proc(1, None, 10.0), proc(2, None, 90.0)]);
         assert!(app.set_snapshot(Arc::clone(&s)));
         assert!(!app.set_snapshot(s));
         assert!(app.set_snapshot(snapshot(2, vec![])));
@@ -518,15 +641,17 @@ mod tests {
         let mut app = App::default();
         app.set_snapshot(snapshot(
             1,
-            vec![proc(1, 10.0), proc(2, 90.0), proc(3, 50.0)],
+            vec![
+                proc(1, None, 10.0),
+                proc(2, None, 90.0),
+                proc(3, None, 50.0),
+            ],
         ));
-        app.handle(UiEvent::Resize(Size::new(800.0, 600.0)));
-        let mut dl = DisplayList::new();
-        app.paint(&mut dl);
+        ready(&mut app);
         assert!(app.handle(UiEvent::Key(Key::Down)));
-        assert_eq!(app.table.selected, Some(row_id(ProcessKey::new(2, 1))));
+        assert_eq!(app.table.selected, Some(id(2)));
         app.handle(UiEvent::Key(Key::Down));
-        assert_eq!(app.table.selected, Some(row_id(ProcessKey::new(3, 1))));
+        assert_eq!(app.table.selected, Some(id(3)));
     }
 
     #[test]
@@ -535,5 +660,141 @@ mod tests {
             row_id(ProcessKey::new(100, 1)),
             row_id(ProcessKey::new(100, 2))
         );
+    }
+
+    #[test]
+    fn list_mode_sorts_by_own_cpu_and_hides_idle() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        assert_eq!(app.view(), ViewMode::List);
+        assert_eq!(
+            painted_names(&mut app),
+            ["p11.exe", "p20.exe", "p12.exe", "p13.exe", "p10.exe", "p4.exe"]
+        );
+    }
+
+    #[test]
+    fn tree_mode_nests_children_and_orders_siblings_by_subtree_cpu() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        app.handle(UiEvent::Command(Command::SetView(ViewMode::Tree)));
+        assert_eq!(app.view(), ViewMode::Tree);
+        // Roots: 4 (subtree 41) above the orphan 20 (10). Under 4: branch 10 (32)
+        // above branch 12 (8), even though 12's own CPU is higher than 10's.
+        assert_eq!(
+            painted_names(&mut app),
+            ["p4.exe", "p10.exe", "p11.exe", "p12.exe", "p13.exe", "p20.exe"]
+        );
+    }
+
+    #[test]
+    fn toggling_keeps_the_selection_and_reveals_it() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        // Pick the hottest process in the list.
+        app.handle(UiEvent::Key(Key::Down));
+        assert_eq!(app.table.selected, Some(id(11)));
+
+        // Collapse everything above it in the tree first, to prove reveal expands.
+        app.handle(UiEvent::Command(Command::ToggleView));
+        app.handle(UiEvent::Key(Key::Left)); // 11 is a leaf: moves to 10
+        app.handle(UiEvent::Key(Key::Left)); // collapses 10
+        app.handle(UiEvent::Key(Key::Left)); // moves to 4
+        app.handle(UiEvent::Key(Key::Left)); // collapses 4
+        assert_eq!(painted_names(&mut app), ["p4.exe (4)", "p20.exe"]);
+        app.table.selected = Some(id(11));
+
+        app.handle(UiEvent::Command(Command::ToggleView));
+        assert_eq!(app.view(), ViewMode::List);
+        assert_eq!(app.table.selected, Some(id(11)));
+        app.handle(UiEvent::Command(Command::ToggleView));
+        assert_eq!(app.view(), ViewMode::Tree);
+        assert_eq!(app.table.selected, Some(id(11)));
+        let names = painted_names(&mut app);
+        assert!(names.iter().any(|n| n == "p11.exe"), "revealed: {names:?}");
+        assert_eq!(names[0], "p4.exe", "ancestors expanded: {names:?}");
+    }
+
+    #[test]
+    fn collapsed_row_paints_subtree_totals() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        app.handle(UiEvent::Command(Command::SetView(ViewMode::Tree)));
+        app.handle(UiEvent::Key(Key::Down)); // selects 4
+        app.handle(UiEvent::Key(Key::Left)); // collapses it
+        let strings = painted_strings(&mut app);
+        assert!(strings.iter().any(|s| s == "p4.exe (4)"), "{strings:?}");
+        // 1 + 2 + 30 + 5 + 3 = 41, shown in the CPU column.
+        assert!(strings.iter().any(|s| s == "41"), "{strings:?}");
+    }
+
+    #[test]
+    fn toolbar_shows_ancestry_of_the_selection_in_both_modes() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let strings = painted_strings(&mut app);
+        assert!(
+            strings.iter().any(|s| s.starts_with("Ctrl+T")),
+            "{strings:?}"
+        );
+        assert!(strings.iter().any(|s| s == "6 processes"), "{strings:?}");
+
+        app.table.selected = Some(id(13));
+        let crumb = "p4.exe › p12.exe › p13.exe";
+        assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
+        app.handle(UiEvent::Command(Command::ToggleView));
+        assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
+    }
+
+    #[test]
+    fn clicking_the_segments_switches_modes() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let tree_seg = app.toolbar.segments[1].center();
+        assert!(app.handle(UiEvent::MouseMove(tree_seg)));
+        assert_eq!(app.toolbar.hover, Some(1));
+        assert!(app.handle(UiEvent::MouseDown {
+            at: tree_seg,
+            button: MouseButton::Left,
+        }));
+        assert_eq!(app.view(), ViewMode::Tree);
+        let list_seg = app.toolbar.segments[0].center();
+        app.handle(UiEvent::MouseDown {
+            at: list_seg,
+            button: MouseButton::Left,
+        });
+        assert_eq!(app.view(), ViewMode::List);
+        assert!(app.handle(UiEvent::MouseLeave));
+        assert_eq!(app.toolbar.hover, None);
+    }
+
+    #[test]
+    fn clicking_an_expander_collapses_without_selecting() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        app.handle(UiEvent::Command(Command::SetView(ViewMode::Tree)));
+        let mut dl = DisplayList::new();
+        app.paint(&mut dl);
+        let theme = app.theme.clone();
+        // First row is p4.exe at depth 0; its expander box starts at the padding.
+        let table_top = theme.gap + CARD_H + theme.gap + theme.toolbar_h + theme.gap * 0.5;
+        let at = Point::new(
+            theme.gap + theme.pad + theme.expander_w * 0.5,
+            table_top + theme.header_h + theme.row_h * 0.5,
+        );
+        assert_eq!(app.table.hit(at, &theme), Hit::Expander(0));
+        assert!(app.handle(UiEvent::MouseDown {
+            at,
+            button: MouseButton::Left,
+        }));
+        assert_eq!(app.table.selected, None);
+        assert_eq!(painted_names(&mut app), ["p4.exe (4)", "p20.exe"]);
     }
 }

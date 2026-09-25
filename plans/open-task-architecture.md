@@ -151,8 +151,9 @@ goes." Same for a future headless/remote mode.
 5. ~~Virtualized table widget + sparkline widget (the two hard ones).~~ Done (first cut:
    linear-axis sparkline, no column resize/reorder yet).
 6. **[current]** Processes view end-to-end (basic version works), then Performance,
-   then the rest of the 12. Next concrete items: process details (image path, command
-   line, user), tree/grouping, search filter, column resize, context menu with End task.
+   then the rest of the 12. Tree mode with a list/tree jump is done (2026-09-25; see
+   `plans/process-tree-view.md`). Next concrete items: process details (image path,
+   command line, user), search filter, column resize, context menu with End task.
 7. Diagnostics engine ("why is my computer slow").
 8. Flight Recorder.
 9. Self-updater + signed releases.
@@ -195,6 +196,15 @@ goes." Same for a future headless/remote mode.
   mode is ever added, switch back to ClearType there.
 - **`FindWindowW(class, $null)` from PowerShell does not find the window**; PowerShell
   marshals `$null` as an empty title. Pass the real title. Bit `scripts/screenshot.ps1`.
+- **Looking a window up by class and title finds whichever instance is oldest.** With
+  the installed `~/.cargo/bin/open-task.exe` running, `scripts/screenshot.ps1`
+  screenshotted that window and reported the freshly built binary as unchanged. The
+  script now finds the top-level window owned by the PID it launched (`EnumWindows` +
+  `GetWindowThreadProcessId`). Bit the tree-view work on 2026-09-25.
+- **`ProcessStatic::parent` was only a PID hint** (`ProcessKey::new(ppid, 0)`) until the
+  tree view needed it. The Windows probe now resolves it once per process at first
+  sight against the live table, accepting only a parent created no later than the
+  child, so a recycled parent PID is never adopted. Consumers can treat it as identity.
 - **`pwsh -File script.ps1 -Arr a,b` does not split into an array.** In `-File` mode
   arguments are literal strings, so a `[string[]]` parameter gets one element `"a,b"`.
   `scripts/screenshot.ps1` takes app arguments as one string (`-AppArgs "--theme light"`).
@@ -264,6 +274,11 @@ goes." Same for a future headless/remote mode.
       machine with ~570 processes, no console window. Target is Process Explorer class
       (10–25 MB); the layout cache and per-process `Arc<ProcessStatic>` strings are the
       likely first places to look, but measure with a profiler before touching anything.
+- [x] Process tree mode in the table (generic `RowSource` hierarchy hooks, subtree
+      rollups, collapse/expand, indent guides), List/Tree toolbar switch, Ctrl+T, and
+      the selection-preserving jump between the two; ancestry breadcrumb; `--view tree`.
+      Probe resolves parent identity. Details and decisions in
+      `plans/process-tree-view.md` (2026-09-25).
 
 ## Open questions for the user
 

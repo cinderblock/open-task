@@ -7,10 +7,11 @@
 #![forbid(unsafe_code)]
 
 pub mod format;
+mod process_rows;
 pub mod sparkline;
 pub mod table;
 pub mod theme;
 pub mod view;
 
 pub use theme::Theme;
-pub use view::{App, Key, MouseButton, UiEvent};
+pub use view::{App, Command, Key, MouseButton, UiEvent, ViewMode};

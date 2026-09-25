@@ -37,6 +37,7 @@ fn main() {
         .init();
 
     let theme = arg_value(&args, "--theme").unwrap_or("system");
+    let view = arg_value(&args, "--view").unwrap_or("list");
     let passes: usize = args
         .iter()
         .position(|a| a == "--passes")
@@ -57,7 +58,7 @@ fn main() {
     if headless {
         run_headless(Box::new(probe), config, passes);
     } else {
-        run_gui(Box::new(probe), config, theme);
+        run_gui(Box::new(probe), config, theme, view);
     }
 }
 
@@ -70,9 +71,10 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 #[cfg(windows)]
-fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str) {
+fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str, view: &str) {
     let options = ot_shell_win::ShellOptions {
         theme: ot_shell_win::ThemePreference::parse(theme),
+        view: ot_shell_win::ViewMode::parse(view),
     };
     if let Err(e) = ot_shell_win::run(probe, config, options) {
         fail(&format!("shell failed: {e}"), 1, true);
@@ -93,8 +95,8 @@ fn fail(message: &str, code: i32, gui: bool) -> ! {
 }
 
 #[cfg(not(windows))]
-fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str) {
-    let _ = (probe, config, theme);
+fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str, view: &str) {
+    let _ = (probe, config, theme, view);
     eprintln!("no GUI shell on this platform yet; use --headless");
     std::process::exit(3);
 }

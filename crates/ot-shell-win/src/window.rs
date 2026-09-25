@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use ot_core::{Sampler, SamplerConfig};
 use ot_paint::{DisplayList, Point, Size};
 use ot_probe::SystemProbe;
-use ot_ui::{App, Key, MouseButton, Theme, UiEvent};
+use ot_ui::{App, Command, Key, MouseButton, Theme, UiEvent};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -23,7 +23,8 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_HOME, VK_NEXT, VK_PRIOR, VK_UP,
+    GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL, VK_DOWN, VK_END, VK_HOME,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
@@ -130,6 +131,7 @@ pub fn run(
 
     let mut app = App::new(theme_for(dark));
     app.set_backdrop(backdrop);
+    app.set_view(options.view);
     app.handle(UiEvent::Resize(to_dips_size(size_px, dpi)));
 
     // The sampler posts a message per publish. HWND is a pointer and therefore not
@@ -445,18 +447,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             let vk = wparam.0 as u16;
-            let key = match vk {
-                v if v == VK_UP.0 => Some(Key::Up),
-                v if v == VK_DOWN.0 => Some(Key::Down),
-                v if v == VK_PRIOR.0 => Some(Key::PageUp),
-                v if v == VK_NEXT.0 => Some(Key::PageDown),
-                v if v == VK_HOME.0 => Some(Key::Home),
-                v if v == VK_END.0 => Some(Key::End),
+            // SAFETY: plain query of the keyboard state; no pointers.
+            let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+            let ev = match vk {
+                v if v == VK_UP.0 => Some(UiEvent::Key(Key::Up)),
+                v if v == VK_DOWN.0 => Some(UiEvent::Key(Key::Down)),
+                v if v == VK_PRIOR.0 => Some(UiEvent::Key(Key::PageUp)),
+                v if v == VK_NEXT.0 => Some(UiEvent::Key(Key::PageDown)),
+                v if v == VK_HOME.0 => Some(UiEvent::Key(Key::Home)),
+                v if v == VK_END.0 => Some(UiEvent::Key(Key::End)),
+                v if v == VK_LEFT.0 => Some(UiEvent::Key(Key::Left)),
+                v if v == VK_RIGHT.0 => Some(UiEvent::Key(Key::Right)),
+                // Ctrl+T: Process Explorer's binding for the process tree.
+                0x54 if ctrl => Some(UiEvent::Command(Command::ToggleView)),
                 _ => None,
             };
-            match key {
-                Some(k) => {
-                    if st.app.handle(UiEvent::Key(k)) {
+            match ev {
+                Some(ev) => {
+                    if st.app.handle(ev) {
                         invalidate(hwnd);
                     }
                     LRESULT(0)
