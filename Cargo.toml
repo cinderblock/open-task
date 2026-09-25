@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.87"
 license = "MIT"
@@ -22,14 +22,14 @@ homepage = "https://github.com/cinderblock/open-task"
 authors = ["Cameron Tacklind <cameron@tacklind.com>"]
 
 [workspace.dependencies]
-ot-model = { path = "crates/ot-model", version = "0.1.0" }
-ot-probe = { path = "crates/ot-probe", version = "0.1.0" }
-ot-core = { path = "crates/ot-core", version = "0.1.0" }
-ot-paint = { path = "crates/ot-paint", version = "0.1.0" }
-ot-ui = { path = "crates/ot-ui", version = "0.1.0" }
-ot-shell-win = { path = "crates/ot-shell-win", version = "0.1.0" }
-ot-record = { path = "crates/ot-record", version = "0.1.0" }
-ot-update = { path = "crates/ot-update", version = "0.1.0" }
+ot-model = { path = "crates/ot-model", version = "0.2.0" }
+ot-probe = { path = "crates/ot-probe", version = "0.2.0" }
+ot-core = { path = "crates/ot-core", version = "0.2.0" }
+ot-paint = { path = "crates/ot-paint", version = "0.2.0" }
+ot-ui = { path = "crates/ot-ui", version = "0.2.0" }
+ot-shell-win = { path = "crates/ot-shell-win", version = "0.2.0" }
+ot-record = { path = "crates/ot-record", version = "0.2.0" }
+ot-update = { path = "crates/ot-update", version = "0.2.0" }
 
 arc-swap = "1.7"
 thiserror = "2"

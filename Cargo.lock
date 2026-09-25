@@ -70,7 +70,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "ot-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ot-core",
  "ot-model",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "ot-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "ot-model",
@@ -92,15 +92,15 @@ dependencies = [
 
 [[package]]
 name = "ot-model"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ot-paint"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ot-probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ot-model",
  "thiserror",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "ot-record"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ot-model",
  "thiserror",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "ot-shell-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ot-core",
  "ot-paint",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "ot-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ot-core",
  "ot-model",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "ot-update"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
  "tracing",
