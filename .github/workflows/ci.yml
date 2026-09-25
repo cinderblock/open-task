@@ -59,11 +59,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --target ${{ matrix.target }}
       - name: Headless smoke run
-        # Exit 3 means "no probe on this platform yet", which is expected on the stubs.
+        # --headless is mandatory here: without it the Windows build opens its window
+        # and runs the message loop until the job times out. Exit 3 means "no probe on
+        # this platform yet", which is expected on the stubs.
         shell: bash
         run: |
           set +e
-          cargo run --target ${{ matrix.target }} -- --passes 2
+          timeout 120 cargo run --target ${{ matrix.target }} -- --headless --passes 2
           code=$?
           set -e
           if [ "$code" = "0" ] || [ "$code" = "3" ]; then exit 0; fi

@@ -241,6 +241,9 @@ goes." Same for a future headless/remote mode.
 - [x] Cross-target clippy clean on Windows, Linux and macOS targets locally.
 - [x] Remote `cinderblock/open-task` created and pushed. First CI run failed on Linux and
       macOS (dead-code lint); fixed in the next commit.
+- [ ] CI visual smoke: GitHub's Windows runners have a desktop session, so
+      `scripts/screenshot.ps1` could run there (WARP fallback covers the missing GPU) and
+      upload the PNG as an artifact. Worth doing once the UI settles.
 - [ ] Idle-CPU: the app should redraw nothing when unchanged (it does) and cost ~0% CPU
       between samples. Not yet measured with a profiler; do this before optimizing anything.
 - [ ] Release-mode console: the binary is still a console-subsystem app so `--headless`
@@ -284,5 +287,8 @@ pwsh -File scripts/screenshot.ps1      # then look at target/screenshot.png
 - Do not use a heavyweight widget toolkit for the data-dense content area. The table is
   custom-drawn in every toolkit anyway.
 - Do not couple sampling cadence to frame rate. They are independent on purpose.
+- Do not run the binary in CI without `--headless`. On Windows it opens the window and
+  the job hangs until GitHub's six-hour limit. Happened on run 36191451129 (2026-09-25);
+  the smoke step now passes `--headless` and is wrapped in `timeout 120`.
 - Do not push to a remote or create a GitHub repo without explicit per-action approval.
 - Do not rename `master`.
