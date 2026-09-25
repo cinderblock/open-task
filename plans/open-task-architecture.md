@@ -260,6 +260,10 @@ goes." Same for a future headless/remote mode.
 - [x] Release builds are `windows_subsystem = "windows"` (no console). Headless mode
       attaches to the parent console; fatal startup errors also go to a message box.
 - [x] First local install via `cargo install --path crates/ot-app --locked` (2026-09-25).
+      Baseline: release binary 862 KB; **38.8 MB working set** shortly after launch on a
+      machine with ~570 processes, no console window. Target is Process Explorer class
+      (10–25 MB); the layout cache and per-process `Arc<ProcessStatic>` strings are the
+      likely first places to look, but measure with a profiler before touching anything.
 
 ## Open questions for the user
 
