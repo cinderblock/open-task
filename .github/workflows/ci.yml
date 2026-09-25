@@ -58,14 +58,18 @@ jobs:
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Test
         run: cargo test --workspace --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --target ${{ matrix.target }} -p ot-app
       - name: Headless smoke run
         # --headless is mandatory here: without it the Windows build opens its window
-        # and runs the message loop until the job times out. Exit 3 means "no probe on
+        # and runs the message loop until the job times out. The step-level timeout is
+        # the portable guard (macOS has no GNU `timeout`). Exit 3 means "no probe on
         # this platform yet", which is expected on the stubs.
+        timeout-minutes: 2
         shell: bash
         run: |
           set +e
-          timeout 120 cargo run --target ${{ matrix.target }} -- --headless --passes 2
+          cargo run --target ${{ matrix.target }} -- --headless --passes 2
           code=$?
           set -e
           if [ "$code" = "0" ] || [ "$code" = "3" ]; then exit 0; fi

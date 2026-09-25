@@ -289,6 +289,8 @@ pwsh -File scripts/screenshot.ps1      # then look at target/screenshot.png
 - Do not couple sampling cadence to frame rate. They are independent on purpose.
 - Do not run the binary in CI without `--headless`. On Windows it opens the window and
   the job hangs until GitHub's six-hour limit. Happened on run 36191451129 (2026-09-25);
-  the smoke step now passes `--headless` and is wrapped in `timeout 120`.
+  the smoke step now passes `--headless` and has a step-level `timeout-minutes: 2`.
+- Do not use GNU `timeout` in CI shell steps: macOS runners do not have it (exit 127,
+  run 36193278405). Use the step's `timeout-minutes` instead; it works on every runner.
 - Do not push to a remote or create a GitHub repo without explicit per-action approval.
 - Do not rename `master`.
