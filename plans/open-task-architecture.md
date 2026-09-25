@@ -1,6 +1,6 @@
 # open-task — Architecture & Build Plan
 
-> **Status:** active · **Started:** 2026-09-24 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`, no remote yet)
+> **Status:** active · **Started:** 2026-09-24 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`, remote `origin` = github.com/cinderblock/open-task)
 
 ## Goal
 
@@ -60,7 +60,14 @@ Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks.
    snapshots + deltas; the UI is a consumer. This is what makes Flight Recorder, headless
    mode, and remote monitoring nearly free later.
 5. **Branch is `master`.** Per the user's standing preference.
-6. **License: to be confirmed, defaulting to GPL-3.0-or-later** — see Open questions.
+6. **License: MIT.** User decision, 2026-09-25.
+7. **GitHub remote: `cinderblock/open-task`, public.** User decision, 2026-09-25.
+8. **Charts use a log-scale time axis** like TMOG's history graphs: the last few
+   seconds at full resolution on the right, hours compressed toward the left. User
+   likes this a lot and wants to *prototype* a log-scale Y axis too. Design
+   consequence: history must be stored with timestamps at multiple resolutions, not
+   as a single fixed-rate ring. First sparklines may be linear; the storage must not
+   paint us into a corner.
 
 ## Why not a webview (the decisive argument)
 
@@ -203,12 +210,8 @@ goes." Same for a future headless/remote mode.
 
 ## Open questions for the user
 
-1. **License.** Recommend **GPL-3.0-or-later**: it is the strongest guarantee that a
-   closed-source competitor cannot absorb this work, which is the stated motivation.
-   MIT/Apache-2.0 would maximize adoption instead. Defaulting to GPL-3.0-or-later until
-   told otherwise.
-2. **Repo name / GitHub org.** Local dir is `open-task`. Publish as `cinderblock/open-task`?
-   No remote has been created yet — needs an explicit yes before anything is pushed.
+1. ~~License.~~ Resolved: MIT.
+2. ~~Repo name / GitHub org.~~ Resolved: `cinderblock/open-task`, public.
 3. **Code signing.** Releases are far more useful signed (SmartScreen). That needs a
    certificate and secrets. Unsigned for now.
    Separately, the **self-updater must verify a detached signature** on every download

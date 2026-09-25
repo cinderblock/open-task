@@ -55,4 +55,4 @@ ARM64) and macOS (Apple silicon, Intel) and publishes a GitHub release with a
 
 ## License
 
-GPL-3.0-or-later. See `LICENSE`.
+MIT. See `LICENSE`.
