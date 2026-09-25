@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -31,11 +32,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
     SW_SHOWDEFAULT, WHEEL_DELTA, WM_APP, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW,
 };
 
 use crate::gfx::Gfx;
-use crate::ShellError;
+use crate::{ShellError, ShellOptions, ThemePreference};
 
 /// Posted by the sampler thread after each publish.
 const WM_APP_SNAPSHOT: u32 = WM_APP + 1;
@@ -52,6 +54,9 @@ struct State {
     dpi: f32,
     tracking_leave: bool,
     backdrop: bool,
+    theme_pref: ThemePreference,
+    /// Whether the current theme is dark. Follows the system when `theme_pref` says so.
+    dark: bool,
 }
 
 fn win(context: &'static str) -> impl FnOnce(windows::core::Error) -> ShellError {
@@ -61,7 +66,11 @@ fn win(context: &'static str) -> impl FnOnce(windows::core::Error) -> ShellError
 // Window class, window, DWM attributes, graphics, sampler, message loop: one setup
 // sequence, read top to bottom. Splitting it would only scatter the order.
 #[allow(clippy::too_many_lines)]
-pub fn run(probe: Box<dyn SystemProbe>, config: SamplerConfig) -> Result<(), ShellError> {
+pub fn run(
+    probe: Box<dyn SystemProbe>,
+    config: SamplerConfig,
+    options: ShellOptions,
+) -> Result<(), ShellError> {
     // SAFETY: plain process-wide setting; failure (already set) is harmless.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -98,17 +107,12 @@ pub fn run(probe: Box<dyn SystemProbe>, config: SamplerConfig) -> Result<(), She
         .map_err(win("CreateWindowExW"))?
     };
 
-    // Dark title bar and a Mica backdrop. Both are best-effort: older builds simply
-    // refuse, and we fall back to an opaque background.
-    // SAFETY: attribute values are locals that outlive the calls; sizes match.
+    // Title bar follows the theme; Mica backdrop is best-effort (older builds refuse,
+    // and we fall back to an opaque background).
+    let dark = resolve_dark(options.theme);
+    apply_title_bar_theme(hwnd, dark);
+    // SAFETY: the attribute value is a local that outlives the call; sizes match.
     let backdrop = unsafe {
-        let dark = BOOL(1);
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            (&raw const dark).cast::<c_void>(),
-            size_of::<BOOL>() as u32,
-        );
         let kind = DWMSBT_MAINWINDOW;
         DwmSetWindowAttribute(
             hwnd,
@@ -124,7 +128,7 @@ pub fn run(probe: Box<dyn SystemProbe>, config: SamplerConfig) -> Result<(), She
     let size_px = client_size(hwnd);
     let gfx = Gfx::new(hwnd, size_px, dpi).map_err(win("Gfx::new"))?;
 
-    let mut app = App::new(Theme::dark());
+    let mut app = App::new(theme_for(dark));
     app.set_backdrop(backdrop);
     app.handle(UiEvent::Resize(to_dips_size(size_px, dpi)));
 
@@ -153,6 +157,8 @@ pub fn run(probe: Box<dyn SystemProbe>, config: SamplerConfig) -> Result<(), She
         dpi,
         tracking_leave: false,
         backdrop,
+        theme_pref: options.theme,
+        dark,
     }));
     let state_ptr = Box::into_raw(state);
     // SAFETY: hwnd is valid; the pointer stays alive until after the loop below.
@@ -161,7 +167,7 @@ pub fn run(probe: Box<dyn SystemProbe>, config: SamplerConfig) -> Result<(), She
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
     }
 
-    tracing::info!(backdrop, dpi, ?size_px, "window up");
+    tracing::info!(backdrop, dark, dpi, ?size_px, "window up");
 
     // SAFETY: standard message loop; MSG is a plain out-struct.
     unsafe {
@@ -187,6 +193,55 @@ pub fn run(probe: Box<dyn SystemProbe>, config: SamplerConfig) -> Result<(), She
         drop(state);
     }
     Ok(())
+}
+
+/// Windows' "Choose your default app mode" setting. A missing value means light,
+/// which is what Windows itself assumes.
+fn system_prefers_dark() -> bool {
+    let mut value: u32 = 1;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: the out-pointers reference locals that outlive the call; `size` matches.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast::<c_void>()),
+            Some(&raw mut size),
+        )
+    };
+    status.is_ok() && value == 0
+}
+
+fn resolve_dark(pref: ThemePreference) -> bool {
+    match pref {
+        ThemePreference::System => system_prefers_dark(),
+        ThemePreference::Dark => true,
+        ThemePreference::Light => false,
+    }
+}
+
+fn apply_title_bar_theme(hwnd: HWND, dark: bool) {
+    let flag = BOOL(i32::from(dark));
+    // SAFETY: the value is a local that outlives the call; the size matches.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&raw const flag).cast::<c_void>(),
+            size_of::<BOOL>() as u32,
+        );
+    }
+}
+
+fn theme_for(dark: bool) -> Theme {
+    if dark {
+        Theme::dark()
+    } else {
+        Theme::light()
+    }
 }
 
 fn client_size(hwnd: HWND) -> (u32, u32) {
@@ -417,6 +472,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            // Sent for any system setting; re-reading one registry value is cheap.
+            if st.theme_pref == ThemePreference::System {
+                let dark = system_prefers_dark();
+                if dark != st.dark {
+                    st.dark = dark;
+                    apply_title_bar_theme(hwnd, dark);
+                    st.app.set_theme(theme_for(dark));
+                    invalidate(hwnd);
+                }
+            }
+            // SAFETY: standard default handling.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_DESTROY => {
             // SAFETY: ends the message loop.

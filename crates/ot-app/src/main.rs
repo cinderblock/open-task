@@ -6,6 +6,13 @@
 //! CI smoke test for the probe on every platform and the seed of a future CLI.
 
 #![forbid(unsafe_code)]
+// Release builds are GUI-subsystem so launching the app does not open a terminal.
+// Debug builds keep the console for logs. Headless mode attaches to the parent
+// console at startup so it can still print from a release build.
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
 
 use std::time::Duration;
 
@@ -14,6 +21,13 @@ use ot_model::Bytes;
 use ot_probe::{PlatformProbe, SystemProbe};
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
+    if headless {
+        #[cfg(windows)]
+        ot_shell_win::attach_parent_console();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -22,8 +36,7 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
+    let theme = arg_value(&args, "--theme").unwrap_or("system");
     let passes: usize = args
         .iter()
         .position(|a| a == "--passes")
@@ -33,10 +46,7 @@ fn main() {
 
     let probe = match PlatformProbe::new() {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("failed to initialize probe: {e}");
-            std::process::exit(2);
-        }
+        Err(e) => fail(&format!("failed to initialize probe: {e}"), 2, !headless),
     };
     tracing::info!(caps = ?probe.capabilities(), "probe capabilities");
 
@@ -47,21 +57,44 @@ fn main() {
     if headless {
         run_headless(Box::new(probe), config, passes);
     } else {
-        run_gui(Box::new(probe), config);
+        run_gui(Box::new(probe), config, theme);
     }
+}
+
+/// Value following `flag`, if present.
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
 }
 
 #[cfg(windows)]
-fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig) {
-    if let Err(e) = ot_shell_win::run(probe, config) {
-        eprintln!("shell failed: {e}");
-        std::process::exit(1);
+fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str) {
+    let options = ot_shell_win::ShellOptions {
+        theme: ot_shell_win::ThemePreference::parse(theme),
+    };
+    if let Err(e) = ot_shell_win::run(probe, config, options) {
+        fail(&format!("shell failed: {e}"), 1, true);
     }
 }
 
+/// Report a fatal startup error and exit. In GUI mode there may be no console, so
+/// the message also goes to a message box.
+fn fail(message: &str, code: i32, gui: bool) -> ! {
+    eprintln!("{message}");
+    #[cfg(windows)]
+    if gui {
+        ot_shell_win::error_box(message);
+    }
+    #[cfg(not(windows))]
+    let _ = gui;
+    std::process::exit(code)
+}
+
 #[cfg(not(windows))]
-fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig) {
-    let _ = (probe, config);
+fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str) {
+    let _ = (probe, config, theme);
     eprintln!("no GUI shell on this platform yet; use --headless");
     std::process::exit(3);
 }

@@ -4,7 +4,9 @@ param(
     [string]$Exe = "target\debug\open-task.exe",
     [string]$Out = "target\screenshot.png",
     [int]$WaitMs = 5000,
-    [int]$SettleMs = 2500
+    [int]$SettleMs = 2500,
+    # Extra command-line arguments for the app, as one string, e.g. "--theme light".
+    [string]$AppArgs = ""
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -15,14 +17,17 @@ public static class Native {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
 }
 "@
 [Native]::SetProcessDPIAware() | Out-Null
 
 $err = [System.IO.Path]::ChangeExtension($Out, ".stderr.txt")
-$p = Start-Process -FilePath $Exe -PassThru -NoNewWindow -RedirectStandardError $err
+$startArgs = @{ FilePath = $Exe; PassThru = $true; NoNewWindow = $true; RedirectStandardError = $err }
+if ($AppArgs -ne "") { $startArgs.ArgumentList = $AppArgs }
+$p = Start-Process @startArgs
 try {
     $h = [IntPtr]::Zero
     $deadline = (Get-Date).AddMilliseconds($WaitMs)
@@ -34,15 +39,21 @@ try {
     }
     if ($h -eq [IntPtr]::Zero) { throw "window did not appear within $WaitMs ms" }
     Start-Sleep -Milliseconds $SettleMs
-    [Native]::SetForegroundWindow($h) | Out-Null
-    Start-Sleep -Milliseconds 300
-
-    $r = [Native+RECT]::new()
+    $rw = [Native+RECT]::new()
+    [Native]::GetWindowRect($h, [ref]$rw) | Out-Null
+    $rd = [Native+RECT]::new()
     # DWMWA_EXTENDED_FRAME_BOUNDS (9): the visible frame, without invisible resize borders.
-    [Native]::DwmGetWindowAttribute($h, 9, [ref]$r, 16) | Out-Null
-    $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+    [Native]::DwmGetWindowAttribute($h, 9, [ref]$rd, 16) | Out-Null
+
+    # PrintWindow with PW_RENDERFULLCONTENT (2) renders DirectComposition content
+    # straight from the window, so it works whatever is on top of it.
+    $full = New-Object System.Drawing.Bitmap ($rw.R - $rw.L), ($rw.B - $rw.T)
+    $g = [System.Drawing.Graphics]::FromImage($full)
+    $hdc = $g.GetHdc()
+    [Native]::PrintWindow($h, $hdc, 2) | Out-Null
+    $g.ReleaseHdc($hdc)
+    $crop = New-Object System.Drawing.Rectangle ($rd.L - $rw.L), ($rd.T - $rw.T), ($rd.R - $rd.L), ($rd.B - $rd.T)
+    $bmp = $full.Clone($crop, $full.PixelFormat)
     $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
     Write-Host "saved $Out ($($bmp.Width)x$($bmp.Height))"
 } finally {

@@ -195,6 +195,11 @@ goes." Same for a future headless/remote mode.
   mode is ever added, switch back to ClearType there.
 - **`FindWindowW(class, $null)` from PowerShell does not find the window**; PowerShell
   marshals `$null` as an empty title. Pass the real title. Bit `scripts/screenshot.ps1`.
+- **`pwsh -File script.ps1 -Arr a,b` does not split into an array.** In `-File` mode
+  arguments are literal strings, so a `[string[]]` parameter gets one element `"a,b"`.
+  `scripts/screenshot.ps1` takes app arguments as one string (`-AppArgs "--theme light"`).
+- Large python patch scripts fed to Bash via heredoc can fail to parse; write the
+  script to `target/*.py` with the Write tool and run it. Anchor on post-rustfmt text.
 - Rustfmt reflows long lines, so python string-anchored patches can miss after a `cargo
   fmt`. Anchor on the post-format text, or patch before formatting.
 - `SystemProcessorPerformanceInformation` only returns processor group 0 (max 64
@@ -249,9 +254,12 @@ goes." Same for a future headless/remote mode.
       upload the PNG as an artifact. Worth doing once the UI settles.
 - [ ] Idle-CPU: the app should redraw nothing when unchanged (it does) and cost ~0% CPU
       between samples. Not yet measured with a profiler; do this before optimizing anything.
-- [ ] Release-mode console: the binary is still a console-subsystem app so `--headless`
-      prints and logs show. Switch to `windows_subsystem = "windows"` for release once
-      there is an `AttachConsole` path for headless mode.
+- [x] Theme and title bar follow the Windows app mode (`AppsUseLightTheme`), with live
+      updates on `WM_SETTINGCHANGE`; `--theme dark|light|system` overrides. Both themes
+      screenshot-verified 2026-09-25.
+- [x] Release builds are `windows_subsystem = "windows"` (no console). Headless mode
+      attaches to the parent console; fatal startup errors also go to a message box.
+- [x] First local install via `cargo install --path crates/ot-app --locked` (2026-09-25).
 
 ## Open questions for the user
 

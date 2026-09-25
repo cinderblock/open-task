@@ -46,9 +46,20 @@ Requires a stable Rust toolchain.
 cargo run --release
 ```
 
-Opens the window on Windows. `--headless --passes 5` prints a few passes of live system
-state to the terminal instead and exits; that is the only mode on Linux and macOS for
-now, where it exits with code 3 ("no probe on this platform yet").
+Opens the window on Windows. The theme and title bar follow the Windows app mode
+setting, including live changes; `--theme dark` or `--theme light` overrides it.
+`--headless --passes 5` prints a few passes of live system state to the terminal
+instead and exits; that is the only mode on Linux and macOS for now, where it exits
+with code 3 ("no probe on this platform yet").
+
+To install the current tree as `open-task` on your `PATH`:
+
+```
+cargo install --path crates/ot-app --locked
+```
+
+Release builds have no console window; `--headless` still prints when run from a
+terminal.
 
 `scripts/screenshot.ps1` launches the app, screenshots its window to
 `target/screenshot.png`, and closes it. Handy for checking a rendering change.
