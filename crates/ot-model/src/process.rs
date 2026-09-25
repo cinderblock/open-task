@@ -28,7 +28,13 @@ pub enum Integrity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessStatic {
     pub key: ProcessKey,
-    /// Parent's identity, absent for the root or when the parent has already exited.
+    /// Parent's identity, absent for a root or when the parent had already exited
+    /// when this process was first seen.
+    ///
+    /// Operating systems only report the parent's PID, and PIDs are recycled. The
+    /// probe resolves the PID against the live table once, at first sight, and only
+    /// accepts a process created no later than this one, so a stranger that inherited
+    /// the parent's PID is never adopted. A consumer can use this as a real identity.
     pub parent: Option<ProcessKey>,
     /// Executable file name only, e.g. `chrome.exe`.
     pub name: String,

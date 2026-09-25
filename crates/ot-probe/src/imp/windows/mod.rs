@@ -113,6 +113,11 @@ pub struct WindowsProbe {
     proc_buf: AlignedBuf,
     core_buf: AlignedBuf,
     tracked: HashMap<ProcessKey, Tracked>,
+    /// Indices into the pass's output of processes first seen in that pass, whose
+    /// parent hints still need resolving.
+    new_this_pass: Vec<u32>,
+    /// PID to output index for the current pass; only filled when needed.
+    by_pid: HashMap<u32, u32>,
     prev_cores: Vec<CoreTimes>,
     /// Physical core index and class for each logical processor, computed once.
     topology: Vec<(u32, CoreKind)>,
@@ -138,6 +143,8 @@ impl WindowsProbe {
             proc_buf: AlignedBuf::default(),
             core_buf: AlignedBuf::default(),
             tracked: HashMap::with_capacity(512),
+            new_this_pass: Vec::new(),
+            by_pid: HashMap::new(),
             prev_cores: vec![CoreTimes::default(); logical_count as usize],
             topology,
             logical_count,
@@ -247,6 +254,7 @@ impl WindowsProbe {
         let first_pass = self.last_pass.is_none();
 
         out.clear();
+        self.new_this_pass.clear();
 
         let base = self.proc_buf.as_ptr();
         let mut offset = 0usize;
@@ -272,12 +280,16 @@ impl WindowsProbe {
                 prev: now,
                 last_seen: pass,
             });
-            let was_new = entry.last_seen != pass;
-            let prev = if was_new { entry.prev } else { now };
+            // A freshly inserted entry already carries this pass number.
+            let seen_before = entry.last_seen != pass;
+            let prev = if seen_before { entry.prev } else { now };
             entry.prev = now;
             entry.last_seen = pass;
+            if !seen_before {
+                self.new_this_pass.push(out.len() as u32);
+            }
 
-            let (cpu, disk_read, disk_write) = if first_pass || !was_new || wall_100ns == 0 {
+            let (cpu, disk_read, disk_write) = if first_pass || !seen_before || wall_100ns == 0 {
                 (Percent::ZERO, Bytes::ZERO, Bytes::ZERO)
             } else {
                 let d_cpu = now.cpu_100ns.wrapping_sub(prev.cpu_100ns);
@@ -311,10 +323,54 @@ impl WindowsProbe {
             offset += p.NextEntryOffset as usize;
         }
 
+        self.resolve_parents(out);
+
         // Reap processes that were not in this pass. Their statics Arcs may still be
         // held by history buffers upstream; that is fine and intended.
         self.tracked.retain(|_, t| t.last_seen == pass);
         Ok(())
+    }
+
+    /// Turn the PID-only parent hint of every process first seen this pass into a
+    /// real identity, or drop it.
+    ///
+    /// The kernel reports only the parent's PID, and PIDs are recycled. The process
+    /// currently holding that PID is the real parent only if it was created no later
+    /// than the child; otherwise the parent exited, a stranger inherited its PID, and
+    /// the child is a root. Runs once per process lifetime, so steady state is free.
+    fn resolve_parents(&mut self, out: &mut [ProcessSample]) {
+        if self.new_this_pass.is_empty() {
+            return;
+        }
+        self.by_pid.clear();
+        for (i, p) in out.iter().enumerate() {
+            self.by_pid.insert(p.key().pid, i as u32);
+        }
+        for &i in &self.new_this_pass {
+            let child = &out[i as usize];
+            let child_key = child.key();
+            let Some(hint) = child.statics.parent else {
+                continue;
+            };
+            // `birth` is `CreateTime` on Windows. Ordering it is meaningful here, in
+            // the layer that defined it; everything above treats it as opaque.
+            let resolved = self
+                .by_pid
+                .get(&hint.pid)
+                .map(|&j| out[j as usize].key())
+                .filter(|parent| parent.birth <= child_key.birth);
+            if resolved == Some(hint) {
+                continue;
+            }
+            let statics = Arc::new(ProcessStatic {
+                parent: resolved,
+                ..(*child.statics).clone()
+            });
+            if let Some(t) = self.tracked.get_mut(&child_key) {
+                t.statics = Arc::clone(&statics);
+            }
+            out[i as usize].statics = statics;
+        }
     }
 }
 
@@ -360,8 +416,8 @@ fn build_statics(p: &SystemProcessInformation, key: ProcessKey) -> ProcessStatic
     }
 
     let parent_pid = p.InheritedFromUniqueProcessId.0 as usize as u32;
-    // We only know the parent's PID here, not its birth stamp. The core resolves this
-    // against the live table; a PID-only parent is a hint, not an identity.
+    // Only the parent's PID is known here. `resolve_parents` replaces this hint with
+    // the parent's full identity (or `None`) before the pass is published.
     let parent = (parent_pid != key.pid).then(|| ProcessKey::new(parent_pid, 0));
 
     let started_unix_ms =
