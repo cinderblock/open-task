@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Test
+        run: cargo test --workspace --target ${{ matrix.target }}
+      - name: Headless smoke run
+        # Exit 3 means "no probe on this platform yet", which is expected on the stubs.
+        shell: bash
+        run: |
+          set +e
+          cargo run --target ${{ matrix.target }} -- --passes 2
+          code=$?
+          set -e
+          if [ "$code" = "0" ] || [ "$code" = "3" ]; then exit 0; fi
+          echo "unexpected exit code $code"; exit "$code"

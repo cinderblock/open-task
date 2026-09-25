@@ -1,0 +1,16 @@
+[package]
+name = "ot-record"
+description = "Flight Recorder: record and replay the open-task sample stream."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ot-model.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

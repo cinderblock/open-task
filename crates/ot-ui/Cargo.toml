@@ -1,0 +1,16 @@
+[package]
+name = "ot-ui"
+description = "UI-agnostic view models: columns, sort, filter, virtualization, charts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ot-model.workspace = true
+ot-core.workspace = true
+
+[lints]
+workspace = true

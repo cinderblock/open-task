@@ -1,0 +1,18 @@
+[package]
+name = "ot-core"
+description = "Sampling scheduler, history ring buffers and snapshot publication for open-task."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ot-model.workspace = true
+ot-probe.workspace = true
+arc-swap.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

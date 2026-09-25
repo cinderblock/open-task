@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ot-model",
+    "crates/ot-probe",
+    "crates/ot-core",
+    "crates/ot-paint",
+    "crates/ot-ui",
+    "crates/ot-record",
+    "crates/ot-update",
+    "crates/ot-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/cinderblock/open-task"
+homepage = "https://github.com/cinderblock/open-task"
+authors = ["Cameron Tacklind <cameron@tacklind.com>"]
+
+[workspace.dependencies]
+ot-model = { path = "crates/ot-model", version = "0.1.0" }
+ot-probe = { path = "crates/ot-probe", version = "0.1.0" }
+ot-core = { path = "crates/ot-core", version = "0.1.0" }
+ot-paint = { path = "crates/ot-paint", version = "0.1.0" }
+ot-ui = { path = "crates/ot-ui", version = "0.1.0" }
+ot-record = { path = "crates/ot-record", version = "0.1.0" }
+ot-update = { path = "crates/ot-update", version = "0.1.0" }
+
+arc-swap = "1.7"
+thiserror = "2"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Noisy and not useful for this codebase's style.
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Fast iteration while still being usable as a perf tool during development.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,15 @@
+[package]
+name = "ot-paint"
+description = "Portable retained scene and draw-command layer for open-task."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ot-model.workspace = true
+
+[lints]
+workspace = true

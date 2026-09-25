@@ -1,0 +1,9 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Flight Recorder captures
+*.otrace
+
+.DS_Store
+Thumbs.db

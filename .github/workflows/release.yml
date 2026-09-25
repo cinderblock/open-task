@@ -1,0 +1,114 @@
+name: Release
+
+# Pushing a tag like v1.2.3 builds every target, packages it, and publishes a GitHub
+# release with checksums. The self-updater reads these releases, so the asset naming
+# below is a contract: <name>-<tag>-<target>.<zip|tar.gz> plus SHA256SUMS.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  BIN: open-task
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ot-app") | .version')"
+          echo "tag=$tag cargo=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match ot-app version $ver"; exit 1; }
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ot-app
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${BIN}-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/${BIN}.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/${BIN}" "dist/$name/"
+          fi
+          cp LICENSE README.md "dist/$name/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            $prerelease
