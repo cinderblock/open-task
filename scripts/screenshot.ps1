@@ -16,10 +16,32 @@ using System.Runtime.InteropServices;
 public static class Native {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
+
+    // The top-level window of class `cls` owned by process `pid`, or zero. Looking up
+    // by class and title alone would find an already-running instance (an installed
+    // copy, say) instead of the one this script just launched.
+    public static IntPtr FindMainWindow(uint pid, string cls) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            uint owner;
+            GetWindowThreadProcessId(h, out owner);
+            if (owner != pid) return true;
+            var name = new System.Text.StringBuilder(256);
+            GetClassNameW(h, name, name.Capacity);
+            if (name.ToString() != cls) return true;
+            found = h;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
 }
 "@
 [Native]::SetProcessDPIAware() | Out-Null
@@ -32,7 +54,7 @@ try {
     $h = [IntPtr]::Zero
     $deadline = (Get-Date).AddMilliseconds($WaitMs)
     while ((Get-Date) -lt $deadline) {
-        $h = [Native]::FindWindowW("OpenTaskMainWindow", "open-task")
+        $h = [Native]::FindMainWindow([uint32]$p.Id, "OpenTaskMainWindow")
         if ($h -ne [IntPtr]::Zero) { break }
         if ($p.HasExited) { throw "process exited early with code $($p.ExitCode)" }
         Start-Sleep -Milliseconds 100
