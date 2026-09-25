@@ -1,6 +1,6 @@
 [package]
 name = "ot-ui"
-description = "UI-agnostic view models: columns, sort, filter, virtualization, charts."
+description = "UI-agnostic view models for open-task: theme, table, charts, root view."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 ot-model.workspace = true
 ot-core.workspace = true
+ot-paint.workspace = true
 
 [lints]
 workspace = true

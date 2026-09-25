@@ -9,7 +9,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-ot-model.workspace = true
 
 [lints]
 workspace = true

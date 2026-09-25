@@ -14,7 +14,9 @@
 pub mod history;
 pub mod sampler;
 pub mod snapshot;
+pub mod timeline;
 
 pub use history::Ring;
 pub use sampler::{Sampler, SamplerConfig};
 pub use snapshot::Snapshot;
+pub use timeline::{Sample, Series, Timeline};

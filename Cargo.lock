@@ -75,6 +75,7 @@ dependencies = [
  "ot-core",
  "ot-model",
  "ot-probe",
+ "ot-shell-win",
  "tracing",
  "tracing-subscriber",
 ]
@@ -96,9 +97,6 @@ version = "0.1.0"
 [[package]]
 name = "ot-paint"
 version = "0.1.0"
-dependencies = [
- "ot-model",
-]
 
 [[package]]
 name = "ot-probe"
@@ -119,11 +117,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ot-shell-win"
+version = "0.1.0"
+dependencies = [
+ "ot-core",
+ "ot-paint",
+ "ot-probe",
+ "ot-ui",
+ "thiserror",
+ "tracing",
+ "windows",
+ "windows-numerics",
+]
+
+[[package]]
 name = "ot-ui"
 version = "0.1.0"
 dependencies = [
  "ot-core",
  "ot-model",
+ "ot-paint",
 ]
 
 [[package]]

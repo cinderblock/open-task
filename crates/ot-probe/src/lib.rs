@@ -36,6 +36,7 @@ pub enum ProbeError {
 }
 
 impl ProbeError {
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn os(context: &'static str, source: std::io::Error) -> Self {
         Self::Os { context, source }
     }

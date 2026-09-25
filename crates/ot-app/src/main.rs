@@ -1,8 +1,9 @@
 //! open-task entry point.
 //!
-//! Until the native shell lands, this runs the measuring core headless and prints a
-//! live table to the terminal. That path stays useful permanently: it is the smoke
-//! test for the probe on every platform in CI, and the basis of a future CLI mode.
+//! On Windows this opens the native window. `--headless` (the only mode on other
+//! platforms until their shells exist) runs the measuring core and prints live
+//! snapshots to the terminal instead. The headless path is permanent: it is the
+//! CI smoke test for the probe on every platform and the seed of a future CLI.
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +23,7 @@ fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
     let passes: usize = args
         .iter()
         .position(|a| a == "--passes")
@@ -36,15 +38,36 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let caps = probe.capabilities();
-    tracing::info!(?caps, "probe capabilities");
+    tracing::info!(caps = ?probe.capabilities(), "probe capabilities");
 
-    let sampler = Sampler::start(
-        Box::new(probe),
-        SamplerConfig {
-            interval: Duration::from_secs(1),
-        },
-    );
+    let config = SamplerConfig {
+        interval: Duration::from_secs(1),
+    };
+
+    if headless {
+        run_headless(Box::new(probe), config, passes);
+    } else {
+        run_gui(Box::new(probe), config);
+    }
+}
+
+#[cfg(windows)]
+fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig) {
+    if let Err(e) = ot_shell_win::run(probe, config) {
+        eprintln!("shell failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(windows))]
+fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig) {
+    let _ = (probe, config);
+    eprintln!("no GUI shell on this platform yet; use --headless");
+    std::process::exit(3);
+}
+
+fn run_headless(probe: Box<dyn SystemProbe>, config: SamplerConfig, passes: usize) {
+    let sampler = Sampler::start(probe, config);
 
     let mut last_tick = None;
     let mut printed = 0usize;

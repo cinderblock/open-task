@@ -7,8 +7,9 @@ paywalls, with the depth of Sysinternals Process Explorer and TMOG's "why is my
 computer slow?" diagnostics, in a native app that stays out of the way of the machine
 it is measuring.
 
-**Status: early scaffold.** The measuring core samples real data on Windows and prints
-it to a terminal. There is no GUI yet. Linux and macOS compile but measure nothing.
+**Status: early, but real.** On Windows it opens a native window with live CPU and
+memory graphs over a sortable process table, drawn with Direct2D over a Mica backdrop.
+Linux and macOS compile, run headless, and measure nothing yet.
 
 ## Why not a webview
 
@@ -26,10 +27,11 @@ class: tens of megabytes, not hundreds.
 | `ot-model` | Pure data types. No I/O, no platform code. |
 | `ot-probe` | Platform sampling. Windows is real; Linux and macOS are stubs. |
 | `ot-core` | Sampling thread, history ring buffers, lock-free snapshot publication. |
-| `ot-paint` | Portable draw-command layer (planned). |
-| `ot-ui` | UI-agnostic view models: columns, sort, filter, virtualization (planned). |
+| `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
+| `ot-ui` | UI-agnostic view models: theme, virtualized table, sparklines, root view. |
 | `ot-record` | Flight Recorder: record and replay a session (planned). |
 | `ot-update` | Self-updater. Automatic updates are opt-in (planned). |
+| `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
 | `ot-app` | The binary. |
 
 The sampling cadence and the UI frame rate are independent. The core publishes
@@ -41,11 +43,15 @@ a reader.
 Requires a stable Rust toolchain.
 
 ```
-cargo run --release -- --passes 5
+cargo run --release
 ```
 
-Prints a few passes of live system state and exits. On Linux and macOS it exits with
-code 3 ("no probe on this platform yet").
+Opens the window on Windows. `--headless --passes 5` prints a few passes of live system
+state to the terminal instead and exits; that is the only mode on Linux and macOS for
+now, where it exits with code 3 ("no probe on this platform yet").
+
+`scripts/screenshot.ps1` launches the app, screenshots its window to
+`target/screenshot.png`, and closes it. Handy for checking a rendering change.
 
 ## Releases
 

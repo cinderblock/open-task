@@ -20,5 +20,8 @@ ot-core.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(windows)'.dependencies]
+ot-shell-win.workspace = true
+
 [lints]
 workspace = true

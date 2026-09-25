@@ -49,11 +49,32 @@ pub struct Sampler {
 impl Sampler {
     /// Start sampling `probe` on a dedicated thread.
     ///
+    /// See [`Sampler::start_with_notify`] to be woken on each publish.
+    ///
     /// # Panics
     /// If the OS refuses to spawn a thread. There is nothing useful the app can do
     /// without its sampler, so this is treated as unrecoverable.
     #[must_use]
     pub fn start(probe: Box<dyn SystemProbe>, config: SamplerConfig) -> Self {
+        Self::spawn(probe, config, None)
+    }
+
+    /// Like [`Sampler::start`], but `notify` is called on the sampler thread right
+    /// after each snapshot is published. It must be cheap and non-blocking; on
+    /// Windows it posts a message to the UI thread, nothing more.
+    ///
+    /// # Panics
+    /// If the OS refuses to spawn a thread.
+    #[must_use]
+    pub fn start_with_notify(
+        probe: Box<dyn SystemProbe>,
+        config: SamplerConfig,
+        notify: impl Fn() + Send + 'static,
+    ) -> Self {
+        Self::spawn(probe, config, Some(Box::new(notify)))
+    }
+
+    fn spawn(probe: Box<dyn SystemProbe>, config: SamplerConfig, notify: Option<Notify>) -> Self {
         let shared = Arc::new(Shared {
             current: ArcSwap::from_pointee(Snapshot::default()),
             interval_us: AtomicU64::new(config.interval.as_micros() as u64),
@@ -65,7 +86,7 @@ impl Sampler {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("ot-sampler".into())
-                .spawn(move || run(probe, &shared))
+                .spawn(move || run(probe, &shared, notify.as_deref()))
                 .expect("spawn sampler thread")
         };
 
@@ -114,7 +135,9 @@ impl Drop for Sampler {
     }
 }
 
-fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared) {
+type Notify = Box<dyn Fn() + Send>;
+
+fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn() + Send)>) {
     let mut out = ProbeOutput::default();
     let mut tick = Tick::default();
     let mut last_start: Option<Instant> = None;
@@ -150,6 +173,9 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared) {
                     memory: out.memory,
                     processes,
                 }));
+                if let Some(n) = notify {
+                    n();
+                }
             }
             Err(ProbeError::Unsupported(platform)) => {
                 // Nothing will ever succeed here; log once and idle rather than spin.

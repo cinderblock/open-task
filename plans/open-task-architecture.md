@@ -147,10 +147,12 @@ goes." Same for a future headless/remote mode.
    compiling stubs for Linux/macOS.~~ Done (first cut; lazy per-process details pending).
 3. ~~`ot-core` sampling loop, ring buffers, snapshot publication.~~ Done. Deltas come
    with the Flight Recorder.
-4. **[current, next]** `ot-paint` draw-command layer + Direct2D backend; window with
-   Mica backdrop.
-5. Virtualized table widget + sparkline widget (the two hard ones).
-6. Processes view end-to-end, then Performance, then the rest of the 12.
+4. ~~`ot-paint` draw-command layer + Direct2D backend; window with Mica backdrop.~~ Done.
+5. ~~Virtualized table widget + sparkline widget (the two hard ones).~~ Done (first cut:
+   linear-axis sparkline, no column resize/reorder yet).
+6. **[current]** Processes view end-to-end (basic version works), then Performance,
+   then the rest of the 12. Next concrete items: process details (image path, command
+   line, user), tree/grouping, search filter, column resize, context menu with End task.
 7. Diagnostics engine ("why is my computer slow").
 8. Flight Recorder.
 9. Self-updater + signed releases.
@@ -175,6 +177,26 @@ goes." Same for a future headless/remote mode.
 - In `windows` 0.62 the struct types live in `Win32::System::WindowsProgramming`, while
   the `NtQuerySystemInformation` function and the `SystemProcessInformation` class
   constants live in `Wdk::System::SystemInformation`. Both features are needed.
+- **Run cross-target clippy locally before pushing.** The first CI run failed on Linux
+  and macOS for a `dead_code` lint on a helper only the Windows probe calls. Both
+  `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin` targets are installed here, and
+  `cargo clippy --workspace --all-targets --target <t> -- -D warnings` type-checks without
+  linking, so it reproduces the CI failure exactly in seconds. See "Verify before pushing".
+- `ID2D1Factory1::CreatePathGeometry` returns `ID2D1PathGeometry1`, not the base type.
+- `ID2D1SimplifiedGeometrySink` (with `BeginFigure`/`EndFigure`/`AddLines`) lives in
+  `Direct2D::Common`; `ID2D1GeometrySink::AddLine` is in `Direct2D`. Method calls resolve
+  through `Deref`, so only the imports care.
+- `&raw const expr` requires a place expression; `&raw const rectf(rect)` does not
+  compile. Bind to a local first. Plain `&` coerces to `*const` but trips clippy's
+  `borrow_as_ptr` under pedantic.
+- **ClearType is wrong over a translucent surface.** With a premultiplied-alpha
+  composition swap chain and Mica behind it, ClearType produces colour fringes. The shell
+  sets grayscale text antialiasing, which is what WinUI does over Mica too. If an opaque
+  mode is ever added, switch back to ClearType there.
+- **`FindWindowW(class, $null)` from PowerShell does not find the window**; PowerShell
+  marshals `$null` as an empty title. Pass the real title. Bit `scripts/screenshot.ps1`.
+- Rustfmt reflows long lines, so python string-anchored patches can miss after a `cargo
+  fmt`. Anchor on the post-format text, or patch before formatting.
 - `SystemProcessorPerformanceInformation` only returns processor group 0 (max 64
   logical processors). Machines with more need `SystemProcessorPerformanceInformationEx`
   per group. Deferred; noted in the probe's module docs.
@@ -205,8 +227,25 @@ goes." Same for a future headless/remote mode.
 - [ ] Windows probe: image path / command line / user (lazy `OpenProcess` path).
 - [ ] Windows probe: per-core frequency via PDH `% Processor Performance`.
 - [ ] Windows probe: processor groups > 0.
-- [ ] `ot-paint` draw-command layer + Direct2D backend; window with Mica backdrop.
-- [ ] Virtualized table widget + sparkline widget.
+- [x] `ot-paint`: DIP geometry, colors, text styles, arena-backed `DisplayList`.
+- [x] `ot-ui`: theme, allocation-free number formatting, virtualized sortable `Table`
+      with id-based selection and a row-visibility hook, peak-preserving `sparkline`,
+      root `App` view with CPU and memory cards over the process table.
+- [x] `ot-core`: `Timeline` of timestamped series; `Sampler::start_with_notify`.
+- [x] `ot-shell-win`: Win32 window, `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition
+      swap chain, Direct2D + DirectWrite renderer with a hashed text-layout cache, Mica
+      via DWM, dark title bar, per-monitor-v2 DPI, mouse/wheel/keyboard, sampler wake-up
+      by posted message, zero redraws when idle. **Verified visually** on 2026-09-25 via
+      `scripts/screenshot.ps1` (screenshot kept out of the repo: it shows the user's
+      process list).
+- [x] Cross-target clippy clean on Windows, Linux and macOS targets locally.
+- [x] Remote `cinderblock/open-task` created and pushed. First CI run failed on Linux and
+      macOS (dead-code lint); fixed in the next commit.
+- [ ] Idle-CPU: the app should redraw nothing when unchanged (it does) and cost ~0% CPU
+      between samples. Not yet measured with a profiler; do this before optimizing anything.
+- [ ] Release-mode console: the binary is still a console-subsystem app so `--headless`
+      prints and logs show. Switch to `windows_subsystem = "windows"` for release once
+      there is an `AttachConsole` path for headless mode.
 
 ## Open questions for the user
 
@@ -222,6 +261,21 @@ goes." Same for a future headless/remote mode.
 4. **Linux toolkit.** Qt 6 (TMOG's choice, better dense-table story, better on KDE) vs
    GTK 4 + libadwaita (much better Rust bindings, more "native" on GNOME). Only a stub is
    needed now, so this is deferred, not blocking.
+
+## Verify before pushing
+
+Run all of these locally; CI runs the same set on real runners and takes minutes to
+tell you what these say in seconds.
+
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
+cargo test --workspace
+cargo run -- --headless --passes 2
+pwsh -File scripts/screenshot.ps1      # then look at target/screenshot.png
+```
 
 ## Things not to do
 
