@@ -3,10 +3,21 @@ name: Release
 # Pushing a tag like v1.2.3 builds every target, packages it, and publishes a GitHub
 # release with checksums. The self-updater reads these releases, so the asset naming
 # below is a contract: <name>-<tag>-<target>.<zip|tar.gz> plus SHA256SUMS.
+#
+# The workflow can also be run by hand for a tag that already exists, to publish or
+# repair a release without moving the tag (a workflow fix after the tag was pushed,
+# a runner that never came, an asset upload that failed). It checks out the tag's
+# commit, so the binaries are still built from exactly the tagged source.
 
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.2.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,6 +26,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   BIN: open-task
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -39,11 +51,17 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-13
+          # Intel macOS is cross-compiled on the Apple silicon runner. GitHub retired
+          # the macos-13 label (the v0.2.0 run sat queued on it indefinitely), and the
+          # remaining Intel labels are on the same path. Apple's toolchain builds both
+          # architectures from either host, so this needs nothing but the Rust target.
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -54,7 +72,7 @@ jobs:
       - name: Verify tag matches Cargo version
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ot-app") | .version')"
           echo "tag=$tag cargo=$ver"
           [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match ot-app version $ver"; exit 1; }
@@ -66,7 +84,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="${BIN}-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="${BIN}-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp "target/${{ matrix.target }}/release/${BIN}.exe" "dist/$name/"
@@ -95,6 +113,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -102,13 +122,18 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS && cat SHA256SUMS
-      - name: Create release
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           prerelease=""
-          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            $prerelease
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG exists; replacing its assets"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --generate-notes \
+              $prerelease
+          fi
