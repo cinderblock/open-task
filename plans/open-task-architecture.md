@@ -234,9 +234,12 @@ goes." Same for a future headless/remote mode.
 - [x] CI: `ci.yml` (fmt, clippy, test, build, headless smoke on 4 targets). **Verified
       green on all jobs** at `2bd71c3` (run 36193617770, 2026-09-25), after three fixes:
       dead-code lint on non-Windows, the GUI-launch hang, and GNU `timeout` on macOS.
-- [ ] `release.yml` (6 targets, zip/tar.gz, SHA256SUMS, GitHub release on `v*` tag).
-      **Unverified until a tag is pushed.** Recommend a `v0.0.1` pre-release tag once the
-      first Performance view lands, to shake the workflow out early.
+- [x] `release.yml` (6 targets, zip/tar.gz, SHA256SUMS, GitHub release on `v*` tag).
+      **Verified with v0.2.0 on 2026-09-25**, on the second attempt: the tag-push run
+      (36202166566) hung on the retired `macos-13` label and was cancelled; the fixed
+      workflow, dispatched by hand for the same tag (run 36203080172), built all six
+      targets and published https://github.com/cinderblock/open-task/releases/tag/v0.2.0.
+      Release builds are quick: Linux ~30 s, macOS ~45 s, Windows ~2 min.
 - [x] Windows probe: processes (CPU%, WS, private, disk I/O, threads, handles, parent,
       start time), per-core CPU with P/E-core classes, memory (total/avail/cached/commit).
 - [x] `ot-core`: sampler thread, `ArcSwap` snapshot slot, `Ring<T>` history buffer.
@@ -274,6 +277,10 @@ goes." Same for a future headless/remote mode.
       machine with ~570 processes, no console window. Target is Process Explorer class
       (10–25 MB); the layout cache and per-process `Arc<ProcessStatic>` strings are the
       likely first places to look, but measure with a profiler before touching anything.
+      **v0.2.0 reading (2026-09-25, ~10 s after launch, list mode, ~550 processes):
+      47.4 MB working set, 37.4 MB private.** Up from 38.8 MB; the two readings were not
+      taken the same way, so treat this as a second data point, not a regression
+      measurement. Still: profile before optimising.
 - [x] Process tree mode in the table (generic `RowSource` hierarchy hooks, subtree
       rollups, collapse/expand, indent guides), List/Tree toolbar switch, Ctrl+T, and
       the selection-preserving jump between the two; ancestry breadcrumb; `--view tree`.
@@ -322,5 +329,13 @@ pwsh -File scripts/screenshot.ps1      # then look at target/screenshot.png
   the smoke step now passes `--headless` and has a step-level `timeout-minutes: 2`.
 - Do not use GNU `timeout` in CI shell steps: macOS runners do not have it (exit 127,
   run 36193278405). Use the step's `timeout-minutes` instead; it works on every runner.
+- Do not pin a job to `macos-13`, or to any Intel macOS label. GitHub retired
+  `macos-13` and the v0.2.0 release run (36202166566, 2026-09-25) sat `queued` with no
+  runner for 13 minutes before being cancelled. Intel macOS is cross-compiled on
+  `macos-latest`. The remaining Intel labels (`macos-15-intel`, `macos-26-intel`) are on
+  the same retirement path; do not reach for them either.
+- Do not move a tag to fix a release. `release.yml` has a `workflow_dispatch` that takes
+  an existing tag and builds that tag's commit: `gh workflow run release.yml -f
+  tag=vX.Y.Z`. It creates the release, or replaces the assets if it already exists.
 - Do not push to a remote or create a GitHub repo without explicit per-action approval.
 - Do not rename `master`.

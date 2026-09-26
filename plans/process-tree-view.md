@@ -129,7 +129,21 @@ All steps below are done; kept as the record of what was built.
 
 ## Status
 
-Done as asked. Not pushed: pushing needs per-action approval per the parent plan.
+Done, pushed and released. On 2026-09-25 the user asked for "committed, deployed,
+and published assets at a new version", which authorised the push:
+
+- Version bumped 0.1.0 → 0.2.0 (`c64b5a4`, "Release v0.2.0"); the never-released
+  0.1.0 was the skeleton, and the tree view is a feature, hence a minor bump.
+- `master` and tag `v0.2.0` pushed to `cinderblock/open-task`. CI run 36202164655
+  green. The tag-push release run 36202166566 hung on the retired `macos-13` runner
+  and was cancelled; `46cb10e` fixed the workflow (Intel macOS cross-compiled on
+  `macos-latest`, plus a `workflow_dispatch` that rebuilds an existing tag), and the
+  dispatched run 36203080172 published the release:
+  https://github.com/cinderblock/open-task/releases/tag/v0.2.0
+- Deployed locally with `cargo install --path crates/ot-app --locked --target-dir
+  target`. The install fails with "Access is denied" while the installed copy is
+  running (Windows locks a mapped image), so the old instance was stopped first and
+  the new one relaunched.
 
 ## Open questions for the user
 
