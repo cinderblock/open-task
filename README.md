@@ -57,6 +57,36 @@ No as the default. Every kill checks the process's creation time against the one
 the table before it acts, so a PID that has been recycled since the last sample is
 never killed by mistake.
 
+**Inside a process.** In tree mode every process can be opened one level further.
+Under it sit the **services** it hosts (from the service control manager, so a
+`svchost.exe` row reads `svchost.exe (DcomLaunch) · BrokerInfrastructure,
+DcomLaunch, PlugPlay, …` and the search finds it by any of those names), a
+**Threads (n)** group, and, under each service, the threads that work for it. These
+inner rows start folded, so the tree reads as before until you press **Right** on a
+process or click its chevron. Each thread row shows its id in the PID column, its
+scheduler state and wait reason in the User column, and its CPU.
+
+When open-task runs as administrator it also reads each thread's *service tag*, the
+mark the service control manager puts on the threads a service creates. Then a
+service row carries the CPU of its own threads, the host's Name cell lists its
+services busiest first (`BrokerInfrastructure 98%, PlugPlay, …`), and the
+question "which service in this svchost is spinning?" is answered by the table
+itself. Threads no service claims stay in the Threads group; a process that refuses
+to be read (a protected process such as the Defender engine) lists its services
+without numbers.
+
+**Sample CPU for 5 s** (context menu, administrator only) answers the next two
+questions: *what code* and *on whose behalf*. It starts a short Event Tracing for
+Windows kernel profile, the same read-only sampling `xperf` uses, and shows under
+the process the modules its threads were executing (`bisrv.dll 71%`), the same
+breakdown under each thread, and, for a service with a known trace provider
+(Background Tasks Infrastructure, Plug and Play, Task Scheduler, Windows Update),
+the clients it was working for: the package and background task, the device, the
+scheduled task, the update. Nothing is suspended, attached or written; only a
+private trace session is opened and closed. The sample rows stay until the next
+sample or until the process exits. The same sample is available from a terminal as
+`open-task --headless --sample <pid> [--seconds 5]`.
+
 ## Why not a webview
 
 A task manager's whole job is telling you what is wasting your RAM and CPU. A webview
@@ -118,9 +148,12 @@ Opens the window on Windows. The theme and title bar follow the Windows app mode
 setting, including live changes; `--theme dark` or `--theme light` overrides it.
 `--view tree` starts with the process tree instead of the list.
 `--headless --passes 5` prints a few passes of live system state to the terminal
-instead and exits (the top processes by CPU, with their owning user); that is the
-only mode on Linux and macOS for now, where it exits with code 3 ("no probe on this
-platform yet").
+instead and exits (the top processes by CPU with their owning user, the busiest
+service hosts with the services they run, and the hottest threads with the service
+each works for); that is the only mode on Linux and macOS for now, where it exits
+with code 3 ("no probe on this platform yet"). `--headless --sample <pid>
+[--seconds N]` takes one CPU sample of a process and prints it (see "Sample CPU"
+above; needs an elevated terminal).
 
 To install the current tree as `open-task` on your `PATH`:
 

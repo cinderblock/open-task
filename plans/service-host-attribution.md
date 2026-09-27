@@ -1,6 +1,6 @@
 # Service host attribution: what is svchost actually doing?
 
-> **Status:** active (full scope approved 2026-09-26: "do it all") · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** built and verified 2026-09-27; commits `5882e46`, `f447029` (docs follow) · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md` (step 7, diagnostics). Follows
 > `plans/process-details-actions.md`. Another thread owns `plans/replace-task-manager.md`
 > (Options menu, single instance, v0.3.0) in this same working tree.
@@ -134,31 +134,78 @@ child of the hot svchost that keeps appearing and disappearing.
 
 ## Plan / steps
 
+All done; kept as the record of what was built.
+
 1. ~~Agree scope.~~ All steps approved.
-2. **[current]** `ot-probe` (Windows): parse `SYSTEM_THREAD_INFORMATION`; per-thread CPU deltas
+2. ~~`ot-probe` (Windows): parse `SYSTEM_THREAD_INFORMATION`; per-thread CPU deltas
    keyed by (pid birth, tid, thread create time); global cap with "hottest N threads
    per process" fallback. SCM enumeration once per pass (cheap; cache display names).
    `ot-model`: `ThreadSample`, `ServiceInfo`, `ProcessSample::services`,
-   `ProcessSample::threads`.
-3. `ot-probe` elevated path: service tag per thread (TEB read) once per thread;
+   `ProcessSample::threads`.~~
+3. ~~`ot-probe` elevated path: service tag per thread (TEB read) once per thread;
    `I_QueryTagInformation` name cache per (pid, tag). Capability flag so the UI can
-   say why attribution is missing.
-4. `ot-ui`: Name-cell attribution for service hosts; service and thread layers in
+   say why attribution is missing.~~
+4. ~~`ot-ui`: Name-cell attribution for service hosts; service and thread layers in
    `ProcessRows` (virtual rows with their own `RowId` kinds so PID reuse logic still
-   holds); expand/collapse; sort by subtree; search matches service names. Tests.
-5. `ot-probe`: ETW kernel profile session (start/stop, `EVENT_TRACE_FLAG_PROFILE`,
+   holds); expand/collapse; sort by subtree; search matches service names. Tests.~~
+5. ~~`ot-probe`: ETW kernel profile session (start/stop, `EVENT_TRACE_FLAG_PROFILE`,
    IP only), real-time consumer thread, IP to module map, 5 s window, result
    published as a one-shot `Attribution` on the snapshot. The kernel logger is a
-   singleton on the machine; detect and refuse if another tool holds it.
-6. Provider table (decision 5), payload histogram, inline presentation under the
-   service row. Context menu "Sample CPU for 5 s" wired through `Effect`.
-7. README ("Service hosts" section), parent plan step 7 note, screenshots of the
+   singleton on the machine; detect and refuse if another tool holds it.~~ (Built as
+   a private system logger instead, so it never touches another tool's session.)
+6. ~~Provider table (decision 5), payload histogram, inline presentation under the
+   service row. Context menu "Sample CPU for 5 s" wired through `Effect`.~~
+7. ~~README ("Service hosts" section), parent plan step 7 note, screenshots of the
    DcomLaunch host expanded; verify on this machine with the Xerox background
-   permission turned back on, which reproduces the spin on demand.
+   permission turned back on, which reproduces the spin on demand.~~ (The
+   permission flip alone did not bring the spin back; verified the client path with
+   the Task Scheduler provider instead, see findings.)
 
 ## Findings / gotchas
 
 - Everything in "What actually identified the culprit" above.
+- **Per-thread CPU really is free.** Parsing the thread records that follow each
+  process entry in the `SystemProcessInformation` buffer left the probe at ~5 ms
+  per pass for 5,600 threads on this machine. The idle process (PID 0) reports one
+  thread per core, all with TID 0; they collide by id and are skipped.
+- **Service tags work as described**: `NtQueryInformationThread` for the TEB, one
+  `ReadProcessMemory` of `TEB+0x1720`, `I_QueryTagInformation` for the name. The
+  first headless pass already read `WSearch` on `SearchIndexer.exe`'s hot thread
+  and `InventorySvc` on an svchost. Protected processes (`MsMpEng.exe`) refuse
+  `PROCESS_VM_READ` even elevated; their services list without numbers, by design.
+- **Tags need `SeDebugPrivilege` enabled explicitly** in practice for SYSTEM hosts;
+  administrators hold it disabled. `enable_privilege` turns it on at probe start.
+- **Kernel profiling in a private system logger works** (`EVENT_TRACE_SYSTEM_LOGGER_MODE`
+  with `EVENT_TRACE_FLAG_PROFILE`, session "open-task CPU sample"); no need for the
+  singleton NT Kernel Logger. `ProcessTrace` returns once the controller stops the
+  session, so stop first, then join the consumer. Timestamps must be QPC
+  (`Wnode.ClientContext = 1`) or the session start fails oddly.
+- **`SampledProfile` payload** is `InstructionPointer` (pointer-sized per the
+  header's 32/64-bit flag), `ThreadId` (u32), `Count` (u16). The record header's
+  own `ThreadId`/`ProcessId` are not the sampled thread.
+- **TDH decodes named string fields from a live `EVENT_RECORD`** with
+  `TdhGetPropertySize` + `TdhGetProperty` and a `PROPERTY_DATA_DESCRIPTOR` naming
+  the field; no manifest lookup needed. Verified live: a throwaway scheduled task
+  run six times during an 8 s sample of the `Schedule` host produced 31
+  `Microsoft-Windows-TaskScheduler` events, 30 bucketed to `\open-task-probe` by
+  `TaskName`. The broker provider table entry
+  (`PackageFullName · TaskName`) is the one observed on 2026-09-26.
+- **Re-enabling the Xerox app's background permission in the registry did not
+  bring the spin back** (the broker did not resume retrying on its own within a
+  minute). Not pursued further on the user's machine; the setting was restored.
+- **A search filter matches your own command line.** The GUI driver script passed
+  the filter text as an argument, so its own `pwsh` process matched; the driver
+  now looks the PID up internally. Real users will hit the same thing when they
+  type a word that appears in a terminal's command line; that is correct behaviour.
+- **Ties in the CPU sort shuffled inner rows** (idle services, the Threads group)
+  every second. Fixed with a rank-then-name tie-break written in reverse, because
+  the table reverses the whole ordering for descending columns.
+- **Verified 2026-09-27:** fmt; clippy `-D warnings` on Windows, Linux and macOS
+  targets; 80 tests (13 in `ot-probe`, including a real 0.6 s self-sample when
+  elevated; 55 in `ot-ui`); headless passes; `--sample` of the DcomLaunch host and
+  of the Schedule host; GUI drive of the context menu (`target/drive-sample.ps1`,
+  not committed) producing the sample rows in the tree; screenshots
+  `target/shot-tree.png`, `target/drive-sample.png`.
 - `SvcHostSplitDisable=1` on BrokerInfrastructure keeps five services in one process
   even on a machine with plenty of RAM, so "one service per svchost" cannot be assumed.
 - The registry `ServiceDll` for BrokerInfrastructure names `psmsrv.dll`; the work ran
@@ -172,12 +219,12 @@ child of the hot svchost that keeps appearing and disappearing.
 
 - [x] Plan written.
 - [x] Scope agreed: everything, 2026-09-26.
-- [ ] Probe: threads + SCM services.
-- [ ] Probe: service tags (elevated).
-- [ ] UI: attribution cell, service and thread layers.
-- [ ] Probe: ETW sampling action.
-- [ ] Provider table + payload histogram.
-- [ ] README, parent plan, screenshots, verification.
+- [x] Probe: threads + SCM services (`5882e46`).
+- [x] Probe: service tags (elevated) (`5882e46`).
+- [x] UI: attribution cell, service and thread layers (`5882e46`).
+- [x] Probe: ETW sampling action (`f447029`).
+- [x] Provider table + payload histogram (`f447029`).
+- [x] README, parent plan, verification (this commit).
 
 ## Open questions for the user
 

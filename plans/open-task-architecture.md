@@ -175,7 +175,10 @@ goes." Same for a future headless/remote mode.
    (2026-09-26; see `plans/process-details-actions.md`). Next: the Performance
    view (per-core graphs, memory breakdown, log-scale time axis per decision 8),
    then column reorder and persisted layout.
-7. Diagnostics engine ("why is my computer slow").
+7. Diagnostics engine ("why is my computer slow"). First piece done 2026-09-27:
+   services, threads and per-service CPU under every process, and an on-demand
+   ETW CPU sample with module and client attribution; see
+   `plans/service-host-attribution.md`.
 8. Flight Recorder.
 9. Self-updater + signed releases.
 10. Linux (Qt 6 or GTK 4 — decide later) and macOS shells.
