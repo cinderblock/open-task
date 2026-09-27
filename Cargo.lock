@@ -121,6 +121,7 @@ name = "ot-shell-win"
 version = "0.2.1"
 dependencies = [
  "ot-core",
+ "ot-model",
  "ot-paint",
  "ot-probe",
  "ot-ui",

@@ -5,7 +5,7 @@ use crate::geom::{Point, Rect};
 use crate::text::{HAlign, TextStyle, VAlign};
 
 /// A range into one of the list's arenas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
     pub start: u32,
     pub len: u32,
@@ -31,6 +31,12 @@ pub struct TextCmd {
     /// Trim with an ellipsis when the text is wider than `rect`. Text is always
     /// clipped to `rect` regardless.
     pub ellipsis: bool,
+    /// Editable-field semantics: never trimmed; when wider than `rect`, shifted
+    /// left so the end of the text stays visible. Backends measure the text, which
+    /// is why this is a flag on the command rather than a computation here.
+    pub field: bool,
+    /// Draw an insertion caret after the last character, in the text color.
+    pub caret: bool,
 }
 
 /// One drawing primitive.
@@ -202,29 +208,59 @@ impl DisplayList {
         valign: VAlign,
         ellipsis: bool,
     ) {
-        if text.is_empty() || rect.is_empty() || color.a <= 0.0 {
-            return;
-        }
-        let start = self.strings.len() as u32;
-        self.strings.push_str(text);
-        self.cmds.push(DrawCmd::Text(TextCmd {
-            text: Span {
-                start,
-                len: text.len() as u32,
+        self.push_text(
+            text,
+            TextCmd {
+                text: Span::default(),
+                rect,
+                style,
+                color,
+                halign,
+                valign,
+                ellipsis,
+                field: false,
+                caret: false,
             },
-            rect,
-            style,
-            color,
-            halign,
-            valign,
-            ellipsis,
-        }));
+        );
     }
 
     /// Convenience: left-aligned, vertically centered, ellipsized. The common
     /// table-cell case.
     pub fn label(&mut self, text: &str, rect: Rect, style: TextStyle, color: Color) {
         self.text(text, rect, style, color, HAlign::Left, VAlign::Middle, true);
+    }
+
+    /// A single-line editable field's text: left-aligned, never trimmed, scrolled
+    /// so the end stays visible, with a caret after it when `caret` is set. Empty
+    /// text draws nothing, caret included; callers paint that caret themselves.
+    pub fn field(&mut self, text: &str, rect: Rect, style: TextStyle, color: Color, caret: bool) {
+        self.push_text(
+            text,
+            TextCmd {
+                text: Span::default(),
+                rect,
+                style,
+                color,
+                halign: HAlign::Left,
+                valign: VAlign::Middle,
+                ellipsis: false,
+                field: true,
+                caret,
+            },
+        );
+    }
+
+    fn push_text(&mut self, text: &str, mut cmd: TextCmd) {
+        if text.is_empty() || cmd.rect.is_empty() || cmd.color.a <= 0.0 {
+            return;
+        }
+        let start = self.strings.len() as u32;
+        self.strings.push_str(text);
+        cmd.text = Span {
+            start,
+            len: text.len() as u32,
+        };
+        self.cmds.push(DrawCmd::Text(cmd));
     }
 
     pub fn push_clip(&mut self, rect: Rect) {

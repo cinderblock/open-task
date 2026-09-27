@@ -14,4 +14,7 @@ pub mod theme;
 pub mod view;
 
 pub use theme::Theme;
-pub use view::{App, Command, Key, MouseButton, UiEvent, ViewMode};
+pub use view::{
+    App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Reaction, UiEvent,
+    ViewMode,
+};

@@ -36,6 +36,27 @@ Parent links are real identities, not just parent PIDs: a process whose parent
 exited, and whose PID was then recycled by a stranger, is shown as a root rather than
 adopted by the stranger.
 
+**Search:** just type. Printable keys go to the filter field above the table whether
+or not it has focus; **Ctrl+F** puts the caret there, **Escape** clears it, and the
+arrow keys keep walking the table while you type. The filter matches name, PID,
+user, image path and command line, case-insensitively. In tree mode the ancestors of
+a match stay listed, dimmed, so the match keeps its place in the hierarchy.
+
+**Columns:** Name, PID, User, CPU %, Memory, Working set, Disk read, Disk write,
+Threads, Handles, Command line. Drag a header divider to resize; **Shift+wheel** (or
+a tilt wheel) scrolls sideways when the columns are wider than the window. The user,
+image path and command line come from a limited-rights handle to each process; a
+process that refuses even that (another user's, from an unelevated open-task) still
+shows its image path, but its user and command line stay blank.
+
+**Right-click a process** for **End task**, **End process tree** (the process and
+everything under it, parents first) and **Open file location**. **Delete** and
+**Shift+Delete** are the keyboard shortcuts for the first two; the menu key or
+**Shift+F10** opens the menu for the selected row. Ending a process asks first, with
+No as the default. Every kill checks the process's creation time against the one in
+the table before it acts, so a PID that has been recycled since the last sample is
+never killed by mistake.
+
 ## Why not a webview
 
 A task manager's whole job is telling you what is wasting your RAM and CPU. A webview
@@ -92,8 +113,9 @@ Opens the window on Windows. The theme and title bar follow the Windows app mode
 setting, including live changes; `--theme dark` or `--theme light` overrides it.
 `--view tree` starts with the process tree instead of the list.
 `--headless --passes 5` prints a few passes of live system state to the terminal
-instead and exits; that is the only mode on Linux and macOS for now, where it exits
-with code 3 ("no probe on this platform yet").
+instead and exits (the top processes by CPU, with their owning user); that is the
+only mode on Linux and macOS for now, where it exits with code 3 ("no probe on this
+platform yet").
 
 To install the current tree as `open-task` on your `PATH`:
 

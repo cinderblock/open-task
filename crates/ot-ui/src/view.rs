@@ -1,14 +1,20 @@
 //! The root view: summary cards on top, a toolbar, and the process table below.
+//!
+//! Input comes in as [`UiEvent`]s and goes out as a [`Reaction`]: whether to repaint,
+//! and optionally an [`Effect`] for the shell to carry out with native APIs (a
+//! context menu, a confirmation and kill, opening a folder). The view decides what
+//! should happen; the shell decides how it looks on the platform.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ot_core::{Snapshot, Timeline};
 use ot_model::cpu::CoreKind;
+use ot_model::ProcessKey;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
 
 use crate::format;
-use crate::process_rows::{col, columns, ProcessRows, ProcessTree};
+use crate::process_rows::{col, columns, process_matches, ProcessRows, ProcessTree};
 use crate::sparkline::{self, SparkStyle};
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
@@ -31,6 +37,14 @@ pub enum Key {
     Left,
     /// In tree mode: expand the selected row, or move to its first child.
     Right,
+    /// Delete the last character of the search.
+    Backspace,
+    /// Delete the last word of the search (Ctrl+Backspace).
+    WordBackspace,
+    /// Clear the search and leave it.
+    Escape,
+    /// Leave the search, keeping it.
+    Enter,
 }
 
 /// How the process table is arranged.
@@ -62,6 +76,29 @@ impl ViewMode {
     }
 }
 
+/// An item of the process context menu, and the meaning of a shortcut that does
+/// the same thing (Delete, Shift+Delete).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    /// Terminate the selected process.
+    EndTask,
+    /// Terminate the selected process and everything below it.
+    EndTree,
+    /// Show the selected process's executable in the file manager.
+    OpenFileLocation,
+}
+
+/// One line of a context menu, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    Item {
+        action: MenuAction,
+        label: &'static str,
+        enabled: bool,
+    },
+    Separator,
+}
+
 /// A semantic action, as a menu item or accelerator would issue it. The shell maps
 /// keys to these; the meaning lives here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +107,10 @@ pub enum Command {
     ToggleView,
     /// Show a particular mode. Asking for the current one re-reveals the selection.
     SetView(ViewMode),
+    /// Put the keyboard in the search field (Ctrl+F).
+    Find,
+    /// A context-menu item was chosen, by mouse or by its shortcut.
+    Menu(MenuAction),
 }
 
 /// Input from the shell, in DIPs.
@@ -86,31 +127,203 @@ pub enum UiEvent {
         at: Point,
         button: MouseButton,
     },
-    /// Positive `lines` scrolls content down (wheel toward the user).
+    /// Positive `lines` scrolls content down (wheel toward the user), or to the
+    /// right when `horizontal`.
     Wheel {
         at: Point,
         lines: f32,
+        horizontal: bool,
     },
     Key(Key),
+    /// A printable character was typed. Goes to the search, focused or not.
+    Char(char),
+    /// The user asked for a context menu: at a point, or from the keyboard
+    /// (`None`), in which case it belongs to the selected row.
+    ContextMenu {
+        at: Option<Point>,
+    },
     Command(Command),
+}
+
+/// Something the shell must do with native means.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// Show a popup menu at `at`. The chosen entry comes back as
+    /// [`Command::Menu`]; dismissal sends nothing.
+    Menu { at: Point, entries: Vec<MenuEntry> },
+    /// After the user confirms, terminate `targets` in order. `label` names what is
+    /// being ended, for the confirmation ("chrome.exe and 41 processes under it").
+    Terminate {
+        targets: Vec<ProcessKey>,
+        label: String,
+    },
+    /// Reveal this file in the platform's file manager.
+    OpenFileLocation(String),
+}
+
+/// What an event led to.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[must_use]
+pub struct Reaction {
+    /// The view changed; paint again.
+    pub repaint: bool,
+    pub effect: Option<Effect>,
+}
+
+impl Reaction {
+    pub const NONE: Self = Self {
+        repaint: false,
+        effect: None,
+    };
+    pub const REPAINT: Self = Self {
+        repaint: true,
+        effect: None,
+    };
+
+    fn painted(repaint: bool) -> Self {
+        Self {
+            repaint,
+            effect: None,
+        }
+    }
+
+    fn effect(effect: Effect) -> Self {
+        Self {
+            repaint: true,
+            effect: Some(effect),
+        }
+    }
+}
+
+/// Which pointer to show, for the shell to map to a platform cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cursor {
+    #[default]
+    Arrow,
+    /// Over a column divider, or dragging one.
+    ResizeColumn,
+    /// Over the search field.
+    Text,
 }
 
 const HISTORY_POINTS: usize = 600;
 const CARD_H: f32 = 96.0;
 
+/// The search field. Type-to-filter: printable keys land here whether or not it has
+/// focus, so focus only decides where Enter and Escape go and whether a caret shows.
+#[derive(Debug, Default)]
+struct SearchBox {
+    text: String,
+    /// Lower-cased `text`, what the matcher uses.
+    needle: String,
+    focused: bool,
+    rect: Rect,
+    /// The clear button at the right end, when there is text.
+    clear_rect: Rect,
+    hover_clear: bool,
+}
+
+impl SearchBox {
+    fn set_text(&mut self, text: &str) {
+        self.text.clear();
+        self.text.push_str(text);
+        self.needle.clear();
+        self.needle
+            .extend(text.chars().map(|c| c.to_ascii_lowercase()));
+    }
+
+    fn push(&mut self, c: char) {
+        self.text.push(c);
+        self.needle.push(c.to_ascii_lowercase());
+    }
+
+    /// Remove the last character, or the last word. Returns false if empty.
+    fn backspace(&mut self, word: bool) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+        if word {
+            let trimmed = self.text.trim_end();
+            let cut = trimmed
+                .rfind(|c: char| c.is_whitespace() || c == '\\' || c == '/')
+                .map_or(0, |i| i + 1);
+            self.text.truncate(cut);
+        } else {
+            self.text.pop();
+        }
+        let t = std::mem::take(&mut self.text);
+        self.set_text(&t);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.needle.clear();
+    }
+
+    fn paint(&mut self, dl: &mut DisplayList, rect: Rect, theme: &Theme) {
+        self.rect = rect;
+        let r = Rect::new(rect.x, rect.y + 2.0, rect.w, rect.h - 4.0);
+        dl.fill_round_rect(r, theme.card_radius, theme.input_bg);
+        let border = if self.focused {
+            theme.accent
+        } else {
+            theme.surface_border
+        };
+        dl.stroke_rect(r, border, 1.0);
+
+        let inner = r.inset(theme.pad, 0.0);
+        if self.text.is_empty() {
+            self.clear_rect = Rect::ZERO;
+            dl.label("Filter (Ctrl+F)", inner, theme.cell, theme.text_dim);
+            if self.focused {
+                dl.fill_rect(
+                    Rect::new(inner.x, inner.y + 5.0, 1.0, inner.h - 10.0),
+                    theme.text,
+                );
+            }
+            return;
+        }
+        let (text_rect, clear) = inner.split_left((inner.w - 18.0).max(0.0));
+        self.clear_rect = clear;
+        dl.field(&self.text, text_rect, theme.cell, theme.text, self.focused);
+        // A small ×, as geometry so it needs no glyph.
+        let c = clear.center();
+        let s = 3.5;
+        let color = if self.hover_clear {
+            theme.text
+        } else {
+            theme.text_dim
+        };
+        dl.line(
+            Point::new(c.x - s, c.y - s),
+            Point::new(c.x + s, c.y + s),
+            color,
+            1.2,
+        );
+        dl.line(
+            Point::new(c.x - s, c.y + s),
+            Point::new(c.x + s, c.y - s),
+            color,
+            1.2,
+        );
+    }
+}
+
 /// The strip between the cards and the table: the List/Tree switch, the selected
-/// process's ancestry, and the process count.
+/// process's ancestry, the search field, and the process count.
 #[derive(Debug, Default)]
 struct Toolbar {
     /// Segment rectangles from the last paint, in [`SEGMENTS`] order.
     segments: [Rect; 2],
     hover: Option<usize>,
     chain: Vec<u32>,
+    search: SearchBox,
 }
 
 const SEGMENTS: [(ViewMode, &str); 2] = [(ViewMode::List, "List"), (ViewMode::Tree, "Tree")];
 const SEGMENT_W: f32 = 60.0;
-const COUNT_W: f32 = 120.0;
+const COUNT_W: f32 = 130.0;
 
 impl Toolbar {
     fn segment_at(&self, p: Point) -> Option<usize> {
@@ -160,11 +373,20 @@ impl Toolbar {
             );
         }
 
-        // Right edge: how many processes the table lists.
+        // Right to left: the count, then the search field; the breadcrumb gets what
+        // is left in the middle.
         let (_, after_group) = rect.split_left(group.w + theme.pad);
-        let (crumb, count) = after_group.split_left((after_group.w - COUNT_W).max(0.0));
+        let (middle, count) = after_group.split_left((after_group.w - COUNT_W).max(0.0));
+        let search_w = theme.search_w.min(middle.w);
+        let (crumb, search) = middle.split_left((middle.w - search_w - theme.pad).max(0.0));
+        let (_, search) = search.split_left(theme.pad.min(search.w));
+
         buf.clear();
-        let _ = write!(buf, "{} processes", rows.listed());
+        if rows.filtered() {
+            let _ = write!(buf, "{} of {} processes", rows.listed(), rows.population());
+        } else {
+            let _ = write!(buf, "{} processes", rows.listed());
+        }
         dl.text(
             buf,
             count,
@@ -174,6 +396,8 @@ impl Toolbar {
             VAlign::Middle,
             true,
         );
+
+        self.search.paint(dl, search, theme);
 
         // Between: where the selected process sits in the hierarchy. The same text in
         // both modes is what ties the sorted list to the tree.
@@ -197,8 +421,16 @@ pub struct App {
     snap: Arc<Snapshot>,
     tree: ProcessTree,
     timeline: Timeline,
+    /// Search results per process; empty when there is no search.
+    matched: Vec<bool>,
+    /// What the table lists: matches, plus their ancestors in tree mode.
+    shown: Vec<bool>,
+    /// Last known pointer position, for the cursor shape.
+    mouse: Option<Point>,
     buf: String,
+    pid_buf: String,
     scratch: Vec<Point>,
+    subtree: Vec<usize>,
 }
 
 impl App {
@@ -213,8 +445,13 @@ impl App {
             snap: Arc::new(Snapshot::default()),
             tree: ProcessTree::default(),
             timeline: Timeline::new(HISTORY_POINTS),
+            matched: Vec::new(),
+            shown: Vec::new(),
+            mouse: None,
             buf: String::with_capacity(64),
+            pid_buf: String::with_capacity(12),
             scratch: Vec::with_capacity(HISTORY_POINTS),
+            subtree: Vec::new(),
         }
     }
 
@@ -244,8 +481,36 @@ impl App {
 
     /// Switch the process table's arrangement, keeping the selection in view.
     pub fn set_view(&mut self, mode: ViewMode) {
-        let rows = rows_of(&self.snap, &self.tree);
+        // The filter's ancestor rule depends on the mode, and the reveal that
+        // follows needs the order the new mode will actually show.
+        self.refilter(mode == ViewMode::Tree);
+        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
         apply_view(&mut self.table, mode, &rows, &self.theme);
+    }
+
+    /// The current search text.
+    #[must_use]
+    pub fn search(&self) -> &str {
+        &self.toolbar.search.text
+    }
+
+    /// Which pointer to show at the last known mouse position.
+    #[must_use]
+    pub fn cursor(&self) -> Cursor {
+        if self.table.resizing() {
+            return Cursor::ResizeColumn;
+        }
+        let Some(p) = self.mouse else {
+            return Cursor::Arrow;
+        };
+        let search = &self.toolbar.search;
+        if self.table.divider_at(p).is_some() {
+            Cursor::ResizeColumn
+        } else if search.rect.contains(p) && !search.clear_rect.contains(p) {
+            Cursor::Text
+        } else {
+            Cursor::Arrow
+        }
     }
 
     /// Offer the newest snapshot. Returns true if it was new and a repaint is due.
@@ -256,84 +521,306 @@ impl App {
         self.timeline.observe(&snap);
         self.tree.rebuild(&snap.processes);
         self.snap = snap;
+        self.refilter(self.table.tree());
         self.table.invalidate_order();
         true
     }
 
-    /// Handle input. Returns true if a repaint is needed.
-    pub fn handle(&mut self, ev: UiEvent) -> bool {
-        let rows = rows_of(&self.snap, &self.tree);
-        let theme = &self.theme;
+    /// Recompute the search results against the current snapshot.
+    fn refilter(&mut self, tree: bool) {
+        self.matched.clear();
+        self.shown.clear();
+        self.table.invalidate_order();
+        let needle = &self.toolbar.search.needle;
+        if needle.is_empty() {
+            return;
+        }
+        let pid_buf = &mut self.pid_buf;
+        self.matched.extend(
+            self.snap
+                .processes
+                .iter()
+                .map(|p| process_matches(p, needle, pid_buf)),
+        );
+        self.shown.extend_from_slice(&self.matched);
+        if tree {
+            self.tree.propagate_up(&mut self.shown);
+        }
+    }
+
+    /// The search text changed: apply it. Repaints.
+    fn search_changed(&mut self) -> Reaction {
+        self.refilter(self.table.tree());
+        Reaction::REPAINT
+    }
+
+    /// Handle input. Says whether to repaint and what else to do.
+    pub fn handle(&mut self, ev: UiEvent) -> Reaction {
         match ev {
             UiEvent::Resize(s) => {
                 self.size = s;
-                true
+                Reaction::REPAINT
             }
             UiEvent::MouseMove(p) => {
-                let hover = match self.table.hit(p, theme) {
+                self.mouse = Some(p);
+                if self.table.resizing() {
+                    return Reaction::painted(self.table.resize_to(p));
+                }
+                let hover = match self.table.hit(p, &self.theme) {
                     Hit::Row(i) | Hit::Expander(i) => Some(i),
                     _ => None,
                 };
                 let segment = self.toolbar.segment_at(p);
-                let changed = hover != self.table.hover || segment != self.toolbar.hover;
+                let clear = self.toolbar.search.clear_rect.contains(p);
+                let changed = hover != self.table.hover
+                    || segment != self.toolbar.hover
+                    || clear != self.toolbar.search.hover_clear;
                 self.table.hover = hover;
                 self.toolbar.hover = segment;
-                changed
+                self.toolbar.search.hover_clear = clear;
+                Reaction::painted(changed)
             }
             UiEvent::MouseLeave => {
+                self.mouse = None;
                 let row = self.table.hover.take().is_some();
                 let segment = self.toolbar.hover.take().is_some();
-                row || segment
+                let clear = std::mem::take(&mut self.toolbar.search.hover_clear);
+                Reaction::painted(row || segment || clear)
             }
             UiEvent::MouseDown {
                 at,
                 button: MouseButton::Left,
+            } => self.left_down(at),
+            UiEvent::MouseUp {
+                at,
+                button: MouseButton::Left,
             } => {
-                if let Some(i) = self.toolbar.segment_at(at) {
-                    apply_view(&mut self.table, SEGMENTS[i].0, &rows, theme);
-                    return true;
+                if self.table.resizing() {
+                    self.table.resize_to(at);
+                    self.table.end_resize();
+                    return Reaction::REPAINT;
                 }
-                match self.table.hit(at, theme) {
-                    Hit::Header(c) => {
-                        self.table.set_sort(c);
-                        true
-                    }
-                    Hit::Expander(pos) => self.table.toggle_expanded(pos, &rows),
-                    Hit::Row(pos) => {
-                        self.table.selected = self.table.row_at(pos).map(|r| rows.id(r));
-                        true
-                    }
-                    Hit::Nothing => false,
+                Reaction::NONE
+            }
+            UiEvent::MouseDown {
+                at,
+                button: MouseButton::Right,
+            } => {
+                // Right-click selects like a left click, so the menu that follows
+                // (via `ContextMenu`) applies to the row under the pointer.
+                Reaction::painted(self.select_at(at))
+            }
+            UiEvent::MouseUp { .. } => Reaction::NONE,
+            UiEvent::Wheel {
+                lines, horizontal, ..
+            } => {
+                if horizontal {
+                    self.table.scroll_x_by(lines * 40.0);
+                } else {
+                    self.table.scroll_lines(lines * 3.0);
                 }
+                Reaction::REPAINT
             }
-            UiEvent::MouseDown { .. } | UiEvent::MouseUp { .. } => false,
-            UiEvent::Wheel { lines, .. } => {
-                self.table.scroll_lines(lines * 3.0);
-                true
+            UiEvent::Char(c) => {
+                self.toolbar.search.focused = true;
+                self.toolbar.search.push(c);
+                self.search_changed()
             }
-            UiEvent::Key(k) => {
-                let page =
-                    isize::try_from(self.table.rows_visible(theme).max(1)).unwrap_or(isize::MAX);
-                match k {
-                    Key::Up => self.table.move_selection(&rows, -1, theme),
-                    Key::Down => self.table.move_selection(&rows, 1, theme),
-                    Key::PageUp => self.table.move_selection(&rows, -page, theme),
-                    Key::PageDown => self.table.move_selection(&rows, page, theme),
-                    Key::Home => self.table.select_end(&rows, true, theme),
-                    Key::End => self.table.select_end(&rows, false, theme),
-                    Key::Left => return self.table.collapse_or_parent(&rows, theme),
-                    Key::Right => return self.table.expand_or_child(&rows, theme),
+            UiEvent::Key(k) => self.key(k),
+            UiEvent::ContextMenu { at } => self.context_menu(at),
+            UiEvent::Command(c) => self.command(c),
+        }
+    }
+
+    fn left_down(&mut self, at: Point) -> Reaction {
+        let theme = &self.theme;
+        if let Some(i) = self.toolbar.segment_at(at) {
+            self.toolbar.search.focused = false;
+            self.set_view(SEGMENTS[i].0);
+            return Reaction::REPAINT;
+        }
+        let search = &mut self.toolbar.search;
+        if search.clear_rect.contains(at) {
+            search.clear();
+            search.focused = false;
+            return self.search_changed();
+        }
+        if search.rect.contains(at) {
+            search.focused = true;
+            return Reaction::REPAINT;
+        }
+        search.focused = false;
+        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        match self.table.hit(at, theme) {
+            Hit::Divider(c) => {
+                self.table.begin_resize(c, at);
+                Reaction::NONE
+            }
+            Hit::Header(c) => {
+                self.table.set_sort(c);
+                Reaction::REPAINT
+            }
+            Hit::Expander(pos) => Reaction::painted(self.table.toggle_expanded(pos, &rows)),
+            Hit::Row(pos) => {
+                self.table.selected = self.table.row_at(pos).map(|r| rows.id(r));
+                Reaction::REPAINT
+            }
+            Hit::Nothing => Reaction::REPAINT,
+        }
+    }
+
+    /// Select the row under `at`, if there is one. Returns whether anything changed.
+    fn select_at(&mut self, at: Point) -> bool {
+        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        match self.table.hit(at, &self.theme) {
+            Hit::Row(pos) | Hit::Expander(pos) => {
+                let id = self.table.row_at(pos).map(|r| rows.id(r));
+                let changed = id != self.table.selected;
+                self.table.selected = id;
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    fn key(&mut self, k: Key) -> Reaction {
+        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        let theme = &self.theme;
+        let page = isize::try_from(self.table.rows_visible(theme).max(1)).unwrap_or(isize::MAX);
+        match k {
+            Key::Up => self.table.move_selection(&rows, -1, theme),
+            Key::Down => self.table.move_selection(&rows, 1, theme),
+            Key::PageUp => self.table.move_selection(&rows, -page, theme),
+            Key::PageDown => self.table.move_selection(&rows, page, theme),
+            Key::Home => self.table.select_end(&rows, true, theme),
+            Key::End => self.table.select_end(&rows, false, theme),
+            Key::Left => return Reaction::painted(self.table.collapse_or_parent(&rows, theme)),
+            Key::Right => return Reaction::painted(self.table.expand_or_child(&rows, theme)),
+            Key::Backspace | Key::WordBackspace => {
+                let search = &mut self.toolbar.search;
+                if !search.backspace(k == Key::WordBackspace) {
+                    return Reaction::NONE;
                 }
-                true
+                search.focused = true;
+                return self.search_changed();
             }
-            UiEvent::Command(c) => {
-                let mode = match c {
-                    Command::ToggleView => self.view().other(),
-                    Command::SetView(m) => m,
+            Key::Escape => {
+                let search = &mut self.toolbar.search;
+                if search.text.is_empty() && !search.focused {
+                    return Reaction::NONE;
+                }
+                search.clear();
+                search.focused = false;
+                return self.search_changed();
+            }
+            Key::Enter => {
+                let search = &mut self.toolbar.search;
+                return Reaction::painted(std::mem::take(&mut search.focused));
+            }
+        }
+        Reaction::REPAINT
+    }
+
+    fn command(&mut self, c: Command) -> Reaction {
+        match c {
+            Command::ToggleView => {
+                self.set_view(self.view().other());
+                Reaction::REPAINT
+            }
+            Command::SetView(m) => {
+                self.set_view(m);
+                Reaction::REPAINT
+            }
+            Command::Find => {
+                self.toolbar.search.focused = true;
+                Reaction::REPAINT
+            }
+            Command::Menu(action) => self.menu_action(action),
+        }
+    }
+
+    /// The selected process's index in the snapshot, if it is still there.
+    fn selected_row(&self) -> Option<usize> {
+        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        self.table.selected.and_then(|id| rows.row_of(id))
+    }
+
+    fn context_menu(&mut self, at: Option<Point>) -> Reaction {
+        let anchor = if let Some(p) = at {
+            self.select_at(p);
+            match self.table.hit(p, &self.theme) {
+                Hit::Row(_) | Hit::Expander(_) => p,
+                _ => return Reaction::NONE,
+            }
+        } else {
+            // From the keyboard: just under the selected row's name.
+            let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+            let Some(r) = self.table.selected_rect(&rows, &self.theme) else {
+                return Reaction::NONE;
+            };
+            Point::new(r.x + self.theme.pad + self.theme.expander_w, r.bottom())
+        };
+        let Some(row) = self.selected_row() else {
+            return Reaction::NONE;
+        };
+        let p = &self.snap.processes[row];
+        let entries = vec![
+            MenuEntry::Item {
+                action: MenuAction::EndTask,
+                label: "End task",
+                enabled: true,
+            },
+            MenuEntry::Item {
+                action: MenuAction::EndTree,
+                label: "End process tree",
+                enabled: self.tree.rollup(row).descendants > 0,
+            },
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                action: MenuAction::OpenFileLocation,
+                label: "Open file location",
+                enabled: p.statics.image_path.is_some(),
+            },
+        ];
+        Reaction::effect(Effect::Menu {
+            at: anchor,
+            entries,
+        })
+    }
+
+    fn menu_action(&mut self, action: MenuAction) -> Reaction {
+        let Some(row) = self.selected_row() else {
+            return Reaction::NONE;
+        };
+        let p = &self.snap.processes[row];
+        match action {
+            MenuAction::EndTask => Reaction::effect(Effect::Terminate {
+                targets: vec![p.key()],
+                label: p.name().to_owned(),
+            }),
+            MenuAction::EndTree => {
+                self.tree.subtree(row, &mut self.subtree);
+                let targets: Vec<ProcessKey> = self
+                    .subtree
+                    .iter()
+                    .map(|&i| self.snap.processes[i].key())
+                    .collect();
+                let below = targets.len() - 1;
+                let label = if below == 0 {
+                    p.name().to_owned()
+                } else {
+                    format!(
+                        "{} and {below} process{} under it",
+                        p.name(),
+                        if below == 1 { "" } else { "es" }
+                    )
                 };
-                apply_view(&mut self.table, mode, &rows, theme);
-                true
+                Reaction::effect(Effect::Terminate { targets, label })
             }
+            MenuAction::OpenFileLocation => match &p.statics.image_path {
+                Some(path) => Reaction::effect(Effect::OpenFileLocation(path.clone())),
+                None => Reaction::NONE,
+            },
         }
     }
 
@@ -376,7 +863,7 @@ impl App {
             &mut self.scratch,
         );
 
-        let rows = rows_of(&snap, &self.tree);
+        let rows = rows_of(&snap, &self.tree, &self.matched, &self.shown);
         // The table first: the toolbar reads its state, and the order must be
         // current before the ancestry lookup.
         self.table
@@ -510,12 +997,19 @@ fn apply_view(table: &mut Table, mode: ViewMode, rows: &ProcessRows<'_>, theme: 
     }
 }
 
-fn rows_of<'a>(snap: &'a Snapshot, tree: &'a ProcessTree) -> ProcessRows<'a> {
+fn rows_of<'a>(
+    snap: &'a Snapshot,
+    tree: &'a ProcessTree,
+    matched: &'a [bool],
+    shown: &'a [bool],
+) -> ProcessRows<'a> {
     ProcessRows {
         procs: &snap.processes,
         tree,
         interval_secs: interval_secs(snap),
         mem_total: snap.memory.total.get() as f32,
+        matched,
+        shown,
     }
 }
 
@@ -535,11 +1029,12 @@ impl Default for App {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)] // tests drive the view and ignore most reactions
 mod tests {
     use super::*;
     use crate::process_rows::row_id;
     use crate::process_rows::tests::proc;
-    use ot_model::process::ProcessSample;
+    use ot_model::process::{ProcessSample, ProcessStatic};
     use ot_model::{ProcessKey, Tick};
     use ot_paint::DrawCmd;
     use std::time::{Duration, SystemTime};
@@ -589,9 +1084,10 @@ mod tests {
             .collect()
     }
 
-    /// Names in the order the table paints them. Only the table body is clipped, so
-    /// text inside a clip is a table cell and not, say, the toolbar's breadcrumb.
-    fn painted_names(app: &mut App) -> Vec<String> {
+    /// Names in the order the table paints them, with the color they got. Only the
+    /// table body and header are clipped, so text inside a clip is a table cell
+    /// and not, say, the toolbar's breadcrumb.
+    fn painted_rows(app: &mut App) -> Vec<(String, Color)> {
         let mut dl = DisplayList::new();
         app.paint(&mut dl);
         let mut depth = 0;
@@ -603,7 +1099,7 @@ mod tests {
                 DrawCmd::Text(t) if depth > 0 => {
                     let s = dl.str(t.text);
                     if s.starts_with('p') && s.contains(".exe") {
-                        names.push(s.to_owned());
+                        names.push((s.to_owned(), t.color));
                     }
                 }
                 _ => {}
@@ -612,10 +1108,28 @@ mod tests {
         names
     }
 
+    fn painted_names(app: &mut App) -> Vec<String> {
+        painted_rows(app).into_iter().map(|(n, _)| n).collect()
+    }
+
     fn ready(app: &mut App) {
         app.handle(UiEvent::Resize(Size::new(900.0, 700.0)));
         let mut dl = DisplayList::new();
         app.paint(&mut dl);
+    }
+
+    fn cmd(app: &mut App, c: Command) -> Reaction {
+        app.handle(UiEvent::Command(c))
+    }
+
+    fn key(app: &mut App, k: Key) -> Reaction {
+        app.handle(UiEvent::Key(k))
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle(UiEvent::Char(c));
+        }
     }
 
     #[test]
@@ -648,9 +1162,9 @@ mod tests {
             ],
         ));
         ready(&mut app);
-        assert!(app.handle(UiEvent::Key(Key::Down)));
+        assert!(key(&mut app, Key::Down).repaint);
         assert_eq!(app.table.selected, Some(id(2)));
-        app.handle(UiEvent::Key(Key::Down));
+        key(&mut app, Key::Down);
         assert_eq!(app.table.selected, Some(id(3)));
     }
 
@@ -679,7 +1193,7 @@ mod tests {
         let mut app = App::default();
         app.set_snapshot(family());
         ready(&mut app);
-        app.handle(UiEvent::Command(Command::SetView(ViewMode::Tree)));
+        cmd(&mut app, Command::SetView(ViewMode::Tree));
         assert_eq!(app.view(), ViewMode::Tree);
         // Roots: 4 (subtree 41) above the orphan 20 (10). Under 4: branch 10 (32)
         // above branch 12 (8), even though 12's own CPU is higher than 10's.
@@ -695,22 +1209,22 @@ mod tests {
         app.set_snapshot(family());
         ready(&mut app);
         // Pick the hottest process in the list.
-        app.handle(UiEvent::Key(Key::Down));
+        key(&mut app, Key::Down);
         assert_eq!(app.table.selected, Some(id(11)));
 
         // Collapse everything above it in the tree first, to prove reveal expands.
-        app.handle(UiEvent::Command(Command::ToggleView));
-        app.handle(UiEvent::Key(Key::Left)); // 11 is a leaf: moves to 10
-        app.handle(UiEvent::Key(Key::Left)); // collapses 10
-        app.handle(UiEvent::Key(Key::Left)); // moves to 4
-        app.handle(UiEvent::Key(Key::Left)); // collapses 4
+        cmd(&mut app, Command::ToggleView);
+        key(&mut app, Key::Left); // 11 is a leaf: moves to 10
+        key(&mut app, Key::Left); // collapses 10
+        key(&mut app, Key::Left); // moves to 4
+        key(&mut app, Key::Left); // collapses 4
         assert_eq!(painted_names(&mut app), ["p4.exe (4)", "p20.exe"]);
         app.table.selected = Some(id(11));
 
-        app.handle(UiEvent::Command(Command::ToggleView));
+        cmd(&mut app, Command::ToggleView);
         assert_eq!(app.view(), ViewMode::List);
         assert_eq!(app.table.selected, Some(id(11)));
-        app.handle(UiEvent::Command(Command::ToggleView));
+        cmd(&mut app, Command::ToggleView);
         assert_eq!(app.view(), ViewMode::Tree);
         assert_eq!(app.table.selected, Some(id(11)));
         let names = painted_names(&mut app);
@@ -723,9 +1237,9 @@ mod tests {
         let mut app = App::default();
         app.set_snapshot(family());
         ready(&mut app);
-        app.handle(UiEvent::Command(Command::SetView(ViewMode::Tree)));
-        app.handle(UiEvent::Key(Key::Down)); // selects 4
-        app.handle(UiEvent::Key(Key::Left)); // collapses it
+        cmd(&mut app, Command::SetView(ViewMode::Tree));
+        key(&mut app, Key::Down); // selects 4
+        key(&mut app, Key::Left); // collapses it
         let strings = painted_strings(&mut app);
         assert!(strings.iter().any(|s| s == "p4.exe (4)"), "{strings:?}");
         // 1 + 2 + 30 + 5 + 3 = 41, shown in the CPU column.
@@ -747,7 +1261,7 @@ mod tests {
         app.table.selected = Some(id(13));
         let crumb = "p4.exe › p12.exe › p13.exe";
         assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
-        app.handle(UiEvent::Command(Command::ToggleView));
+        cmd(&mut app, Command::ToggleView);
         assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
     }
 
@@ -757,12 +1271,15 @@ mod tests {
         app.set_snapshot(family());
         ready(&mut app);
         let tree_seg = app.toolbar.segments[1].center();
-        assert!(app.handle(UiEvent::MouseMove(tree_seg)));
+        assert!(app.handle(UiEvent::MouseMove(tree_seg)).repaint);
         assert_eq!(app.toolbar.hover, Some(1));
-        assert!(app.handle(UiEvent::MouseDown {
-            at: tree_seg,
-            button: MouseButton::Left,
-        }));
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at: tree_seg,
+                button: MouseButton::Left,
+            })
+            .repaint
+        );
         assert_eq!(app.view(), ViewMode::Tree);
         let list_seg = app.toolbar.segments[0].center();
         app.handle(UiEvent::MouseDown {
@@ -770,8 +1287,12 @@ mod tests {
             button: MouseButton::Left,
         });
         assert_eq!(app.view(), ViewMode::List);
-        assert!(app.handle(UiEvent::MouseLeave));
+        assert!(app.handle(UiEvent::MouseLeave).repaint);
         assert_eq!(app.toolbar.hover, None);
+    }
+
+    fn table_top(theme: &Theme) -> f32 {
+        theme.gap + CARD_H + theme.gap + theme.toolbar_h + theme.gap * 0.5
     }
 
     #[test]
@@ -779,22 +1300,343 @@ mod tests {
         let mut app = App::default();
         app.set_snapshot(family());
         ready(&mut app);
-        app.handle(UiEvent::Command(Command::SetView(ViewMode::Tree)));
+        cmd(&mut app, Command::SetView(ViewMode::Tree));
         let mut dl = DisplayList::new();
         app.paint(&mut dl);
         let theme = app.theme.clone();
         // First row is p4.exe at depth 0; its expander box starts at the padding.
-        let table_top = theme.gap + CARD_H + theme.gap + theme.toolbar_h + theme.gap * 0.5;
         let at = Point::new(
             theme.gap + theme.pad + theme.expander_w * 0.5,
-            table_top + theme.header_h + theme.row_h * 0.5,
+            table_top(&theme) + theme.header_h + theme.row_h * 0.5,
         );
         assert_eq!(app.table.hit(at, &theme), Hit::Expander(0));
-        assert!(app.handle(UiEvent::MouseDown {
-            at,
-            button: MouseButton::Left,
-        }));
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at,
+                button: MouseButton::Left,
+            })
+            .repaint
+        );
         assert_eq!(app.table.selected, None);
         assert_eq!(painted_names(&mut app), ["p4.exe (4)", "p20.exe"]);
+    }
+
+    #[test]
+    fn typing_filters_the_list_and_escape_clears() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        type_str(&mut app, "P1");
+        assert_eq!(app.search(), "P1");
+        assert!(app.toolbar.search.focused);
+        assert_eq!(
+            painted_names(&mut app),
+            ["p11.exe", "p12.exe", "p13.exe", "p10.exe"]
+        );
+        let strings = painted_strings(&mut app);
+        assert!(
+            strings.iter().any(|s| s == "4 of 6 processes"),
+            "{strings:?}"
+        );
+        assert!(strings.iter().any(|s| s == "P1"), "field text painted");
+
+        // Backspace narrows back out; Ctrl+Backspace removes the word.
+        key(&mut app, Key::Backspace);
+        assert_eq!(app.search(), "P");
+        type_str(&mut app, "20 tail");
+        key(&mut app, Key::WordBackspace);
+        assert_eq!(app.search(), "P20 ");
+        key(&mut app, Key::WordBackspace);
+        assert_eq!(app.search(), "");
+        assert_eq!(key(&mut app, Key::Backspace), Reaction::NONE);
+
+        type_str(&mut app, "zzz");
+        assert_eq!(painted_names(&mut app), Vec::<String>::new());
+        assert!(key(&mut app, Key::Escape).repaint);
+        assert_eq!(app.search(), "");
+        assert!(!app.toolbar.search.focused);
+        assert_eq!(painted_names(&mut app).len(), 6);
+        assert_eq!(key(&mut app, Key::Escape), Reaction::NONE);
+
+        // Enter just leaves the field.
+        assert!(cmd(&mut app, Command::Find).repaint);
+        assert!(key(&mut app, Key::Enter).repaint);
+        assert_eq!(key(&mut app, Key::Enter), Reaction::NONE);
+    }
+
+    #[test]
+    fn a_filtered_tree_keeps_ancestors_muted_and_arrows_still_move() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        cmd(&mut app, Command::SetView(ViewMode::Tree));
+        type_str(&mut app, "p13");
+        let rows = painted_rows(&mut app);
+        let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["p4.exe", "p12.exe", "p13.exe"]);
+        let dim = app.theme.text_dim;
+        assert_eq!(rows[0].1, dim, "context ancestor is muted");
+        assert_eq!(rows[1].1, dim);
+        assert_eq!(rows[2].1, app.theme.text, "the match is not");
+
+        // Switching to the list drops the context rows; back to the tree brings
+        // them back, because the filter is recomputed for the mode.
+        cmd(&mut app, Command::ToggleView);
+        assert_eq!(painted_names(&mut app), ["p13.exe"]);
+        cmd(&mut app, Command::ToggleView);
+        assert_eq!(painted_names(&mut app).len(), 3);
+
+        // The field has focus, and Down still walks the table.
+        assert!(app.toolbar.search.focused);
+        key(&mut app, Key::Down);
+        assert_eq!(app.table.selected, Some(id(4)));
+    }
+
+    #[test]
+    fn clicking_the_field_and_its_clear_button() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let field = app.toolbar.search.rect;
+        assert!(field.w > 0.0, "the field was laid out");
+        let at = Point::new(field.x + 5.0, field.center().y);
+        app.handle(UiEvent::MouseMove(at));
+        assert_eq!(app.cursor(), Cursor::Text);
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at,
+                button: MouseButton::Left
+            })
+            .repaint
+        );
+        assert!(app.toolbar.search.focused);
+        type_str(&mut app, "p2");
+        painted_strings(&mut app); // lays out the clear button
+        let clear = app.toolbar.search.clear_rect.center();
+        assert!(app.handle(UiEvent::MouseMove(clear)).repaint);
+        assert!(app.toolbar.search.hover_clear);
+        assert_eq!(app.cursor(), Cursor::Arrow);
+        app.handle(UiEvent::MouseDown {
+            at: clear,
+            button: MouseButton::Left,
+        });
+        assert_eq!(app.search(), "");
+        assert!(!app.toolbar.search.focused);
+        // Clicking empty table space drops focus too.
+        cmd(&mut app, Command::Find);
+        app.handle(UiEvent::MouseDown {
+            at: Point::new(400.0, 690.0),
+            button: MouseButton::Left,
+        });
+        assert!(!app.toolbar.search.focused);
+    }
+
+    #[test]
+    fn right_click_selects_and_the_menu_reflects_the_row() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let theme = app.theme.clone();
+        let row_y =
+            |pos: usize| table_top(&theme) + theme.header_h + theme.row_h * (pos as f32 + 0.5);
+        // List order: p11 first. Right-click the second row (p20, a leaf).
+        let at = Point::new(100.0, row_y(1));
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at,
+                button: MouseButton::Right
+            })
+            .repaint
+        );
+        assert_eq!(app.table.selected, Some(id(20)));
+        let r = app.handle(UiEvent::ContextMenu { at: Some(at) });
+        let Some(Effect::Menu {
+            at: anchor,
+            entries,
+        }) = r.effect
+        else {
+            panic!("{r:?}");
+        };
+        assert_eq!(anchor, at);
+        assert_eq!(
+            entries,
+            vec![
+                MenuEntry::Item {
+                    action: MenuAction::EndTask,
+                    label: "End task",
+                    enabled: true
+                },
+                MenuEntry::Item {
+                    action: MenuAction::EndTree,
+                    label: "End process tree",
+                    enabled: false
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    action: MenuAction::OpenFileLocation,
+                    label: "Open file location",
+                    enabled: false
+                },
+            ]
+        );
+        // Off the rows: nothing.
+        assert_eq!(
+            app.handle(UiEvent::ContextMenu {
+                at: Some(Point::new(100.0, 5.0))
+            }),
+            Reaction::NONE
+        );
+        // From the keyboard: anchored to the selected row.
+        let r = app.handle(UiEvent::ContextMenu { at: None });
+        let Some(Effect::Menu { at: anchor, .. }) = r.effect else {
+            panic!("{r:?}");
+        };
+        assert!((anchor.y - (row_y(1) + theme.row_h * 0.5)).abs() < 0.01);
+        app.table.selected = None;
+        assert_eq!(
+            app.handle(UiEvent::ContextMenu { at: None }),
+            Reaction::NONE
+        );
+    }
+
+    #[test]
+    fn end_task_and_end_tree_name_their_targets_parent_first() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        assert_eq!(
+            cmd(&mut app, Command::Menu(MenuAction::EndTask)),
+            Reaction::NONE
+        );
+        app.table.selected = Some(id(4));
+        let r = cmd(&mut app, Command::Menu(MenuAction::EndTask));
+        assert_eq!(
+            r.effect,
+            Some(Effect::Terminate {
+                targets: vec![ProcessKey::new(4, 1)],
+                label: "p4.exe".to_owned()
+            })
+        );
+        let r = cmd(&mut app, Command::Menu(MenuAction::EndTree));
+        let Some(Effect::Terminate { targets, label }) = r.effect else {
+            panic!("{r:?}");
+        };
+        assert_eq!(label, "p4.exe and 4 processes under it");
+        assert_eq!(targets[0], ProcessKey::new(4, 1));
+        assert_eq!(targets.len(), 5);
+        let pos = |pid: u32| targets.iter().position(|k| k.pid == pid).unwrap();
+        assert!(pos(10) < pos(11) && pos(12) < pos(13));
+        // A leaf's tree is just itself, named plainly.
+        app.table.selected = Some(id(20));
+        let r = cmd(&mut app, Command::Menu(MenuAction::EndTree));
+        assert!(
+            matches!(r.effect, Some(Effect::Terminate { ref label, ref targets }) if label == "p20.exe" && targets.len() == 1)
+        );
+        // No path known: no effect.
+        assert_eq!(
+            cmd(&mut app, Command::Menu(MenuAction::OpenFileLocation)),
+            Reaction::NONE
+        );
+    }
+
+    #[test]
+    fn open_file_location_uses_the_image_path() {
+        let mut p = proc(7, None, 1.0);
+        p.statics = Arc::new(ProcessStatic {
+            image_path: Some("C:\\x\\p7.exe".to_owned()),
+            ..(*p.statics).clone()
+        });
+        let mut app = App::default();
+        app.set_snapshot(snapshot(1, vec![p]));
+        ready(&mut app);
+        app.table.selected = Some(id(7));
+        let r = cmd(&mut app, Command::Menu(MenuAction::OpenFileLocation));
+        assert_eq!(
+            r.effect,
+            Some(Effect::OpenFileLocation("C:\\x\\p7.exe".to_owned()))
+        );
+        let r = app.handle(UiEvent::ContextMenu { at: None });
+        let Some(Effect::Menu { entries, .. }) = r.effect else {
+            panic!("{r:?}");
+        };
+        assert!(matches!(
+            entries[3],
+            MenuEntry::Item {
+                action: MenuAction::OpenFileLocation,
+                enabled: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dragging_a_header_divider_resizes_the_column() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let theme = app.theme.clone();
+        let name_w = app.table.columns[0].width;
+        let edge = Point::new(theme.gap + name_w, table_top(&theme) + theme.header_h * 0.5);
+        app.handle(UiEvent::MouseMove(edge));
+        assert_eq!(app.cursor(), Cursor::ResizeColumn);
+        assert_eq!(
+            app.handle(UiEvent::MouseDown {
+                at: edge,
+                button: MouseButton::Left
+            }),
+            Reaction::NONE
+        );
+        assert!(app.table.resizing());
+        let moved = Point::new(edge.x + 35.0, 300.0);
+        assert!(app.handle(UiEvent::MouseMove(moved)).repaint);
+        assert_eq!(app.cursor(), Cursor::ResizeColumn);
+        assert!(
+            app.handle(UiEvent::MouseUp {
+                at: moved,
+                button: MouseButton::Left
+            })
+            .repaint
+        );
+        assert!(!app.table.resizing());
+        assert!((app.table.columns[0].width - (name_w + 35.0)).abs() < 0.01);
+        // The sort did not change: a divider click is not a header click.
+        assert_eq!(app.table.sort_col, col::CPU);
+        app.handle(UiEvent::MouseMove(Point::new(400.0, 400.0)));
+        assert_eq!(app.cursor(), Cursor::Arrow);
+    }
+
+    #[test]
+    fn a_horizontal_wheel_scrolls_the_columns() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let total = app.table.total_width();
+        assert!(total > 900.0, "columns overflow a 900-wide window: {total}");
+        assert!(
+            app.handle(UiEvent::Wheel {
+                at: Point::new(400.0, 400.0),
+                lines: 1.0,
+                horizontal: true
+            })
+            .repaint
+        );
+        painted_strings(&mut app);
+        let theme = app.theme.clone();
+        // The first header cell moved left by the wheel step.
+        assert_eq!(
+            app.table
+                .hit(Point::new(theme.gap + 2.0, table_top(&theme) + 5.0), &theme),
+            Hit::Header(0)
+        );
+        assert!(matches!(
+            app.table.hit(
+                Point::new(
+                    theme.gap + app.table.columns[0].width - 30.0,
+                    table_top(&theme) + 5.0
+                ),
+                &theme
+            ),
+            Hit::Header(1) | Hit::Divider(0)
+        ));
     }
 }

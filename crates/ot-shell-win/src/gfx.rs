@@ -40,8 +40,9 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_PARAGRAPH_ALIGNMENT_FAR, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_RANGE,
-    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
@@ -56,6 +57,12 @@ use windows_numerics::Vector2;
 
 /// Frames a cached layout may go unused before it is evicted.
 const LAYOUT_TTL_FRAMES: u64 = 120;
+
+/// Layout width for editable fields: wide enough that nothing wraps or trims, so
+/// the text can be measured and scrolled to keep its end visible.
+const FIELD_LAYOUT_W: f32 = 1.0e6;
+/// Caret width in DIPs.
+const CARET_W: f32 = 1.0;
 
 struct CachedLayout {
     layout: IDWriteTextLayout,
@@ -345,6 +352,38 @@ impl Gfx {
                         self.set_color(c);
                         self.dc.FillGeometry(&geom, &self.brush, None);
                     }
+                    DrawCmd::Text(t) if t.field => {
+                        // Measure, then shift left so the end stays in the box, and
+                        // put the caret right after the last character.
+                        let layout = self.layout_for(dl.str(t.text), &t)?;
+                        let mut m = DWRITE_TEXT_METRICS::default();
+                        layout.GetMetrics(&raw mut m)?;
+                        let width = m.widthIncludingTrailingWhitespace;
+                        let shift = (width - t.rect.w).max(0.0);
+                        let clip = rectf(t.rect);
+                        self.dc
+                            .PushAxisAlignedClip(&raw const clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                        self.set_color(t.color);
+                        self.dc.DrawTextLayout(
+                            Vector2 {
+                                X: t.rect.x - shift,
+                                Y: t.rect.y,
+                            },
+                            &layout,
+                            &self.brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        );
+                        if t.caret {
+                            let caret = rectf(Rect::new(
+                                (t.rect.x - shift + width).round(),
+                                t.rect.y + m.top,
+                                CARET_W,
+                                m.height,
+                            ));
+                            self.dc.FillRectangle(&raw const caret, &self.brush);
+                        }
+                        self.dc.PopAxisAlignedClip();
+                    }
                     DrawCmd::Text(t) => {
                         let layout = self.layout_for(dl.str(t.text), &t)?;
                         self.set_color(t.color);
@@ -446,7 +485,9 @@ impl Gfx {
         self.utf16.clear();
         self.utf16.extend(text.encode_utf16());
         let len = self.utf16.len() as u32;
-        let (w, h) = (t.rect.w, t.rect.h);
+        // A field lays out at its natural width and is scrolled at draw time.
+        let w = if t.field { FIELD_LAYOUT_W } else { t.rect.w };
+        let h = t.rect.h;
         let (halign, valign, ellipsis, tabular) =
             (t.halign, t.valign, t.ellipsis, t.style.tabular_numbers);
 
@@ -548,6 +589,7 @@ fn layout_key(text: &str, t: &TextCmd) -> u64 {
     t.halign.hash(&mut h);
     t.valign.hash(&mut h);
     t.ellipsis.hash(&mut h);
+    t.field.hash(&mut h);
     h.finish()
 }
 

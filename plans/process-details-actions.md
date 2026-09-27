@@ -65,33 +65,77 @@ daily task manager before the Performance view starts:
 
 ## Plan / steps
 
+All done; kept as the record of what was built.
+
 1. ~~Read the code, write this plan.~~
-2. **[current]** Probe: details enrichment with budget; `ProcessControl`.
-3. `ot-ui`: User and Command line columns; horizontal scroll; column resize;
-   `Reaction`/`Effect`; search filter with tree-aware visibility; context menu model.
-4. Shell: WM_CHAR, capture, WM_SETCURSOR, native popup menu, confirm box,
-   `ShellExecuteW` for Open file location, `ProcessControl` wiring.
-5. Tests, README, parent plan; verify (fmt, clippy on three targets, tests, headless,
-   screenshots); commit at each logical step.
+2. ~~Probe: details enrichment with budget; `ProcessControl`.~~ Commit `d3d666c`.
+3. ~~`ot-ui`: User and Command line columns; horizontal scroll; column resize;
+   `Reaction`/`Effect`; search filter with tree-aware visibility; context menu
+   model.~~
+4. ~~Shell: `WM_CHAR`, capture, `WM_SETCURSOR`, native popup menu, confirm box,
+   `ShellExecuteW` for Open file location, `ProcessControl` wiring.~~
+5. ~~Tests, README, parent plan; verify (fmt, clippy on three targets, tests,
+   headless, screenshots); commit.~~
 
 ## Findings / gotchas
 
-(filled in as work proceeds)
+- **`SystemProcessIdInformation` is not in the `windows` crate metadata** (class 88;
+  `SYSTEM_PROCESS_ID_INFORMATION` struct). Declared by hand in `nt.rs` next to the
+  process structure. It is what gives an unelevated app the image path of another
+  user's process.
+- **Details cost.** With 555 processes, the first pass enriched 385 inline inside the
+  20 ms budget and the second pass the remaining 170; total probe cost of that
+  second pass 20.8 ms, steady state 8.3–9.2 ms after (the same as before the
+  change). Roughly 50 µs per process for OpenProcess + path + command line + token.
+- **This user account can open SYSTEM processes with limited rights** (svchost,
+  `MsMpEng` show `SYSTEM`), so the by-PID fallback was exercised only by design, not
+  observed. It is the path a plain standard-user account would take.
+- **`Point` is not `Eq`** (f32), so `Effect` and `Reaction` are `PartialEq` only.
+- **Clearing the search left the table showing the old filtered order**: `refilter`
+  returned early on an empty needle before invalidating the order. Invalidate first.
+- **`#[must_use]` on `Reaction`** made every test call noisy; the test module has
+  `#[allow(unused_must_use)]` rather than `let _ =` on eighty lines.
+- **`Rect::contains` is exclusive on the right edge**, which bit a divider hit test
+  placed exactly at the table's right edge.
+- **Driving the GUI for an end-to-end check works with posted messages**: `WM_CHAR`
+  to type into the filter, `WM_KEYDOWN` for Down/Delete, `WM_CONTEXTMENU` with
+  lparam `-1` for the keyboard menu, `WM_CANCELMODE` posted to the owner to close
+  the popup menu (a real Escape keystroke goes to whatever window is in the
+  foreground, which was not ours), and `WM_COMMAND IDYES` posted to the `#32770`
+  dialog to answer the confirmation. Capture with `PrintWindow(PW_RENDERFULLCONTENT)`
+  per window, never `CopyFromScreen`: the latter captured the user's foreground
+  window on the first attempt. The driver lives in `target/drive-endtask.ps1`
+  (not committed; it kills a throwaway `powershell -Command Start-Sleep`).
+- **The launched window takes focus.** During one screenshot run the window
+  received keystrokes meant for another app ("I will" landed in the filter). Any
+  launched app does this; noting it because type-to-filter makes it visible.
+- **Verified 2026-09-26:** fmt; clippy `-D warnings` on the Windows, Linux and macOS
+  targets; 70 tests (52 in `ot-ui`); headless run; screenshots of list and tree
+  with the new columns and field; the End task flow above against a throwaway
+  process (confirmation shown with No default, Yes terminated it, table went to
+  "0 of N processes").
 
 ## Progress log
 
 - [x] Plan written.
-- [ ] Probe details + budget.
-- [ ] `ProcessControl` (terminate with identity check).
-- [ ] Columns, horizontal scroll, column resize.
-- [ ] Search filter.
-- [ ] Reaction/Effect, context menu, End task / End tree / Open file location.
-- [ ] Shell wiring.
-- [ ] README + parent plan; verified; committed.
+- [x] Probe details + budget (`d3d666c`).
+- [x] `ProcessControl` (terminate with identity check) (`d3d666c`).
+- [x] Columns, horizontal scroll, column resize.
+- [x] Search filter.
+- [x] Reaction/Effect, context menu, End task / End tree / Open file location.
+- [x] Shell wiring: `WM_CHAR` with surrogate pairs, capture during drags,
+      `WM_SETCURSOR`, `WM_CONTEXTMENU`, `WM_MOUSEHWHEEL`, native popup menu, confirm
+      and error boxes, `explorer.exe /select`.
+- [x] README + parent plan; verified; committed.
 
 ## Open questions for the user
 
-None yet.
+1. **Confirmation on End task.** Process Explorer confirms; Task Manager does not
+   for ordinary apps. Implemented with confirmation and No as the default. Easy to
+   relax to "confirm only for trees and system processes" if it gets in the way.
+2. **Search focus stealing.** Type-to-filter means any keystroke that reaches the
+   window edits the filter. If that ever surprises, the alternative is requiring
+   Ctrl+F or a click first; the field, caret and Escape behaviour stay the same.
 
 ## Things not to do
 

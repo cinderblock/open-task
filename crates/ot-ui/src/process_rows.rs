@@ -20,19 +20,22 @@ use crate::table::{Column, RowId, RowSource};
 pub(crate) mod col {
     pub const NAME: usize = 0;
     pub const PID: usize = 1;
-    pub const CPU: usize = 2;
-    pub const MEMORY: usize = 3;
-    pub const WORKING_SET: usize = 4;
-    pub const DISK_READ: usize = 5;
-    pub const DISK_WRITE: usize = 6;
-    pub const THREADS: usize = 7;
-    pub const HANDLES: usize = 8;
+    pub const USER: usize = 2;
+    pub const CPU: usize = 3;
+    pub const MEMORY: usize = 4;
+    pub const WORKING_SET: usize = 5;
+    pub const DISK_READ: usize = 6;
+    pub const DISK_WRITE: usize = 7;
+    pub const THREADS: usize = 8;
+    pub const HANDLES: usize = 9;
+    pub const COMMAND_LINE: usize = 10;
 }
 
 pub(crate) fn columns() -> Vec<Column> {
     vec![
         Column::text("Name", 240.0),
         Column::number("PID", 70.0),
+        Column::text("User", 110.0),
         Column::number("CPU %", 70.0),
         Column::number("Memory", 95.0),
         Column::number("Working set", 95.0),
@@ -40,7 +43,50 @@ pub(crate) fn columns() -> Vec<Column> {
         Column::number("Disk write", 95.0),
         Column::number("Threads", 70.0),
         Column::number("Handles", 75.0),
+        Column::text("Command line", 480.0),
     ]
+}
+
+/// ASCII case-insensitive substring test. `needle` must already be lower-case.
+/// Non-ASCII letters compare exactly, which is the honest cheap answer; a task
+/// manager's haystacks (names, paths, command lines) are overwhelmingly ASCII.
+pub(crate) fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    n.is_empty() || (h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n)))
+}
+
+/// Whether a process matches a search: by name, PID, user, image path or command
+/// line. `pid_buf` is caller-owned scratch so the PID needs no allocation.
+pub(crate) fn process_matches(p: &ProcessSample, needle: &str, pid_buf: &mut String) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let s = &p.statics;
+    format::count(pid_buf, s.key.pid);
+    let opt = |v: &Option<String>| v.as_deref().is_some_and(|v| contains_ci(v, needle));
+    contains_ci(&s.name, needle)
+        || contains_ci(pid_buf, needle)
+        || opt(&s.user)
+        || opt(&s.image_path)
+        || opt(&s.command_line)
+}
+
+/// Case-insensitive ordering of two names without allocating.
+fn cmp_ci(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+}
+
+/// Ordering for optional text: present sorts before absent, so a column of
+/// unknowns sinks to the bottom in ascending order.
+fn cmp_opt(a: Option<&str>, b: Option<&str>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => cmp_ci(a, b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 pub(crate) fn row_id(key: ProcessKey) -> RowId {
@@ -202,6 +248,48 @@ impl ProcessTree {
     pub fn rollup(&self, row: usize) -> Rollup {
         self.rollup.get(row).copied().unwrap_or_default()
     }
+
+    /// Set the flag of every ancestor of a set row, so a filtered tree keeps the
+    /// path from each match up to its root. `flags` is parallel to the process list.
+    pub fn propagate_up(&self, flags: &mut [bool]) {
+        // Deepest first, so a node is visited after every node below it.
+        for &i in &self.by_depth {
+            let i = i as usize;
+            if flags.get(i).copied().unwrap_or(false) {
+                let p = self.parent[i];
+                if p != NONE {
+                    flags[p as usize] = true;
+                }
+            }
+        }
+    }
+
+    /// `root` followed by every process below it, shallowest first, so that an
+    /// action applied in order reaches a parent before its children.
+    pub fn subtree(&self, root: usize, out: &mut Vec<usize>) {
+        out.clear();
+        if root >= self.parent.len() {
+            return;
+        }
+        out.push(root);
+        for &i in self.by_depth.iter().rev() {
+            let i = i as usize;
+            if i == root {
+                continue;
+            }
+            let mut j = i;
+            for _ in 0..self.parent.len() {
+                match self.parent(j) {
+                    Some(p) if p == root => {
+                        out.push(i);
+                        break;
+                    }
+                    Some(p) => j = p,
+                    None => break,
+                }
+            }
+        }
+    }
 }
 
 /// Adapts a snapshot's process list to the table.
@@ -210,9 +298,26 @@ pub(crate) struct ProcessRows<'a> {
     pub tree: &'a ProcessTree,
     pub interval_secs: f32,
     pub mem_total: f32,
+    /// Search results, parallel to `procs`; empty when there is no search.
+    pub matched: &'a [bool],
+    /// Rows to list: the matches, plus their ancestors in tree mode. Empty means
+    /// everything.
+    pub shown: &'a [bool],
 }
 
 impl ProcessRows<'_> {
+    /// Real processes in the snapshot, whether or not the search shows them.
+    #[must_use]
+    pub fn population(&self) -> usize {
+        self.procs.iter().filter(|p| p.key().pid != 0).count()
+    }
+
+    /// Whether a search is narrowing the list.
+    #[must_use]
+    pub fn filtered(&self) -> bool {
+        !self.shown.is_empty()
+    }
+
     /// Root-first chain of ancestor names ending in the row itself, e.g.
     /// `wininit.exe › services.exe › svchost.exe`. `chain` is caller-owned scratch.
     pub fn ancestry(&self, row: usize, out: &mut String, chain: &mut Vec<u32>) {
@@ -270,6 +375,14 @@ impl RowSource for ProcessRows<'_> {
                 out.clear();
                 out.push_str(p.name());
             }
+            col::USER => {
+                out.clear();
+                out.push_str(p.statics.user.as_deref().unwrap_or(""));
+            }
+            col::COMMAND_LINE => {
+                out.clear();
+                out.push_str(p.statics.command_line.as_deref().unwrap_or(""));
+            }
             col::PID => format::count(out, p.key().pid),
             col::CPU => format::percent(out, p.cpu.get()),
             col::MEMORY => format::bytes(out, p.private_bytes),
@@ -294,16 +407,22 @@ impl RowSource for ProcessRows<'_> {
     fn visible(&self, row: usize) -> bool {
         // PID 0 is the kernel's idle accounting, not a process. Its "CPU" is the
         // machine's idle time, which would otherwise pin it to the top of every sort.
-        self.procs[row].key().pid != 0
+        self.procs[row].key().pid != 0 && self.shown.get(row).is_none_or(|&s| s)
+    }
+
+    fn muted(&self, row: usize) -> bool {
+        self.matched.get(row).is_some_and(|&m| !m)
     }
 
     fn compare(&self, a: usize, b: usize, col: usize) -> Ordering {
         let (a, b) = (&self.procs[a], &self.procs[b]);
         match col {
-            col::NAME => a
-                .name()
-                .to_ascii_lowercase()
-                .cmp(&b.name().to_ascii_lowercase()),
+            col::NAME => cmp_ci(a.name(), b.name()),
+            col::USER => cmp_opt(a.statics.user.as_deref(), b.statics.user.as_deref()),
+            col::COMMAND_LINE => cmp_opt(
+                a.statics.command_line.as_deref(),
+                b.statics.command_line.as_deref(),
+            ),
             col::PID => a.key().pid.cmp(&b.key().pid),
             col::CPU => a.cpu.get().total_cmp(&b.cpu.get()),
             col::MEMORY => a.private_bytes.cmp(&b.private_bytes),
@@ -480,12 +599,85 @@ pub(crate) mod tests {
             tree: &t,
             interval_secs: 1.0,
             mem_total: 0.0,
+            matched: &[],
+            shown: &[],
         };
         let mut out = String::new();
         let mut chain = Vec::new();
         rows.ancestry(2, &mut out, &mut chain);
         assert_eq!(out, "p4.exe › p9.exe");
         assert_eq!(rows.listed(), 2);
+        assert_eq!(rows.population(), 2);
+        assert!(!rows.filtered());
+    }
+
+    #[test]
+    fn search_matches_any_detail_field_case_insensitively() {
+        let mut p = proc(42, None, 0.0);
+        p.statics = Arc::new(ProcessStatic {
+            user: Some("CORP\\Cameron".to_owned()),
+            image_path: Some("C:\\Tools\\Thing.exe".to_owned()),
+            command_line: Some("\"C:\\Tools\\Thing.exe\" --serve".to_owned()),
+            ..(*p.statics).clone()
+        });
+        let mut buf = String::new();
+        for needle in ["p42", "42", "cameron", "tools", "--serve", ""] {
+            assert!(process_matches(&p, needle, &mut buf), "{needle}");
+        }
+        for needle in ["p43", "root", "--run"] {
+            assert!(!process_matches(&p, needle, &mut buf), "{needle}");
+        }
+        assert!(contains_ci("Svchost.EXE", "host.e"));
+        assert!(!contains_ci("ab", "abc"));
+    }
+
+    #[test]
+    fn shown_and_matched_drive_visibility_and_muting() {
+        let procs = vec![proc(1, None, 0.0), proc(2, Some(1), 0.0)];
+        let t = tree_of(&procs);
+        let rows = ProcessRows {
+            procs: &procs,
+            tree: &t,
+            interval_secs: 1.0,
+            mem_total: 0.0,
+            matched: &[false, true],
+            shown: &[true, true],
+        };
+        assert!(rows.visible(0) && rows.visible(1));
+        assert!(rows.muted(0) && !rows.muted(1));
+        assert!(rows.filtered());
+        let mut s = String::new();
+        rows.cell(0, col::USER, &mut s);
+        assert_eq!(s, "");
+        assert_eq!(rows.compare(0, 1, col::USER), Ordering::Equal);
+    }
+
+    #[test]
+    fn propagate_up_reaches_every_ancestor_and_subtree_lists_parents_first() {
+        // 1 ─ 2 ─ 3
+        //   └─ 4
+        // 5
+        let procs = vec![
+            proc(1, None, 0.0),
+            proc(2, Some(1), 0.0),
+            proc(3, Some(2), 0.0),
+            proc(4, Some(1), 0.0),
+            proc(5, None, 0.0),
+        ];
+        let t = tree_of(&procs);
+        let mut flags = vec![false, false, true, false, false];
+        t.propagate_up(&mut flags);
+        assert_eq!(flags, [true, true, true, false, false]);
+
+        let mut out = Vec::new();
+        t.subtree(0, &mut out);
+        assert_eq!(out[0], 0);
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().position(|&i| i == 1) < out.iter().position(|&i| i == 2));
+        t.subtree(2, &mut out);
+        assert_eq!(out, [2]);
+        t.subtree(99, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -501,6 +693,8 @@ pub(crate) mod tests {
             tree: &t,
             interval_secs: 1.0,
             mem_total: 0.0,
+            matched: &[],
+            shown: &[],
         };
         let mut s = String::new();
         rows.cell(0, col::CPU, &mut s);

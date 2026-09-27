@@ -50,6 +50,12 @@ pub trait RowSource {
         true
     }
 
+    /// Whether a listed row is there for context rather than on its own merits (an
+    /// ancestor of a search match, say). Painted in the dim text color.
+    fn muted(&self, _row: usize) -> bool {
+        false
+    }
+
     /// Parent row, for tree mode. A row is a root when this is `None`, out of range,
     /// the row itself, or a hidden row. Parent links must not form cycles; the table
     /// tolerates one by listing the unreachable rows flat at the end, but that is a
@@ -115,11 +121,27 @@ impl Column {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     Header(usize),
+    /// The right edge of column `i` in the header: dragging it resizes the column.
+    Divider(usize),
     /// Position in the current display order.
     Row(usize),
     /// The expand/collapse box of a row that has children (tree mode only).
     Expander(usize),
     Nothing,
+}
+
+/// Narrowest a column can be dragged.
+const MIN_COLUMN_W: f32 = 40.0;
+/// How close to a column edge counts as grabbing it, in DIPs either side.
+const DIVIDER_GRAB: f32 = 4.0;
+
+/// A column-resize drag in progress.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Resize {
+    col: usize,
+    /// Pointer x when the drag started, and the column's width then.
+    start_x: f32,
+    start_w: f32,
 }
 
 /// Per-position tree facts, parallel to the display order. Empty in list mode.
@@ -151,6 +173,9 @@ pub struct Table {
     pub sort_desc: bool,
     /// Scroll offset in rows; fractional for smooth wheel scrolling.
     scroll: f32,
+    /// Horizontal scroll offset in DIPs, when the columns are wider than the table.
+    scroll_x: f32,
+    resize: Option<Resize>,
     /// Source row indices in display order.
     order: Vec<usize>,
     meta: Vec<RowMeta>,
@@ -177,6 +202,8 @@ impl Table {
             sort_col,
             sort_desc,
             scroll: 0.0,
+            scroll_x: 0.0,
+            resize: None,
             order: Vec::new(),
             meta: Vec::new(),
             order_dirty: true,
@@ -339,7 +366,10 @@ impl Table {
     #[must_use]
     pub fn hit(&self, p: Point, theme: &Theme) -> Hit {
         if self.header.contains(p) {
-            let mut x = self.header.x;
+            if let Some(i) = self.divider_at(p) {
+                return Hit::Divider(i);
+            }
+            let mut x = self.header.x - self.scroll_x;
             for (i, c) in self.columns.iter().enumerate() {
                 if p.x < x + c.width {
                     return Hit::Header(i);
@@ -355,7 +385,9 @@ impl Table {
                 if self.tree {
                     if let Some(m) = self.meta.get(pos) {
                         if m.has_children {
-                            let x0 = self.body.x + theme.pad + f32::from(m.depth) * theme.indent;
+                            let x0 = self.body.x - self.scroll_x
+                                + theme.pad
+                                + f32::from(m.depth) * theme.indent;
                             if p.x >= x0 && p.x < x0 + theme.expander_w {
                                 return Hit::Expander(pos);
                             }
@@ -366,6 +398,79 @@ impl Table {
             }
         }
         Hit::Nothing
+    }
+
+    /// The column whose right edge is under `p`, if `p` is in the header and within
+    /// grabbing distance of one. The cursor changes here before any drag starts.
+    #[must_use]
+    pub fn divider_at(&self, p: Point) -> Option<usize> {
+        if !self.header.contains(p) {
+            return None;
+        }
+        let mut edge = self.header.x - self.scroll_x;
+        for (i, c) in self.columns.iter().enumerate() {
+            edge += c.width;
+            if (p.x - edge).abs() <= DIVIDER_GRAB {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Start dragging column `col`'s right edge from pointer position `p`.
+    pub fn begin_resize(&mut self, col: usize, p: Point) {
+        if let Some(c) = self.columns.get(col) {
+            self.resize = Some(Resize {
+                col,
+                start_x: p.x,
+                start_w: c.width,
+            });
+        }
+    }
+
+    /// Continue a drag. Returns true if a width changed.
+    pub fn resize_to(&mut self, p: Point) -> bool {
+        let Some(r) = self.resize else {
+            return false;
+        };
+        let Some(c) = self.columns.get_mut(r.col) else {
+            return false;
+        };
+        let w = (r.start_w + p.x - r.start_x).max(MIN_COLUMN_W);
+        if (w - c.width).abs() < f32::EPSILON {
+            return false;
+        }
+        c.width = w;
+        true
+    }
+
+    pub fn end_resize(&mut self) {
+        self.resize = None;
+    }
+
+    #[must_use]
+    pub fn resizing(&self) -> bool {
+        self.resize.is_some()
+    }
+
+    /// Sum of the column widths.
+    #[must_use]
+    pub fn total_width(&self) -> f32 {
+        self.columns.iter().map(|c| c.width).sum()
+    }
+
+    /// Positive scrolls the columns to the left. Clamped on next paint.
+    pub fn scroll_x_by(&mut self, dx: f32) {
+        self.scroll_x = (self.scroll_x + dx).max(0.0);
+    }
+
+    /// Where the selected row is drawn, if it is selected and in view.
+    #[must_use]
+    pub fn selected_rect<S: RowSource>(&self, src: &S, theme: &Theme) -> Option<Rect> {
+        let pos = self.selected_pos(src)?;
+        let y = self.body.y + (pos as f32 - self.scroll) * theme.row_h;
+        let r = Rect::new(self.body.x, y, self.body.w, theme.row_h);
+        (r.bottom() > self.body.y && y < self.body.bottom()).then_some(r)
     }
 
     /// Source row at a display position.
@@ -579,6 +684,8 @@ impl Table {
         let visible = self.rows_visible(theme) as f32;
         let max = (self.order.len() as f32 - visible).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
+        let max_x = (self.total_width() - self.body.w).max(0.0);
+        self.scroll_x = self.scroll_x.clamp(0.0, max_x);
     }
 
     /// The selected row's sibling block in tree mode: the guide level to highlight
@@ -613,10 +720,14 @@ impl Table {
         self.body = body;
         self.ensure_order(src);
         self.clamp_scroll(theme);
+        // Columns slide left by the horizontal scroll; rows and their backgrounds
+        // span the whole width regardless.
+        let ox = -self.scroll_x;
 
         // Header.
         dl.fill_rect(header, theme.surface);
-        let mut x = header.x;
+        dl.push_clip(header);
+        let mut x = header.x + ox;
         for (ci, col) in self.columns.iter().enumerate() {
             let cr = Rect::new(x, header.y, col.width, header.h);
             let align = if col.numeric {
@@ -648,6 +759,7 @@ impl Table {
             );
             x += col.width;
         }
+        dl.pop_clip();
         dl.fill_rect(
             Rect::new(header.x, header.bottom() - 1.0, header.w, 1.0),
             theme.grid,
@@ -684,8 +796,13 @@ impl Table {
             } else if pos % 2 == 1 {
                 dl.fill_rect(rr, theme.row_alt);
             }
+            let text_color = if src.muted(row) {
+                theme.text_dim
+            } else {
+                theme.text
+            };
 
-            let mut x = body.x;
+            let mut x = body.x + ox;
             for (ci, col) in self.columns.iter().enumerate() {
                 let cr = Rect::new(x, y, col.width, row_h);
                 let heat = if collapsed {
@@ -739,7 +856,7 @@ impl Table {
                     buf,
                     text_rect,
                     style,
-                    theme.text,
+                    text_color,
                     align,
                     VAlign::Middle,
                     true,
@@ -749,7 +866,7 @@ impl Table {
         }
         dl.pop_clip();
 
-        // Scrollbar thumb.
+        // Scrollbar thumbs, drawn only when there is something to scroll.
         let total = self.order.len() as f32;
         let vis = self.rows_visible(theme) as f32;
         if total > vis && vis > 0.0 {
@@ -758,6 +875,17 @@ impl Table {
             let thumb_y = track.y + (track.h - thumb_h) * (self.scroll / (total - vis));
             dl.fill_round_rect(
                 Rect::new(track.x, thumb_y, track.w, thumb_h),
+                2.0,
+                theme.scrollbar,
+            );
+        }
+        let total_w = self.total_width();
+        if total_w > body.w && body.w > 12.0 {
+            let track = Rect::new(body.x + 2.0, body.bottom() - 6.0, body.w - 12.0, 4.0);
+            let thumb_w = (track.w * body.w / total_w).max(20.0);
+            let thumb_x = track.x + (track.w - thumb_w) * (self.scroll_x / (total_w - body.w));
+            dl.fill_round_rect(
+                Rect::new(thumb_x, track.y, thumb_w, track.h),
                 2.0,
                 theme.scrollbar,
             );
@@ -893,6 +1021,76 @@ mod tests {
         // 1 header label + at most 11 visible rows (10 plus one partial).
         assert!(texts <= 12, "emitted {texts} text runs");
         assert_eq!(dl.clip_depth(), 0);
+    }
+
+    #[test]
+    fn dragging_a_divider_resizes_and_scrolling_shifts_hits() {
+        let src = Nums((0..50).collect());
+        let mut t = Table::new(
+            vec![Column::number("a", 100.0), Column::number("b", 100.0)],
+            0,
+        );
+        let theme = Theme::dark();
+        let mut dl = DisplayList::new();
+        let mut buf = String::new();
+        let rect = Rect::new(0.0, 0.0, 150.0, 300.0);
+        t.paint(&mut dl, rect, &src, &theme, &mut buf);
+        assert_eq!(dl.clip_depth(), 0);
+
+        // The first column's right edge is at x = 100; nearby is the divider.
+        assert_eq!(t.hit(Point::new(98.0, 5.0), &theme), Hit::Divider(0));
+        assert_eq!(t.hit(Point::new(103.0, 5.0), &theme), Hit::Divider(0));
+        assert_eq!(t.hit(Point::new(110.0, 5.0), &theme), Hit::Header(1));
+        assert_eq!(
+            t.divider_at(Point::new(100.0, 50.0)),
+            None,
+            "not in the header"
+        );
+
+        t.begin_resize(0, Point::new(100.0, 5.0));
+        assert!(t.resizing());
+        assert!(t.resize_to(Point::new(130.0, 5.0)));
+        assert!(
+            !t.resize_to(Point::new(130.0, 9.0)),
+            "same width: no change"
+        );
+        t.end_resize();
+        assert!((t.columns[0].width - 130.0).abs() < f32::EPSILON);
+        assert!(!t.resize_to(Point::new(0.0, 0.0)), "no drag: no change");
+        t.begin_resize(0, Point::new(130.0, 5.0));
+        t.resize_to(Point::new(-500.0, 5.0));
+        t.end_resize();
+        assert!((t.columns[0].width - MIN_COLUMN_W).abs() < f32::EPSILON);
+
+        // Columns total 140 in a 150-wide table: nothing to scroll.
+        t.scroll_x_by(50.0);
+        t.paint(&mut dl, rect, &src, &theme, &mut buf);
+        assert!(t.scroll_x.abs() < f32::EPSILON);
+        // Widen: 240 total, 90 of overflow. Scroll clamps to it, and hits shift.
+        t.columns[1].width = 200.0;
+        t.scroll_x_by(500.0);
+        t.paint(&mut dl, rect, &src, &theme, &mut buf);
+        assert!((t.scroll_x - 90.0).abs() < f32::EPSILON);
+        assert_eq!(t.hit(Point::new(5.0, 5.0), &theme), Hit::Header(1));
+        // Column 1's right edge now sits at the table's right edge (exclusive).
+        assert_eq!(t.divider_at(Point::new(149.0, 5.0)), Some(1));
+    }
+
+    #[test]
+    fn selected_rect_follows_scroll_and_hides_off_screen() {
+        let src = Nums((0..50).collect());
+        let mut t = table();
+        let theme = Theme::dark();
+        let mut dl = DisplayList::new();
+        let mut buf = String::new();
+        let rect = Rect::new(0.0, 0.0, 100.0, theme.header_h + theme.row_h * 5.0);
+        t.paint(&mut dl, rect, &src, &theme, &mut buf);
+        assert_eq!(t.selected_rect(&src, &theme), None);
+        t.selected = Some(src.id(49)); // value 49 sorts first (descending)
+        let r = t.selected_rect(&src, &theme).expect("in view");
+        assert!((r.y - theme.header_h).abs() < f32::EPSILON);
+        t.selected = Some(src.id(0)); // last row, well below the five visible
+        assert_eq!(t.selected_rect(&src, &theme), None);
     }
 
     #[test]

@@ -150,10 +150,14 @@ goes." Same for a future headless/remote mode.
 4. ~~`ot-paint` draw-command layer + Direct2D backend; window with Mica backdrop.~~ Done.
 5. ~~Virtualized table widget + sparkline widget (the two hard ones).~~ Done (first cut:
    linear-axis sparkline, no column resize/reorder yet).
-6. **[current]** Processes view end-to-end (basic version works), then Performance,
-   then the rest of the 12. Tree mode with a list/tree jump is done (2026-09-25; see
-   `plans/process-tree-view.md`). Next concrete items: process details (image path,
-   command line, user), search filter, column resize, context menu with End task.
+6. **[current]** Processes view end-to-end, then Performance, then the rest of the
+   12. Tree mode with a list/tree jump is done (2026-09-25; see
+   `plans/process-tree-view.md`). Process details (image path, command line, user,
+   integrity), the search filter, column resize with horizontal scroll, and the
+   context menu (End task, End process tree, Open file location) are done
+   (2026-09-26; see `plans/process-details-actions.md`). Next: the Performance
+   view (per-core graphs, memory breakdown, log-scale time axis per decision 8),
+   then column reorder and persisted layout.
 7. Diagnostics engine ("why is my computer slow").
 8. Flight Recorder.
 9. Self-updater + signed releases.
@@ -210,6 +214,13 @@ goes." Same for a future headless/remote mode.
   `scripts/screenshot.ps1` takes app arguments as one string (`-AppArgs "--theme light"`).
 - Large python patch scripts fed to Bash via heredoc can fail to parse; write the
   script to `target/*.py` with the Write tool and run it. Anchor on post-rustfmt text.
+- **Multi-line `perl -0pi` patterns need `\r?\n`**: the tree is CRLF, so a pattern
+  written with plain `\n` silently matches nothing. Single-line `perl -pi` is fine.
+- **The view talks to the shell in effects, not callbacks.** `App::handle` returns
+  a `Reaction { repaint, effect }`; the shell performs the effect (menu, dialog,
+  shell verb) after releasing its `RefCell` borrow, because those pump messages
+  that re-enter the window procedure. `window.rs` is structured as
+  `handle_message -> Outcome` then `dispatch`, for exactly that reason.
 - Rustfmt reflows long lines, so python string-anchored patches can miss after a `cargo
   fmt`. Anchor on the post-format text, or patch before formatting.
 - `SystemProcessorPerformanceInformation` only returns processor group 0 (max 64
@@ -245,7 +256,10 @@ goes." Same for a future headless/remote mode.
 - [x] `ot-core`: sampler thread, `ArcSwap` snapshot slot, `Ring<T>` history buffer.
 - [x] Headless `ot-app` that prints live snapshots; doubles as the CI smoke test.
 - [x] README, GPL-3.0 LICENSE, `.gitattributes` (CRLF), rustfmt config.
-- [ ] Windows probe: image path / command line / user (lazy `OpenProcess` path).
+- [x] Windows probe: image path / command line / user / integrity, once per process
+      under a 20 ms per-pass budget; `SystemProcessIdInformation` fallback for
+      processes that refuse to open. `ProcessControl::terminate` with the creation
+      time check (2026-09-26, `d3d666c`; details in `plans/process-details-actions.md`).
 - [ ] Windows probe: per-core frequency via PDH `% Processor Performance`.
 - [ ] Windows probe: processor groups > 0.
 - [x] `ot-paint`: DIP geometry, colors, text styles, arena-backed `DisplayList`.
@@ -286,6 +300,12 @@ goes." Same for a future headless/remote mode.
       the selection-preserving jump between the two; ancestry breadcrumb; `--view tree`.
       Probe resolves parent identity. Details and decisions in
       `plans/process-tree-view.md` (2026-09-25).
+- [x] User and Command line columns; type-to-filter search (tree-aware, muted
+      context rows); column resize by header drag; horizontal scroll; `Reaction` /
+      `Effect` between view and shell; native context menu with End task, End
+      process tree, Open file location; Delete / Shift+Delete; confirmation box.
+      Verified end to end against a throwaway process (2026-09-26; see
+      `plans/process-details-actions.md`).
 - [x] Windows installer (Inno Setup, per-user by default, x64 + ARM64 in one file,
       optional PATH) built by the release workflow and shipped from v0.2.1
       (2026-09-26). Verified from the published asset. `plans/windows-installer.md`.
@@ -343,3 +363,6 @@ pwsh -File scripts/screenshot.ps1      # then look at target/screenshot.png
   tag=vX.Y.Z`. It creates the release, or replaces the assets if it already exists.
 - Do not push to a remote or create a GitHub repo without explicit per-action approval.
 - Do not rename `master`.
+- Do not capture the screen with `CopyFromScreen` when checking the app: it grabs
+  whatever is in front, which on this machine is the user's other windows. Use
+  `PrintWindow(PW_RENDERFULLCONTENT)` on the app's own window (`scripts/screenshot.ps1`).

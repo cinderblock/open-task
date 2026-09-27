@@ -60,6 +60,11 @@ pub struct Theme {
     /// Segmented-control fills.
     pub button_hover: Color,
     pub button_active: Color,
+
+    /// Text field fill; the border is `surface_border`, or `accent` when focused.
+    pub input_bg: Color,
+    /// Width of the search field in the toolbar.
+    pub search_w: f32,
 }
 
 impl Theme {
@@ -99,6 +104,8 @@ impl Theme {
             toolbar_h: 30.0,
             button_hover: Color::rgba(1.0, 1.0, 1.0, 0.06),
             button_active: Color::hex(0x60_CD_FF).with_alpha(0.22),
+            input_bg: Color::rgba(0.0, 0.0, 0.0, 0.18),
+            search_w: 220.0,
         }
     }
 
@@ -138,6 +145,8 @@ impl Theme {
             toolbar_h: 30.0,
             button_hover: Color::rgba(0.0, 0.0, 0.0, 0.05),
             button_active: Color::hex(0x00_5F_B8).with_alpha(0.16),
+            input_bg: Color::rgba(1.0, 1.0, 1.0, 0.75),
+            search_w: 220.0,
         }
     }
 }
