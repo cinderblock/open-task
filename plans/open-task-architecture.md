@@ -286,6 +286,10 @@ goes." Same for a future headless/remote mode.
       the selection-preserving jump between the two; ancestry breadcrumb; `--view tree`.
       Probe resolves parent identity. Details and decisions in
       `plans/process-tree-view.md` (2026-09-25).
+- [x] Windows installer (Inno Setup, per-user by default, x64 + ARM64 in one file,
+      optional PATH) built by the release workflow and shipped from v0.2.1
+      (2026-09-26). Verified from the published asset. `plans/windows-installer.md`.
+      Follow-ups there: code signing, winget manifest, an app icon.
 
 ## Open questions for the user
 

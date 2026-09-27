@@ -1,6 +1,6 @@
 # Windows installer
 
-> **Status:** active · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md`. Follows `plans/process-tree-view.md`, which shipped v0.2.0 as zip/tar.gz only.
 
 ## Goal
@@ -107,7 +107,18 @@ place.
 - [x] Workflow: `installer` job on `windows-latest` after `build`; `publish` needs it;
       naming-contract comment updated.
 - [x] README "Install" section.
-- [ ] v0.2.1 released with the installer; asset verified.
+- [x] v0.2.1 released with the installer (run 36281790335, 2026-09-26; the installer
+      job took 21 s). Asset verified from GitHub: 2,735,927-byte
+      `open-task-v0.2.1-windows-setup.exe`, SHA-256 matches `SHA256SUMS`, file
+      version 0.2.1, silent per-user install exits 0 and puts down an exe
+      byte-identical to the one in the x64 archive, it runs `--headless`, silent
+      uninstall leaves no directory, shortcut, registry key or PATH change.
+      https://github.com/cinderblock/open-task/releases/tag/v0.2.1
+
+## Status
+
+Done. The installer is a release asset from v0.2.1 on. Open questions above (code
+signing, winget, an app icon) are follow-ups, not blockers.
 
 ## Open questions for the user
 
