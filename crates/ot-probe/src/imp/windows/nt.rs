@@ -10,8 +10,26 @@
 
 use std::mem::{offset_of, size_of};
 
+use windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS;
 use windows::Win32::Foundation::{HANDLE, UNICODE_STRING};
 use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION as SdkSpi;
+
+/// `SystemProcessIdInformation`: the image path of one process, by PID, as an NT
+/// device path (`\Device\HarddiskVolume3\Windows\...`), without a handle to the
+/// process. Absent from the SDK metadata; the class number and structure are from
+/// `phnt`'s `ntexapi.h`, and System Informer relies on them the same way.
+pub const SYSTEM_PROCESS_ID_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(88);
+
+/// In: `ProcessId`, and `ImageName.MaximumLength` / `Buffer` describing a caller
+/// buffer. Out: `ImageName` filled in, or `STATUS_INFO_LENGTH_MISMATCH` with
+/// `ImageName.MaximumLength` set to the size that would have sufficed.
+#[repr(C)]
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Copy)]
+pub struct SystemProcessIdInformation {
+    pub ProcessId: HANDLE,
+    pub ImageName: UNICODE_STRING,
+}
 
 /// `SYSTEM_PROCESS_INFORMATION` with its real field names.
 ///

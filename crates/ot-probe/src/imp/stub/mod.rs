@@ -4,11 +4,23 @@
 //! and macOS before their real probes exist. Every call reports
 //! [`ProbeError::Unsupported`] rather than fabricating data.
 
-use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
+use ot_model::ProcessKey;
+
+use crate::{Capabilities, ControlError, ProbeError, ProbeOutput, ProcessControl, SystemProbe};
 
 /// Probe that measures nothing.
 #[derive(Debug, Default)]
 pub struct StubProbe;
+
+/// Process actions that do nothing.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StubControl;
+
+impl ProcessControl for StubControl {
+    fn terminate(&self, _key: ProcessKey) -> Result<(), ControlError> {
+        Err(ControlError::Unsupported)
+    }
+}
 
 impl StubProbe {
     /// Construct the stub. Never fails.

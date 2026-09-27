@@ -158,18 +158,19 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
     let mut procs: Vec<_> = snap.processes.iter().collect();
     procs.sort_by(|a, b| b.cpu.get().total_cmp(&a.cpu.get()));
     println!(
-        "  {:>7}  {:>6}  {:>10}  {:>10}  {:>5}  {:>6}  name",
-        "pid", "cpu%", "ws", "private", "thr", "hnd"
+        "  {:>7}  {:>6}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  name",
+        "pid", "cpu%", "ws", "private", "thr", "hnd", "user"
     );
     for p in procs.iter().take(12) {
         println!(
-            "  {:>7}  {:>6.1}  {:>10}  {:>10}  {:>5}  {:>6}  {}",
+            "  {:>7}  {:>6.1}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  {}",
             p.key().pid,
             p.cpu.get(),
             human(p.working_set),
             human(p.private_bytes),
             p.threads,
             p.handles,
+            p.statics.user.as_deref().unwrap_or(""),
             p.name(),
         );
     }

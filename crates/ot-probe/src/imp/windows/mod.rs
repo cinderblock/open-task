@@ -14,10 +14,13 @@
 //! The process structure is declared by hand in [`nt`] because the public SDK hides
 //! its fields behind `Reserved` names; see that module for the layout pins.
 //!
+//! Image path, command line, user and integrity need a handle per process. They are
+//! collected once per process lifetime by [`details`], at first sight when the pass's
+//! time budget allows and from a queue over the following passes otherwise, so a
+//! first pass over hundreds of processes stays quick.
+//!
 //! # Known gaps (tracked in the plan)
 //! - Only the first processor group (up to 64 logical processors) is sampled.
-//! - Image path, command line, user and integrity are not yet collected; they need
-//!   `OpenProcess` and are deferred to a lazy on-demand path.
 //! - Per-core frequency is not reported. `CallNtPowerInformation` is known to be
 //!   stale on modern Windows; the correct source is the PDH counter
 //!   `\Processor Information(*)\% Processor Performance` scaled by base frequency.
@@ -25,7 +28,7 @@
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ot_model::cpu::{CoreKind, CpuSample, LogicalCore};
 use ot_model::memory::MemorySample;
@@ -48,12 +51,23 @@ use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INF
 
 use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
 
+mod control;
+mod details;
 mod nt;
+
+pub use control::WindowsControl;
+use details::DetailProbe;
 use nt::SystemProcessInformation;
 
 /// Difference between the Windows FILETIME epoch (1601-01-01) and the Unix epoch, in
 /// 100 ns units.
 const FILETIME_UNIX_OFFSET_100NS: i64 = 116_444_736_000_000_000;
+
+/// Time per pass spent collecting per-process details (path, command line, user).
+/// The sampler thread pays this, not the UI. A full first pass on a busy machine
+/// takes a few passes to fill in; each later pass only sees a handful of new
+/// processes and finishes well inside the budget.
+const DETAIL_BUDGET: Duration = Duration::from_millis(20);
 
 /// Raw monotonic counters from the previous pass, per process.
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,8 +130,13 @@ pub struct WindowsProbe {
     /// Indices into the pass's output of processes first seen in that pass, whose
     /// parent hints still need resolving.
     new_this_pass: Vec<u32>,
-    /// PID to output index for the current pass; only filled when needed.
+    /// PID to output index for the current pass; only filled when needed, at most
+    /// once per pass (`by_pid_pass` records which).
     by_pid: HashMap<u32, u32>,
+    by_pid_pass: u64,
+    details: DetailProbe,
+    /// Processes seen while the details budget was spent; drained on later passes.
+    pending_details: Vec<ProcessKey>,
     prev_cores: Vec<CoreTimes>,
     /// Physical core index and class for each logical processor, computed once.
     topology: Vec<(u32, CoreKind)>,
@@ -145,6 +164,9 @@ impl WindowsProbe {
             tracked: HashMap::with_capacity(512),
             new_this_pass: Vec::new(),
             by_pid: HashMap::new(),
+            by_pid_pass: 0,
+            details: DetailProbe::new(),
+            pending_details: Vec::new(),
             prev_cores: vec![CoreTimes::default(); logical_count as usize],
             topology,
             logical_count,
@@ -252,6 +274,7 @@ impl WindowsProbe {
         let pass = self.pass;
         let max_cpu = self.logical_count as f32 * 100.0;
         let first_pass = self.last_pass.is_none();
+        let deadline = Instant::now() + DETAIL_BUDGET;
 
         out.clear();
         self.new_this_pass.clear();
@@ -275,10 +298,21 @@ impl WindowsProbe {
                 write_bytes: p.WriteTransferCount as u64,
             };
 
-            let entry = self.tracked.entry(key).or_insert_with(|| Tracked {
-                statics: Arc::new(build_statics(p, key)),
-                prev: now,
-                last_seen: pass,
+            let details = &mut self.details;
+            let pending = &mut self.pending_details;
+            let entry = self.tracked.entry(key).or_insert_with(|| {
+                let mut statics = build_statics(p, key);
+                // Details at first sight while the budget lasts; the rest queue up.
+                if Instant::now() < deadline {
+                    details.query(pid).apply(&mut statics);
+                } else {
+                    pending.push(key);
+                }
+                Tracked {
+                    statics: Arc::new(statics),
+                    prev: now,
+                    last_seen: pass,
+                }
             });
             // A freshly inserted entry already carries this pass number.
             let seen_before = entry.last_seen != pass;
@@ -324,11 +358,61 @@ impl WindowsProbe {
         }
 
         self.resolve_parents(out);
+        self.collect_pending_details(out, deadline);
 
         // Reap processes that were not in this pass. Their statics Arcs may still be
         // held by history buffers upstream; that is fine and intended.
         self.tracked.retain(|_, t| t.last_seen == pass);
         Ok(())
+    }
+
+    /// Refill `by_pid` for this pass's output. PIDs are unique within one pass.
+    fn index_by_pid(&mut self, out: &[ProcessSample]) {
+        if self.by_pid_pass == self.pass {
+            return;
+        }
+        self.by_pid_pass = self.pass;
+        self.by_pid.clear();
+        for (i, p) in out.iter().enumerate() {
+            self.by_pid.insert(p.key().pid, i as u32);
+        }
+    }
+
+    /// Collect details for processes that were queued when an earlier pass ran out
+    /// of budget, until this pass's budget is spent too. Both the tracked entry and
+    /// this pass's output get the new statics, so the UI sees them now.
+    fn collect_pending_details(&mut self, out: &mut [ProcessSample], deadline: Instant) {
+        if self.pending_details.is_empty() {
+            return;
+        }
+        self.index_by_pid(out);
+        let mut done = 0u32;
+        while Instant::now() < deadline {
+            let Some(key) = self.pending_details.pop() else {
+                break;
+            };
+            // Exited before its turn came: nothing to learn.
+            let Some(t) = self.tracked.get_mut(&key) else {
+                continue;
+            };
+            let mut statics = (*t.statics).clone();
+            self.details.query(key.pid).apply(&mut statics);
+            let statics = Arc::new(statics);
+            t.statics = Arc::clone(&statics);
+            if let Some(&i) = self.by_pid.get(&key.pid) {
+                if out[i as usize].key() == key {
+                    out[i as usize].statics = statics;
+                }
+            }
+            done += 1;
+        }
+        if done > 0 {
+            tracing::debug!(
+                done,
+                left = self.pending_details.len(),
+                "process details collected"
+            );
+        }
     }
 
     /// Turn the PID-only parent hint of every process first seen this pass into a
@@ -342,10 +426,7 @@ impl WindowsProbe {
         if self.new_this_pass.is_empty() {
             return;
         }
-        self.by_pid.clear();
-        for (i, p) in out.iter().enumerate() {
-            self.by_pid.insert(p.key().pid, i as u32);
-        }
+        self.index_by_pid(out);
         for &i in &self.new_this_pass {
             let child = &out[i as usize];
             let child_key = child.key();
@@ -423,6 +504,7 @@ fn build_statics(p: &SystemProcessInformation, key: ProcessKey) -> ProcessStatic
     let started_unix_ms =
         (p.CreateTime > 0).then(|| (p.CreateTime - FILETIME_UNIX_OFFSET_100NS) / 10_000);
 
+    // Details (path, command line, user, integrity) are filled in by `DetailProbe`.
     ProcessStatic {
         key,
         parent,
@@ -579,7 +661,7 @@ fn nt_error(status: NTSTATUS) -> std::io::Error {
     std::io::Error::other(format!("NTSTATUS 0x{:08X}", status.0 as u32))
 }
 
-fn unicode_to_string(u: &UNICODE_STRING) -> String {
+pub(super) fn unicode_to_string(u: &UNICODE_STRING) -> String {
     if u.Buffer.is_null() || u.Length == 0 {
         return String::new();
     }

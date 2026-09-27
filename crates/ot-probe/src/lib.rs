@@ -15,10 +15,11 @@
 use ot_model::cpu::CpuSample;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
+use ot_model::ProcessKey;
 
 mod imp;
 
-pub use imp::PlatformProbe;
+pub use imp::{PlatformControl, PlatformProbe};
 
 /// Why a sampling pass could not produce data.
 #[derive(Debug, thiserror::Error)]
@@ -94,4 +95,38 @@ pub trait SystemProbe: Send + std::fmt::Debug {
     /// # Errors
     /// Returns [`ProbeError`] if the platform is unsupported or an OS call fails.
     fn sample(&mut self, out: &mut ProbeOutput) -> Result<(), ProbeError>;
+}
+
+/// Why an action on a process did not happen.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    /// This platform has no implementation yet.
+    #[error("process actions are not implemented on this platform yet")]
+    Unsupported,
+    /// The process has exited, or its PID now belongs to a different process. Either
+    /// way there is nothing left to act on, and nothing was touched.
+    #[error("the process is no longer running")]
+    Gone,
+    /// An OS call failed; typically access denied for another user's process.
+    #[error("{context}: {source}")]
+    Os {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Actions on processes.
+///
+/// Separate from [`SystemProbe`] so the UI thread can act while the sampler thread
+/// samples. Every action is keyed by [`ProcessKey`], never a bare PID, and the
+/// implementation must verify the identity before acting: a PID that has been
+/// recycled since the snapshot was taken belongs to a stranger.
+pub trait ProcessControl: Send + Sync + std::fmt::Debug {
+    /// Kill the process. Fails with [`ControlError::Gone`] if it already exited or
+    /// the PID has been reused.
+    ///
+    /// # Errors
+    /// See [`ControlError`].
+    fn terminate(&self, key: ProcessKey) -> Result<(), ControlError>;
 }
