@@ -2,7 +2,8 @@ name: Release
 
 # Pushing a tag like v1.2.3 builds every target, packages it, and publishes a GitHub
 # release with checksums. The self-updater reads these releases, so the asset naming
-# below is a contract: <name>-<tag>-<target>.<zip|tar.gz> plus SHA256SUMS.
+# below is a contract: <name>-<tag>-<target>.<zip|tar.gz>, the Windows installer
+# <name>-<tag>-windows-setup.exe (both architectures in one file), plus SHA256SUMS.
 #
 # The workflow can also be run by hand for a tag that already exists, to publish or
 # repair a release without moving the tag (a workflow fix after the tag was pushed,
@@ -107,9 +108,44 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  installer:
+    name: Windows installer
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-pc-windows-msvc"
+          path: dist
+          merge-multiple: true
+      - name: Unpack the Windows binaries
+        shell: pwsh
+        run: |
+          Expand-Archive "dist/$env:BIN-$env:TAG-x86_64-pc-windows-msvc.zip" -DestinationPath unpacked
+          Expand-Archive "dist/$env:BIN-$env:TAG-aarch64-pc-windows-msvc.zip" -DestinationPath unpacked
+          Get-ChildItem -Recurse unpacked -File | Select-Object FullName, Length
+      - name: Build installer
+        # Inno Setup 6 is preinstalled on the Windows runner images; the build script
+        # finds it in Program Files (x86).
+        shell: pwsh
+        run: |
+          $ver = $env:TAG.TrimStart("v")
+          & ./scripts/build-installer.ps1 -Version $ver `
+            -X64Exe "unpacked/$env:BIN-$env:TAG-x86_64-pc-windows-msvc/$env:BIN.exe" `
+            -Arm64Exe "unpacked/$env:BIN-$env:TAG-aarch64-pc-windows-msvc/$env:BIN.exe" `
+            -OutDir installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer/*.exe
+          if-no-files-found: error
+
   publish:
     name: Publish release
-    needs: build
+    needs: [build, installer]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

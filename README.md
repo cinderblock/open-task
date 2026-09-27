@@ -63,6 +63,23 @@ The sampling cadence and the UI frame rate are independent. The core publishes
 immutable snapshots; readers never block the sampler and the sampler never waits for
 a reader.
 
+## Install
+
+**Windows:** download `open-task-vX.Y.Z-windows-setup.exe` from the
+[latest release](https://github.com/cinderblock/open-task/releases/latest) and run it.
+It installs for the current user without administrator rights, or for all users if
+you pick that on the first page; installs the x64 or ARM64 build to match the
+machine; adds a Start Menu entry and an uninstaller; and can put `open-task` on your
+PATH for `open-task --headless` in a terminal. A newer installer upgrades in place.
+Silent install: `open-task-vX.Y.Z-windows-setup.exe /VERYSILENT /NORESTART`.
+
+The installer and the binaries are not code-signed yet, so SmartScreen asks you to
+confirm the first run.
+
+The bare binaries for every platform are on the same release as `.zip` / `.tar.gz`
+with a `SHA256SUMS` file. Linux and macOS have no installer because there is nothing
+to install yet beyond the headless probe stub.
+
 ## Build
 
 Requires a stable Rust toolchain.
