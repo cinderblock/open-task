@@ -9,12 +9,13 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ot_core::{Snapshot, Timeline};
+use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
 use ot_model::ProcessKey;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
 
 use crate::format;
-use crate::process_rows::{col, columns, process_matches, ProcessRows, ProcessTree};
+use crate::process_rows::{col, columns, process_matches, Layout, ProcessRows, ProcessTree};
 use crate::sparkline::{self, SparkStyle};
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
@@ -86,6 +87,9 @@ pub enum MenuAction {
     EndTree,
     /// Show the selected process's executable in the file manager.
     OpenFileLocation,
+    /// Sample the selected process's CPU for a few seconds: which modules its
+    /// threads run, and for a broker service, which clients it served.
+    SampleCpu,
 }
 
 /// One line of a context menu, in order.
@@ -159,6 +163,9 @@ pub enum Effect {
     },
     /// Reveal this file in the platform's file manager.
     OpenFileLocation(String),
+    /// Sample `target`'s CPU for `seconds`, off the UI thread, and hand the result
+    /// to [`App::set_attribution`] (or [`App::sampling_failed`]).
+    SampleCpu { target: ProcessKey, seconds: u32 },
 }
 
 /// What an event led to.
@@ -208,6 +215,26 @@ pub enum Cursor {
 
 const HISTORY_POINTS: usize = 600;
 const CARD_H: f32 = 96.0;
+
+/// Build a [`ProcessRows`] from an [`App`]'s fields without borrowing the table,
+/// so the table can be mutated while the rows are in use. A macro rather than a
+/// method because a method would borrow all of `self`.
+macro_rules! rows_of {
+    ($app:expr, $tree_mode:expr) => {
+        ProcessRows {
+            procs: &$app.snap.processes,
+            threads: &$app.snap.threads,
+            tree: &$app.tree,
+            layout: &$app.layout,
+            attribution: $app.attribution.as_deref(),
+            interval_secs: interval_secs(&$app.snap),
+            mem_total: $app.snap.memory.total.get() as f32,
+            matched: &$app.matched,
+            shown: &$app.shown,
+            tree_mode: $tree_mode,
+        }
+    };
+}
 
 /// The search field. Type-to-filter: printable keys land here whether or not it has
 /// focus, so focus only decides where Enter and Escape go and whether a caret shows.
@@ -420,6 +447,11 @@ pub struct App {
     toolbar: Toolbar,
     snap: Arc<Snapshot>,
     tree: ProcessTree,
+    layout: Layout,
+    /// The last finished CPU sample, shown under its process while it lives.
+    attribution: Option<Arc<Attribution>>,
+    /// A sample in progress, shown as a marker row under its process.
+    sampling: Option<ProcessKey>,
     timeline: Timeline,
     /// Search results per process; empty when there is no search.
     matched: Vec<bool>,
@@ -444,6 +476,9 @@ impl App {
             toolbar: Toolbar::default(),
             snap: Arc::new(Snapshot::default()),
             tree: ProcessTree::default(),
+            layout: Layout::default(),
+            attribution: None,
+            sampling: None,
             timeline: Timeline::new(HISTORY_POINTS),
             matched: Vec::new(),
             shown: Vec::new(),
@@ -484,8 +519,48 @@ impl App {
         // The filter's ancestor rule depends on the mode, and the reveal that
         // follows needs the order the new mode will actually show.
         self.refilter(mode == ViewMode::Tree);
-        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        let rows = rows_of!(self, mode == ViewMode::Tree);
         apply_view(&mut self.table, mode, &rows, &self.theme);
+    }
+
+    /// The row source for the current snapshot and mode, borrowing all of `self`.
+    /// Where the table is mutated while the rows are alive, use [`rows_of!`], which
+    /// borrows only the fields it needs.
+    fn rows(&self) -> ProcessRows<'_> {
+        rows_of!(self, self.table.tree())
+    }
+
+    fn relayout(&mut self) {
+        self.layout
+            .rebuild(&self.snap, self.attribution.as_deref(), self.sampling);
+        self.table.invalidate_order();
+    }
+
+    /// A CPU sample finished: show it under its process. Returns true if the
+    /// process is still in the table.
+    pub fn set_attribution(&mut self, a: Arc<Attribution>) -> bool {
+        if self.sampling == Some(a.target) {
+            self.sampling = None;
+        }
+        let live = self.snap.processes.iter().any(|p| p.key() == a.target);
+        self.attribution = Some(a);
+        self.relayout();
+        live
+    }
+
+    /// A CPU sample could not run or finish. Clears the marker row; the shell
+    /// tells the user why.
+    pub fn sampling_failed(&mut self, target: ProcessKey) {
+        if self.sampling == Some(target) {
+            self.sampling = None;
+            self.relayout();
+        }
+    }
+
+    /// Whether a sample is in progress.
+    #[must_use]
+    pub fn sampling(&self) -> Option<ProcessKey> {
+        self.sampling
     }
 
     /// The current search text.
@@ -521,8 +596,14 @@ impl App {
         self.timeline.observe(&snap);
         self.tree.rebuild(&snap.processes);
         self.snap = snap;
+        // A finished sample outlives its process only until the next snapshot.
+        if let Some(a) = &self.attribution {
+            if !self.snap.processes.iter().any(|p| p.key() == a.target) {
+                self.attribution = None;
+            }
+        }
+        self.relayout();
         self.refilter(self.table.tree());
-        self.table.invalidate_order();
         true
     }
 
@@ -650,7 +731,7 @@ impl App {
             return Reaction::REPAINT;
         }
         search.focused = false;
-        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, theme) {
             Hit::Divider(c) => {
                 self.table.begin_resize(c, at);
@@ -671,7 +752,7 @@ impl App {
 
     /// Select the row under `at`, if there is one. Returns whether anything changed.
     fn select_at(&mut self, at: Point) -> bool {
-        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, &self.theme) {
             Hit::Row(pos) | Hit::Expander(pos) => {
                 let id = self.table.row_at(pos).map(|r| rows.id(r));
@@ -684,7 +765,7 @@ impl App {
     }
 
     fn key(&mut self, k: Key) -> Reaction {
-        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+        let rows = rows_of!(self, self.table.tree());
         let theme = &self.theme;
         let page = isize::try_from(self.table.rows_visible(theme).max(1)).unwrap_or(isize::MAX);
         match k {
@@ -739,10 +820,14 @@ impl App {
         }
     }
 
-    /// The selected process's index in the snapshot, if it is still there.
-    fn selected_row(&self) -> Option<usize> {
-        let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
-        self.table.selected.and_then(|id| rows.row_of(id))
+    /// The process the selected row belongs to, as an index into the snapshot. A
+    /// service, thread or sample row acts for its process.
+    fn selected_process(&self) -> Option<usize> {
+        let rows = self.rows();
+        self.table
+            .selected
+            .and_then(|id| rows.row_of(id))
+            .map(|row| rows.process_of(row))
     }
 
     fn context_menu(&mut self, at: Option<Point>) -> Reaction {
@@ -754,16 +839,18 @@ impl App {
             }
         } else {
             // From the keyboard: just under the selected row's name.
-            let rows = rows_of(&self.snap, &self.tree, &self.matched, &self.shown);
+            let rows = self.rows();
             let Some(r) = self.table.selected_rect(&rows, &self.theme) else {
                 return Reaction::NONE;
             };
             Point::new(r.x + self.theme.pad + self.theme.expander_w, r.bottom())
         };
-        let Some(row) = self.selected_row() else {
+        let Some(row) = self.selected_process() else {
             return Reaction::NONE;
         };
         let p = &self.snap.processes[row];
+        let can_sample =
+            self.snap.capabilities.cpu_sampling && p.key().pid > 4 && self.sampling.is_none();
         let entries = vec![
             MenuEntry::Item {
                 action: MenuAction::EndTask,
@@ -781,6 +868,12 @@ impl App {
                 label: "Open file location",
                 enabled: p.statics.image_path.is_some(),
             },
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                action: MenuAction::SampleCpu,
+                label: "Sample CPU for 5 s",
+                enabled: can_sample,
+            },
         ];
         Reaction::effect(Effect::Menu {
             at: anchor,
@@ -789,11 +882,20 @@ impl App {
     }
 
     fn menu_action(&mut self, action: MenuAction) -> Reaction {
-        let Some(row) = self.selected_row() else {
+        let Some(row) = self.selected_process() else {
             return Reaction::NONE;
         };
         let p = &self.snap.processes[row];
         match action {
+            MenuAction::SampleCpu => {
+                if !self.snap.capabilities.cpu_sampling || self.sampling.is_some() {
+                    return Reaction::NONE;
+                }
+                let target = p.key();
+                self.sampling = Some(target);
+                self.relayout();
+                Reaction::effect(Effect::SampleCpu { target, seconds: 5 })
+            }
             MenuAction::EndTask => Reaction::effect(Effect::Terminate {
                 targets: vec![p.key()],
                 label: p.name().to_owned(),
@@ -863,7 +965,18 @@ impl App {
             &mut self.scratch,
         );
 
-        let rows = rows_of(&snap, &self.tree, &self.matched, &self.shown);
+        let rows = ProcessRows {
+            procs: &snap.processes,
+            threads: &snap.threads,
+            tree: &self.tree,
+            layout: &self.layout,
+            attribution: self.attribution.as_deref(),
+            interval_secs: interval_secs(&snap),
+            mem_total: snap.memory.total.get() as f32,
+            matched: &self.matched,
+            shown: &self.shown,
+            tree_mode: self.table.tree(),
+        };
         // The table first: the toolbar reads its state, and the order must be
         // current before the ancestry lookup.
         self.table
@@ -994,22 +1107,6 @@ fn apply_view(table: &mut Table, mode: ViewMode, rows: &ProcessRows<'_>, theme: 
         table.reveal_selected(rows, theme);
     } else {
         table.set_tree(tree, rows, theme);
-    }
-}
-
-fn rows_of<'a>(
-    snap: &'a Snapshot,
-    tree: &'a ProcessTree,
-    matched: &'a [bool],
-    shown: &'a [bool],
-) -> ProcessRows<'a> {
-    ProcessRows {
-        procs: &snap.processes,
-        tree,
-        interval_secs: interval_secs(snap),
-        mem_total: snap.memory.total.get() as f32,
-        matched,
-        shown,
     }
 }
 
@@ -1475,6 +1572,12 @@ mod tests {
                 MenuEntry::Item {
                     action: MenuAction::OpenFileLocation,
                     label: "Open file location",
+                    enabled: false
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    action: MenuAction::SampleCpu,
+                    label: "Sample CPU for 5 s",
                     enabled: false
                 },
             ]

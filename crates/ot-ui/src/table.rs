@@ -83,6 +83,13 @@ pub trait RowSource {
     fn compare_subtree(&self, a: usize, b: usize, col: usize) -> Ordering {
         self.compare(a, b, col)
     }
+
+    /// Whether a row with children starts out folded. A process's child processes
+    /// are worth seeing by default; its threads are not, until asked. The table
+    /// remembers the user's toggles relative to this default.
+    fn collapsed_by_default(&self, _row: usize) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +194,7 @@ pub struct Table {
     pub hover: Option<usize>,
     pub selected: Option<RowId>,
     tree: bool,
+    /// Rows whose fold state the user flipped away from the source's default.
     collapsed: HashSet<RowId>,
     scratch: TreeScratch,
     body: Rect,
@@ -275,8 +283,8 @@ impl Table {
                 if p >= n || p == r || !src.visible(p) {
                     break;
                 }
-                if self.collapsed.remove(&src.id(p)) {
-                    self.order_dirty = true;
+                if self.is_collapsed(src, p) {
+                    self.set_collapsed(src, p, false);
                 }
                 r = p;
             }
@@ -317,10 +325,9 @@ impl Table {
             return false;
         };
         let m = self.meta[pos];
-        let id = src.id(self.order[pos]);
-        if m.has_children && !self.collapsed.contains(&id) {
-            self.collapsed.insert(id);
-            self.order_dirty = true;
+        let row = self.order[pos];
+        if m.has_children && !self.is_collapsed(src, row) {
+            self.set_collapsed(src, row, true);
             return true;
         }
         if m.depth == 0 {
@@ -348,9 +355,9 @@ impl Table {
         if !self.meta[pos].has_children {
             return false;
         }
-        let id = src.id(self.order[pos]);
-        if self.collapsed.remove(&id) {
-            self.order_dirty = true;
+        let row = self.order[pos];
+        if self.is_collapsed(src, row) {
+            self.set_collapsed(src, row, false);
             return true;
         }
         // Expanded, so the first child is the next row.
@@ -361,6 +368,22 @@ impl Table {
         self.selected = Some(src.id(self.order[next]));
         self.scroll_into_view(next, theme);
         true
+    }
+
+    /// Effective fold state of a row: the source's default, flipped if the user
+    /// toggled it.
+    fn is_collapsed<S: RowSource>(&self, src: &S, row: usize) -> bool {
+        src.collapsed_by_default(row) != self.collapsed.contains(&src.id(row))
+    }
+
+    fn set_collapsed<S: RowSource>(&mut self, src: &S, row: usize, on: bool) {
+        if self.is_collapsed(src, row) != on {
+            let id = src.id(row);
+            if !self.collapsed.remove(&id) {
+                self.collapsed.insert(id);
+            }
+            self.order_dirty = true;
+        }
     }
 
     #[must_use]
@@ -584,6 +607,8 @@ impl Table {
             self.collapsed.retain(|id| live.contains(id));
         }
 
+        let toggled = &self.collapsed;
+        let is_collapsed = |r: usize| src.collapsed_by_default(r) != toggled.contains(&src.id(r));
         let TreeScratch {
             parent,
             child_start,
@@ -664,7 +689,7 @@ impl Table {
                 });
             }
             if has_children {
-                let hide = hidden || self.collapsed.contains(&src.id(ri));
+                let hide = hidden || is_collapsed(ri);
                 let d = depth.saturating_add(1);
                 stack.extend(child_list[kids].iter().rev().map(|&c| (c, d, hide)));
             }
@@ -787,7 +812,8 @@ impl Table {
             } else {
                 RowMeta::default()
             };
-            let collapsed = meta.has_children && self.collapsed.contains(&id);
+            let collapsed = meta.has_children
+                && (src.collapsed_by_default(row) != self.collapsed.contains(&id));
 
             if self.selected == Some(id) {
                 dl.fill_rect(rr, theme.row_selected);

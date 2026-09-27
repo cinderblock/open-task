@@ -1,16 +1,27 @@
-//! The process table's row source: columns, cells, ordering, and the process
-//! hierarchy with its subtree rollups.
+//! The process table's row source: columns, cells, ordering, the process hierarchy
+//! with its subtree rollups, and the rows that live *inside* a process.
 //!
 //! [`ProcessTree`] is rebuilt once per snapshot. It turns each process's parent
 //! identity into an index into the snapshot's process list, breaks any cycle a
 //! malformed parent chain could form, and folds every process's usage into its
 //! ancestors so a collapsed branch can be shown as one row that still adds up.
+//!
+//! [`Layout`] is rebuilt with it. Its rows are the processes first, in snapshot
+//! order (so a process's row index is its index in the snapshot), followed by the
+//! rows beneath each process: one per hosted service, a "Threads" group for the
+//! threads no service claims, one per thread, and, after an on-demand CPU sample,
+//! the modules and clients that sample found. In list mode only the process rows
+//! are visible; in tree mode the inner rows hang under their process, folded by
+//! default so the tree reads as it always has until you open one.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use ot_core::Snapshot;
+use ot_model::attribution::Attribution;
 use ot_model::process::ProcessSample;
+use ot_model::thread::{ServiceTag, ThreadSample, ThreadState};
 use ot_model::{Bytes, ProcessKey};
 
 use crate::format;
@@ -33,7 +44,7 @@ pub(crate) mod col {
 
 pub(crate) fn columns() -> Vec<Column> {
     vec![
-        Column::text("Name", 240.0),
+        Column::text("Name", 300.0),
         Column::number("PID", 70.0),
         Column::text("User", 110.0),
         Column::number("CPU %", 70.0),
@@ -55,8 +66,9 @@ pub(crate) fn contains_ci(hay: &str, needle: &str) -> bool {
     n.is_empty() || (h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n)))
 }
 
-/// Whether a process matches a search: by name, PID, user, image path or command
-/// line. `pid_buf` is caller-owned scratch so the PID needs no allocation.
+/// Whether a process matches a search: by name, PID, user, image path, command
+/// line, or the name of a service it hosts. `pid_buf` is caller-owned scratch so
+/// the PID needs no allocation.
 pub(crate) fn process_matches(p: &ProcessSample, needle: &str, pid_buf: &mut String) -> bool {
     if needle.is_empty() {
         return true;
@@ -69,6 +81,20 @@ pub(crate) fn process_matches(p: &ProcessSample, needle: &str, pid_buf: &mut Str
         || opt(&s.user)
         || opt(&s.image_path)
         || opt(&s.command_line)
+        || p.services
+            .iter()
+            .any(|svc| contains_ci(&svc.name, needle) || contains_ci(&svc.display_name, needle))
+}
+
+/// The `-k <group>` of a `svchost.exe` command line, if present.
+pub(crate) fn svchost_group(command_line: &str) -> Option<&str> {
+    let mut parts = command_line.split_whitespace();
+    while let Some(p) = parts.next() {
+        if p.eq_ignore_ascii_case("-k") {
+            return parts.next().map(|g| g.trim_matches('"'));
+        }
+    }
+    None
 }
 
 /// Case-insensitive ordering of two names without allocating.
@@ -91,6 +117,19 @@ fn cmp_opt(a: Option<&str>, b: Option<&str>) -> Ordering {
 
 pub(crate) fn row_id(key: ProcessKey) -> RowId {
     RowId(u64::from(key.pid) ^ key.birth.0.rotate_left(32))
+}
+
+/// Derive a stable id for a row beneath a process from the process's id and the
+/// row's own identity. A multiply-xorshift mix; collisions only matter within one
+/// process's rows, where the inputs are distinct by construction.
+fn sub_id(base: RowId, kind: u64, a: u64, b: u64) -> RowId {
+    let mut h = base.0 ^ 0x9E37_79B9_7F4A_7C15;
+    for v in [kind, a, b] {
+        h ^= v.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 31;
+    }
+    RowId(h)
 }
 
 /// Sums over a process and everything below it.
@@ -292,10 +331,276 @@ impl ProcessTree {
     }
 }
 
-/// Adapts a snapshot's process list to the table.
+/// What a row is. Process rows come first in the layout and are indexed like the
+/// snapshot's process list; every other kind hangs under a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowKind {
+    Process,
+    /// A hosted service; the index is into the process's service list.
+    Service(u16),
+    /// The group holding the threads no service claims.
+    ThreadGroup,
+    /// A thread; the index is into the snapshot's thread list.
+    Thread(u32),
+    /// A CPU sample is running for this process.
+    Sampling,
+    /// Header of a finished CPU sample.
+    Sample,
+    /// A module the sample landed in; index into the attribution's module list.
+    Module(u16),
+    /// Header of the clients a broker service reported during the sample.
+    Clients,
+    /// One client bucket.
+    Client(u16),
+    /// A module one thread's samples landed in: (thread index, module index within
+    /// that thread's list in the attribution).
+    ThreadModule(u32, u16),
+}
+
+/// One row of the layout.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Row {
+    pub kind: RowKind,
+    /// Owning process, as an index into the process list.
+    pub proc: u32,
+    /// Parent row for rows beneath a process. Process rows use the process tree.
+    pub parent: u32,
+    pub id: RowId,
+    /// The number the row sorts and heats by: CPU % for service, group and thread
+    /// rows; share of samples or events, in percent, for sample rows.
+    pub value: f32,
+    /// Threads under a service or group; samples or events for sample rows.
+    pub count: u32,
+}
+
+/// Per-process facts about its inner rows.
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcExtra {
+    /// First service row, or `NONE`; the process's services are contiguous.
+    svc_start: u32,
+    /// Whether any thread of this process carries a known service tag, i.e. the
+    /// per-service CPU numbers mean something.
+    tags_known: bool,
+    /// Index into the attribution's thread list for each thread row, if sampled.
+    _reserved: u32,
+}
+
+/// Every row the table can show for one snapshot. See the module docs.
+#[derive(Debug, Default)]
+pub(crate) struct Layout {
+    pub rows: Vec<Row>,
+    extra: Vec<ProcExtra>,
+    /// Scratch: thread row index by TID, per process, for attaching sample rows.
+    tid_rows: Vec<(u32, u32)>,
+}
+
+impl Layout {
+    /// Rebuild for a snapshot, an optional finished sample and an optional sample
+    /// in progress.
+    // One walk per process that emits its services, threads and sample rows in
+    // order; the row indices each step hands to the next are what keep it in one
+    // function.
+    #[allow(clippy::too_many_lines)]
+    pub fn rebuild(
+        &mut self,
+        snap: &Snapshot,
+        attribution: Option<&Attribution>,
+        sampling: Option<ProcessKey>,
+    ) {
+        let procs = &snap.processes;
+        let threads = &snap.threads;
+        self.rows.clear();
+        self.extra.clear();
+        self.extra.resize(procs.len(), ProcExtra::default());
+        for e in &mut self.extra {
+            e.svc_start = NONE;
+        }
+
+        for (i, p) in procs.iter().enumerate() {
+            self.rows.push(Row {
+                kind: RowKind::Process,
+                proc: i as u32,
+                parent: NONE,
+                id: row_id(p.key()),
+                value: p.cpu.get(),
+                count: 0,
+            });
+        }
+
+        for (i, p) in procs.iter().enumerate() {
+            let key = p.key();
+            if key.pid == 0 {
+                continue;
+            }
+            let base = row_id(key);
+            let pi = i as u32;
+            let push = |rows: &mut Vec<Row>, kind, parent, id, value, count| {
+                rows.push(Row {
+                    kind,
+                    proc: pi,
+                    parent,
+                    id,
+                    value,
+                    count,
+                });
+                (rows.len() - 1) as u32
+            };
+
+            // Services, in the probe's (name) order.
+            let svc_start = self.rows.len() as u32;
+            for (k, s) in p.services.iter().enumerate() {
+                let id = sub_id(base, 1, hash_str(&s.name), 0);
+                push(&mut self.rows, RowKind::Service(k as u16), pi, id, 0.0, 0);
+            }
+            if !p.services.is_empty() {
+                self.extra[i].svc_start = svc_start;
+            }
+
+            // Threads: tagged ones under their service, the rest under a group.
+            let range = p.thread_range();
+            let range = range.start.min(threads.len())..range.end.min(threads.len());
+            let mut group = NONE;
+            if !range.is_empty() {
+                group = push(
+                    &mut self.rows,
+                    RowKind::ThreadGroup,
+                    pi,
+                    sub_id(base, 2, 0, 0),
+                    0.0,
+                    0,
+                );
+            }
+            self.tid_rows.clear();
+            for t_idx in range {
+                let t = &threads[t_idx];
+                let parent = match t.service {
+                    ServiceTag::Service(k) if usize::from(k) < p.services.len() => {
+                        self.extra[i].tags_known = true;
+                        svc_start + u32::from(k)
+                    }
+                    ServiceTag::None => {
+                        self.extra[i].tags_known = true;
+                        group
+                    }
+                    _ => group,
+                };
+                let parent_row = &mut self.rows[parent as usize];
+                parent_row.value += t.cpu.get();
+                parent_row.count += 1;
+                let id = sub_id(base, 3, u64::from(t.tid), t.birth);
+                let r = push(
+                    &mut self.rows,
+                    RowKind::Thread(t_idx as u32),
+                    parent,
+                    id,
+                    t.cpu.get(),
+                    0,
+                );
+                self.tid_rows.push((t.tid, r));
+            }
+
+            if sampling == Some(key) {
+                push(
+                    &mut self.rows,
+                    RowKind::Sampling,
+                    pi,
+                    sub_id(base, 9, 0, 0),
+                    0.0,
+                    0,
+                );
+            }
+            let Some(a) = attribution.filter(|a| a.target == key) else {
+                continue;
+            };
+            let total = a.samples.max(1) as f32;
+            let sample = push(
+                &mut self.rows,
+                RowKind::Sample,
+                pi,
+                sub_id(base, 4, 0, 0),
+                a.samples as f32,
+                a.samples,
+            );
+            for (m, share) in a.modules.iter().enumerate() {
+                let pct = share.count as f32 / total * 100.0;
+                let id = sub_id(base, 5, m as u64, 0);
+                push(
+                    &mut self.rows,
+                    RowKind::Module(m as u16),
+                    sample,
+                    id,
+                    pct,
+                    share.count,
+                );
+            }
+            if let Some(c) = &a.clients {
+                let clients = push(
+                    &mut self.rows,
+                    RowKind::Clients,
+                    pi,
+                    sub_id(base, 6, 0, 0),
+                    c.events as f32,
+                    c.events,
+                );
+                let ev = c.events.max(1) as f32;
+                for (b, share) in c.buckets.iter().enumerate() {
+                    let pct = share.count as f32 / ev * 100.0;
+                    let id = sub_id(base, 7, b as u64, 0);
+                    push(
+                        &mut self.rows,
+                        RowKind::Client(b as u16),
+                        clients,
+                        id,
+                        pct,
+                        share.count,
+                    );
+                }
+            }
+            for ts in &a.threads {
+                let Some(&(_, trow)) = self.tid_rows.iter().find(|(tid, _)| *tid == ts.tid) else {
+                    continue;
+                };
+                let RowKind::Thread(t_idx) = self.rows[trow as usize].kind else {
+                    continue;
+                };
+                let own = ts.samples.max(1) as f32;
+                for (m, share) in ts.modules.iter().enumerate() {
+                    let pct = share.count as f32 / own * 100.0;
+                    let id = sub_id(base, 8, u64::from(ts.tid), m as u64);
+                    push(
+                        &mut self.rows,
+                        RowKind::ThreadModule(t_idx, m as u16),
+                        trow,
+                        id,
+                        pct,
+                        share.count,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Service rows of process `proc`, in service-list order.
+    fn service_rows(&self, proc: usize, n: usize) -> Option<std::ops::Range<usize>> {
+        let s = self.extra.get(proc)?.svc_start;
+        (s != NONE).then(|| s as usize..s as usize + n)
+    }
+}
+
+fn hash_str(s: &str) -> u64 {
+    // FNV-1a; short strings, stability across runs is all that matters.
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Adapts a snapshot's process list, threads and layout to the table.
 pub(crate) struct ProcessRows<'a> {
     pub procs: &'a [ProcessSample],
+    pub threads: &'a [ThreadSample],
     pub tree: &'a ProcessTree,
+    pub layout: &'a Layout,
+    pub attribution: Option<&'a Attribution>,
     pub interval_secs: f32,
     pub mem_total: f32,
     /// Search results, parallel to `procs`; empty when there is no search.
@@ -303,6 +608,8 @@ pub(crate) struct ProcessRows<'a> {
     /// Rows to list: the matches, plus their ancestors in tree mode. Empty means
     /// everything.
     pub shown: &'a [bool],
+    /// Tree mode: the rows beneath a process are listed. In list mode they are not.
+    pub tree_mode: bool,
 }
 
 impl ProcessRows<'_> {
@@ -318,35 +625,49 @@ impl ProcessRows<'_> {
         !self.shown.is_empty()
     }
 
-    /// Root-first chain of ancestor names ending in the row itself, e.g.
-    /// `wininit.exe › services.exe › svchost.exe`. `chain` is caller-owned scratch.
+    /// The process a row belongs to, as an index into the process list.
+    #[must_use]
+    pub fn process_of(&self, row: usize) -> usize {
+        self.layout.rows[row].proc as usize
+    }
+
+    #[cfg(test)]
+    pub fn kind(&self, row: usize) -> RowKind {
+        self.layout.rows[row].kind
+    }
+
+    /// Root-first chain of names ending in the row itself, e.g.
+    /// `wininit.exe › services.exe › svchost.exe › BrokerInfrastructure`. `chain` is
+    /// caller-owned scratch.
     pub fn ancestry(&self, row: usize, out: &mut String, chain: &mut Vec<u32>) {
         out.clear();
         chain.clear();
-        let n = self.procs.len();
+        let n = self.layout.rows.len();
         let mut r = row;
         for _ in 0..n {
             chain.push(r as u32);
-            match self.tree.parent(r) {
+            match self.parent(r) {
                 Some(p) if p < n && self.visible(p) => r = p,
                 _ => break,
             }
         }
+        let mut name = String::new();
         for (i, &r) in chain.iter().rev().enumerate() {
             if i > 0 {
                 out.push_str(" › ");
             }
-            out.push_str(self.procs[r as usize].name());
+            self.name_of(r as usize, &mut name);
+            out.push_str(&name);
         }
     }
 
-    /// Row index of a process by table id, if it is in this snapshot.
+    /// Row index by table id, if it is in this snapshot.
     #[must_use]
     pub fn row_of(&self, id: RowId) -> Option<usize> {
-        (0..self.procs.len()).find(|&r| self.id(r) == id)
+        self.layout.rows.iter().position(|r| r.id == id)
     }
 
-    /// Number of rows the table lists.
+    /// Number of processes the table lists.
     #[must_use]
     pub fn listed(&self) -> usize {
         (0..self.procs.len()).filter(|&r| self.visible(r)).count()
@@ -357,108 +678,352 @@ impl ProcessRows<'_> {
         // machine is fully hot.
         (self.mem_total > 0.0).then(|| (private_bytes as f32 / (self.mem_total * 0.1)).min(1.0))
     }
+
+    fn row(&self, row: usize) -> Row {
+        self.layout.rows[row]
+    }
+
+    /// Plain name of any row, for the Name column and the ancestry strip.
+    fn name_of(&self, row: usize, out: &mut String) {
+        out.clear();
+        let r = self.row(row);
+        let p = &self.procs[r.proc as usize];
+        match r.kind {
+            RowKind::Process => out.push_str(p.name()),
+            RowKind::Service(k) => {
+                out.push_str(p.services.get(usize::from(k)).map_or("", |s| &s.name));
+            }
+            RowKind::ThreadGroup => out.push_str("Threads"),
+            RowKind::Thread(t) => {
+                let _ = write!(out, "Thread {}", self.threads[t as usize].tid);
+            }
+            RowKind::Sampling => out.push_str("Sampling CPU\u{2026}"),
+            RowKind::Sample => match self.attribution {
+                Some(a) => {
+                    let _ = write!(
+                        out,
+                        "CPU sample \u{b7} {} samples in {:.1} s",
+                        a.samples,
+                        a.duration.as_secs_f32()
+                    );
+                }
+                None => out.push_str("CPU sample"),
+            },
+            RowKind::Module(m) => {
+                if let Some(s) = self.attribution.and_then(|a| a.modules.get(usize::from(m))) {
+                    out.push_str(&s.label);
+                }
+            }
+            RowKind::Clients => {
+                if let Some(c) = self.attribution.and_then(|a| a.clients.as_ref()) {
+                    let _ = write!(
+                        out,
+                        "Clients of {} \u{b7} {} events by {}",
+                        c.service, c.events, c.field
+                    );
+                    if c.lost > 0 {
+                        let _ = write!(out, " ({} lost)", c.lost);
+                    }
+                }
+            }
+            RowKind::Client(b) => {
+                if let Some(s) = self
+                    .attribution
+                    .and_then(|a| a.clients.as_ref())
+                    .and_then(|c| c.buckets.get(usize::from(b)))
+                {
+                    out.push_str(&s.label);
+                }
+            }
+            RowKind::ThreadModule(t, m) => {
+                let tid = self.threads[t as usize].tid;
+                if let Some(s) = self
+                    .attribution
+                    .and_then(|a| a.threads.iter().find(|ts| ts.tid == tid))
+                    .and_then(|ts| ts.modules.get(usize::from(m)))
+                {
+                    out.push_str(&s.label);
+                }
+            }
+        }
+    }
+
+    /// The Name cell of a process: its name, and for a service host the group and
+    /// the services it runs, busiest first when per-service CPU is known.
+    fn process_name_cell(&self, proc: usize, out: &mut String) {
+        let p = &self.procs[proc];
+        out.clear();
+        out.push_str(p.name());
+        if p.services.is_empty() {
+            return;
+        }
+        if let Some(group) = p.statics.command_line.as_deref().and_then(svchost_group) {
+            let _ = write!(out, " ({group})");
+        }
+        out.push_str(" \u{b7} ");
+        let known = self.layout.extra.get(proc).is_some_and(|e| e.tags_known);
+        let rows = self.layout.service_rows(proc, p.services.len());
+        let mut order: Vec<usize> = (0..p.services.len()).collect();
+        if let (true, Some(rows)) = (known, rows.clone()) {
+            let cpu = |k: usize| self.layout.rows[rows.start + k].value;
+            order.sort_by(|&a, &b| cpu(b).total_cmp(&cpu(a)));
+        }
+        for (n, k) in order.into_iter().enumerate() {
+            if n > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&p.services[k].name);
+            if let (true, Some(rows)) = (known, rows.clone()) {
+                let cpu = self.layout.rows[rows.start + k].value;
+                if cpu >= 0.05 {
+                    let _ = write!(out, " {cpu:.0}%");
+                }
+            }
+        }
+    }
+
+    fn thread_state_cell(t: &ThreadSample, out: &mut String) {
+        out.clear();
+        out.push_str(t.state.label());
+        if t.state == ThreadState::Waiting {
+            match t.wait_reason.label() {
+                Some(w) => {
+                    let _ = write!(out, " \u{b7} {w}");
+                }
+                None => {
+                    let _ = write!(out, " \u{b7} {}", t.wait_reason.0);
+                }
+            }
+        }
+    }
 }
 
 impl RowSource for ProcessRows<'_> {
     fn len(&self) -> usize {
-        self.procs.len()
+        self.layout.rows.len()
     }
 
     fn id(&self, row: usize) -> RowId {
-        row_id(self.procs[row].key())
+        self.layout.rows[row].id
     }
 
     fn cell(&self, row: usize, col: usize, out: &mut String) {
-        let p = &self.procs[row];
-        match col {
-            col::NAME => {
-                out.clear();
-                out.push_str(p.name());
+        let r = self.row(row);
+        let p = &self.procs[r.proc as usize];
+        match r.kind {
+            RowKind::Process => match col {
+                col::NAME => self.process_name_cell(r.proc as usize, out),
+                col::USER => {
+                    out.clear();
+                    out.push_str(p.statics.user.as_deref().unwrap_or(""));
+                }
+                col::COMMAND_LINE => {
+                    out.clear();
+                    out.push_str(p.statics.command_line.as_deref().unwrap_or(""));
+                }
+                col::PID => format::count(out, p.key().pid),
+                col::CPU => format::percent(out, p.cpu.get()),
+                col::MEMORY => format::bytes(out, p.private_bytes),
+                col::WORKING_SET => format::bytes(out, p.working_set),
+                col::DISK_READ => format::rate(out, p.disk_read, self.interval_secs),
+                col::DISK_WRITE => format::rate(out, p.disk_write, self.interval_secs),
+                col::THREADS => format::count(out, p.threads),
+                col::HANDLES => format::count(out, p.handles),
+                _ => out.clear(),
+            },
+            RowKind::Service(k) => {
+                let s = p.services.get(usize::from(k));
+                let known = self
+                    .layout
+                    .extra
+                    .get(r.proc as usize)
+                    .is_some_and(|e| e.tags_known);
+                match col {
+                    col::NAME => self.name_of(row, out),
+                    col::USER => {
+                        out.clear();
+                        out.push_str(s.map_or("", |s| s.state.label()));
+                    }
+                    col::CPU if known => format::percent(out, r.value),
+                    col::THREADS if known => format::count(out, r.count),
+                    col::COMMAND_LINE => {
+                        out.clear();
+                        if let Some(s) = s {
+                            out.push_str(&s.display_name);
+                            if let Some(dll) = &s.dll {
+                                let _ = write!(out, " \u{b7} {dll}");
+                            }
+                        }
+                    }
+                    _ => out.clear(),
+                }
             }
-            col::USER => {
-                out.clear();
-                out.push_str(p.statics.user.as_deref().unwrap_or(""));
+            RowKind::Thread(t) => {
+                let t = &self.threads[t as usize];
+                match col {
+                    col::NAME => self.name_of(row, out),
+                    col::PID => format::count(out, t.tid),
+                    col::USER => Self::thread_state_cell(t, out),
+                    col::CPU => format::percent(out, t.cpu.get()),
+                    col::COMMAND_LINE => {
+                        out.clear();
+                        if let ServiceTag::Service(k) = t.service {
+                            out.push_str(p.services.get(usize::from(k)).map_or("", |s| &s.name));
+                        }
+                    }
+                    _ => out.clear(),
+                }
             }
-            col::COMMAND_LINE => {
-                out.clear();
-                out.push_str(p.statics.command_line.as_deref().unwrap_or(""));
-            }
-            col::PID => format::count(out, p.key().pid),
-            col::CPU => format::percent(out, p.cpu.get()),
-            col::MEMORY => format::bytes(out, p.private_bytes),
-            col::WORKING_SET => format::bytes(out, p.working_set),
-            col::DISK_READ => format::rate(out, p.disk_read, self.interval_secs),
-            col::DISK_WRITE => format::rate(out, p.disk_write, self.interval_secs),
-            col::THREADS => format::count(out, p.threads),
-            col::HANDLES => format::count(out, p.handles),
-            _ => out.clear(),
+            RowKind::Sampling | RowKind::Sample | RowKind::Clients => match col {
+                col::NAME => self.name_of(row, out),
+                _ => out.clear(),
+            },
+            RowKind::ThreadGroup
+            | RowKind::Module(_)
+            | RowKind::Client(_)
+            | RowKind::ThreadModule(..) => match col {
+                col::NAME => self.name_of(row, out),
+                col::CPU => format::percent(out, r.value),
+                col::THREADS => format::count(out, r.count),
+                _ => out.clear(),
+            },
         }
     }
 
     fn heat(&self, row: usize, col: usize) -> Option<f32> {
-        let p = &self.procs[row];
-        match col {
-            col::CPU => Some((p.cpu.get() / 100.0).min(1.0)),
-            col::MEMORY => self.memory_heat(p.private_bytes.get()),
+        let r = self.row(row);
+        match (r.kind, col) {
+            (RowKind::Process, col::CPU) => Some((r.value / 100.0).min(1.0)),
+            (RowKind::Process, col::MEMORY) => {
+                self.memory_heat(self.procs[r.proc as usize].private_bytes.get())
+            }
+            (RowKind::Process | RowKind::Sampling | RowKind::Sample | RowKind::Clients, _) => None,
+            (RowKind::Service(_), col::CPU) => {
+                let known = self
+                    .layout
+                    .extra
+                    .get(r.proc as usize)
+                    .is_some_and(|e| e.tags_known);
+                known.then(|| (r.value / 100.0).min(1.0))
+            }
+            (_, col::CPU) => Some((r.value / 100.0).min(1.0)),
             _ => None,
         }
     }
 
     fn visible(&self, row: usize) -> bool {
+        let r = self.row(row);
+        let proc = r.proc as usize;
         // PID 0 is the kernel's idle accounting, not a process. Its "CPU" is the
         // machine's idle time, which would otherwise pin it to the top of every sort.
-        self.procs[row].key().pid != 0 && self.shown.get(row).is_none_or(|&s| s)
+        if self.procs[proc].key().pid == 0 {
+            return false;
+        }
+        let owner_shown = self.shown.get(proc).is_none_or(|&s| s);
+        match r.kind {
+            RowKind::Process => owner_shown,
+            _ => self.tree_mode && owner_shown,
+        }
     }
 
     fn muted(&self, row: usize) -> bool {
-        self.matched.get(row).is_some_and(|&m| !m)
+        let proc = self.process_of(row);
+        self.matched.get(proc).is_some_and(|&m| !m)
     }
 
     fn compare(&self, a: usize, b: usize, col: usize) -> Ordering {
-        let (a, b) = (&self.procs[a], &self.procs[b]);
+        let (ra, rb) = (self.row(a), self.row(b));
+        if ra.kind == RowKind::Process && rb.kind == RowKind::Process {
+            let (a, b) = (&self.procs[ra.proc as usize], &self.procs[rb.proc as usize]);
+            return match col {
+                col::NAME => cmp_ci(a.name(), b.name()),
+                col::USER => cmp_opt(a.statics.user.as_deref(), b.statics.user.as_deref()),
+                col::COMMAND_LINE => cmp_opt(
+                    a.statics.command_line.as_deref(),
+                    b.statics.command_line.as_deref(),
+                ),
+                col::PID => a.key().pid.cmp(&b.key().pid),
+                col::CPU => a.cpu.get().total_cmp(&b.cpu.get()),
+                col::MEMORY => a.private_bytes.cmp(&b.private_bytes),
+                col::WORKING_SET => a.working_set.cmp(&b.working_set),
+                col::DISK_READ => a.disk_read.cmp(&b.disk_read),
+                col::DISK_WRITE => a.disk_write.cmp(&b.disk_write),
+                col::THREADS => a.threads.cmp(&b.threads),
+                col::HANDLES => a.handles.cmp(&b.handles),
+                _ => Ordering::Equal,
+            };
+        }
+        // Rows beneath a process, or a mix: order by the one number each has, or
+        // by name. Threads sort by id in the PID column.
         match col {
-            col::NAME => cmp_ci(a.name(), b.name()),
-            col::USER => cmp_opt(a.statics.user.as_deref(), b.statics.user.as_deref()),
-            col::COMMAND_LINE => cmp_opt(
-                a.statics.command_line.as_deref(),
-                b.statics.command_line.as_deref(),
-            ),
-            col::PID => a.key().pid.cmp(&b.key().pid),
-            col::CPU => a.cpu.get().total_cmp(&b.cpu.get()),
-            col::MEMORY => a.private_bytes.cmp(&b.private_bytes),
-            col::WORKING_SET => a.working_set.cmp(&b.working_set),
-            col::DISK_READ => a.disk_read.cmp(&b.disk_read),
-            col::DISK_WRITE => a.disk_write.cmp(&b.disk_write),
-            col::THREADS => a.threads.cmp(&b.threads),
-            col::HANDLES => a.handles.cmp(&b.handles),
+            col::NAME => {
+                let (mut na, mut nb) = (String::new(), String::new());
+                self.name_of(a, &mut na);
+                self.name_of(b, &mut nb);
+                cmp_ci(&na, &nb)
+            }
+            col::PID => match (ra.kind, rb.kind) {
+                (RowKind::Thread(x), RowKind::Thread(y)) => self.threads[x as usize]
+                    .tid
+                    .cmp(&self.threads[y as usize].tid),
+                _ => Ordering::Equal,
+            },
+            col::THREADS => ra.count.cmp(&rb.count),
+            col::CPU | col::MEMORY | col::WORKING_SET | col::DISK_READ | col::DISK_WRITE => {
+                self.value_of(a).total_cmp(&self.value_of(b))
+            }
             _ => Ordering::Equal,
         }
     }
 
     fn parent(&self, row: usize) -> Option<usize> {
-        self.tree.parent(row)
+        let r = self.row(row);
+        match r.kind {
+            RowKind::Process => self.tree.parent(row),
+            _ => (r.parent != NONE).then_some(r.parent as usize),
+        }
     }
 
     fn cell_collapsed(&self, row: usize, col: usize, out: &mut String) {
-        let r = self.tree.rollup(row);
-        match col {
-            col::NAME => {
-                out.clear();
-                out.push_str(self.procs[row].name());
-                let _ = write!(out, " ({})", r.descendants);
+        let r = self.row(row);
+        match r.kind {
+            RowKind::Process => {
+                let ru = self.tree.rollup(row);
+                match col {
+                    col::NAME => {
+                        self.process_name_cell(r.proc as usize, out);
+                        if ru.descendants > 0 {
+                            let _ = write!(out, " ({})", ru.descendants);
+                        }
+                    }
+                    col::CPU => format::percent(out, ru.cpu),
+                    col::MEMORY => format::bytes(out, Bytes(ru.private_bytes)),
+                    col::WORKING_SET => format::bytes(out, Bytes(ru.working_set)),
+                    col::DISK_READ => format::rate(out, Bytes(ru.disk_read), self.interval_secs),
+                    col::DISK_WRITE => format::rate(out, Bytes(ru.disk_write), self.interval_secs),
+                    col::THREADS => format::count(out, ru.threads),
+                    col::HANDLES => format::count(out, ru.handles),
+                    _ => self.cell(row, col, out),
+                }
             }
-            col::CPU => format::percent(out, r.cpu),
-            col::MEMORY => format::bytes(out, Bytes(r.private_bytes)),
-            col::WORKING_SET => format::bytes(out, Bytes(r.working_set)),
-            col::DISK_READ => format::rate(out, Bytes(r.disk_read), self.interval_secs),
-            col::DISK_WRITE => format::rate(out, Bytes(r.disk_write), self.interval_secs),
-            col::THREADS => format::count(out, r.threads),
-            col::HANDLES => format::count(out, r.handles),
+            RowKind::ThreadGroup if col == col::NAME => {
+                out.clear();
+                let _ = write!(out, "Threads ({})", r.count);
+            }
+            RowKind::Service(_) if col == col::NAME => {
+                self.name_of(row, out);
+                if r.count > 0 {
+                    let _ = write!(out, " ({})", r.count);
+                }
+            }
             _ => self.cell(row, col, out),
         }
     }
 
     fn heat_collapsed(&self, row: usize, col: usize) -> Option<f32> {
+        if self.row(row).kind != RowKind::Process {
+            return self.heat(row, col);
+        }
         let r = self.tree.rollup(row);
         match col {
             col::CPU => Some((r.cpu / 100.0).min(1.0)),
@@ -468,16 +1033,48 @@ impl RowSource for ProcessRows<'_> {
     }
 
     fn compare_subtree(&self, a: usize, b: usize, col: usize) -> Ordering {
-        let (ra, rb) = (self.tree.rollup(a), self.tree.rollup(b));
+        let (ra, rb) = (self.row(a), self.row(b));
+        if ra.kind == RowKind::Process && rb.kind == RowKind::Process {
+            let (ra, rb) = (self.tree.rollup(a), self.tree.rollup(b));
+            return match col {
+                col::CPU => ra.cpu.total_cmp(&rb.cpu),
+                col::MEMORY => ra.private_bytes.cmp(&rb.private_bytes),
+                col::WORKING_SET => ra.working_set.cmp(&rb.working_set),
+                col::DISK_READ => ra.disk_read.cmp(&rb.disk_read),
+                col::DISK_WRITE => ra.disk_write.cmp(&rb.disk_write),
+                col::THREADS => ra.threads.cmp(&rb.threads),
+                col::HANDLES => ra.handles.cmp(&rb.handles),
+                _ => self.compare(a, b, col),
+            };
+        }
         match col {
-            col::CPU => ra.cpu.total_cmp(&rb.cpu),
-            col::MEMORY => ra.private_bytes.cmp(&rb.private_bytes),
-            col::WORKING_SET => ra.working_set.cmp(&rb.working_set),
-            col::DISK_READ => ra.disk_read.cmp(&rb.disk_read),
-            col::DISK_WRITE => ra.disk_write.cmp(&rb.disk_write),
-            col::THREADS => ra.threads.cmp(&rb.threads),
-            col::HANDLES => ra.handles.cmp(&rb.handles),
+            col::CPU
+            | col::MEMORY
+            | col::WORKING_SET
+            | col::DISK_READ
+            | col::DISK_WRITE
+            | col::THREADS
+            | col::HANDLES => self.value_of(a).total_cmp(&self.value_of(b)),
             _ => self.compare(a, b, col),
+        }
+    }
+
+    fn collapsed_by_default(&self, row: usize) -> bool {
+        matches!(
+            self.row(row).kind,
+            RowKind::Service(_) | RowKind::ThreadGroup | RowKind::Thread(_)
+        )
+    }
+}
+
+impl ProcessRows<'_> {
+    /// The sortable number of any row when siblings of mixed kinds are compared: a
+    /// process's subtree CPU, an inner row's own value.
+    fn value_of(&self, row: usize) -> f32 {
+        let r = self.row(row);
+        match r.kind {
+            RowKind::Process => self.tree.rollup(row).cpu,
+            _ => r.value,
         }
     }
 }
@@ -485,9 +1082,13 @@ impl RowSource for ProcessRows<'_> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use ot_model::attribution::{ClientReport, Share, ThreadShares};
     use ot_model::process::{Integrity, ProcessStatic};
+    use ot_model::service::{ServiceInfo, ServiceState};
+    use ot_model::thread::WaitReason;
     use ot_model::Percent;
     use std::sync::Arc;
+    use std::time::Duration;
 
     /// A process with a fixed birth stamp of 1; `parent` is a PID with the same
     /// convention, so `Some(0)` is the idle pseudo-process.
@@ -515,6 +1116,53 @@ pub(crate) mod tests {
             power: None,
             gpu: None,
             suspended: false,
+            services: Vec::new().into(),
+            thread_first: 0,
+            thread_rows: 0,
+        }
+    }
+
+    pub fn service(name: &str) -> ServiceInfo {
+        ServiceInfo {
+            name: Arc::from(name),
+            display_name: Arc::from(format!("{name} Service").as_str()),
+            state: ServiceState::Running,
+            dll: Some(Arc::from("x.dll")),
+        }
+    }
+
+    pub fn thread(tid: u32, cpu: f32, service: ServiceTag) -> ThreadSample {
+        ThreadSample {
+            tid,
+            birth: 5,
+            cpu: Percent(cpu),
+            state: ThreadState::Running,
+            wait_reason: WaitReason(0),
+            service,
+            started_unix_ms: None,
+        }
+    }
+
+    /// A service host: PID 7 hosting `Alpha` and `Beta`, with three threads: one
+    /// tagged Alpha (30%), one tagged Beta (5%), one untagged (1%).
+    pub fn host_snapshot() -> Snapshot {
+        let mut host = proc(7, None, 36.0);
+        host.statics = Arc::new(ProcessStatic {
+            command_line: Some("C:\\Windows\\system32\\svchost.exe -k DcomLaunch -p".to_owned()),
+            ..(*host.statics).clone()
+        });
+        host.services = vec![service("Alpha"), service("Beta")].into();
+        host.thread_first = 0;
+        host.thread_rows = 3;
+        host.threads = 3;
+        Snapshot {
+            processes: vec![host, proc(8, Some(7), 2.0)],
+            threads: vec![
+                thread(70, 30.0, ServiceTag::Service(0)),
+                thread(71, 5.0, ServiceTag::Service(1)),
+                thread(72, 1.0, ServiceTag::None),
+            ],
+            ..Default::default()
         }
     }
 
@@ -522,6 +1170,39 @@ pub(crate) mod tests {
         let mut t = ProcessTree::default();
         t.rebuild(procs);
         t
+    }
+
+    fn layout_of(snap: &Snapshot, a: Option<&Attribution>) -> Layout {
+        let mut l = Layout::default();
+        l.rebuild(snap, a, None);
+        l
+    }
+
+    fn rows<'a>(
+        snap: &'a Snapshot,
+        tree: &'a ProcessTree,
+        layout: &'a Layout,
+        a: Option<&'a Attribution>,
+        tree_mode: bool,
+    ) -> ProcessRows<'a> {
+        ProcessRows {
+            procs: &snap.processes,
+            threads: &snap.threads,
+            tree,
+            layout,
+            attribution: a,
+            interval_secs: 1.0,
+            mem_total: 0.0,
+            matched: &[],
+            shown: &[],
+            tree_mode,
+        }
+    }
+
+    fn cell(r: &ProcessRows<'_>, row: usize, col: usize) -> String {
+        let mut s = String::new();
+        r.cell(row, col, &mut s);
+        s
     }
 
     #[test]
@@ -588,31 +1269,28 @@ pub(crate) mod tests {
 
     #[test]
     fn ancestry_reads_root_first_and_skips_the_idle_process() {
-        let procs = vec![
-            proc(0, None, 0.0),
-            proc(4, Some(0), 0.0),
-            proc(9, Some(4), 0.0),
-        ];
-        let t = tree_of(&procs);
-        let rows = ProcessRows {
-            procs: &procs,
-            tree: &t,
-            interval_secs: 1.0,
-            mem_total: 0.0,
-            matched: &[],
-            shown: &[],
+        let snap = Snapshot {
+            processes: vec![
+                proc(0, None, 0.0),
+                proc(4, Some(0), 0.0),
+                proc(9, Some(4), 0.0),
+            ],
+            ..Default::default()
         };
+        let t = tree_of(&snap.processes);
+        let l = layout_of(&snap, None);
+        let r = rows(&snap, &t, &l, None, false);
         let mut out = String::new();
         let mut chain = Vec::new();
-        rows.ancestry(2, &mut out, &mut chain);
+        r.ancestry(2, &mut out, &mut chain);
         assert_eq!(out, "p4.exe › p9.exe");
-        assert_eq!(rows.listed(), 2);
-        assert_eq!(rows.population(), 2);
-        assert!(!rows.filtered());
+        assert_eq!(r.listed(), 2);
+        assert_eq!(r.population(), 2);
+        assert!(!r.filtered());
     }
 
     #[test]
-    fn search_matches_any_detail_field_case_insensitively() {
+    fn search_matches_any_detail_field_and_hosted_services() {
         let mut p = proc(42, None, 0.0);
         p.statics = Arc::new(ProcessStatic {
             user: Some("CORP\\Cameron".to_owned()),
@@ -620,8 +1298,18 @@ pub(crate) mod tests {
             command_line: Some("\"C:\\Tools\\Thing.exe\" --serve".to_owned()),
             ..(*p.statics).clone()
         });
+        p.services = vec![service("BrokerInfrastructure")].into();
         let mut buf = String::new();
-        for needle in ["p42", "42", "cameron", "tools", "--serve", ""] {
+        for needle in [
+            "p42",
+            "42",
+            "cameron",
+            "tools",
+            "--serve",
+            "",
+            "brokerinfra",
+            "infrastructure service",
+        ] {
             assert!(process_matches(&p, needle, &mut buf), "{needle}");
         }
         for needle in ["p43", "root", "--run"] {
@@ -629,27 +1317,35 @@ pub(crate) mod tests {
         }
         assert!(contains_ci("Svchost.EXE", "host.e"));
         assert!(!contains_ci("ab", "abc"));
+        assert_eq!(
+            svchost_group("C:\\W\\svchost.exe -k DcomLaunch -p"),
+            Some("DcomLaunch")
+        );
+        assert_eq!(
+            svchost_group("C:\\W\\svchost.exe -K \"netsvcs\""),
+            Some("netsvcs")
+        );
+        assert_eq!(svchost_group("C:\\W\\svchost.exe"), None);
     }
 
     #[test]
     fn shown_and_matched_drive_visibility_and_muting() {
-        let procs = vec![proc(1, None, 0.0), proc(2, Some(1), 0.0)];
-        let t = tree_of(&procs);
-        let rows = ProcessRows {
-            procs: &procs,
-            tree: &t,
-            interval_secs: 1.0,
-            mem_total: 0.0,
+        let snap = Snapshot {
+            processes: vec![proc(1, None, 0.0), proc(2, Some(1), 0.0)],
+            ..Default::default()
+        };
+        let t = tree_of(&snap.processes);
+        let l = layout_of(&snap, None);
+        let r = ProcessRows {
             matched: &[false, true],
             shown: &[true, true],
+            ..rows(&snap, &t, &l, None, false)
         };
-        assert!(rows.visible(0) && rows.visible(1));
-        assert!(rows.muted(0) && !rows.muted(1));
-        assert!(rows.filtered());
-        let mut s = String::new();
-        rows.cell(0, col::USER, &mut s);
-        assert_eq!(s, "");
-        assert_eq!(rows.compare(0, 1, col::USER), Ordering::Equal);
+        assert!(r.visible(0) && r.visible(1));
+        assert!(r.muted(0) && !r.muted(1));
+        assert!(r.filtered());
+        assert_eq!(cell(&r, 0, col::USER), "");
+        assert_eq!(r.compare(0, 1, col::USER), Ordering::Equal);
     }
 
     #[test]
@@ -682,30 +1378,218 @@ pub(crate) mod tests {
 
     #[test]
     fn collapsed_cells_show_subtree_totals_and_descendant_count() {
-        let procs = vec![
-            proc(1, None, 1.0),
-            proc(2, Some(1), 2.0),
-            proc(3, Some(2), 4.0),
-        ];
-        let t = tree_of(&procs);
-        let rows = ProcessRows {
-            procs: &procs,
-            tree: &t,
-            interval_secs: 1.0,
-            mem_total: 0.0,
-            matched: &[],
-            shown: &[],
+        let snap = Snapshot {
+            processes: vec![
+                proc(1, None, 1.0),
+                proc(2, Some(1), 2.0),
+                proc(3, Some(2), 4.0),
+            ],
+            ..Default::default()
         };
+        let t = tree_of(&snap.processes);
+        let l = layout_of(&snap, None);
+        let r = rows(&snap, &t, &l, None, true);
         let mut s = String::new();
-        rows.cell(0, col::CPU, &mut s);
+        r.cell(0, col::CPU, &mut s);
         assert_eq!(s, "1.0");
-        rows.cell_collapsed(0, col::CPU, &mut s);
+        r.cell_collapsed(0, col::CPU, &mut s);
         assert_eq!(s, "7.0");
-        rows.cell_collapsed(0, col::NAME, &mut s);
+        r.cell_collapsed(0, col::NAME, &mut s);
         assert_eq!(s, "p1.exe (2)");
-        rows.cell_collapsed(0, col::PID, &mut s);
+        r.cell_collapsed(2, col::NAME, &mut s);
+        assert_eq!(s, "p3.exe", "a leaf process shows no count");
+        r.cell_collapsed(0, col::PID, &mut s);
         assert_eq!(s, "1", "identity columns never aggregate");
-        assert_eq!(rows.compare_subtree(0, 2, col::CPU), Ordering::Greater);
-        assert_eq!(rows.compare(0, 2, col::CPU), Ordering::Less);
+        assert_eq!(r.compare_subtree(0, 2, col::CPU), Ordering::Greater);
+        assert_eq!(r.compare(0, 2, col::CPU), Ordering::Less);
+    }
+
+    #[test]
+    fn a_service_host_lays_out_services_a_thread_group_and_threads() {
+        let snap = host_snapshot();
+        let t = tree_of(&snap.processes);
+        let l = layout_of(&snap, None);
+        let r = rows(&snap, &t, &l, None, true);
+        // 2 processes, 2 services, 1 group, 3 threads.
+        assert_eq!(r.len(), 8);
+        let kinds: Vec<RowKind> = (0..r.len()).map(|i| r.kind(i)).collect();
+        assert_eq!(kinds[0], RowKind::Process);
+        assert_eq!(kinds[2], RowKind::Service(0));
+        assert_eq!(kinds[3], RowKind::Service(1));
+        assert_eq!(kinds[4], RowKind::ThreadGroup);
+        assert!(matches!(kinds[5], RowKind::Thread(_)));
+
+        // Threads hang under their service; the untagged one under the group.
+        assert_eq!(r.parent(5), Some(2));
+        assert_eq!(r.parent(6), Some(3));
+        assert_eq!(r.parent(7), Some(4));
+        assert_eq!(r.parent(2), Some(0));
+        assert_eq!(r.parent(4), Some(0));
+        // The child process is a tree child of the host too.
+        assert_eq!(r.parent(1), Some(0));
+
+        // Per-service CPU is the sum of tagged threads.
+        assert_eq!(cell(&r, 2, col::CPU), "30");
+        assert_eq!(cell(&r, 3, col::CPU), "5.0");
+        assert_eq!(cell(&r, 4, col::CPU), "1.0");
+        assert_eq!(cell(&r, 2, col::THREADS), "1");
+        assert_eq!(cell(&r, 2, col::NAME), "Alpha");
+        assert_eq!(cell(&r, 2, col::USER), "Running");
+        assert_eq!(cell(&r, 2, col::COMMAND_LINE), "Alpha Service \u{b7} x.dll");
+        assert_eq!(cell(&r, 5, col::NAME), "Thread 70");
+        assert_eq!(cell(&r, 5, col::PID), "70");
+        assert_eq!(cell(&r, 5, col::COMMAND_LINE), "Alpha");
+        assert_eq!(cell(&r, 7, col::COMMAND_LINE), "");
+
+        // The host's Name cell names the group and the services, busiest first.
+        assert_eq!(
+            cell(&r, 0, col::NAME),
+            "p7.exe (DcomLaunch) \u{b7} Alpha 30%, Beta 5%"
+        );
+        let mut s = String::new();
+        r.cell_collapsed(4, col::NAME, &mut s);
+        assert_eq!(s, "Threads (1)");
+        r.cell_collapsed(2, col::NAME, &mut s);
+        assert_eq!(s, "Alpha (1)");
+
+        // Inner rows fold by default; processes do not.
+        assert!(
+            r.collapsed_by_default(2) && r.collapsed_by_default(4) && r.collapsed_by_default(5)
+        );
+        assert!(!r.collapsed_by_default(0));
+
+        // Siblings under the host order by their one number.
+        assert_eq!(r.compare_subtree(2, 3, col::CPU), Ordering::Greater);
+        assert_eq!(
+            r.compare_subtree(2, 1, col::CPU),
+            Ordering::Greater,
+            "Alpha 30 > child 2"
+        );
+
+        // Ancestry walks through inner rows.
+        let mut out = String::new();
+        let mut chain = Vec::new();
+        r.ancestry(5, &mut out, &mut chain);
+        assert_eq!(out, "p7.exe › Alpha › Thread 70");
+
+        // Ids are stable across rebuilds and distinct.
+        let l2 = layout_of(&snap, None);
+        assert!(l.rows.iter().zip(&l2.rows).all(|(a, b)| a.id == b.id));
+        let mut ids: Vec<u64> = l.rows.iter().map(|r| r.id.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), l.rows.len());
+    }
+
+    #[test]
+    fn inner_rows_are_hidden_in_list_mode_and_without_tags_cpu_is_blank() {
+        let mut snap = host_snapshot();
+        let t = tree_of(&snap.processes);
+        let l = layout_of(&snap, None);
+        let list = rows(&snap, &t, &l, None, false);
+        assert!(list.visible(0) && list.visible(1));
+        assert!((2..8).all(|i| !list.visible(i)));
+        assert_eq!(list.listed(), 2);
+
+        // Unelevated: no tags known. Services still list, without numbers, and all
+        // threads sit in the group.
+        for th in &mut snap.threads {
+            th.service = ServiceTag::Unknown;
+        }
+        let l = layout_of(&snap, None);
+        let r = rows(&snap, &t, &l, None, true);
+        assert_eq!(cell(&r, 2, col::CPU), "");
+        assert_eq!(cell(&r, 2, col::THREADS), "");
+        assert_eq!(r.heat(2, col::CPU), None);
+        assert_eq!(cell(&r, 4, col::CPU), "36");
+        assert!((5..8).all(|i| r.parent(i) == Some(4)));
+        assert_eq!(
+            cell(&r, 0, col::NAME),
+            "p7.exe (DcomLaunch) \u{b7} Alpha, Beta"
+        );
+    }
+
+    #[test]
+    fn a_finished_sample_adds_modules_clients_and_per_thread_modules() {
+        let snap = host_snapshot();
+        let t = tree_of(&snap.processes);
+        let a = Attribution {
+            target: ProcessKey::new(7, 1),
+            duration: Duration::from_secs(5),
+            samples: 200,
+            modules: vec![
+                Share {
+                    label: "bisrv.dll".into(),
+                    count: 150,
+                },
+                Share {
+                    label: "ntdll.dll".into(),
+                    count: 50,
+                },
+            ],
+            threads: vec![ThreadShares {
+                tid: 70,
+                samples: 100,
+                modules: vec![Share {
+                    label: "bisrv.dll".into(),
+                    count: 100,
+                }],
+            }],
+            clients: Some(ClientReport {
+                service: "Alpha".into(),
+                provider: "Microsoft-Windows-Alpha".into(),
+                field: "PackageFullName".into(),
+                events: 1000,
+                lost: 7,
+                buckets: vec![Share {
+                    label: "Xerox.PrintExperience".into(),
+                    count: 1000,
+                }],
+            }),
+            notes: vec![],
+        };
+        let l = layout_of(&snap, Some(&a));
+        let r = rows(&snap, &t, &l, Some(&a), true);
+        let kinds: Vec<RowKind> = (0..r.len()).map(|i| r.kind(i)).collect();
+        let sample = kinds.iter().position(|k| *k == RowKind::Sample).unwrap();
+        assert_eq!(r.parent(sample), Some(0));
+        assert!(!r.collapsed_by_default(sample));
+        assert_eq!(
+            cell(&r, sample, col::NAME),
+            "CPU sample \u{b7} 200 samples in 5.0 s"
+        );
+        let m0 = kinds.iter().position(|k| *k == RowKind::Module(0)).unwrap();
+        assert_eq!(r.parent(m0), Some(sample));
+        assert_eq!(cell(&r, m0, col::NAME), "bisrv.dll");
+        assert_eq!(cell(&r, m0, col::CPU), "75");
+        assert_eq!(cell(&r, m0, col::THREADS), "150");
+        let clients = kinds.iter().position(|k| *k == RowKind::Clients).unwrap();
+        assert_eq!(r.parent(clients), Some(0));
+        assert_eq!(
+            cell(&r, clients, col::NAME),
+            "Clients of Alpha \u{b7} 1000 events by PackageFullName (7 lost)"
+        );
+        let c0 = kinds.iter().position(|k| *k == RowKind::Client(0)).unwrap();
+        assert_eq!(r.parent(c0), Some(clients));
+        assert_eq!(cell(&r, c0, col::CPU), "100");
+        let tm = kinds
+            .iter()
+            .position(|k| matches!(k, RowKind::ThreadModule(..)))
+            .unwrap();
+        assert_eq!(r.parent(tm), Some(5), "under Thread 70");
+        assert_eq!(cell(&r, tm, col::NAME), "bisrv.dll");
+        assert_eq!(cell(&r, tm, col::CPU), "100");
+
+        // A sample for a process that is gone adds nothing; a sample in progress
+        // adds one marker row.
+        let mut l2 = Layout::default();
+        let other = Attribution {
+            target: ProcessKey::new(99, 1),
+            ..a.clone()
+        };
+        l2.rebuild(&snap, Some(&other), Some(ProcessKey::new(7, 1)));
+        let kinds: Vec<RowKind> = l2.rows.iter().map(|r| r.kind).collect();
+        assert!(!kinds.contains(&RowKind::Sample));
+        assert_eq!(kinds.iter().filter(|k| **k == RowKind::Sampling).count(), 1);
     }
 }

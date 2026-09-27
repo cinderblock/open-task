@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 use ot_model::cpu::{CoreKind, CpuSample, LogicalCore};
 use ot_model::memory::MemorySample;
 use ot_model::process::{Integrity, ProcessSample, ProcessStatic};
+use ot_model::service::ServiceInfo;
+use ot_model::thread::{ServiceTag, ThreadSample, ThreadState, WaitReason};
 use ot_model::{Bytes, Percent, ProcessKey};
 
 use windows::Wdk::System::SystemInformation::{
@@ -54,10 +56,14 @@ use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
 mod control;
 mod details;
 mod nt;
+mod services;
+mod tags;
 
 pub use control::WindowsControl;
 use details::DetailProbe;
-use nt::SystemProcessInformation;
+use nt::{SystemProcessInformation, SystemThreadInformation};
+use services::ServiceProbe;
+use tags::{OwnedHandle, TagProbe};
 
 /// Difference between the Windows FILETIME epoch (1601-01-01) and the Unix epoch, in
 /// 100 ns units.
@@ -69,6 +75,10 @@ const FILETIME_UNIX_OFFSET_100NS: i64 = 116_444_736_000_000_000;
 /// processes and finishes well inside the budget.
 const DETAIL_BUDGET: Duration = Duration::from_millis(20);
 
+/// Hard cap on thread rows per pass, so a runaway process cannot make the snapshot
+/// arbitrarily large. Processes past the cap report no thread rows that pass.
+const MAX_THREAD_ROWS: usize = 65_536;
+
 /// Raw monotonic counters from the previous pass, per process.
 #[derive(Debug, Clone, Copy, Default)]
 struct Counters {
@@ -78,6 +88,26 @@ struct Counters {
     write_bytes: u64,
 }
 
+/// What a thread's service tag read produced, remembered per thread lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagState {
+    /// Not read yet (no budget, or the process handle is not open yet).
+    Unresolved,
+    /// Read failed for this thread; do not retry.
+    Failed,
+    /// The raw tag. Zero means untagged.
+    Tag(u32),
+}
+
+/// Per-thread memory between passes.
+#[derive(Debug, Clone, Copy)]
+struct ThreadPrev {
+    birth: u64,
+    cpu_100ns: u64,
+    last_seen: u64,
+    tag: TagState,
+}
+
 /// Everything we remember about a process between passes.
 #[derive(Debug)]
 struct Tracked {
@@ -85,6 +115,15 @@ struct Tracked {
     prev: Counters,
     /// Pass number this entry was last observed in, for reaping exited processes.
     last_seen: u64,
+    /// Services the SCM says run here; shared with the published sample until the
+    /// set changes.
+    services: Arc<[ServiceInfo]>,
+    /// Threads by TID.
+    threads: HashMap<u32, ThreadPrev>,
+    /// Handle for reading thread tags, opened once for a service host when tags
+    /// are available. `tag_tried` stops a refused open from being retried.
+    tag_handle: Option<OwnedHandle>,
+    tag_tried: bool,
 }
 
 /// Per-core raw times from the previous pass.
@@ -135,6 +174,11 @@ pub struct WindowsProbe {
     by_pid: HashMap<u32, u32>,
     by_pid_pass: u64,
     details: DetailProbe,
+    services: ServiceProbe,
+    /// Present only when elevated; see [`tags`].
+    tags: Option<TagProbe>,
+    /// The shared empty list every non-host process points at.
+    no_services: Arc<[ServiceInfo]>,
     /// Processes seen while the details budget was spent; drained on later passes.
     pending_details: Vec<ProcessKey>,
     prev_cores: Vec<CoreTimes>,
@@ -166,6 +210,9 @@ impl WindowsProbe {
             by_pid: HashMap::new(),
             by_pid_pass: 0,
             details: DetailProbe::new(),
+            services: ServiceProbe::new(),
+            tags: TagProbe::new(),
+            no_services: Vec::new().into(),
             pending_details: Vec::new(),
             prev_cores: vec![CoreTimes::default(); logical_count as usize],
             topology,
@@ -260,9 +307,14 @@ impl WindowsProbe {
         Ok(())
     }
 
+    // One pass over the kernel's process list, read top to bottom: counters,
+    // identity, details, services, threads. Splitting it would scatter the
+    // per-entry bookkeeping across helpers that all need the same locals.
+    #[allow(clippy::too_many_lines)]
     fn sample_processes(
         &mut self,
         out: &mut Vec<ProcessSample>,
+        threads_out: &mut Vec<ThreadSample>,
         wall_100ns: u64,
     ) -> Result<(), ProbeError> {
         let len = query_growing(
@@ -277,7 +329,9 @@ impl WindowsProbe {
         let deadline = Instant::now() + DETAIL_BUDGET;
 
         out.clear();
+        threads_out.clear();
         self.new_this_pass.clear();
+        self.services.refresh();
 
         let base = self.proc_buf.as_ptr();
         let mut offset = 0usize;
@@ -300,6 +354,7 @@ impl WindowsProbe {
 
             let details = &mut self.details;
             let pending = &mut self.pending_details;
+            let no_services = &self.no_services;
             let entry = self.tracked.entry(key).or_insert_with(|| {
                 let mut statics = build_statics(p, key);
                 // Details at first sight while the budget lasts; the rest queue up.
@@ -312,8 +367,61 @@ impl WindowsProbe {
                     statics: Arc::new(statics),
                     prev: now,
                     last_seen: pass,
+                    services: Arc::clone(no_services),
+                    threads: HashMap::new(),
+                    tag_handle: None,
+                    tag_tried: false,
                 }
             });
+
+            // Services hosted here, republished by pointer while unchanged.
+            match self.services.services_of(pid) {
+                Some(list) if entry.services[..] != *list => entry.services = Arc::from(list),
+                None if !entry.services.is_empty() => {
+                    entry.services = Arc::clone(no_services);
+                }
+                _ => {}
+            }
+
+            // Thread rows follow the process entry in the same buffer.
+            let thread_first = threads_out.len() as u32;
+            let n_threads = p.NumberOfThreads as usize;
+            let t_off = offset + size_of::<SystemProcessInformation>();
+            let t_bytes = n_threads * size_of::<SystemThreadInformation>();
+            let fits_entry = p.NextEntryOffset == 0
+                || size_of::<SystemProcessInformation>() + t_bytes <= p.NextEntryOffset as usize;
+            // PID 0 is the idle accounting, one entry per core all with TID 0: not
+            // threads in any useful sense, and they would collide by id.
+            if pid != 0
+                && t_off + t_bytes <= len
+                && fits_entry
+                && threads_out.len() + n_threads <= MAX_THREAD_ROWS
+            {
+                // SAFETY: `n_threads` structures lie within the bytes the kernel
+                // wrote, at an 8-byte-aligned offset, and the slice does not outlive
+                // this iteration.
+                let ts = unsafe {
+                    std::slice::from_raw_parts(
+                        base.byte_add(t_off).cast::<SystemThreadInformation>(),
+                        n_threads,
+                    )
+                };
+                sample_threads(
+                    entry,
+                    pid,
+                    ts,
+                    ThreadPass {
+                        pass,
+                        wall_100ns,
+                        rates: !first_pass && wall_100ns != 0,
+                        max_cpu,
+                        deadline,
+                    },
+                    self.tags.as_mut(),
+                    threads_out,
+                );
+            }
+            let thread_rows = threads_out.len() as u32 - thread_first;
             // A freshly inserted entry already carries this pass number.
             let seen_before = entry.last_seen != pass;
             let prev = if seen_before { entry.prev } else { now };
@@ -349,6 +457,9 @@ impl WindowsProbe {
                 power: None,
                 gpu: None,
                 suspended: false,
+                services: Arc::clone(&entry.services),
+                thread_first,
+                thread_rows,
             });
 
             if p.NextEntryOffset == 0 {
@@ -362,7 +473,16 @@ impl WindowsProbe {
 
         // Reap processes that were not in this pass. Their statics Arcs may still be
         // held by history buffers upstream; that is fine and intended.
-        self.tracked.retain(|_, t| t.last_seen == pass);
+        let tags = &mut self.tags;
+        self.tracked.retain(|k, t| {
+            let keep = t.last_seen == pass;
+            if !keep {
+                if let Some(tags) = tags {
+                    tags.forget(k.pid);
+                }
+            }
+            keep
+        });
         Ok(())
     }
 
@@ -467,6 +587,10 @@ impl SystemProbe for WindowsProbe {
             package_power: false,
             thermals: false,
             hybrid_core_kinds: self.topology.iter().any(|(_, k)| *k != CoreKind::Unknown),
+            threads: true,
+            services: self.services.available(),
+            service_tags: self.tags.is_some(),
+            cpu_sampling: false,
         }
     }
 
@@ -477,12 +601,113 @@ impl SystemProbe for WindowsProbe {
             .map_or(0, |prev| (now.duration_since(prev).as_nanos() / 100) as u64);
 
         self.sample_cores(&mut out.cpu)?;
-        self.sample_processes(&mut out.processes, wall_100ns)?;
+        self.sample_processes(&mut out.processes, &mut out.threads, wall_100ns)?;
         out.memory = sample_memory()?;
 
         self.last_pass = Some(now);
         Ok(())
     }
+}
+
+/// Pass-wide constants for thread sampling.
+#[derive(Debug, Clone, Copy)]
+struct ThreadPass {
+    pass: u64,
+    wall_100ns: u64,
+    /// Whether rates can be computed this pass (not the first, interval known).
+    rates: bool,
+    max_cpu: f32,
+    /// Service tag reads stop once this passes; the rest wait for the next pass.
+    deadline: Instant,
+}
+
+/// Difference each thread's CPU time against the previous pass, read service tags
+/// for a service host when possible, and append the rows.
+///
+/// Thread identity is `(tid, CreateTime)`: a TID recycled within the same process
+/// starts over rather than inheriting the old thread's counters or tag.
+fn sample_threads(
+    entry: &mut Tracked,
+    pid: u32,
+    ts: &[SystemThreadInformation],
+    pp: ThreadPass,
+    mut tags: Option<&mut TagProbe>,
+    out: &mut Vec<ThreadSample>,
+) {
+    // Tags are only meaningful in a service host, and only readable when elevated.
+    let want_tags = !entry.services.is_empty() && tags.is_some();
+    if want_tags && entry.tag_handle.is_none() && !entry.tag_tried {
+        entry.tag_tried = true;
+        entry.tag_handle = TagProbe::open(pid);
+    }
+
+    for t in ts {
+        let tid = t.ClientId.UniqueThread.0 as usize as u32;
+        let birth = t.CreateTime as u64;
+        let cpu_now = (t.KernelTime as u64).wrapping_add(t.UserTime as u64);
+        let tp = entry.threads.entry(tid).or_insert(ThreadPrev {
+            birth,
+            cpu_100ns: cpu_now,
+            last_seen: 0,
+            tag: TagState::Unresolved,
+        });
+        if tp.birth != birth {
+            *tp = ThreadPrev {
+                birth,
+                cpu_100ns: cpu_now,
+                last_seen: 0,
+                tag: TagState::Unresolved,
+            };
+        }
+        let continuous = tp.last_seen + 1 == pp.pass;
+        let prev = tp.cpu_100ns;
+        tp.cpu_100ns = cpu_now;
+        tp.last_seen = pp.pass;
+
+        let cpu = if continuous && pp.rates {
+            let d = cpu_now.wrapping_sub(prev);
+            Percent((d as f64 / pp.wall_100ns as f64 * 100.0) as f32).clamped(pp.max_cpu)
+        } else {
+            Percent::ZERO
+        };
+
+        if want_tags && tp.tag == TagState::Unresolved && Instant::now() < pp.deadline {
+            if let Some(h) = &entry.tag_handle {
+                tp.tag = match TagProbe::thread_tag(h.0, tid) {
+                    Some(tag) => TagState::Tag(tag),
+                    None => TagState::Failed,
+                };
+            }
+        }
+        let service = match tp.tag {
+            TagState::Tag(0) if want_tags => ServiceTag::None,
+            TagState::Tag(tag) if want_tags => tags
+                .as_mut()
+                .and_then(|t| t.name(pid, tag))
+                .and_then(|name| entry.services.iter().position(|s| *s.name == *name))
+                .map_or(ServiceTag::Unknown, |i| ServiceTag::Service(i as u16)),
+            _ => ServiceTag::Unknown,
+        };
+
+        let state = match t.ThreadState {
+            1 => ThreadState::Ready,
+            2 => ThreadState::Running,
+            5 => ThreadState::Waiting,
+            _ => ThreadState::Other,
+        };
+        let started_unix_ms =
+            (t.CreateTime > 0).then(|| (t.CreateTime - FILETIME_UNIX_OFFSET_100NS) / 10_000);
+        out.push(ThreadSample {
+            tid,
+            birth,
+            cpu,
+            state,
+            wait_reason: WaitReason(t.WaitReason.min(255) as u8),
+            service,
+            started_unix_ms,
+        });
+    }
+    entry.threads.retain(|_, t| t.last_seen == pp.pass);
 }
 
 /// Build the immutable half of a process record from its first observation.

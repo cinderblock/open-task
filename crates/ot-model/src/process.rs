@@ -1,6 +1,7 @@
 //! Per-process state.
 
 use crate::identity::ProcessKey;
+use crate::service::ServiceInfo;
 use crate::units::{Bytes, Percent, Watts};
 use std::sync::Arc;
 
@@ -92,6 +93,16 @@ pub struct ProcessSample {
     /// A suspended process at 0% CPU is idle by design, not stuck, and the diagnostics
     /// engine must not flag it.
     pub suspended: bool,
+
+    /// Services hosted by this process, as the platform's service manager reports
+    /// them. Empty for an ordinary program. Shared by pointer between passes while
+    /// the set is unchanged.
+    pub services: Arc<[ServiceInfo]>,
+    /// Start and length of this process's rows in the snapshot's thread list, see
+    /// [`ProcessSample::thread_range`]. Zero rows when the platform does not sample
+    /// threads.
+    pub thread_first: u32,
+    pub thread_rows: u32,
 }
 
 impl ProcessSample {
@@ -105,5 +116,18 @@ impl ProcessSample {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.statics.name
+    }
+
+    /// Index range of this process's rows in the snapshot's thread list.
+    #[must_use]
+    pub fn thread_range(&self) -> std::ops::Range<usize> {
+        let first = self.thread_first as usize;
+        first..first + self.thread_rows as usize
+    }
+
+    /// Whether the platform's service manager says this process hosts services.
+    #[must_use]
+    pub fn is_service_host(&self) -> bool {
+        !self.services.is_empty()
     }
 }

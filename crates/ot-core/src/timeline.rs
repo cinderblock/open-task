@@ -171,6 +171,8 @@ mod tests {
                 ..Default::default()
             },
             processes: Vec::new(),
+            threads: Vec::new(),
+            capabilities: ot_model::Capabilities::default(),
         }
     }
 

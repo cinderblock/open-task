@@ -670,7 +670,19 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
             open_file_location(hwnd, &path);
             None
         }
+        Effect::SampleCpu { target, seconds } => {
+            sample_cpu(cell, hwnd, target, seconds);
+            None
+        }
     }
+}
+
+/// Placeholder until the profiler lands: report that sampling is unavailable.
+fn sample_cpu(cell: &RefCell<State>, hwnd: HWND, target: ProcessKey, _seconds: u32) {
+    if let Ok(mut st) = cell.try_borrow_mut() {
+        st.app.sampling_failed(target);
+    }
+    invalidate(hwnd);
 }
 
 /// A native popup menu. Blocks until the user picks or dismisses; messages keep

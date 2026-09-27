@@ -139,6 +139,7 @@ type Notify = Box<dyn Fn() + Send>;
 
 fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn() + Send)>) {
     let mut out = ProbeOutput::default();
+    let capabilities = probe.capabilities();
     let mut tick = Tick::default();
     let mut last_start: Option<Instant> = None;
 
@@ -159,6 +160,8 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                 // drops it.
                 let proc_cap = out.processes.capacity();
                 let processes = std::mem::replace(&mut out.processes, Vec::with_capacity(proc_cap));
+                let thread_cap = out.threads.capacity();
+                let threads = std::mem::replace(&mut out.threads, Vec::with_capacity(thread_cap));
                 let core_cap = out.cpu.cores.capacity();
                 let cores = std::mem::replace(&mut out.cpu.cores, Vec::with_capacity(core_cap));
                 let mut cpu = out.cpu.clone();
@@ -172,6 +175,8 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                     cpu,
                     memory: out.memory,
                     processes,
+                    threads,
+                    capabilities,
                 }));
                 if let Some(n) = notify {
                     n();

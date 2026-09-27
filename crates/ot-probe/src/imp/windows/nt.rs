@@ -11,8 +11,11 @@
 use std::mem::{offset_of, size_of};
 
 use windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS;
+use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Foundation::{HANDLE, UNICODE_STRING};
+use windows::Win32::System::WindowsProgramming::CLIENT_ID;
 use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION as SdkSpi;
+use windows::Win32::System::WindowsProgramming::SYSTEM_THREAD_INFORMATION as SdkSti;
 
 /// `SystemProcessIdInformation`: the image path of one process, by PID, as an NT
 /// device path (`\Device\HarddiskVolume3\Windows\...`), without a handle to the
@@ -136,3 +139,65 @@ const _: () = {
         offset_of!(SystemProcessInformation, ReadOperationCount) == offset_of!(SdkSpi, Reserved7)
     );
 };
+
+/// `SYSTEM_THREAD_INFORMATION` with its real field names. `NumberOfThreads` of these
+/// follow each process entry; the SDK hides the three times and the wait time behind
+/// `Reserved1..3`. Times are in 100 ns units; `CreateTime` is a FILETIME.
+#[repr(C)]
+#[allow(non_snake_case, dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct SystemThreadInformation {
+    pub KernelTime: i64,
+    pub UserTime: i64,
+    pub CreateTime: i64,
+    pub WaitTime: u32,
+    pub StartAddress: *mut core::ffi::c_void,
+    pub ClientId: CLIENT_ID,
+    pub Priority: i32,
+    pub BasePriority: i32,
+    pub ContextSwitches: u32,
+    pub ThreadState: u32,
+    pub WaitReason: u32,
+}
+
+const _: () = {
+    assert!(size_of::<SystemThreadInformation>() == size_of::<SdkSti>());
+    assert!(offset_of!(SystemThreadInformation, KernelTime) == offset_of!(SdkSti, Reserved1));
+    assert!(offset_of!(SystemThreadInformation, WaitTime) == offset_of!(SdkSti, Reserved2));
+    assert!(offset_of!(SystemThreadInformation, StartAddress) == offset_of!(SdkSti, StartAddress));
+    assert!(offset_of!(SystemThreadInformation, ClientId) == offset_of!(SdkSti, ClientId));
+    assert!(offset_of!(SystemThreadInformation, Priority) == offset_of!(SdkSti, Priority));
+    assert!(offset_of!(SystemThreadInformation, ContextSwitches) == offset_of!(SdkSti, Reserved3));
+    assert!(offset_of!(SystemThreadInformation, ThreadState) == offset_of!(SdkSti, ThreadState));
+    assert!(offset_of!(SystemThreadInformation, WaitReason) == offset_of!(SdkSti, WaitReason));
+};
+
+/// `THREAD_BASIC_INFORMATION`, the `ThreadBasicInformation` class of
+/// `NtQueryInformationThread`. Absent from the SDK metadata; layout from `phnt`.
+/// Only `TebBaseAddress` is used here.
+#[repr(C)]
+#[allow(non_snake_case, dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadBasicInformation {
+    pub ExitStatus: NTSTATUS,
+    pub TebBaseAddress: *mut core::ffi::c_void,
+    pub ClientId: CLIENT_ID,
+    pub AffinityMask: usize,
+    pub Priority: i32,
+    pub BasePriority: i32,
+}
+
+impl Default for ThreadBasicInformation {
+    fn default() -> Self {
+        // SAFETY: all-zero is a valid value for every field (null pointers, zeros).
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Offset of `SubProcessTag` in the TEB: the service tag the service control
+/// manager stamps on every thread a service creates. Stable since Vista; the value
+/// System Informer and Process Explorer read.
+#[cfg(target_pointer_width = "64")]
+pub const TEB_SUB_PROCESS_TAG_OFFSET: usize = 0x1720;
+#[cfg(target_pointer_width = "32")]
+pub const TEB_SUB_PROCESS_TAG_OFFSET: usize = 0x0f60;

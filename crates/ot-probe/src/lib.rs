@@ -15,6 +15,8 @@
 use ot_model::cpu::CpuSample;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
+use ot_model::thread::ThreadSample;
+pub use ot_model::Capabilities;
 use ot_model::ProcessKey;
 
 mod imp;
@@ -43,25 +45,6 @@ impl ProbeError {
     }
 }
 
-/// Which metrics this platform can actually supply.
-///
-/// The UI uses this to hide columns rather than show a grid of dashes. A column that
-/// can never have data on this machine is worse than no column at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-// A flag set is the honest shape for this; enums would add nothing but ceremony.
-#[allow(clippy::struct_excessive_bools)]
-pub struct Capabilities {
-    pub per_process_cpu: bool,
-    pub per_process_disk: bool,
-    pub per_process_network: bool,
-    pub per_process_gpu: bool,
-    pub per_process_power: bool,
-    pub core_frequency: bool,
-    pub package_power: bool,
-    pub thermals: bool,
-    pub hybrid_core_kinds: bool,
-}
-
 /// One full sampling pass.
 ///
 /// Reused between passes so a steady state does not allocate. The sampler calls
@@ -71,12 +54,15 @@ pub struct ProbeOutput {
     pub cpu: CpuSample,
     pub memory: MemorySample,
     pub processes: Vec<ProcessSample>,
+    /// Every sampled thread, grouped by process: each process names its range.
+    pub threads: Vec<ThreadSample>,
 }
 
 impl ProbeOutput {
     /// Empty the buffers while keeping their capacity.
     pub fn clear(&mut self) {
         self.processes.clear();
+        self.threads.clear();
         self.cpu.cores.clear();
         self.memory = MemorySample::default();
     }

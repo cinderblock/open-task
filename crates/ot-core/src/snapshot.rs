@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime};
 use ot_model::cpu::CpuSample;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
-use ot_model::Tick;
+use ot_model::thread::ThreadSample;
+use ot_model::{Capabilities, Tick};
 
 /// Everything the probe measured in one pass, plus timing.
 ///
@@ -27,6 +28,12 @@ pub struct Snapshot {
     pub memory: MemorySample,
     /// All processes, in the order the OS returned them. Sorting is the UI's job.
     pub processes: Vec<ProcessSample>,
+    /// Every sampled thread; each process names its own range with
+    /// [`ProcessSample::thread_range`]. Empty on platforms without thread sampling.
+    pub threads: Vec<ThreadSample>,
+    /// What the probe behind this snapshot can measure, so the UI can explain a
+    /// missing column or attribution rather than show a blank.
+    pub capabilities: Capabilities,
 }
 
 impl Snapshot {

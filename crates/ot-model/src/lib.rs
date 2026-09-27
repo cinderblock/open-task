@@ -7,14 +7,45 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attribution;
 pub mod cpu;
 pub mod identity;
 pub mod memory;
 pub mod process;
+pub mod service;
+pub mod thread;
 pub mod units;
 
 pub use identity::{ProcessKey, ProcessKeyRaw};
 pub use units::{Bytes, Hertz, Percent, Watts};
+
+/// Which metrics this platform can actually supply.
+///
+/// The UI uses this to hide columns rather than show a grid of dashes, and to say
+/// why a piece of attribution is missing (not elevated, not implemented here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// A flag set is the honest shape for this; enums would add nothing but ceremony.
+#[allow(clippy::struct_excessive_bools)]
+pub struct Capabilities {
+    pub per_process_cpu: bool,
+    pub per_process_disk: bool,
+    pub per_process_network: bool,
+    pub per_process_gpu: bool,
+    pub per_process_power: bool,
+    pub core_frequency: bool,
+    pub package_power: bool,
+    pub thermals: bool,
+    pub hybrid_core_kinds: bool,
+    /// Per-thread CPU rows.
+    pub threads: bool,
+    /// Which services live in which process.
+    pub services: bool,
+    /// Which service each thread of a service host works for. Needs elevation on
+    /// Windows.
+    pub service_tags: bool,
+    /// On-demand CPU sampling of one process by module. Needs elevation.
+    pub cpu_sampling: bool,
+}
 
 /// Monotonic sample counter. Increments once per full sampling pass.
 ///

@@ -174,6 +174,77 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
             p.name(),
         );
     }
+
+    print_attribution(snap, &procs);
+}
+
+/// Service hosts and the hottest threads: what turns "svchost.exe is busy" into a
+/// service name.
+fn print_attribution(snap: &ot_core::Snapshot, procs: &[&ot_model::process::ProcessSample]) {
+    // Service hosts: which services, and which of them the hot threads belong to.
+    // This is the view that turns "svchost.exe is busy" into a service name.
+    let hosts: Vec<_> = procs
+        .iter()
+        .filter(|p| p.is_service_host())
+        .take(3)
+        .collect();
+    if !hosts.is_empty() {
+        println!("  service hosts (top 3 by CPU):");
+        for p in hosts {
+            let names: Vec<&str> = p.services.iter().map(|s| &*s.name).collect();
+            println!(
+                "    pid {:>6} {:>5.1}%  {}  [{}]",
+                p.key().pid,
+                p.cpu.get(),
+                p.name(),
+                names.join(", ")
+            );
+        }
+    }
+
+    let mut threads: Vec<(
+        &ot_model::process::ProcessSample,
+        &ot_model::thread::ThreadSample,
+    )> = snap
+        .processes
+        .iter()
+        .flat_map(|p| snap.threads[p.thread_range()].iter().map(move |t| (p, t)))
+        .filter(|(_, t)| t.cpu.get() > 0.0)
+        .collect();
+    threads.sort_by(|a, b| b.1.cpu.get().total_cmp(&a.1.cpu.get()));
+    if !threads.is_empty() {
+        println!(
+            "  threads ({} sampled; tags {}):",
+            snap.threads.len(),
+            if snap.capabilities.service_tags {
+                "on"
+            } else {
+                "off, not elevated"
+            }
+        );
+        println!(
+            "  {:>7}  {:>7}  {:>6}  {:<10}  {:<28}  process",
+            "pid", "tid", "cpu%", "state", "service"
+        );
+        for (p, t) in threads.iter().take(8) {
+            let service = match t.service {
+                ot_model::thread::ServiceTag::Service(i) => {
+                    p.services.get(usize::from(i)).map_or("?", |s| &*s.name)
+                }
+                ot_model::thread::ServiceTag::None => "-",
+                ot_model::thread::ServiceTag::Unknown => "",
+            };
+            println!(
+                "  {:>7}  {:>7}  {:>6.1}  {:<10}  {:<28}  {}",
+                p.key().pid,
+                t.tid,
+                t.cpu.get(),
+                t.state.label(),
+                service,
+                p.name()
+            );
+        }
+    }
     println!();
 }
 

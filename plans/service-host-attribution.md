@@ -1,6 +1,6 @@
 # Service host attribution: what is svchost actually doing?
 
-> **Status:** proposal, awaiting scope decision · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** active (full scope approved 2026-09-26: "do it all") · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md` (step 7, diagnostics). Follows
 > `plans/process-details-actions.md`. Another thread owns `plans/replace-task-manager.md`
 > (Options menu, single instance, v0.3.0) in this same working tree.
@@ -75,7 +75,11 @@ ETW. No `SuspendThread`, no debugger, no dumps of service hosts.
   and a Threads tab with per-thread service names when elevated. TMOG has a Services
   view. None of them attributes CPU to a service or names the ETW client.
 
-## Proposed decisions (confirm or change before building)
+## Decisions already made (don't re-ask)
+
+User approved the whole proposal and all three recommendations on 2026-09-26
+("do it all"): every step below, threads under every process folded by default,
+profiling on demand only.
 
 1. **Threads become a first-class layer under a process in tree mode**, folded by
    default. A process row expands to its threads only when the user asks (Right on a
@@ -130,10 +134,8 @@ child of the hot svchost that keeps appearing and disappearing.
 
 ## Plan / steps
 
-1. **[current]** Agree scope. Recommended first cut: steps 2 to 4 (services inline,
-   threads layer, per-service CPU when elevated). Steps 5 and 6 are the "diagnose"
-   action.
-2. `ot-probe` (Windows): parse `SYSTEM_THREAD_INFORMATION`; per-thread CPU deltas
+1. ~~Agree scope.~~ All steps approved.
+2. **[current]** `ot-probe` (Windows): parse `SYSTEM_THREAD_INFORMATION`; per-thread CPU deltas
    keyed by (pid birth, tid, thread create time); global cap with "hottest N threads
    per process" fallback. SCM enumeration once per pass (cheap; cache display names).
    `ot-model`: `ThreadSample`, `ServiceInfo`, `ProcessSample::services`,
@@ -169,7 +171,7 @@ child of the hot svchost that keeps appearing and disappearing.
 ## Progress log
 
 - [x] Plan written.
-- [ ] Scope agreed.
+- [x] Scope agreed: everything, 2026-09-26.
 - [ ] Probe: threads + SCM services.
 - [ ] Probe: service tags (elevated).
 - [ ] UI: attribution cell, service and thread layers.
@@ -179,15 +181,8 @@ child of the hot svchost that keeps appearing and disappearing.
 
 ## Open questions for the user
 
-1. **Scope of the first cut.** Recommendation: steps 2 to 4 now (they need no new
-   permissions beyond what the app has, and cover "which service is hot" once
-   elevated), then 5 and 6 as a second cycle once the elevated relaunch from the
-   Options menu exists.
-2. **Threads under every process, or only service hosts?** Recommendation: every
-   process (a spinning thread in Chrome is the same question), folded by default.
-3. **Continuous vs on-demand profiling.** Recommendation: on-demand only (decision 4).
-   A kernel profiling session is cheap but it is still a system-wide logger, and a
-   task manager should not hold one open all day.
+None. The three scope questions were answered on 2026-09-26: all steps; threads
+under every process, folded by default; profiling on demand only.
 
 ## Things not to do
 
