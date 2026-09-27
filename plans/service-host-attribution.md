@@ -1,6 +1,6 @@
 # Service host attribution: what is svchost actually doing?
 
-> **Status:** built and verified 2026-09-27; commits `5882e46`, `f447029` (docs follow) · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done, CI green 2026-09-27; commits `5882e46`, `f447029`, `fb3155c` · **Started:** 2026-09-26 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md` (step 7, diagnostics). Follows
 > `plans/process-details-actions.md`. Another thread owns `plans/replace-task-manager.md`
 > (Options menu, single instance, v0.3.0) in this same working tree.
@@ -206,6 +206,8 @@ All done; kept as the record of what was built.
   of the Schedule host; GUI drive of the context menu (`target/drive-sample.ps1`,
   not committed) producing the sample rows in the tree; screenshots
   `target/shot-tree.png`, `target/drive-sample.png`.
+- **CI green for `fb3155c`** on all five jobs (run 36300537662, 2026-09-27),
+  including the elevated self-sample test on both Windows runners.
 - `SvcHostSplitDisable=1` on BrokerInfrastructure keeps five services in one process
   even on a machine with plenty of RAM, so "one service per svchost" cannot be assumed.
 - The registry `ServiceDll` for BrokerInfrastructure names `psmsrv.dll`; the work ran
