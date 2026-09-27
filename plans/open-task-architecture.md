@@ -68,6 +68,23 @@ Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks.
    consequence: history must be stored with timestamps at multiple resolutions, not
    as a single fixed-rate ring. First sparklines may be linear; the storage must not
    paint us into a corner.
+9. **The Windows installer is per-machine (Program Files, elevated), and updates
+   will need a UAC prompt.** User decision 2026-09-26: "I don't mind a UAC prompt on
+   update. keep it safe." A task manager runs elevated; its binary must not sit
+   where an unelevated process can replace it. So `ot-update` checks for updates
+   unelevated and elevates only to apply one. Per-user install exists only behind
+   `/CURRENTUSER`. See `plans/windows-installer.md`.
+10. **Runtime elevation follows Process Explorer.** User, 2026-09-26: "Process
+    Explorer launches in user mode by default, but offers a menu option to 'List
+    processes from all users' which restarts as admin (shows UAC). This seems like a
+    nice way to cover both." So: the app launches as the user with no prompt; a menu
+    action relaunches it elevated (`ShellExecuteEx` with the `runas` verb, same
+    arguments, then the unelevated instance exits; a declined prompt leaves it
+    running); the title shows "(Administrator)" when elevated and the action is
+    disabled then. Together with decision 9 this covers safety (Program Files),
+    convenience (no prompt day to day) and capability (elevate on demand). Not built
+    yet; it belongs in the Options menu that `plans/replace-task-manager.md`
+    introduces, next to "Replace Task Manager".
 
 ## Why not a webview (the decisive argument)
 

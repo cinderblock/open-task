@@ -88,11 +88,16 @@ a reader.
 
 **Windows:** download `open-task-vX.Y.Z-windows-setup.exe` from the
 [latest release](https://github.com/cinderblock/open-task/releases/latest) and run it.
-It installs for the current user without administrator rights, or for all users if
-you pick that on the first page; installs the x64 or ARM64 build to match the
-machine; adds a Start Menu entry and an uninstaller; and can put `open-task` on your
-PATH for `open-task --headless` in a terminal. A newer installer upgrades in place.
-Silent install: `open-task-vX.Y.Z-windows-setup.exe /VERYSILENT /NORESTART`.
+It installs for all users into Program Files, which needs an administrator prompt,
+for the install and for every update. That is on purpose: a task manager is the kind
+of program you run elevated, and it should not live somewhere any program running
+as you could overwrite it. It installs the x64 or ARM64 build to match the machine,
+adds a Start Menu entry and an uninstaller, and can put `open-task` on the PATH for
+`open-task --headless` in a terminal. A newer installer upgrades in place.
+
+Silent install, from an elevated prompt:
+`open-task-vX.Y.Z-windows-setup.exe /VERYSILENT /NORESTART`. If you cannot elevate,
+`/CURRENTUSER` installs into your own profile instead, without the protection above.
 
 The installer and the binaries are not code-signed yet, so SmartScreen asks you to
 confirm the first run.

@@ -34,11 +34,22 @@ place.
    MSI is the enterprise shape but makes a self-updater clumsy (it must go through
    `msiexec`). Inno Setup gives per-user installs without elevation, an uninstaller,
    Add/Remove entry, silent switches winget understands, and it is on the runners.
-2. **Per-user by default, per-machine offered.** `PrivilegesRequired=lowest` with
-   `PrivilegesRequiredOverridesAllowed=dialog`. Default location is
-   `%LOCALAPPDATA%\Programs\open-task`. This is what lets the planned self-updater
-   (`ot-update`) replace the binary without a UAC prompt, the way VS Code's user
-   installer works.
+2. **Per-machine, elevated. User decision, 2026-09-26: "I don't mind a UAC prompt on
+   update. keep it safe."** Supersedes the first cut, which defaulted to a per-user
+   install in `%LOCALAPPDATA%\Programs` to spare the future self-updater a UAC prompt.
+   The reason it matters: a task manager gets run elevated, and a binary in a
+   user-writable folder that is launched elevated is a privilege-escalation path for
+   anything running as that user. Now `PrivilegesRequired=admin` with
+   `PrivilegesRequiredOverridesAllowed=commandline`: Program Files, HKLM uninstall
+   key and PATH, common Start Menu; `/CURRENTUSER` on the command line still allows a
+   per-user install for people who cannot elevate, and the wizard never offers it.
+   Consequence for `ot-update`: checking for updates stays unelevated; applying one
+   must elevate (run the new installer, or a helper, with a UAC prompt). Landed on
+   `master` 2026-09-26, verified locally (per-machine and `/CURRENTUSER` paths, see
+   findings); ships with the next release, v0.3.0, which
+   `plans/replace-task-manager.md` owns together with the "Replace Task Manager"
+   installer task. Until then the published v0.2.1 installer still defaults to
+   per-user.
 3. **One installer for x64 and ARM64.** It carries both binaries and installs the one
    matching the machine (`IsArm64`). Users should not have to know their
    architecture; the self-updater can still fetch the per-target archive.
@@ -115,10 +126,19 @@ place.
       uninstall leaves no directory, shortcut, registry key or PATH change.
       https://github.com/cinderblock/open-task/releases/tag/v0.2.1
 
+- Per-machine verification (2026-09-26, elevated shell, Inno 6.7.3 build of the
+  hardened script): silent default install exits 0 into `C:\Program Files\open-task`,
+  which `BUILTIN\Users` cannot write; HKLM uninstall key with version and location;
+  all-users Start Menu shortcut; machine PATH gains the directory with the task and
+  is byte-identical after uninstall; the installed binary runs; uninstall leaves no
+  directory, shortcut or key. `/CURRENTUSER` still installs into the profile with an
+  HKCU key only, and uninstalls clean.
+
 ## Status
 
-Done. The installer is a release asset from v0.2.1 on. Open questions above (code
-signing, winget, an app icon) are follow-ups, not blockers.
+Done. The installer is a release asset from v0.2.1 on; the per-machine default is on
+`master` and ships with v0.3.0. Open questions above (code signing, winget, an app
+icon) are follow-ups, not blockers.
 
 ## Open questions for the user
 

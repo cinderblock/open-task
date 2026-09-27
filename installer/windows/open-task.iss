@@ -2,9 +2,12 @@
 ;
 ; Compiled by scripts/build-installer.ps1, locally and in .github/workflows/release.yml.
 ; One installer carries both the x64 and the ARM64 binary and installs the one that
-; matches the machine. It installs per user by default, without elevation, so a
-; self-updater can later replace the binary without a UAC prompt; "all users" is
-; offered on the first page and elevates.
+; matches the machine. It installs for all users into Program Files and needs
+; elevation (a UAC prompt), also for every update. That is deliberate: a task manager
+; gets run elevated, and a binary in a user-writable folder that is launched elevated
+; is a privilege-escalation path for anything running as that user. A per-user
+; install into the user's profile is available only by asking for it explicitly with
+; /CURRENTUSER on the command line; the wizard does not offer it.
 ;
 ; Required defines (the build script passes them):
 ;   AppVersion   version string, e.g. 0.2.1 or 0.3.0-pre.1
@@ -49,8 +52,10 @@ VersionInfoDescription=open-task installer
 DefaultDirName={autopf}\open-task
 DefaultGroupName=open-task
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; Per machine, elevated. `commandline` lets /CURRENTUSER opt into a per-user install
+; without ever showing a dialog that suggests it.
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=commandline
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -83,7 +88,10 @@ Name: "{autoprograms}\open-task"; Filename: "{app}\open-task.exe"
 Name: "{autodesktop}\open-task"; Filename: "{app}\open-task.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\open-task.exe"; Description: "{cm:LaunchProgram,open-task}"; Flags: nowait postinstall skipifsilent
+; runasoriginaluser: the app launched from the wizard's last page must run as the
+; user, not with Setup's elevation. Inno 6 defaults postinstall entries to this;
+; stated here so nobody has to remember that.
+Filename: "{app}\open-task.exe"; Description: "{cm:LaunchProgram,open-task}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
 const
