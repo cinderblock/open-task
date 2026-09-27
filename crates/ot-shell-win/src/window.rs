@@ -10,10 +10,14 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use ot_core::{Sampler, SamplerConfig};
 use ot_model::ProcessKey;
 use ot_paint::{DisplayList, Point, Size};
 use ot_probe::{ControlError, PlatformControl, ProcessControl, SystemProbe};
+use ot_probe::{CpuSampler, PlatformSampler};
 use ot_ui::{
     App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Theme, UiEvent,
 };
@@ -57,6 +61,15 @@ use crate::{ShellError, ShellOptions, ThemePreference};
 
 /// Posted by the sampler thread after each publish.
 const WM_APP_SNAPSHOT: u32 = WM_APP + 1;
+/// A CPU sample finished on its worker thread; `lparam` is a `Box<SampleOutcome>`.
+const WM_APP_SAMPLE: u32 = WM_APP + 2;
+
+/// What a sampling thread hands back to the window.
+struct SampleOutcome {
+    target: ProcessKey,
+    name: String,
+    result: Result<ot_model::attribution::Attribution, ot_probe::SampleError>,
+}
 
 const CLASS_NAME: PCWSTR = w!("OpenTaskMainWindow");
 const INITIAL_SIZE: (i32, i32) = (1180, 760);
@@ -99,6 +112,8 @@ enum Outcome {
     Event(UiEvent),
     /// `WM_DPICHANGED`: move to the suggested rectangle, which re-enters with `WM_SIZE`.
     Rescale(RECT),
+    /// Tell the user something in a message box, once the state is released.
+    Notify(String),
 }
 
 fn win(context: &'static str) -> impl FnOnce(windows::core::Error) -> ShellError {
@@ -434,6 +449,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             invalidate(hwnd);
             LRESULT(0)
         }
+        Outcome::Notify(text) => {
+            let text = HSTRING::from(text);
+            // SAFETY: strings outlive the call; hwnd is valid.
+            unsafe {
+                MessageBoxW(Some(hwnd), &text, w!("open-task"), MB_OK | MB_ICONWARNING);
+            }
+            LRESULT(0)
+        }
     }
 }
 
@@ -604,6 +627,30 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 None => Outcome::Done(LRESULT(0)),
             }
         }
+        WM_APP_SAMPLE => {
+            // SAFETY: the pointer was made by `Box::into_raw` in `sample_cpu` and is
+            // delivered exactly once.
+            let outcome = unsafe { Box::from_raw(lparam.0 as *mut SampleOutcome) };
+            let SampleOutcome {
+                target,
+                name,
+                result,
+            } = *outcome;
+            match result {
+                Ok(a) => {
+                    tracing::info!(pid = target.pid, samples = a.samples, "CPU sample done");
+                    st.app.set_attribution(Arc::new(a));
+                    invalidate(hwnd);
+                    Outcome::Done(LRESULT(0))
+                }
+                Err(e) => {
+                    tracing::warn!(pid = target.pid, error = %e, "CPU sample failed");
+                    st.app.sampling_failed(target);
+                    invalidate(hwnd);
+                    Outcome::Notify(format!("Could not sample {name}.\n\n{e}"))
+                }
+            }
+        }
         WM_APP_SNAPSHOT => {
             if let Some(s) = &st.sampler {
                 if st.app.set_snapshot(s.latest()) {
@@ -677,12 +724,63 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
     }
 }
 
-/// Placeholder until the profiler lands: report that sampling is unavailable.
-fn sample_cpu(cell: &RefCell<State>, hwnd: HWND, target: ProcessKey, _seconds: u32) {
-    if let Ok(mut st) = cell.try_borrow_mut() {
-        st.app.sampling_failed(target);
+/// Sample a process's CPU on a worker thread and post the result back as
+/// `WM_APP_SAMPLE`. The sampler blocks for the whole window, so it must not run on
+/// this thread; the table keeps updating meanwhile.
+fn sample_cpu(cell: &RefCell<State>, hwnd: HWND, target: ProcessKey, seconds: u32) {
+    let (name, services) = {
+        let Ok(st) = cell.try_borrow() else {
+            return;
+        };
+        let snap = st.sampler.as_ref().map(Sampler::latest);
+        let p = snap
+            .as_ref()
+            .and_then(|s| s.processes.iter().find(|p| p.key() == target));
+        match p {
+            Some(p) => (
+                p.name().to_owned(),
+                p.services
+                    .iter()
+                    .map(|s| s.name.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            None => (format!("PID {}", target.pid), Vec::new()),
+        }
+    };
+    let hwnd_bits = hwnd.0 as isize;
+    let spawned = std::thread::Builder::new()
+        .name("ot-cpu-sample".into())
+        .spawn(move || {
+            let result =
+                PlatformSampler.sample(target, &services, Duration::from_secs(u64::from(seconds)));
+            let outcome = Box::new(SampleOutcome {
+                target,
+                name,
+                result,
+            });
+            let ptr = Box::into_raw(outcome);
+            // SAFETY: posting to a window handle is thread-safe. If the window is
+            // gone the post fails and the box is reclaimed here.
+            let posted = unsafe {
+                PostMessageW(
+                    Some(HWND(hwnd_bits as *mut c_void)),
+                    WM_APP_SAMPLE,
+                    WPARAM(0),
+                    LPARAM(ptr as isize),
+                )
+            };
+            if posted.is_err() {
+                // SAFETY: the message was not delivered, so we still own the box.
+                drop(unsafe { Box::from_raw(ptr) });
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not start the sampling thread");
+        if let Ok(mut st) = cell.try_borrow_mut() {
+            st.app.sampling_failed(target);
+        }
+        invalidate(hwnd);
     }
-    invalidate(hwnd);
 }
 
 /// A native popup menu. Blocks until the user picks or dismisses; messages keep

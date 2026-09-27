@@ -56,12 +56,14 @@ use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
 mod control;
 mod details;
 mod nt;
+mod profile;
 mod services;
 mod tags;
 
 pub use control::WindowsControl;
 use details::DetailProbe;
 use nt::{SystemProcessInformation, SystemThreadInformation};
+pub use profile::WindowsSampler;
 use services::ServiceProbe;
 use tags::{OwnedHandle, TagProbe};
 
@@ -137,24 +139,24 @@ struct CoreTimes {
 /// A byte buffer with 8-byte alignment, because the structures the kernel writes
 /// into it are 8-byte aligned and `Vec<u8>` only promises 1.
 #[derive(Debug, Default)]
-struct AlignedBuf(Vec<u64>);
+pub(super) struct AlignedBuf(Vec<u64>);
 
 impl AlignedBuf {
-    fn len_bytes(&self) -> usize {
+    pub(super) fn len_bytes(&self) -> usize {
         self.0.len() * 8
     }
 
-    fn resize_bytes(&mut self, bytes: usize) {
+    pub(super) fn resize_bytes(&mut self, bytes: usize) {
         self.0.resize(bytes.div_ceil(8), 0);
     }
 
     /// 8-byte-aligned base pointer. Callers use `byte_add` for byte offsets.
-    fn as_mut_ptr(&mut self) -> *mut u64 {
+    pub(super) fn as_mut_ptr(&mut self) -> *mut u64 {
         self.0.as_mut_ptr()
     }
 
     /// 8-byte-aligned base pointer. Callers use `byte_add` for byte offsets.
-    fn as_ptr(&self) -> *const u64 {
+    pub(super) fn as_ptr(&self) -> *const u64 {
         self.0.as_ptr()
     }
 }
@@ -590,7 +592,7 @@ impl SystemProbe for WindowsProbe {
             threads: true,
             services: self.services.available(),
             service_tags: self.tags.is_some(),
-            cpu_sampling: false,
+            cpu_sampling: self.tags.is_some(),
         }
     }
 
@@ -849,7 +851,7 @@ fn discover_topology(logical_count: u32) -> Result<Vec<(u32, CoreKind)>, ProbeEr
 /// Call `NtQuerySystemInformation`, growing `buf` until the result fits.
 ///
 /// Returns the number of bytes written.
-fn query_growing(
+pub(super) fn query_growing(
     class: SYSTEM_INFORMATION_CLASS,
     buf: &mut AlignedBuf,
     context: &'static str,

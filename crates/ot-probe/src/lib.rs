@@ -12,6 +12,9 @@
 //! | Linux | stub; returns [`ProbeError::Unsupported`] |
 //! | macOS | stub; returns [`ProbeError::Unsupported`] |
 
+use std::time::Duration;
+
+use ot_model::attribution::Attribution;
 use ot_model::cpu::CpuSample;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
@@ -21,7 +24,7 @@ use ot_model::ProcessKey;
 
 mod imp;
 
-pub use imp::{PlatformControl, PlatformProbe};
+pub use imp::{PlatformControl, PlatformProbe, PlatformSampler};
 
 /// Why a sampling pass could not produce data.
 #[derive(Debug, thiserror::Error)]
@@ -115,4 +118,70 @@ pub trait ProcessControl: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// See [`ControlError`].
     fn terminate(&self, key: ProcessKey) -> Result<(), ControlError>;
+}
+
+/// Why a CPU sample could not be taken.
+#[derive(Debug, thiserror::Error)]
+pub enum SampleError {
+    /// This platform has no implementation yet.
+    #[error("CPU sampling is not implemented on this platform yet")]
+    Unsupported,
+    /// Sampling needs an elevated process on this platform.
+    #[error("CPU sampling needs open-task to run as administrator")]
+    NotElevated,
+    /// The process exited, or its PID was recycled, before sampling began.
+    #[error("the process is no longer running")]
+    Gone,
+    /// An OS call failed.
+    #[error("{context}: {source}")]
+    Os {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl SampleError {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn os(
+        context: &'static str,
+        e: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Os {
+            context,
+            source: std::io::Error::other(e),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn os_code(
+        context: &'static str,
+        code: windows::Win32::Foundation::WIN32_ERROR,
+    ) -> Self {
+        Self::Os {
+            context,
+            source: std::io::Error::from_raw_os_error(code.0.cast_signed()),
+        }
+    }
+}
+
+/// On-demand CPU sampling of one process: which modules its threads were
+/// executing over a short window, and for a service with a known trace provider,
+/// which clients it served. See [`Attribution`].
+///
+/// Blocking: a call takes about `duration`. Callers run it off the UI thread.
+/// Implementations must be read-only with respect to the target: no suspension,
+/// no debugger, no memory writes.
+pub trait CpuSampler: Send + Sync + std::fmt::Debug {
+    /// Sample `target` for `duration`. `services` are the names of the services
+    /// the target hosts, for the client report.
+    ///
+    /// # Errors
+    /// See [`SampleError`].
+    fn sample(
+        &self,
+        target: ProcessKey,
+        services: &[String],
+        duration: Duration,
+    ) -> Result<Attribution, SampleError>;
 }

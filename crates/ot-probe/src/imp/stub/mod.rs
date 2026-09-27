@@ -4,9 +4,15 @@
 //! and macOS before their real probes exist. Every call reports
 //! [`ProbeError::Unsupported`] rather than fabricating data.
 
+use std::time::Duration;
+
+use ot_model::attribution::Attribution;
 use ot_model::ProcessKey;
 
-use crate::{Capabilities, ControlError, ProbeError, ProbeOutput, ProcessControl, SystemProbe};
+use crate::{
+    Capabilities, ControlError, CpuSampler, ProbeError, ProbeOutput, ProcessControl, SampleError,
+    SystemProbe,
+};
 
 /// Probe that measures nothing.
 #[derive(Debug, Default)]
@@ -15,6 +21,21 @@ pub struct StubProbe;
 /// Process actions that do nothing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubControl;
+
+/// CPU sampling that is not available.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StubSampler;
+
+impl CpuSampler for StubSampler {
+    fn sample(
+        &self,
+        _target: ProcessKey,
+        _services: &[String],
+        _duration: Duration,
+    ) -> Result<Attribution, SampleError> {
+        Err(SampleError::Unsupported)
+    }
+}
 
 impl ProcessControl for StubControl {
     fn terminate(&self, _key: ProcessKey) -> Result<(), ControlError> {

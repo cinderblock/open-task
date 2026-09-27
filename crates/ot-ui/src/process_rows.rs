@@ -381,8 +381,6 @@ struct ProcExtra {
     /// Whether any thread of this process carries a known service tag, i.e. the
     /// per-service CPU numbers mean something.
     tags_known: bool,
-    /// Index into the attribution's thread list for each thread row, if sampled.
-    _reserved: u32,
 }
 
 /// Every row the table can show for one snapshot. See the module docs.
@@ -1054,7 +1052,10 @@ impl RowSource for ProcessRows<'_> {
             | col::DISK_READ
             | col::DISK_WRITE
             | col::THREADS
-            | col::HANDLES => self.value_of(a).total_cmp(&self.value_of(b)),
+            | col::HANDLES => self
+                .value_of(a)
+                .total_cmp(&self.value_of(b))
+                .then_with(|| self.tie_break(a, b)),
             _ => self.compare(a, b, col),
         }
     }
@@ -1069,13 +1070,41 @@ impl RowSource for ProcessRows<'_> {
 
 impl ProcessRows<'_> {
     /// The sortable number of any row when siblings of mixed kinds are compared: a
-    /// process's subtree CPU, an inner row's own value.
+    /// process's subtree CPU, an inner row's own value. The rows of a CPU sample
+    /// the user asked for sort above everything else in their process.
     fn value_of(&self, row: usize) -> f32 {
         let r = self.row(row);
         match r.kind {
             RowKind::Process => self.tree.rollup(row).cpu,
+            RowKind::Sampling | RowKind::Sample | RowKind::Clients => f32::INFINITY,
             _ => r.value,
         }
+    }
+
+    /// Order among siblings whose numbers tie, so a host's idle services do not
+    /// shuffle: sample rows, child processes, services, the thread group, threads,
+    /// each group by name. Expressed *reversed*, because the numeric columns sort
+    /// descending by default and the table reverses the whole ordering; this way
+    /// names still read A to Z in the usual direction.
+    fn tie_break(&self, a: usize, b: usize) -> Ordering {
+        fn rank(k: RowKind) -> u8 {
+            match k {
+                RowKind::Sampling | RowKind::Sample => 0,
+                RowKind::Clients => 1,
+                RowKind::Process => 2,
+                RowKind::Service(_) => 3,
+                RowKind::ThreadGroup => 4,
+                RowKind::Thread(_) => 5,
+                RowKind::Module(_) | RowKind::Client(_) | RowKind::ThreadModule(..) => 6,
+            }
+        }
+        let (ra, rb) = (self.row(a), self.row(b));
+        rank(rb.kind).cmp(&rank(ra.kind)).then_with(|| {
+            let (mut na, mut nb) = (String::new(), String::new());
+            self.name_of(a, &mut na);
+            self.name_of(b, &mut nb);
+            cmp_ci(&nb, &na)
+        })
     }
 }
 
@@ -1465,6 +1494,29 @@ pub(crate) mod tests {
             Ordering::Greater,
             "Alpha 30 > child 2"
         );
+        // Ties: in the descending direction the table reverses, so a "greater"
+        // answer here lists first there. Services before the group, A before B.
+        let mut idle = host_snapshot();
+        for th in &mut idle.threads {
+            th.cpu = Percent(0.0);
+        }
+        let lt = layout_of(&idle, None);
+        let ri = rows(&idle, &t, &lt, None, true);
+        assert_eq!(
+            ri.compare_subtree(2, 3, col::CPU),
+            Ordering::Greater,
+            "Alpha before Beta"
+        );
+        assert_eq!(
+            ri.compare_subtree(3, 4, col::CPU),
+            Ordering::Greater,
+            "Beta before Threads"
+        );
+        assert_eq!(
+            ri.compare_subtree(1, 2, col::CPU),
+            Ordering::Greater,
+            "child before services"
+        );
 
         // Ancestry walks through inner rows.
         let mut out = String::new();
@@ -1554,6 +1606,9 @@ pub(crate) mod tests {
         let sample = kinds.iter().position(|k| *k == RowKind::Sample).unwrap();
         assert_eq!(r.parent(sample), Some(0));
         assert!(!r.collapsed_by_default(sample));
+        // The sample the user asked for leads its process, whatever the CPU column says.
+        assert_eq!(r.compare_subtree(sample, 1, col::CPU), Ordering::Greater);
+        assert_eq!(r.compare_subtree(sample, 2, col::CPU), Ordering::Greater);
         assert_eq!(
             cell(&r, sample, col::NAME),
             "CPU sample \u{b7} 200 samples in 5.0 s"

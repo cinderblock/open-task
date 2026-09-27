@@ -68,7 +68,7 @@ impl ProcessControl for WindowsControl {
 }
 
 /// Creation time as the raw FILETIME value, and whether the process has exited.
-fn times_of(h: HANDLE) -> Result<(u64, bool), ControlError> {
+pub(super) fn times_of(h: HANDLE) -> Result<(u64, bool), ControlError> {
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use ot_core::{Sampler, SamplerConfig};
 use ot_model::Bytes;
-use ot_probe::{PlatformProbe, SystemProbe};
+use ot_probe::{CpuSampler, PlatformProbe, PlatformSampler, SystemProbe};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -55,7 +55,12 @@ fn main() {
         interval: Duration::from_secs(1),
     };
 
-    if headless {
+    if let Some(pid) = arg_value(&args, "--sample").and_then(|s| s.parse::<u32>().ok()) {
+        let seconds: u64 = arg_value(&args, "--seconds")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        run_sample(Box::new(probe), config, pid, seconds);
+    } else if headless {
         run_headless(Box::new(probe), config, passes);
     } else {
         run_gui(Box::new(probe), config, theme, view);
@@ -123,6 +128,91 @@ fn run_headless(probe: Box<dyn SystemProbe>, config: SamplerConfig, passes: usiz
         }
         print_snapshot(&snap);
         printed += 1;
+    }
+}
+
+/// `--sample <pid>`: one snapshot to identify the process, then a CPU sample of
+/// it, printed. The command-line face of the "Sample CPU" menu item.
+fn run_sample(probe: Box<dyn SystemProbe>, config: SamplerConfig, pid: u32, seconds: u64) {
+    let sampler = Sampler::start(probe, config);
+    let snap = loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if sampler.consecutive_errors() == u64::MAX {
+            eprintln!("this platform has no probe implementation yet");
+            std::process::exit(3);
+        }
+        let snap = sampler.latest();
+        if !snap.is_empty() {
+            break snap;
+        }
+    };
+    let Some(p) = snap.processes.iter().find(|p| p.key().pid == pid) else {
+        eprintln!("no process with PID {pid}");
+        std::process::exit(4);
+    };
+    let services: Vec<String> = p.services.iter().map(|s| s.name.to_string()).collect();
+    println!(
+        "sampling {} (PID {pid}) for {seconds} s; services: [{}]",
+        p.name(),
+        services.join(", ")
+    );
+    match PlatformSampler.sample(p.key(), &services, Duration::from_secs(seconds)) {
+        Ok(a) => print_attribution_result(&a),
+        Err(e) => {
+            eprintln!("sample failed: {e}");
+            std::process::exit(5);
+        }
+    }
+}
+
+fn print_attribution_result(a: &ot_model::attribution::Attribution) {
+    println!(
+        "{} samples over {:.1} s",
+        a.samples,
+        a.duration.as_secs_f32()
+    );
+    let total = a.samples.max(1) as f32;
+    println!("  by module:");
+    for m in a.modules.iter().take(12) {
+        println!(
+            "    {:>5.1}%  {:>7}  {}",
+            m.count as f32 / total * 100.0,
+            m.count,
+            m.label
+        );
+    }
+    println!("  by thread:");
+    for t in a.threads.iter().take(8) {
+        let top: Vec<String> = t
+            .modules
+            .iter()
+            .take(3)
+            .map(|m| {
+                format!(
+                    "{} {:.0}%",
+                    m.label,
+                    m.count as f32 / t.samples.max(1) as f32 * 100.0
+                )
+            })
+            .collect();
+        println!(
+            "    tid {:>7}  {:>5.1}%  {}",
+            t.tid,
+            t.samples as f32 / total * 100.0,
+            top.join(", ")
+        );
+    }
+    if let Some(c) = &a.clients {
+        println!(
+            "  clients of {} via {} ({} events, {} lost), by {}:",
+            c.service, c.provider, c.events, c.lost, c.field
+        );
+        for b in c.buckets.iter().take(12) {
+            println!("    {:>7}  {}", b.count, b.label);
+        }
+    }
+    for n in &a.notes {
+        println!("  note: {n}");
     }
 }
 
