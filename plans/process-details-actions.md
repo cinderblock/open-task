@@ -109,6 +109,10 @@ All done; kept as the record of what was built.
 - **The launched window takes focus.** During one screenshot run the window
   received keystrokes meant for another app ("I will" landed in the filter). Any
   launched app does this; noting it because type-to-filter makes it visible.
+- **CI green for `bd70392`** on all five jobs (run 36283731170, 2026-09-26). The run
+  warned that `actions/checkout@v4` targets Node 20 (forced onto Node 24) and that
+  `ubuntu-latest` becomes Ubuntu 26 on 2026-10-19; bump `checkout` to v5 with the
+  next workflow change.
 - **Verified 2026-09-26:** fmt; clippy `-D warnings` on the Windows, Linux and macOS
   targets; 70 tests (52 in `ot-ui`); headless run; screenshots of list and tree
   with the new columns and field; the End task flow above against a throwaway
