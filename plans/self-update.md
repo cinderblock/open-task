@@ -43,6 +43,10 @@ the update if it downloads a new one".
    (the running exe is in the `InstallLocation` of the Inno uninstall key, HKLM or
    HKCU). Any other copy (zip, `cargo install`, a dev build) is told a release exists
    and offered the release page, never overwritten in place.
+8. **The rail shows the short form** (Claude's call, 2026-09-28): `v0.2.1` for a
+   release, the commit for anything else (`25c2e9c-dirty`), because the full describe
+   string does not fit the 184 DIP rail. The Settings card, `--version`, the log and
+   the exe's ProductVersion carry the full string.
 
 ## Design
 
@@ -108,22 +112,52 @@ the update if it downloads a new one".
 ## Plan / steps
 
 1. ~~Plan.~~
-2. **[current]** Build identity: `build.rs` (describe, `.res`), `--version`. Commit.
-3. `ot-update` core: `Version`, sums parsing, feed verification, tests with a test
-   key. Commit.
-4. `ot-update` Windows: WinHTTP client, installation detection, installer launch;
-   `--check-update` CLI. Commit.
-5. UI: rail button, Settings section, prefs, shell wiring, `WM_ENDSESSION`. Commit.
-6. Installer `[Run]` relaunch; release workflow: full-history checkout, `--version`
-   check, signing; `minisign.pub`; README. Commit.
-7. Key: install minisign, generate the keypair. **Stage** `gh secret set` for the
-   user's explicit yes (third-party account setting).
-8. End-to-end locally: test key + local feed build, per-user install, update it to a
+2. ~~Build identity: `build.rs` (describe, `.res`), `--version`.~~ `dbfe022`.
+3. ~~`ot-update` core + Windows (WinHTTP, install detection, Setup),
+   `--check-update`.~~ `25c2e9c`.
+4. ~~UI: rail button, Settings section, prefs, shell wiring, `WM_ENDSESSION`.~~
+   `d7967da`.
+5. **[current]** Installer `[Run]` relaunch; release workflow: full-history
+   checkout, `--version` check, signing; README. Commit.
+6. ~~Key: minisign installed (winget `jedisct1.minisign` 0.12), keypair generated.~~
+   **Stage** `gh secret set` for the user's explicit yes (third-party account setting).
+7. End-to-end locally: test key + local feed build, per-user install, update it to a
    newer local build, relaunch.
-9. Merge into `master` (fast-forward from the shared tree when my files are clean
+8. Merge into `master` (fast-forward from the shared tree when my files are clean
    there). Release is the user's call.
 
 ## Findings / gotchas
+
+- **The release key:** ID `F458D6C29DBD2C05`, public key
+  `RWQFLL2dwtZY9DF+FMseD0gj8++iXgURRbysZlwxPPzFowjJEgtnWcAx` (`minisign.pub`). Secret,
+  unencrypted, only at `C:\Users\camer\.minisign\open-task.key` until it becomes the
+  `MINISIGN_SECRET_KEY` secret. Test fixtures use a separate throwaway key whose
+  secret was never kept (`crates/ot-update/testdata/test.pub`).
+- **The hand-written `.res` is byte-identical to `rc.exe`'s** (Windows Kits
+  10.0.26100, `/l 0x409`) for the same VERSIONINFO. PowerShell's
+  `(Get-Item exe).VersionInfo` reads every field; `IsPreRelease` is set for dev
+  builds.
+- **`git describe --dirty` takes the index lock** (it refreshes the index), which
+  could fail another thread's `git add` in the shared tree during any build. The
+  build script uses `describe` without `--dirty` plus `status --porcelain
+  --untracked-files=no` with `GIT_OPTIONAL_LOCKS=0`: read-only.
+- A no-op rebuild stays `Fresh`: `rerun-if-changed` only lists paths that exist
+  (a missing `packed-refs` would force a re-run every build).
+- **`cargo remove` garbage-collects unused `[workspace.dependencies]`**: removing a
+  stray dev-dependency from `ot-update` also deleted the (unused) `ot-record` and
+  `ot-update` workspace entries. Restored from HEAD.
+- **Git Bash `sed -i` strips the CRs** from a CRLF file; use Python with
+  `newline=""` or the Edit tool. `rustfmt.toml` has `newline_style = "Windows"`.
+- `sha2` 0.11 no longer implements `std::io::Write`; hashing uses a read loop.
+- WinHTTP's error codes (12002, 12007, 12029, ...) have no text in the system message
+  table; `imp/windows.rs` spells out the common ones.
+- Live check against GitHub (2026-09-28): `--check-update` and the app's "Check now"
+  both report "the latest release is not signed, or there is none": v0.2.1 has no
+  `SHA256SUMS.minisig`, so `latest/download/SHA256SUMS.minisig` is a 404. The network
+  test (`cargo test -p ot-update -- --ignored`) fetches v0.2.1's `SHA256SUMS`
+  through GitHub's redirect, and gets 404 and the size limit right.
+- Inno's `setup.exe` stub is `asInvoker` (checked in a built installer's manifest), so
+  `std::process::Command` starts it and Setup elevates itself.
 
 - Existing tags `v0.2.0`, `v0.2.1` are annotated; `--tags` covers lightweight ones too.
 - This Claude session runs elevated (High integrity): installs here never show UAC,
@@ -139,12 +173,13 @@ the update if it downloads a new one".
 ## Progress log
 
 - [x] Plan written.
-- [ ] Build identity.
-- [ ] `ot-update` core.
-- [ ] `ot-update` Windows + `--check-update`.
-- [ ] UI + shell.
+- [x] Build identity (`dbfe022`).
+- [x] `ot-update` core (`25c2e9c`): 20 tests, clippy clean on Windows, Linux, macOS.
+- [x] `ot-update` Windows + `--check-update` (`25c2e9c`).
+- [x] UI + shell (`d7967da`): screenshots of the rail and Settings; a posted click on
+      "Check now" reaches GitHub and shows the failure.
 - [ ] Installer relaunch, workflow signing, README.
-- [ ] Key generated; secret staged for approval.
+- [x] Key generated. [ ] Secret staged for approval.
 - [ ] Local end-to-end update.
 - [ ] Merged to `master`.
 

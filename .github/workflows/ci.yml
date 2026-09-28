@@ -69,6 +69,7 @@ jobs:
         shell: bash
         run: |
           set +e
+          cargo run --target ${{ matrix.target }} -- --version || exit 1
           cargo run --target ${{ matrix.target }} -- --headless --passes 2
           code=$?
           set -e

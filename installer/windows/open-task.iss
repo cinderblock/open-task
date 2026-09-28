@@ -16,6 +16,13 @@
 ; Optional:
 ;   VersionInfoVersion   numeric x.y.z for the file version resource (default AppVersion)
 ;   OutputDir            where the setup .exe goes (default: the script's directory)
+;
+; The app updates itself by running this installer (crates/ot-update):
+;   /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /NORESTARTAPPLICATIONS
+;   /RELAUNCH=1 and /ALLUSERS or /CURRENTUSER to match the install.
+; Setup closes the running app through Restart Manager, which the app answers
+; (WM_ENDSESSION), installs, and with /RELAUNCH=1 starts the new version. Keep AppId
+; in step with crates/ot-update/src/imp/windows.rs, which finds the install by it.
 
 #ifndef AppVersion
   #error Pass /DAppVersion=x.y.z
@@ -92,11 +99,22 @@ Name: "{autodesktop}\open-task"; Filename: "{app}\open-task.exe"; Tasks: desktop
 ; user, not with Setup's elevation. Inno 6 defaults postinstall entries to this;
 ; stated here so nobody has to remember that.
 Filename: "{app}\open-task.exe"; Description: "{cm:LaunchProgram,open-task}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; After an update the app asked for (/RELAUNCH=1), start the new version. Silent, so
+; not a postinstall entry; runasoriginaluser starts it as the user who ran the app,
+; not elevated, because the app starts Setup unelevated and Setup elevates itself.
+; (Started from an elevated app, Setup is elevated from the start, and so is this.)
+Filename: "{app}\open-task.exe"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 
 [Code]
 const
   MachineEnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
   UserEnvKey = 'Environment';
+
+{ The app's updater passes /RELAUNCH=1: start the new version when done. }
+function RelaunchRequested: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
 
 { PATH lives in HKLM for an all-users install and HKCU for a per-user one. }
 function EnvRootKey: Integer;

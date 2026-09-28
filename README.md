@@ -17,7 +17,8 @@ and measure nothing yet.
 ## Using it
 
 **Pages:** the rail down the left edge switches between **Processes** and
-**Performance**, with **Settings** at its bottom. It shows labels when the window is
+**Performance**, with **Settings** at its bottom and the version above it, which is
+also the update button (see [Updates](#updates)). It shows labels when the window is
 wide and icons alone when it is narrow; the button at its top flips that.
 **Ctrl+Tab** and **Ctrl+Shift+Tab** step through the pages, and **Ctrl+1**,
 **Ctrl+2** jump to one. Typing (or **Ctrl+F**) on any page goes to the process
@@ -167,7 +168,7 @@ class: tens of megabytes, not hundreds.
 | `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
 | `ot-ui` | UI-agnostic view models: theme, pages, navigation rail, virtualized table, charts. |
 | `ot-record` | Flight Recorder: record and replay a session (planned). |
-| `ot-update` | Self-updater. Automatic updates are opt-in (planned). |
+| `ot-update` | Self-updater: finds signed releases, downloads, verifies and installs them. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
 | `ot-app` | The binary. |
 
@@ -184,7 +185,8 @@ for the install and for every update. That is on purpose: a task manager is the 
 of program you run elevated, and it should not live somewhere any program running
 as you could overwrite it. It installs the x64 or ARM64 build to match the machine,
 adds a Start Menu entry and an uninstaller, and can put `open-task` on the PATH for
-`open-task --headless` in a terminal. A newer installer upgrades in place.
+`open-task --headless` in a terminal. A newer installer upgrades in place, and
+open-task can run it for you (see [Updates](#updates)).
 
 Silent install, from an elevated prompt:
 `open-task-vX.Y.Z-windows-setup.exe /VERYSILENT /NORESTART`. If you cannot elevate,
@@ -196,6 +198,41 @@ confirm the first run.
 The bare binaries for every platform are on the same release as `.zip` / `.tar.gz`
 with a `SHA256SUMS` file. Linux and macOS have no installer because there is nothing
 to install yet beyond the headless probe stub.
+
+## Updates
+
+The version is at the bottom of the rail, above Settings: `v0.3.0` for a release,
+the commit (`25c2e9c-dirty`) for a build from source. It is also the update button. A
+click looks on GitHub for a newer release and, if there is one, downloads and
+verifies it; then the button says **Install v0.3.0**, and a click on that runs the
+installer, which closes open-task, updates it (with an administrator prompt for the
+usual all-users install) and starts the new version. The Settings page has the same
+button with the full version and a sentence on what it is doing.
+
+By default open-task checks when it starts and then once a day, and only says so: it
+downloads on its own only if you turn on **Download updates automatically**, and it
+installs only when you click. **Check for updates automatically** turns the checks
+off. A check fetches two small files from github.com, the latest release's signed
+checksums, and sends nothing but the request for them.
+
+Every release's `SHA256SUMS` is signed with
+[minisign](https://jedisct1.github.io/minisign/), and open-task has the public key
+built in (`minisign.pub` in this repository). It installs nothing that does not match
+a signed checksum, and it never offers a version older than the one running.
+Releases from before the updater (v0.2.1 and earlier) are not signed. To check a
+download yourself:
+
+```
+minisign -Vm SHA256SUMS -P RWQFLL2dwtZY9DF+FMseD0gj8++iXgURRbysZlwxPPzFowjJEgtnWcAx
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Only a copy the installer put in place updates itself. Any other copy (a zip,
+`cargo install`, your own build) is told about a new release, and the button opens
+the release's page.
+
+From a terminal, `open-task --version` prints the version and
+`open-task --check-update` runs a check and prints what it found.
 
 ## Build
 
@@ -230,14 +267,28 @@ terminal.
 `scripts/screenshot.ps1` launches the app, screenshots its window to
 `target/screenshot.png`, and closes it. Handy for checking a rendering change;
 `-AppArgs "--view tree"` captures the tree and `-AppArgs "--page performance"` the
-Performance page. It only ever captures and closes the
+Performance page. `-Click "x,y"` clicks first, at a point read off an earlier
+screenshot. It only ever captures and closes the
 instance it launched, so an installed copy can keep running.
+
+The build names itself from git: a clean checkout of a release tag is that release
+(`0.2.1`); anything else carries the commit, `git describe` style
+(`0.2.1-21-g25c2e9c`), with `-dirty` for uncommitted changes. On Windows the exe
+carries it as its version resource too (Properties > Details).
 
 ## Releases
 
 CI builds every push. Pushing a tag `vX.Y.Z` builds Windows (x64, ARM64), Linux (x64,
 ARM64) and macOS (Apple silicon, Intel) and publishes a GitHub release with a
-`SHA256SUMS` file. The tag must match the workspace version in `Cargo.toml`.
+`SHA256SUMS` file and its minisign signature, `SHA256SUMS.minisig`, which is what the
+updater trusts. The tag must match the workspace version in `Cargo.toml`, and each
+binary must report it. Signing needs the repository secret `MINISIGN_SECRET_KEY`, the
+secret half of `minisign.pub`; without it the release fails rather than publish
+something the updater cannot verify.
+
+To try the updater against a local copy of a release, build with
+`OT_UPDATE_FEED=http://127.0.0.1:8000/releases` and `OT_UPDATE_PUBLIC_KEY` set to a
+throwaway minisign public key; only a binary built that way is affected.
 
 ## License
 
