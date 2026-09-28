@@ -14,7 +14,9 @@
 //!
 //! The Updates section starts with the update button as a card: the full version,
 //! what the updater is doing in a sentence, and a button for the next step, the
-//! same step a click on the rail's version takes.
+//! same step a click on the rail's version takes. Its three switches build on each
+//! other (checking, then downloading, then installing), so turning one on turns on
+//! those it needs, and turning one off turns off those that need it.
 
 use ot_paint::{DisplayList, HAlign, Point, Rect, VAlign};
 
@@ -33,8 +35,12 @@ pub struct Settings {
     /// button. On unless turned off.
     pub check_updates: bool,
     /// Download and verify a new release as soon as a check finds it, so a click
-    /// installs it. Off unless turned on. Installing always takes a click.
+    /// installs it. Off unless turned on.
     pub download_updates: bool,
+    /// Install a downloaded release when open-task is closed, so the next start
+    /// is the new version. Off unless turned on; implies the two above. Never while
+    /// it runs: restarting would lose the history it has gathered.
+    pub install_updates: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +49,7 @@ impl Default for Settings {
             animate_rows: None,
             check_updates: true,
             download_updates: false,
+            install_updates: false,
         }
     }
 }
@@ -69,6 +76,7 @@ enum Toggle {
     AnimateRows,
     CheckUpdates,
     DownloadUpdates,
+    InstallUpdates,
 }
 
 impl Toggle {
@@ -77,6 +85,7 @@ impl Toggle {
             Self::AnimateRows => "Animate rows as the order changes",
             Self::CheckUpdates => "Check for updates automatically",
             Self::DownloadUpdates => "Download updates automatically",
+            Self::InstallUpdates => "Install updates automatically",
         }
     }
 
@@ -96,8 +105,12 @@ impl Toggle {
                 "Looks on GitHub for a new release when open-task starts and once a day."
             }
             (Self::DownloadUpdates, _, _) => {
-                "Downloads and verifies a new release as soon as one is found. \
-                 Installing it always takes a click."
+                "Downloads and verifies a new release as soon as one is found, so one \
+                 click installs it."
+            }
+            (Self::InstallUpdates, _, _) => {
+                "Installs a downloaded release when you close open-task, so it starts \
+                 as the new version next time."
             }
         }
     }
@@ -124,16 +137,32 @@ impl Toggle {
             Self::AnimateRows => s.animates_rows(cx.system_animations),
             Self::CheckUpdates => s.check_updates,
             Self::DownloadUpdates => s.download_updates,
+            Self::InstallUpdates => s.install_updates,
         }
     }
 
-    /// Flip what the switch shows, making it the user's explicit choice.
+    /// Flip what the switch shows, making it the user's explicit choice. The
+    /// update switches keep their chain: installing needs downloading, which needs
+    /// checking.
     fn flip(self, s: &mut Settings, cx: Context<'_>) {
         let on = !self.get(*s, cx);
         match self {
             Self::AnimateRows => s.animate_rows = Some(on),
-            Self::CheckUpdates => s.check_updates = on,
-            Self::DownloadUpdates => s.download_updates = on,
+            Self::CheckUpdates => {
+                s.check_updates = on;
+                s.download_updates &= on;
+                s.install_updates &= on;
+            }
+            Self::DownloadUpdates => {
+                s.download_updates = on;
+                s.check_updates |= on;
+                s.install_updates &= on;
+            }
+            Self::InstallUpdates => {
+                s.install_updates = on;
+                s.check_updates |= on;
+                s.download_updates |= on;
+            }
         }
     }
 }
@@ -155,10 +184,11 @@ const SECTIONS: [(&str, &[Card]); 2] = [
             Card::Update,
             Card::Toggle(Toggle::CheckUpdates),
             Card::Toggle(Toggle::DownloadUpdates),
+            Card::Toggle(Toggle::InstallUpdates),
         ],
     ),
 ];
-const CARD_COUNT: usize = 4;
+const CARD_COUNT: usize = 5;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -584,5 +614,37 @@ mod tests {
         let at = page.cards[3].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
+        assert!(s.check_updates, "downloading needs checking");
+    }
+
+    #[test]
+    fn installing_automatically_is_off_and_brings_what_it_needs() {
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        let dl = paint(&mut page, s, cx(true, &update));
+        assert_eq!(state_of(&dl, page.cards[4]), "Off");
+        assert!(texts(&dl)
+            .iter()
+            .any(|t| t == "Install updates automatically"));
+
+        // On: downloading and checking come with it.
+        s.check_updates = false;
+        let at = page.cards[4].center();
+        let r = click(&mut page, at, &mut s, cx(true, &update));
+        assert!(s.install_updates && s.download_updates && s.check_updates);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        // Downloading off: installing goes too, checking stays.
+        let _ = paint(&mut page, s, cx(true, &update));
+        let at = page.cards[3].center();
+        let _ = click(&mut page, at, &mut s, cx(true, &update));
+        assert!(!s.download_updates && !s.install_updates && s.check_updates);
+        // Checking off takes everything with it.
+        s.download_updates = true;
+        s.install_updates = true;
+        let _ = paint(&mut page, s, cx(true, &update));
+        let at = page.cards[2].center();
+        let _ = click(&mut page, at, &mut s, cx(true, &update));
+        assert!(!s.check_updates && !s.download_updates && !s.install_updates);
     }
 }

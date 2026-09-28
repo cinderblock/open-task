@@ -2,8 +2,9 @@
 //! follows.
 //!
 //! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each
-//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`), per user like every other
-//! per-user preference on Windows. A missing key or value means the default. Nothing here is fatal: a value that cannot be read or written is
+//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`, `InstallUpdates`), per user
+//! like every other per-user preference on Windows. A missing key or value means the
+//! default. Nothing here is fatal: a value that cannot be read or written is
 //! logged and the app carries on with what it has.
 
 use std::ffi::c_void;
@@ -22,6 +23,7 @@ const KEY: PCWSTR = w!(r"Software\open-task");
 const ANIMATE_ROWS: PCWSTR = w!("AnimateRows");
 const CHECK_UPDATES: PCWSTR = w!("CheckForUpdates");
 const DOWNLOAD_UPDATES: PCWSTR = w!("DownloadUpdates");
+const INSTALL_UPDATES: PCWSTR = w!("InstallUpdates");
 
 /// The settings as last saved, defaults for anything never saved.
 pub fn load() -> Settings {
@@ -31,6 +33,7 @@ pub fn load() -> Settings {
         animate_rows: read_dword(ANIMATE_ROWS).map(|v| v != 0),
         check_updates: flag(CHECK_UPDATES, defaults.check_updates),
         download_updates: flag(DOWNLOAD_UPDATES, defaults.download_updates),
+        install_updates: flag(INSTALL_UPDATES, defaults.install_updates),
     }
 }
 
@@ -41,6 +44,7 @@ pub fn save(s: &Settings) {
         (ANIMATE_ROWS, s.animate_rows),
         (CHECK_UPDATES, Some(s.check_updates)),
         (DOWNLOAD_UPDATES, Some(s.download_updates)),
+        (INSTALL_UPDATES, Some(s.install_updates)),
     ];
     let mut key = HKEY::default();
     // SAFETY: the out-pointer is a local; the strings are static.

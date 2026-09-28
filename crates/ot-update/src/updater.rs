@@ -305,8 +305,10 @@ impl Updater {
         self.spawn("ot-update-download", Shared::download);
     }
 
-    /// Run the downloaded installer. It closes this app if it goes ahead.
-    pub fn install(&self) {
+    /// Run the downloaded installer. It closes this app if it goes ahead, and with
+    /// `relaunch` starts the new version when it is done (a click); without, it
+    /// leaves it closed (installing as the app closes).
+    pub fn install(&self, relaunch: bool) {
         let (ready, installation) = {
             let mut state = self.shared.lock();
             let Some(installation) = self.shared.config.installation.clone() else {
@@ -326,7 +328,7 @@ impl Updater {
         };
         self.shared.changed();
         self.spawn("ot-update-install", move |shared| {
-            let args = installer_args(installation.scope);
+            let args = installer_args(installation.scope, relaunch);
             tracing::info!(installer = %ready.path.display(), ?args, "starting setup");
             let outcome = shared.platform.run_installer(&ready.path, &args);
             let mut state = shared.lock();
@@ -515,22 +517,26 @@ fn get(platform: &dyn Platform, url: &str, limit: u64) -> Result<Vec<u8>, Update
 
 /// Setup's command line for an update: no wizard (a progress window only), no
 /// questions, no reboot; close the running app and do not let Restart Manager
-/// restart it, because the installer's own `[Run]` entry (enabled by `/RELAUNCH=1`)
-/// starts the new version as the user who started Setup, not elevated.
+/// restart it. With `relaunch`, the installer's own `[Run]` entry (enabled by
+/// `/RELAUNCH=1`) starts the new version as the user who started Setup, not
+/// elevated.
 #[must_use]
-pub fn installer_args(scope: Scope) -> Vec<&'static str> {
-    vec![
+pub fn installer_args(scope: Scope, relaunch: bool) -> Vec<&'static str> {
+    let mut args = vec![
         "/SILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/CLOSEAPPLICATIONS",
         "/NORESTARTAPPLICATIONS",
-        "/RELAUNCH=1",
-        match scope {
-            Scope::Machine => "/ALLUSERS",
-            Scope::User => "/CURRENTUSER",
-        },
-    ]
+    ];
+    if relaunch {
+        args.push("/RELAUNCH=1");
+    }
+    args.push(match scope {
+        Scope::Machine => "/ALLUSERS",
+        Scope::User => "/CURRENTUSER",
+    });
+    args
 }
 
 /// Inno Setup's exit codes, in words.
@@ -785,7 +791,7 @@ mod tests {
         #[cfg(windows)]
         assert!(std::fs::remove_file(&path).is_err());
 
-        rig.updater.install();
+        rig.updater.install(true);
         let after = rig.settle();
         let runs = rig.fake.runs.lock().unwrap().clone();
         assert_eq!(runs.len(), 1);
@@ -816,11 +822,15 @@ mod tests {
         let rig = Rig::new("0.2.1", true, fake);
         rig.updater.check(true, true);
         assert_eq!(rig.settle(), Status::Ready { version: v030() });
-        rig.updater.install();
+        rig.updater.install(true);
         assert_eq!(rig.settle(), Status::Ready { version: v030() });
-        rig.updater.install();
+        // Installing as the app closes: the same, without the relaunch.
+        rig.updater.install(false);
         assert_eq!(rig.settle(), Status::Ready { version: v030() });
-        assert_eq!(rig.fake.runs.lock().unwrap().len(), 2);
+        let runs = rig.fake.runs.lock().unwrap().clone();
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].1.iter().any(|a| a == "/RELAUNCH=1"));
+        assert!(!runs[1].1.iter().any(|a| a == "/RELAUNCH=1"));
     }
 
     #[test]
@@ -833,7 +843,7 @@ mod tests {
             rig.updater.release_page().as_deref(),
             Some("https://example.test/releases/tag/v0.3.0")
         );
-        rig.updater.install();
+        rig.updater.install(true);
         assert_eq!(rig.settle(), Status::Available { version: v030() });
         assert!(rig.fake.runs.lock().unwrap().is_empty());
     }

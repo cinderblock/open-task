@@ -51,12 +51,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowTextW, ShowWindow, TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES,
     MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, SW_SHOWNORMAL,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_APP, WM_CHAR,
-    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    MF_STRING, MSG, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWDEFAULT,
+    SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA,
+    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::gfx::Gfx;
@@ -125,6 +125,19 @@ struct State {
     /// `None` if this build's version does not parse, which a build from this
     /// repository never produces.
     updater: Option<Updater>,
+    closing: Closing,
+}
+
+/// How far the app is along in closing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closing {
+    No,
+    /// Closed with an update waiting and "Install updates automatically" on: the
+    /// window is hidden and Setup is running. Restart Manager ends the process, or
+    /// the close finishes if Setup gives up.
+    InstallingUpdate,
+    /// Logoff, shutdown or Restart Manager is closing the app: never install then.
+    SessionEnding,
 }
 
 /// What a message handler decided. The borrow on [`State`] ends before anything
@@ -144,6 +157,8 @@ enum Outcome {
     Rescale(RECT),
     /// Tell the user something in a message box, once the state is released.
     Notify(String),
+    /// Hide the window, once the state is released (`ShowWindow` re-enters).
+    Hide,
 }
 
 fn win(context: &'static str) -> impl FnOnce(windows::core::Error) -> ShellError {
@@ -267,6 +282,7 @@ pub fn run(
         cursors,
         title: TITLE,
         updater,
+        closing: Closing::No,
     }));
     let state_ptr = Box::into_raw(state);
     // SAFETY: hwnd is valid; the pointer stays alive until after the loop below.
@@ -549,6 +565,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        Outcome::Hide => {
+            // SAFETY: hwnd is valid.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            LRESULT(0)
+        }
     }
 }
 
@@ -762,12 +785,24 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_UPDATE => {
             if let Some(u) = &st.updater {
-                if st.app.set_update_status(u.status()) {
+                let status = u.status();
+                // Installing as it closed, and Setup ended without closing it
+                // (cancelled, or failed): finish closing.
+                let installing = matches!(status, ot_update::Status::Installing { .. });
+                if st.closing == Closing::InstallingUpdate && !installing {
+                    tracing::info!(?status, "setup did not close the app; closing");
+                    // SAFETY: posting to our own window.
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+                if st.app.set_update_status(status) {
                     invalidate(hwnd);
                 }
             }
             Outcome::Done(LRESULT(0))
         }
+        WM_CLOSE => close(st),
         WM_TIMER if wparam.0 == TIMER_UPDATE => {
             // After the first tick, look hourly; the updater decides whether a day
             // has passed since the last check.
@@ -778,7 +813,8 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let settings = st.app.settings();
             if let Some(u) = &st.updater {
                 if settings.check_updates && u.due(CHECK_EVERY) {
-                    u.check(false, settings.download_updates && u.can_install());
+                    let download = settings.download_updates || settings.install_updates;
+                    u.check(false, download && u.can_install());
                 }
             }
             Outcome::Done(LRESULT(0))
@@ -789,6 +825,7 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 tracing::info!(reason = lparam.0, "session ending; closing");
+                st.closing = Closing::SessionEnding;
                 // SAFETY: posting to our own window.
                 unsafe {
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -879,7 +916,8 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
             let updater = cell.try_borrow().ok().and_then(|st| st.updater.clone());
             if let Some(u) = updater {
                 let waiting = matches!(u.status(), ot_update::Status::Available { .. });
-                if settings.download_updates && waiting && u.can_install() {
+                let download = settings.download_updates || settings.install_updates;
+                if download && waiting && u.can_install() {
                     u.download();
                 }
             }
@@ -892,6 +930,32 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
     }
 }
 
+/// `WM_CLOSE`. With "Install updates automatically" on and a verified update
+/// waiting, the window hides and Setup runs without relaunching the app: the next
+/// start is the new version. The process stays until Setup's Restart Manager ends
+/// it, which keeps the installer locked through Setup's elevation, as a click does.
+/// Anything else closes as usual.
+fn close(st: &mut State) -> Outcome {
+    if st.closing != Closing::No {
+        return Outcome::Default;
+    }
+    let settings = st.app.settings();
+    let Some(u) = st.updater.clone() else {
+        return Outcome::Default;
+    };
+    let ready = matches!(u.status(), ot_update::Status::Ready { .. });
+    if !(settings.install_updates && ready && u.can_install()) {
+        return Outcome::Default;
+    }
+    tracing::info!("installing the update as open-task closes");
+    st.closing = Closing::InstallingUpdate;
+    if let Some(mut s) = st.sampler.take() {
+        s.stop();
+    }
+    u.install(false);
+    Outcome::Hide
+}
+
 /// The update button was pressed. The updater works on its own threads and
 /// reports back with `WM_APP_UPDATE`.
 fn update(cell: &RefCell<State>, hwnd: HWND, action: UpdateAction) {
@@ -902,7 +966,7 @@ fn update(cell: &RefCell<State>, hwnd: HWND, action: UpdateAction) {
         // Asked for: download straight away if this copy can install it.
         UpdateAction::Check => u.check(true, u.can_install()),
         UpdateAction::Download => u.download(),
-        UpdateAction::Install => u.install(),
+        UpdateAction::Install => u.install(true),
         UpdateAction::OpenReleasePage => {
             if let Some(url) = u.release_page() {
                 open_url(hwnd, &url);
