@@ -28,8 +28,9 @@ const VERSION: &str = env!("OT_VERSION");
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let version = args.iter().any(|a| a == "--version" || a == "-V");
+    let check_update = args.iter().any(|a| a == "--check-update");
     let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
-    if headless || version {
+    if headless || version || check_update {
         #[cfg(windows)]
         ot_shell_win::attach_parent_console();
     }
@@ -46,6 +47,9 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
     tracing::info!(version = VERSION, "open-task");
+    if check_update {
+        std::process::exit(run_check_update());
+    }
 
     let theme = arg_value(&args, "--theme").unwrap_or("system");
     let view = arg_value(&args, "--view").unwrap_or("list");
@@ -76,6 +80,40 @@ fn main() {
         run_headless(Box::new(probe), config, passes);
     } else {
         run_gui(Box::new(probe), config, theme, view, page);
+    }
+}
+
+/// `--check-update`: what the update button's check does, printed. Exit code 0
+/// whether or not there is an update; 1 if the check failed.
+fn run_check_update() -> i32 {
+    let build = match ot_update::Build::parse(VERSION) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("this build's version does not parse: {e}");
+            return 1;
+        }
+    };
+    println!("open-task v{build}");
+    match ot_update::installation() {
+        Some(i) => println!("installed for {:?} in {}", i.scope, i.dir.display()),
+        None => println!("not installed by the installer: updates are announced, not installed"),
+    }
+    let feed = ot_update::Feed::official();
+    let platform = ot_update::native(&format!("open-task/{VERSION}"));
+    match ot_update::latest(platform.as_ref(), &feed) {
+        Ok(release) => {
+            let v = &release.version;
+            if build.is_older_than(v) {
+                println!("v{v} is available: {}", feed.release_page(v));
+            } else {
+                println!("up to date (the latest release is v{v})");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("could not check for updates: {e}");
+            1
+        }
     }
 }
 

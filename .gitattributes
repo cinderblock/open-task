@@ -10,3 +10,6 @@
 *.png     binary
 *.ico     binary
 *.icns    binary
+
+# Signed test fixtures: the signatures cover these exact bytes.
+crates/ot-update/testdata/** -text
