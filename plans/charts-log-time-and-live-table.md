@@ -110,6 +110,11 @@ The user's feedback on 2026-09-28, five items:
     Option<bool>`, `None` = follow Windows, not written to the registry). Changed
     from "system off always wins" on finding this machine has animation effects
     off: the user asked for G and would never have seen it.
+    **User, 2026-09-28: the setting must show that Windows' animations are
+    globally off, if they are.** So whenever they are off the card carries an
+    extra accent-colored line, in all three states: never chosen ("so this is
+    off until you turn it on here"), on ("open-task animates rows anyway"), off
+    ("off too"). The page repaints when `WM_SETTINGCHANGE` reports a change.
 13. **Settings live on a Settings page** at the bottom of the navigation rail (the
     Windows 11 Task Manager layout), in its own module `settings.rs`. Persisted per
     user in `HKCU\Software\open-task` (DWORD values) by the Windows shell; `ot-ui`
@@ -233,6 +238,10 @@ The user's feedback on 2026-09-28, five items:
       Settings page off/on and the registry value (then removed again; the key did
       not exist before), pause (title, status, table unchanged pixel for pixel over
       2.5 s), "Order held" with rows staying put, a mid-slide frame.
+- [x] Settings card shows Windows' animation effects being off in every state
+      (checked in the app: `target/drive/note-states.png`; registry key removed
+      again). The live repaint on a Windows change is untested here: testing it
+      means toggling the user's own Windows animation setting.
 - [ ] Item 5: treemap, then icicle strip.
 
 ## Item 4: keeping the table from jumping (options put to the user)

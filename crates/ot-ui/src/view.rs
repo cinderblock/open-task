@@ -694,6 +694,12 @@ impl App {
         self.apply_animation();
     }
 
+    /// The platform's animation effects, as last told.
+    #[must_use]
+    pub fn system_animations(&self) -> bool {
+        self.system_animations
+    }
+
     fn apply_animation(&mut self) {
         self.table
             .set_animate(self.settings.animates_rows(self.system_animations));

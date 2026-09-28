@@ -89,7 +89,8 @@ under a click; new processes still appear where they belong, exited ones go, and
 table re-sorts the moment the pointer leaves. When a re-sort moves the selected
 row, the table scrolls with it so it stays where it was on screen. Rows slide to
 their new places instead of jumping; that follows Windows' animation effects setting
-until you set it yourself on the **Settings** page.
+until you set it yourself on the **Settings** page, which says whenever Windows has
+animation effects off, whichever way you set the switch.
 
 **Space** pauses the display, as in Process Explorer: the table, the cards and every
 graph stay as they were, and the title says "(paused)". Sampling carries on

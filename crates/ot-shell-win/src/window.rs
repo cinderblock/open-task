@@ -705,8 +705,13 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             Outcome::Done(LRESULT(0))
         }
         WM_SETTINGCHANGE => {
-            // Sent for any system setting; re-reading these is cheap.
-            st.app.set_system_animations(prefs::system_animations());
+            // Sent for any system setting; re-reading these is cheap. The Settings
+            // page shows Windows' animation effects, so a change repaints.
+            let animations = prefs::system_animations();
+            if animations != st.app.system_animations() {
+                st.app.set_system_animations(animations);
+                invalidate(hwnd);
+            }
             if st.theme_pref == ThemePreference::System {
                 let dark = system_prefers_dark();
                 if dark != st.dark {

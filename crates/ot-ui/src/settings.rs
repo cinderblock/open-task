@@ -8,7 +8,9 @@
 //!
 //! A setting that follows a system preference (row animation follows Windows'
 //! animation effects, the reduced-motion switch) does so only until the user flips
-//! it here; from then on the user's choice stands.
+//! it here; from then on the user's choice stands. Whenever that system preference
+//! is off, the card says so, whichever way the switch is set, so the state of both
+//! is always in view.
 
 use ot_paint::{DisplayList, HAlign, Point, Rect, VAlign};
 
@@ -47,23 +49,37 @@ impl Toggle {
         }
     }
 
-    /// The line under the title: what the setting does, or, while it still
-    /// follows the system, that it does.
+    /// The line under the title: what the setting does, and while it still
+    /// follows Windows (with Windows' animations on), that it does.
     fn detail(self, s: Settings, system_animations: bool) -> &'static str {
         match (self, s.animate_rows, system_animations) {
-            (Self::AnimateRows, Some(_), _) => {
-                "Rows slide to their new place when the table re-sorts, instead of \
-                 jumping there."
-            }
             (Self::AnimateRows, None, true) => {
                 "Rows slide to their new place when the table re-sorts. Following \
                  Windows' animation effects."
             }
-            (Self::AnimateRows, None, false) => {
-                "Off because Windows' animation effects are off. Turn on to animate \
-                 the table anyway."
+            (Self::AnimateRows, _, _) => {
+                "Rows slide to their new place when the table re-sorts, instead of \
+                 jumping there."
             }
         }
+    }
+
+    /// A line of its own when Windows' animation effects are off, whatever the
+    /// switch says, with what that means for the switch.
+    fn system_note(self, s: Settings, system_animations: bool) -> Option<&'static str> {
+        if system_animations {
+            return None;
+        }
+        Some(match (self, s.animate_rows) {
+            (Self::AnimateRows, None) => {
+                "Windows' animation effects are off, so this is off until you turn it \
+                 on here."
+            }
+            (Self::AnimateRows, Some(true)) => {
+                "Windows' animation effects are off; open-task animates rows anyway."
+            }
+            (Self::AnimateRows, Some(false)) => "Windows' animation effects are off too.",
+        })
     }
 
     /// Whether the switch shows on.
@@ -83,6 +99,10 @@ impl Toggle {
 }
 
 const CARD_H: f32 = 64.0;
+/// A card with a line about the system setting under its detail.
+const CARD_H_NOTE: f32 = 80.0;
+const TITLE_LINE_H: f32 = 20.0;
+const LINE_H: f32 = 17.0;
 const SWITCH_W: f32 = 40.0;
 const SWITCH_H: f32 = 20.0;
 const KNOB_R: f32 = 5.0;
@@ -159,7 +179,9 @@ impl SettingsPage {
         dl.label("Process table", heading, theme.title, theme.text_dim);
 
         for (i, toggle) in Toggle::ALL.into_iter().enumerate() {
-            let (card, below) = remaining.split_top(CARD_H);
+            let note = toggle.system_note(settings, system_animations);
+            let card_h = if note.is_some() { CARD_H_NOTE } else { CARD_H };
+            let (card, below) = remaining.split_top(card_h);
             let (_, below) = below.split_top(4.0);
             remaining = below;
             self.cards[i] = card;
@@ -173,26 +195,33 @@ impl SettingsPage {
 
             let inner = card.inset(theme.pad * 2.0, theme.pad);
             let (text, control) = inner.split_left((inner.w - SWITCH_W - STATE_W).max(0.0));
-            let (head, sub) = text.split_top(text.h * 0.5);
-            dl.text(
+            // Title, detail and the note, as one block centered in the card.
+            let lines = if note.is_some() { 2.0 } else { 1.0 };
+            let block_h = TITLE_LINE_H + LINE_H * lines;
+            let top = text.y + ((text.h - block_h) * 0.5).max(0.0);
+            let line = |y: f32, h: f32| Rect::new(text.x, y, text.w, h);
+            dl.label(
                 toggle.title(),
-                head,
+                line(top, TITLE_LINE_H),
                 theme.cell,
                 theme.text,
-                HAlign::Left,
-                VAlign::Bottom,
-                true,
             );
-            let on = toggle.get(settings, system_animations);
-            dl.text(
+            let below_title = top + TITLE_LINE_H;
+            dl.label(
                 toggle.detail(settings, system_animations),
-                sub,
+                line(below_title, LINE_H),
                 theme.small,
                 theme.text_dim,
-                HAlign::Left,
-                VAlign::Top,
-                true,
             );
+            if let Some(note) = note {
+                dl.label(
+                    note,
+                    line(below_title + LINE_H, LINE_H),
+                    theme.small,
+                    theme.accent,
+                );
+            }
+            let on = toggle.get(settings, system_animations);
 
             let (state, switch) = control.split_left(STATE_W);
             dl.text(
@@ -309,20 +338,45 @@ mod tests {
         page.paint(&mut dl, Rect::new(0.0, 0.0, 600.0, 400.0), s, false, &theme);
         let strings = texts(&dl);
         assert!(strings.iter().any(|t| t == "Off"));
-        assert!(strings
-            .iter()
-            .any(|t| t.starts_with("Off because Windows' animation effects are off")));
-        // Turning it on here overrides Windows, for this app.
+        assert!(strings.iter().any(|t| t
+            == "Windows' animation effects are off, so this is off until you turn it on here."));
+        let tall = page.cards[0].h;
+        // Turning it on here overrides Windows, for this app, and the card still
+        // says Windows has them off.
         let card = page.cards[0].center();
-        let _ = page.handle(
-            UiEvent::MouseDown {
-                at: card,
-                button: MouseButton::Left,
-            },
-            &mut s,
-            false,
-        );
+        let click = |page: &mut SettingsPage, s: &mut Settings| {
+            let _ = page.handle(
+                UiEvent::MouseDown {
+                    at: card,
+                    button: MouseButton::Left,
+                },
+                s,
+                false,
+            );
+        };
+        click(&mut page, &mut s);
         assert_eq!(s.animate_rows, Some(true));
         assert!(s.animates_rows(false));
+        dl.clear();
+        page.paint(&mut dl, Rect::new(0.0, 0.0, 600.0, 400.0), s, false, &theme);
+        let strings = texts(&dl);
+        assert!(strings.iter().any(|t| t == "On"));
+        assert!(strings
+            .iter()
+            .any(|t| t == "Windows' animation effects are off; open-task animates rows anyway."));
+        // Off by choice: still said.
+        click(&mut page, &mut s);
+        assert_eq!(s.animate_rows, Some(false));
+        dl.clear();
+        page.paint(&mut dl, Rect::new(0.0, 0.0, 600.0, 400.0), s, false, &theme);
+        assert!(texts(&dl)
+            .iter()
+            .any(|t| t == "Windows' animation effects are off too."));
+        // With Windows' animations on there is nothing to say, and the card is
+        // back to its usual height.
+        dl.clear();
+        page.paint(&mut dl, Rect::new(0.0, 0.0, 600.0, 400.0), s, true, &theme);
+        assert!(!texts(&dl).iter().any(|t| t.starts_with("Windows'")));
+        assert!(page.cards[0].h < tall);
     }
 }
