@@ -19,4 +19,4 @@ pub mod timeline;
 pub use history::Ring;
 pub use sampler::{Sampler, SamplerConfig};
 pub use snapshot::Snapshot;
-pub use timeline::{Sample, Series, Timeline};
+pub use timeline::{Bucket, History, Resolution, Retention, Sample, Series, Timeline};

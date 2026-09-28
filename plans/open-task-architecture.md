@@ -67,7 +67,9 @@ Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks.
    likes this a lot and wants to *prototype* a log-scale Y axis too. Design
    consequence: history must be stored with timestamps at multiple resolutions, not
    as a single fixed-rate ring. First sparklines may be linear; the storage must not
-   paint us into a corner.
+   paint us into a corner. Built 2026-09-28 for the summary charts (one-hour span,
+   raw samples plus 10 s buckets, synced hover crosshair); see
+   `plans/charts-log-time-and-live-table.md`. The log Y axis is still unbuilt.
 9. **The Windows installer is per-machine (Program Files, elevated), and updates
    will need a UAC prompt.** User decision 2026-09-26: "I don't mind a UAC prompt on
    update. keep it safe." A task manager runs elevated; its binary must not sit
@@ -172,9 +174,10 @@ goes." Same for a future headless/remote mode.
    `plans/process-tree-view.md`). Process details (image path, command line, user,
    integrity), the search filter, column resize with horizontal scroll, and the
    context menu (End task, End process tree, Open file location) are done
-   (2026-09-26; see `plans/process-details-actions.md`). Next: the Performance
-   view (per-core graphs, memory breakdown, log-scale time axis per decision 8),
-   then column reorder and persisted layout.
+   (2026-09-26; see `plans/process-details-actions.md`). The summary charts moved
+   to the log-scale time axis with a shared hover (2026-09-28; see
+   `plans/charts-log-time-and-live-table.md`). Next: the Performance view
+   (per-core graphs, memory breakdown), then column reorder and persisted layout.
 7. Diagnostics engine ("why is my computer slow"). First piece done 2026-09-27:
    services, threads and per-service CPU under every process, and an on-demand
    ETW CPU sample with module and client attribution; see

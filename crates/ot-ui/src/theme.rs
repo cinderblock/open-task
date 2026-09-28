@@ -26,6 +26,8 @@ pub struct Theme {
     pub row_hover: Color,
     pub row_selected: Color,
     pub grid: Color,
+    /// The hover line across the charts.
+    pub crosshair: Color,
     /// Base color for per-cell heat tint; alpha is scaled by intensity.
     pub heat: Color,
     pub scrollbar: Color,
@@ -84,6 +86,7 @@ impl Theme {
             row_hover: Color::rgba(1.0, 1.0, 1.0, 0.06),
             row_selected: Color::hex(0x60_CD_FF).with_alpha(0.22),
             grid: Color::rgba(1.0, 1.0, 1.0, 0.07),
+            crosshair: Color::rgba(1.0, 1.0, 1.0, 0.35),
             heat: Color::hex(0xFF_B4_54),
             scrollbar: Color::rgba(1.0, 1.0, 1.0, 0.25),
             cell,
@@ -125,6 +128,7 @@ impl Theme {
             row_hover: Color::rgba(0.0, 0.0, 0.0, 0.05),
             row_selected: Color::hex(0x00_5F_B8).with_alpha(0.18),
             grid: Color::rgba(0.0, 0.0, 0.0, 0.08),
+            crosshair: Color::rgba(0.0, 0.0, 0.0, 0.35),
             heat: Color::hex(0xE0_7A_00),
             scrollbar: Color::rgba(0.0, 0.0, 0.0, 0.3),
             cell,

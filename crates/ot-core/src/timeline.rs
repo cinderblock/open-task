@@ -2,14 +2,19 @@
 //!
 //! Every graph is a window over one of these. Each point carries its own timestamp
 //! rather than assuming a fixed cadence, because the sampling interval is adjustable
-//! at runtime and because the charts are meant to grow a log-scale time axis, which
-//! needs real times, not sample indices.
+//! at runtime and because the charts draw on a log-scale time axis, which needs real
+//! times, not sample indices.
 //!
-//! Capacity is fixed, so a session that runs for a week has the same memory ceiling
-//! as one that runs for a minute. Multi-resolution retention (full rate for the last
-//! minutes, decimated for hours) is the planned next step and slots in behind this
-//! API without changing callers.
+//! History is kept at several resolutions, the way the charts read it: every raw
+//! sample for the last few minutes, then fixed-width buckets (min, max, mean) for
+//! the hours behind that. A log axis spends most of its width on the recent past and
+//! compresses the rest, so the old end never needs raw samples, only enough
+//! resolution for the pixels it gets. Every tier has a fixed capacity, so a session
+//! that runs for a week has the same memory ceiling as one that runs for a minute.
 
+use std::collections::vec_deque;
+use std::iter::Rev;
+use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ot_model::Tick;
@@ -17,7 +22,7 @@ use ot_model::Tick;
 use crate::history::Ring;
 use crate::snapshot::Snapshot;
 
-/// One point on a series.
+/// One raw sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     /// Wall-clock time of the sample, milliseconds since the Unix epoch.
@@ -25,54 +30,236 @@ pub struct Sample {
     pub value: f32,
 }
 
-/// A bounded series of timestamped values.
+/// A summary of one or more consecutive samples. A raw sample reads as a bucket of
+/// one, so readers handle every resolution the same way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bucket {
+    /// Time of the first and last sample in the bucket, milliseconds since the Unix
+    /// epoch. Equal for a single sample.
+    pub first_ms: i64,
+    pub last_ms: i64,
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    /// Samples summarized.
+    pub count: u32,
+}
+
+impl Bucket {
+    fn of(s: Sample) -> Self {
+        Self {
+            first_ms: s.at_unix_ms,
+            last_ms: s.at_unix_ms,
+            min: s.value,
+            max: s.value,
+            mean: s.value,
+            count: 1,
+        }
+    }
+
+    /// Midpoint in time, where a chart places the bucket.
+    #[must_use]
+    pub fn mid_ms(&self) -> i64 {
+        self.first_ms + (self.last_ms - self.first_ms) / 2
+    }
+}
+
+/// One coarse tier of a series' history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolution {
+    /// Bucket width in milliseconds. Buckets are aligned to multiples of this since
+    /// the Unix epoch, so two series (or two sessions) bucket the same instants alike.
+    pub bucket_ms: i64,
+    /// Buckets kept.
+    pub capacity: usize,
+}
+
+/// How much history a series keeps, at which resolutions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// Raw samples kept, each at its own timestamp.
+    pub raw: usize,
+    /// Coarser tiers, finest first. Each should cover more time than the one before
+    /// it, or it adds nothing.
+    pub tiers: &'static [Resolution],
+}
+
+impl Retention {
+    /// Raw samples only.
+    #[must_use]
+    pub const fn raw(capacity: usize) -> Self {
+        Self {
+            raw: capacity,
+            tiers: &[],
+        }
+    }
+}
+
+/// A bucket being filled: the sum is kept wide so a long bucket's mean does not
+/// drift.
+#[derive(Debug, Clone, Copy)]
+struct Open {
+    index: i64,
+    bucket: Bucket,
+    sum: f64,
+}
+
+#[derive(Debug, Clone)]
+struct Tier {
+    bucket_ms: i64,
+    closed: Ring<Bucket>,
+    open: Option<Open>,
+}
+
+impl Tier {
+    fn push(&mut self, s: Sample) {
+        let index = s.at_unix_ms.div_euclid(self.bucket_ms);
+        match &mut self.open {
+            Some(o) if o.index == index => {
+                let b = &mut o.bucket;
+                b.last_ms = b.last_ms.max(s.at_unix_ms);
+                b.min = b.min.min(s.value);
+                b.max = b.max.max(s.value);
+                b.count += 1;
+                o.sum += f64::from(s.value);
+                b.mean = (o.sum / f64::from(b.count)) as f32;
+            }
+            open => {
+                if let Some(done) = open.take() {
+                    self.closed.push(done.bucket);
+                }
+                *open = Some(Open {
+                    index,
+                    bucket: Bucket::of(s),
+                    sum: f64::from(s.value),
+                });
+            }
+        }
+    }
+}
+
+/// A bounded, multi-resolution series of timestamped values.
 #[derive(Debug, Clone)]
 pub struct Series {
-    ring: Ring<Sample>,
+    raw: Ring<Sample>,
+    tiers: Vec<Tier>,
+    retention: Retention,
 }
 
 impl Series {
     #[must_use]
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(retention: Retention) -> Self {
         Self {
-            ring: Ring::new(capacity),
+            raw: Ring::new(retention.raw),
+            tiers: retention
+                .tiers
+                .iter()
+                .map(|r| Tier {
+                    bucket_ms: r.bucket_ms.max(1),
+                    closed: Ring::new(r.capacity),
+                    open: None,
+                })
+                .collect(),
+            retention,
         }
     }
 
+    /// Append a sample. Samples are expected in time order; one that is older than
+    /// the newest is still kept raw, but a coarse tier folds it into whichever
+    /// bucket is open.
     pub fn push(&mut self, at_unix_ms: i64, value: f32) {
-        self.ring.push(Sample { at_unix_ms, value });
+        let s = Sample { at_unix_ms, value };
+        self.raw.push(s);
+        for t in &mut self.tiers {
+            t.push(s);
+        }
     }
 
     #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.ring.capacity()
+    pub fn retention(&self) -> Retention {
+        self.retention
     }
 
+    /// Raw samples held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.ring.len()
+        self.raw.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.ring.is_empty()
+        self.raw.is_empty()
     }
 
     #[must_use]
     pub fn latest(&self) -> Option<Sample> {
-        self.ring.latest().copied()
+        self.raw.latest().copied()
     }
 
-    /// Oldest to newest.
+    /// Raw samples, oldest to newest.
     #[must_use]
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Sample> + ExactSizeIterator {
-        self.ring.iter()
+    pub fn raw(&self) -> impl DoubleEndedIterator<Item = &Sample> + ExactSizeIterator {
+        self.raw.iter()
     }
 
-    /// Largest value currently held, or `0.0` when empty. For auto-scaling axes.
+    /// The whole history, newest to oldest, each stretch of time at the finest
+    /// resolution that still covers it: raw samples first, then each coarser tier's
+    /// buckets from where the finer one runs out. A bucket is only used once it lies
+    /// wholly before everything already yielded, so no instant is counted twice; at
+    /// each seam that leaves a gap of at most one bucket, which a line simply spans.
+    /// Does not allocate.
     #[must_use]
-    pub fn max_value(&self) -> f32 {
-        self.ring.iter().map(|s| s.value).fold(0.0, f32::max)
+    pub fn history(&self) -> History<'_> {
+        History {
+            raw: self.raw.into_iter().rev(),
+            tiers: self.tiers.iter(),
+            open: None,
+            closed: None,
+            cut: i64::MAX,
+        }
+    }
+}
+
+/// Iterator returned by [`Series::history`].
+#[derive(Debug)]
+pub struct History<'a> {
+    raw: Rev<vec_deque::Iter<'a, Sample>>,
+    tiers: slice::Iter<'a, Tier>,
+    /// The current tier's bucket still filling, then its closed ones.
+    open: Option<Bucket>,
+    closed: Option<Rev<vec_deque::Iter<'a, Bucket>>>,
+    /// Start of the oldest thing yielded so far; anything yielded next must end
+    /// before it.
+    cut: i64,
+}
+
+impl Iterator for History<'_> {
+    type Item = Bucket;
+
+    fn next(&mut self) -> Option<Bucket> {
+        if let Some(s) = self.raw.next() {
+            self.cut = s.at_unix_ms;
+            return Some(Bucket::of(*s));
+        }
+        loop {
+            let next = match self.open.take() {
+                Some(b) => Some(b),
+                None => self.closed.as_mut().and_then(Iterator::next).copied(),
+            };
+            match next {
+                Some(b) if b.last_ms < self.cut => {
+                    self.cut = b.first_ms;
+                    return Some(b);
+                }
+                // Overlaps something finer that was already yielded.
+                Some(_) => {}
+                None => {
+                    let t = self.tiers.next()?;
+                    self.open = t.open.map(|o| o.bucket);
+                    self.closed = Some(t.closed.into_iter().rev());
+                }
+            }
+        }
     }
 }
 
@@ -86,19 +273,18 @@ pub struct Timeline {
     pub cores: Vec<Series>,
     /// Physical memory in use, bytes.
     pub mem_in_use: Series,
-    capacity: usize,
+    retention: Retention,
     last_tick: Option<Tick>,
 }
 
 impl Timeline {
-    /// `capacity` points per series. At 1 Hz, 3600 is one hour.
     #[must_use]
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(retention: Retention) -> Self {
         Self {
-            cpu_total: Series::new(capacity),
+            cpu_total: Series::new(retention),
             cores: Vec::new(),
-            mem_in_use: Series::new(capacity),
-            capacity,
+            mem_in_use: Series::new(retention),
+            retention,
             last_tick: None,
         }
     }
@@ -122,7 +308,7 @@ impl Timeline {
 
         if self.cores.len() != snap.cpu.cores.len() {
             self.cores = (0..snap.cpu.cores.len())
-                .map(|_| Series::new(self.capacity))
+                .map(|_| Series::new(self.retention))
                 .collect();
         }
         for (series, core) in self.cores.iter_mut().zip(&snap.cpu.cores) {
@@ -178,7 +364,7 @@ mod tests {
 
     #[test]
     fn same_tick_is_not_double_counted() {
-        let mut t = Timeline::new(10);
+        let mut t = Timeline::new(Retention::raw(10));
         let s = snap(1, 50.0, 2);
         t.observe(&s);
         t.observe(&s);
@@ -190,7 +376,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_is_ignored() {
-        let mut t = Timeline::new(10);
+        let mut t = Timeline::new(Retention::raw(10));
         t.observe(&Snapshot::default());
         assert!(t.cpu_total.is_empty());
         assert!(t.last_tick().is_none());
@@ -198,8 +384,96 @@ mod tests {
 
     #[test]
     fn timestamps_come_from_the_snapshot() {
-        let mut t = Timeline::new(10);
+        let mut t = Timeline::new(Retention::raw(10));
         t.observe(&snap(7, 1.0, 1));
         assert_eq!(t.cpu_total.latest().map(|s| s.at_unix_ms), Some(7000));
+    }
+
+    const TIERED: Retention = Retention {
+        raw: 30,
+        tiers: &[Resolution {
+            bucket_ms: 10_000,
+            capacity: 6,
+        }],
+    };
+
+    /// One sample a second from t = 0 s, value = the second.
+    fn seconds(n: i64) -> Series {
+        let mut s = Series::new(TIERED);
+        for i in 0..n {
+            s.push(i * 1000, i as f32);
+        }
+        s
+    }
+
+    #[test]
+    fn buckets_summarize_aligned_windows() {
+        let s = seconds(25);
+        // Closed: [0, 10) and [10, 20). Open: [20, 25).
+        let t = &s.tiers[0];
+        let closed: Vec<Bucket> = t.closed.iter().copied().collect();
+        assert_eq!(closed.len(), 2);
+        assert_eq!(
+            closed[1],
+            Bucket {
+                first_ms: 10_000,
+                last_ms: 19_000,
+                min: 10.0,
+                max: 19.0,
+                mean: 14.5,
+                count: 10,
+            }
+        );
+        let open = t.open.expect("filling").bucket;
+        assert_eq!((open.first_ms, open.count, open.mean), (20_000, 5, 22.0));
+    }
+
+    #[test]
+    fn history_is_raw_while_raw_covers_everything() {
+        let s = seconds(25);
+        let h: Vec<Bucket> = s.history().collect();
+        assert_eq!(h.len(), 25, "no bucket repeats what raw already covers");
+        assert!(h.iter().all(|b| b.count == 1));
+        assert_eq!(h[0].first_ms, 24_000, "newest first");
+        assert_eq!(h[24].first_ms, 0);
+    }
+
+    #[test]
+    fn history_continues_in_buckets_where_raw_runs_out() {
+        // 100 s of samples; raw keeps the last 30 (70..=99 s). The tier keeps six
+        // closed buckets, [30, 40) through [80, 90), plus [90, 100) filling. Of
+        // those, the ones wholly before 70 s continue the history.
+        let s = seconds(100);
+        let h: Vec<Bucket> = s.history().collect();
+        let raw: Vec<&Bucket> = h.iter().take_while(|b| b.count == 1).collect();
+        assert_eq!(raw.len(), 30);
+        assert_eq!(raw.last().unwrap().first_ms, 70_000);
+        let coarse: Vec<i64> = h[30..].iter().map(|b| b.first_ms).collect();
+        assert_eq!(coarse, [60_000, 50_000, 40_000, 30_000]);
+        assert!(h[30..].iter().all(|b| b.count == 10));
+        // Strictly older all the way down: nothing overlaps, nothing is reordered.
+        assert!(h.windows(2).all(|w| w[1].last_ms < w[0].first_ms));
+    }
+
+    #[test]
+    fn a_seam_that_splits_a_bucket_skips_it() {
+        // Raw keeps 30 samples; with 105 s pushed, raw starts at 75 s, inside the
+        // [70, 80) bucket. That bucket is not wholly older, so it is skipped and the
+        // coarse part starts at [60, 70): a gap of 5 s at the seam, not an overlap.
+        let s = seconds(105);
+        let h: Vec<Bucket> = s.history().collect();
+        let first_coarse = h.iter().find(|b| b.count > 1).unwrap();
+        assert_eq!(first_coarse.first_ms, 60_000);
+        assert!(h.windows(2).all(|w| w[1].last_ms < w[0].first_ms));
+    }
+
+    #[test]
+    fn memory_is_bounded_by_the_retention() {
+        let s = seconds(10_000);
+        assert_eq!(s.len(), 30);
+        assert_eq!(s.tiers[0].closed.len(), 6);
+        // Raw covers the last 30 s, which the filling bucket and the two newest
+        // closed ones overlap; the other four closed buckets extend it.
+        assert_eq!(s.history().count(), 34);
     }
 }

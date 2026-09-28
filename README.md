@@ -14,6 +14,16 @@ nothing yet.
 
 ## Using it
 
+**Charts:** the CPU and memory graphs share a log-scale time axis, labeled
+`1h 10m 1m 10s now` underneath. The newest sample is on the right edge; the last
+ten seconds take about a third of the width, the last minute half, and the rest
+of the hour is compressed into the left end. Recent history is drawn sample by
+sample. Older stretches are summarized, with a faint band from the lowest to the
+highest value, so a short spike stays visible after it has been averaged. Point
+at either graph and a hairline marks the same moment in both, with each graph's
+value and how long ago it was; where a point summarizes several samples, the
+readout gives the average and the peak.
+
 The process table has two arrangements, switched with the **List / Tree** control
 above it or with **Ctrl+T** (Process Explorer's binding):
 
@@ -102,7 +112,7 @@ class: tens of megabytes, not hundreds.
 | --- | --- |
 | `ot-model` | Pure data types. No I/O, no platform code. |
 | `ot-probe` | Platform sampling. Windows is real; Linux and macOS are stubs. |
-| `ot-core` | Sampling thread, history ring buffers, lock-free snapshot publication. |
+| `ot-core` | Sampling thread, multi-resolution history, lock-free snapshot publication. |
 | `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
 | `ot-ui` | UI-agnostic view models: theme, virtualized table, sparklines, root view. |
 | `ot-record` | Flight Recorder: record and replay a session (planned). |

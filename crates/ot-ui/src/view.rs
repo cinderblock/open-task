@@ -8,15 +8,15 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use ot_core::{Snapshot, Timeline};
+use ot_core::{Resolution, Retention, Snapshot, Timeline};
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
-use ot_model::ProcessKey;
+use ot_model::{Bytes, ProcessKey};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
 
 use crate::format;
 use crate::process_rows::{col, columns, process_matches, Layout, ProcessRows, ProcessTree};
-use crate::sparkline::{self, SparkStyle};
+use crate::sparkline::{self, Plot, PlotPoint, SparkStyle, TimeAxis};
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
 
@@ -213,8 +213,148 @@ pub enum Cursor {
     Text,
 }
 
-const HISTORY_POINTS: usize = 600;
+/// History kept for the summary charts: every sample for ten minutes (at the
+/// default 1 Hz), then 10 s buckets for two hours. Covers [`AXIS`] (one hour) with
+/// room to spare.
+const HISTORY: Retention = Retention {
+    raw: 600,
+    tiers: &[Resolution {
+        bucket_ms: 10_000,
+        capacity: 720,
+    }],
+};
+/// The time axis every summary chart shares, so one hover lines up across them.
+const AXIS: TimeAxis = TimeAxis::DEFAULT;
+/// Height of the time labels (or the hover readout) under each chart.
+const AXIS_BAND_H: f32 = 14.0;
 const CARD_H: f32 = 96.0;
+
+/// The summary charts between frames: their plots, where they are, and the hover
+/// they share. Index 0 is CPU, 1 is memory.
+#[derive(Debug, Default)]
+struct Charts {
+    plots: [Plot; 2],
+    /// Each chart's whole area, plot and labels, for hit-testing.
+    areas: [Rect; 2],
+    /// The pointer over a chart: which one, and its x.
+    pointer: Option<(usize, f32)>,
+    /// The age the crosshair marks in every chart: the pointer snapped to the
+    /// nearest plotted point of the chart under it.
+    hover_age: Option<f32>,
+    scratch: Vec<Point>,
+    readout: String,
+}
+
+impl Charts {
+    fn snapped(&self) -> Option<f32> {
+        let (i, x) = self.pointer?;
+        self.plots[i].nearest_x(x).map(|p| p.age_ms)
+    }
+
+    /// Follow the pointer, `None` when it left the window. Returns whether the
+    /// crosshair moved.
+    fn hover(&mut self, at: Option<Point>) -> bool {
+        self.pointer = at.and_then(|p| {
+            self.areas
+                .iter()
+                .position(|r| r.contains(p))
+                .map(|i| (i, p.x))
+        });
+        let age = self.snapped();
+        std::mem::replace(&mut self.hover_age, age) != age
+    }
+
+    /// Plot both series into the graph areas the cards left, then draw them with
+    /// their time labels, or with the crosshair and readouts while hovered.
+    fn paint(
+        &mut self,
+        dl: &mut DisplayList,
+        graphs: [Rect; 2],
+        snap: &Snapshot,
+        tl: &Timeline,
+        theme: &Theme,
+        buf: &mut String,
+    ) {
+        let series = [&tl.cpu_total, &tl.mem_in_use];
+        let max = [100.0, snap.memory.total.get() as f32];
+        let color = [theme.cpu, theme.memory];
+        let value: [fn(&mut String, f32); 2] = [percent_value, bytes_value];
+        let mut bands = [Rect::ZERO; 2];
+        for i in 0..2 {
+            self.areas[i] = graphs[i];
+            let (band, plot) = graphs[i].split_bottom(AXIS_BAND_H);
+            bands[i] = band;
+            self.plots[i].build(series[i], plot, max[i], &AXIS);
+        }
+        // Re-snap against what is on screen now: new samples slide under a pointer
+        // that stays put, and the line should sit on one of them.
+        self.hover_age = self.snapped();
+
+        for i in 0..2 {
+            let style = SparkStyle {
+                line: color[i],
+                wash: color[i].with_alpha(0.12),
+                envelope: color[i].with_alpha(0.2),
+                grid: theme.grid,
+                crosshair: theme.crosshair,
+                width: 1.5,
+            };
+            let plot = &self.plots[i];
+            plot.paint(dl, &style, &AXIS, &mut self.scratch);
+            if let Some(age) = self.hover_age {
+                let point = plot.paint_crosshair(dl, age, &style, &AXIS);
+                readout(&mut self.readout, buf, value[i], point.as_ref(), age);
+                let x = AXIS.x(plot.rect(), age);
+                sparkline::paint_readout(dl, bands[i], x, &self.readout, theme.small, theme.text);
+            } else {
+                sparkline::paint_axis(
+                    dl,
+                    plot.rect(),
+                    bands[i],
+                    &AXIS,
+                    theme.small,
+                    theme.text_dim,
+                );
+            }
+        }
+    }
+}
+
+fn percent_value(out: &mut String, v: f32) {
+    format::percent(out, v);
+    out.push('%');
+}
+
+fn bytes_value(out: &mut String, v: f32) {
+    format::bytes(out, Bytes(v.max(0.0) as u64));
+}
+
+/// What a chart says at the crosshair: `34% · 12 s ago`. Where the point summarizes
+/// several samples and their peak reads differently from their mean, both:
+/// `12% avg · 80% peak · 25 min ago`, so a spike the envelope shows is also named.
+fn readout(
+    out: &mut String,
+    tmp: &mut String,
+    value: fn(&mut String, f32),
+    point: Option<&PlotPoint>,
+    age_ms: f32,
+) {
+    out.clear();
+    if let Some(p) = point {
+        value(tmp, p.mean);
+        out.push_str(tmp);
+        let mean_len = out.len();
+        value(tmp, p.max);
+        if p.count > 1 && tmp.as_str() != &out[..mean_len] {
+            out.push_str(" avg \u{b7} ");
+            out.push_str(tmp);
+            out.push_str(" peak");
+        }
+        out.push_str(" \u{b7} ");
+    }
+    format::ago(tmp, age_ms);
+    out.push_str(tmp);
+}
 
 /// Build a [`ProcessRows`] from an [`App`]'s fields without borrowing the table,
 /// so the table can be mutated while the rows are in use. A macro rather than a
@@ -453,6 +593,7 @@ pub struct App {
     /// A sample in progress, shown as a marker row under its process.
     sampling: Option<ProcessKey>,
     timeline: Timeline,
+    charts: Charts,
     /// Search results per process; empty when there is no search.
     matched: Vec<bool>,
     /// What the table lists: matches, plus their ancestors in tree mode.
@@ -461,7 +602,6 @@ pub struct App {
     mouse: Option<Point>,
     buf: String,
     pid_buf: String,
-    scratch: Vec<Point>,
     subtree: Vec<usize>,
 }
 
@@ -479,13 +619,13 @@ impl App {
             layout: Layout::default(),
             attribution: None,
             sampling: None,
-            timeline: Timeline::new(HISTORY_POINTS),
+            timeline: Timeline::new(HISTORY),
+            charts: Charts::default(),
             matched: Vec::new(),
             shown: Vec::new(),
             mouse: None,
             buf: String::with_capacity(64),
             pid_buf: String::with_capacity(12),
-            scratch: Vec::with_capacity(HISTORY_POINTS),
             subtree: Vec::new(),
         }
     }
@@ -653,9 +793,11 @@ impl App {
                 };
                 let segment = self.toolbar.segment_at(p);
                 let clear = self.toolbar.search.clear_rect.contains(p);
+                let crosshair = self.charts.hover(Some(p));
                 let changed = hover != self.table.hover
                     || segment != self.toolbar.hover
-                    || clear != self.toolbar.search.hover_clear;
+                    || clear != self.toolbar.search.hover_clear
+                    || crosshair;
                 self.table.hover = hover;
                 self.toolbar.hover = segment;
                 self.toolbar.search.hover_clear = clear;
@@ -666,7 +808,8 @@ impl App {
                 let row = self.table.hover.take().is_some();
                 let segment = self.toolbar.hover.take().is_some();
                 let clear = std::mem::take(&mut self.toolbar.search.hover_clear);
-                Reaction::painted(row || segment || clear)
+                let crosshair = self.charts.hover(None);
+                Reaction::painted(row || segment || clear || crosshair)
             }
             UiEvent::MouseDown {
                 at,
@@ -946,24 +1089,12 @@ impl App {
         let (_, mem_card) = mem_card.split_left(theme.gap);
 
         let snap = Arc::clone(&self.snap);
-        Self::paint_cpu_card(
-            dl,
-            cpu_card,
-            &snap,
-            &self.timeline,
-            theme,
-            &mut self.buf,
-            &mut self.scratch,
-        );
-        Self::paint_mem_card(
-            dl,
-            mem_card,
-            &snap,
-            &self.timeline,
-            theme,
-            &mut self.buf,
-            &mut self.scratch,
-        );
+        let graphs = [
+            Self::paint_cpu_card(dl, cpu_card, &snap, theme, &mut self.buf),
+            Self::paint_mem_card(dl, mem_card, &snap, theme, &mut self.buf),
+        ];
+        self.charts
+            .paint(dl, graphs, &snap, &self.timeline, theme, &mut self.buf);
 
         let rows = ProcessRows {
             procs: &snap.processes,
@@ -991,15 +1122,14 @@ impl App {
         rect.inset(theme.pad, theme.pad * 0.75)
     }
 
+    /// The card's frame and text; returns the area left for its chart.
     fn paint_cpu_card(
         dl: &mut DisplayList,
         rect: Rect,
         snap: &Snapshot,
-        tl: &Timeline,
         theme: &Theme,
         buf: &mut String,
-        scratch: &mut Vec<Point>,
-    ) {
+    ) -> Rect {
         let inner = Self::card_frame(dl, rect, theme);
         let (text_col, graph) = inner.split_left(150.0);
         let (title, below) = text_col.split_top(16.0);
@@ -1034,25 +1164,17 @@ impl App {
             let _ = write!(buf, "{n} logical cores");
         }
         dl.label(buf, sub, theme.small, theme.text_dim);
-
-        let style = SparkStyle {
-            line: theme.cpu,
-            fill: theme.cpu.with_alpha(0.18),
-            grid: theme.grid,
-            width: 1.5,
-        };
-        sparkline::paint(dl, graph, &tl.cpu_total, 100.0, &style, scratch);
+        graph
     }
 
+    /// The card's frame and text; returns the area left for its chart.
     fn paint_mem_card(
         dl: &mut DisplayList,
         rect: Rect,
         snap: &Snapshot,
-        tl: &Timeline,
         theme: &Theme,
         buf: &mut String,
-        scratch: &mut Vec<Point>,
-    ) {
+    ) -> Rect {
         let inner = Self::card_frame(dl, rect, theme);
         let (text_col, graph) = inner.split_left(170.0);
         let (title, below) = text_col.split_top(16.0);
@@ -1081,21 +1203,7 @@ impl App {
             let _ = write!(buf, "{pct:.0}% in use");
         }
         dl.label(buf, sub, theme.small, theme.text_dim);
-
-        let style = SparkStyle {
-            line: theme.memory,
-            fill: theme.memory.with_alpha(0.18),
-            grid: theme.grid,
-            width: 1.5,
-        };
-        sparkline::paint(
-            dl,
-            graph,
-            &tl.mem_in_use,
-            m.total.get() as f32,
-            &style,
-            scratch,
-        );
+        graph
     }
 }
 
@@ -1131,8 +1239,9 @@ mod tests {
     use super::*;
     use crate::process_rows::row_id;
     use crate::process_rows::tests::proc;
+    use ot_model::memory::MemorySample;
     use ot_model::process::{ProcessSample, ProcessStatic};
-    use ot_model::{ProcessKey, Tick};
+    use ot_model::{Percent, ProcessKey, Tick};
     use ot_paint::DrawCmd;
     use std::time::{Duration, SystemTime};
 
@@ -1706,6 +1815,88 @@ mod tests {
         assert_eq!(app.table.sort_col, col::CPU);
         app.handle(UiEvent::MouseMove(Point::new(400.0, 400.0)));
         assert_eq!(app.cursor(), Cursor::Arrow);
+    }
+
+    /// Twenty seconds of history ending at t = 20 s: CPU climbing 5 % a second to
+    /// 95 %, memory steady at 60 of 100 bytes.
+    fn with_history(app: &mut App) {
+        for t in 1..=20u64 {
+            let mut s = (*snapshot(t, vec![proc(1, None, 1.0)])).clone();
+            s.cpu.total = Percent(t as f32 * 5.0 - 5.0);
+            s.memory = MemorySample {
+                total: Bytes(100),
+                available: Bytes(40),
+                ..Default::default()
+            };
+            app.set_snapshot(Arc::new(s));
+        }
+    }
+
+    #[test]
+    fn charts_label_their_log_axis_and_share_one_crosshair() {
+        let mut app = App::default();
+        with_history(&mut app);
+        ready(&mut app);
+        let strings = painted_strings(&mut app);
+        for label in ["now", "10s", "1m", "10m", "1h"] {
+            let n = strings.iter().filter(|s| *s == label).count();
+            assert_eq!(n, 2, "{label} under both charts: {strings:?}");
+        }
+
+        // Point at the CPU chart, a little off the sample 3 s old: it snaps.
+        let cpu = app.charts.plots[0].rect();
+        let at = Point::new(AXIS.x(cpu, 3000.0) + 1.5, cpu.center().y);
+        assert!(app.handle(UiEvent::MouseMove(at)).repaint);
+        assert_eq!(app.charts.hover_age, Some(3000.0));
+        let nudge = Point::new(at.x + 0.5, at.y);
+        assert!(
+            !app.handle(UiEvent::MouseMove(nudge)).repaint,
+            "same sample, nothing to redraw"
+        );
+        // Both charts read out the same moment; the tick labels make way.
+        let strings = painted_strings(&mut app);
+        assert!(strings.iter().any(|s| s == "80% · 3 s ago"), "{strings:?}");
+        assert!(strings.iter().any(|s| s == "60 B · 3 s ago"), "{strings:?}");
+        assert!(!strings.iter().any(|s| s == "10s"), "{strings:?}");
+
+        // Hovering the memory chart drives the CPU chart's line too.
+        let mem = app.charts.plots[1].rect();
+        app.handle(UiEvent::MouseMove(Point::new(
+            mem.right() - 1.0,
+            mem.center().y,
+        )));
+        assert_eq!(app.charts.hover_age, Some(0.0));
+        assert!(painted_strings(&mut app).iter().any(|s| s == "95% · now"));
+
+        assert!(app.handle(UiEvent::MouseLeave).repaint);
+        assert_eq!(app.charts.hover_age, None);
+        let n = painted_strings(&mut app)
+            .iter()
+            .filter(|s| *s == "1m")
+            .count();
+        assert_eq!(n, 2, "labels are back");
+    }
+
+    #[test]
+    fn a_summarized_point_names_its_peak() {
+        let mut out = String::new();
+        let mut tmp = String::new();
+        let p = PlotPoint {
+            x: 0.0,
+            age_ms: 1_500_000.0,
+            mean: 12.0,
+            min: 3.0,
+            max: 80.0,
+            count: 60,
+        };
+        readout(&mut out, &mut tmp, percent_value, Some(&p), p.age_ms);
+        assert_eq!(out, "12% avg · 80% peak · 25 min ago");
+        // A summary whose peak reads the same as its mean does not repeat it.
+        let flat = PlotPoint { max: 12.2, ..p };
+        readout(&mut out, &mut tmp, percent_value, Some(&flat), p.age_ms);
+        assert_eq!(out, "12% · 25 min ago");
+        readout(&mut out, &mut tmp, percent_value, None, 4000.0);
+        assert_eq!(out, "4 s ago");
     }
 
     #[test]

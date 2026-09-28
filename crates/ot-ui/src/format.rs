@@ -74,6 +74,22 @@ pub fn bytes_of(out: &mut String, used: Bytes, total: Bytes) {
     let _ = write!(out, "{a:.1} / {b:.1} {}", UNITS[u]);
 }
 
+/// How long ago, for a chart readout: `now`, `12 s ago`, `2 min 15 s ago`,
+/// `25 min ago`, `1 h 5 min ago`. Coarser as it gets older, like the time axis.
+pub fn ago(out: &mut String, ms: f32) {
+    out.clear();
+    let s = (ms / 1000.0).round().max(0.0) as u64;
+    let (m, h) = (s / 60, s / 3600);
+    let _ = match s {
+        0 => write!(out, "now"),
+        1..=59 => write!(out, "{s} s ago"),
+        60..=599 if !s.is_multiple_of(60) => write!(out, "{m} min {} s ago", s % 60),
+        60..=3599 => write!(out, "{m} min ago"),
+        _ if !m.is_multiple_of(60) => write!(out, "{h} h {} min ago", m % 60),
+        _ => write!(out, "{h} h ago"),
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +133,17 @@ mod tests {
             s(|b| bytes_of(b, Bytes(52 * gb + gb / 3), Bytes(64 * gb))),
             "52.3 / 64.0 GB"
         );
+    }
+
+    #[test]
+    fn ago_coarsens_with_age() {
+        assert_eq!(s(|b| ago(b, 0.0)), "now");
+        assert_eq!(s(|b| ago(b, 400.0)), "now");
+        assert_eq!(s(|b| ago(b, 12_300.0)), "12 s ago");
+        assert_eq!(s(|b| ago(b, 135_000.0)), "2 min 15 s ago");
+        assert_eq!(s(|b| ago(b, 120_000.0)), "2 min ago");
+        assert_eq!(s(|b| ago(b, 1_530_000.0)), "25 min ago");
+        assert_eq!(s(|b| ago(b, 3_900_000.0)), "1 h 5 min ago");
+        assert_eq!(s(|b| ago(b, 7_200_000.0)), "2 h ago");
     }
 }
