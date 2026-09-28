@@ -155,6 +155,13 @@ line shared across every chart on the page.
   1.2 ms mean with the machine 27% busy; a whole pass 7.5 ms (446 processes, 5,895
   threads, 1 disk, 12 adapters). A connection that comes up is listed within 5 s;
   one that goes down drops out at once and triggers a fresh discovery.
+- **The ETW sampling test fails under a basic-user token, as it should, but runs
+  at all only because that token keeps High integrity**:
+  `a_short_sample_of_ourselves_runs_when_elevated` decided it was elevated and got
+  `StartTrace (profile): Access is denied`. Another thread's area
+  (`plans/service-host-attribution.md`); worth checking that the app's own
+  "can I sample?" test looks at the Administrators group or the privilege, not the
+  integrity level. Not changed here.
 - **The working tree stopped building mid-cycle** because the table-jitter thread
   (`plans/charts-log-time-and-live-table.md`) was halfway through an edit
   (`ProcessRows` gained a field `view.rs` did not set yet). This cycle's changes
@@ -196,9 +203,15 @@ page with CPU and memory), `b7ce60a` (PDH clock and memory lists), `f9928bd`
 (disks and network connections), and the network cost split. **Not pushed**: the
 charts thread's `2ccdd44` and `06779d7` sit underneath, unpushed, and that thread
 was mid-edit at the end of this cycle (settings, table steadiness), so pushing is
-left to whoever finishes last, with CI then run over the lot. Not verified
-unelevated: the storage query and PDH were designed for it and documented to work
-without elevation, but this session is elevated.
+left to whoever finishes last, with CI then run over the lot.
+
+**Checked without administrator rights** (2026-09-28): the probe's test binary run
+through `runas /trustlevel:0x20000` (a SAFER "basic user" token: the Administrators
+group removed). The storage query, the PDH counters (clock, memory lists, disks),
+network discovery and sampling, and process details all pass (20 tests). Caveat:
+that token keeps the High integrity label (`whoami /groups` shows `High Mandatory
+Level`), so it is not an exact standard user at Medium; the account is also in
+`Performance Log Users`. A true standard-user run is still worth doing once.
 
 ## Open questions for the user
 
