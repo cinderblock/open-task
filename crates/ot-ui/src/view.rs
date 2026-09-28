@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ot_core::{Resolution, Retention, Snapshot, Timeline};
 use ot_model::attribution::Attribution;
@@ -18,7 +19,9 @@ use crate::charts::{self, ChartGroup};
 use crate::format;
 use crate::nav::{NavHit, NavRail, Page};
 use crate::perf::PerfPage;
-use crate::process_rows::{col, columns, process_matches, Layout, ProcessRows, ProcessTree};
+use crate::process_rows::{self, col, columns, process_matches, Layout, ProcessRows, ProcessTree};
+use crate::settings::{Settings, SettingsPage};
+use crate::steady::Steady;
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
 
@@ -121,6 +124,9 @@ pub enum Command {
     SetPage(Page),
     /// Move along the rail, wrapping (Ctrl+Tab is 1, Ctrl+Shift+Tab is -1).
     StepPage(isize),
+    /// Freeze the display, or let it follow the samples again (Space, when the
+    /// search field does not have the keyboard). Sampling carries on underneath.
+    TogglePause,
 }
 
 /// Input from the shell, in DIPs.
@@ -172,6 +178,8 @@ pub enum Effect {
     /// Sample `target`'s CPU for `seconds`, off the UI thread, and hand the result
     /// to [`App::set_attribution`] (or [`App::sampling_failed`]).
     SampleCpu { target: ProcessKey, seconds: u32 },
+    /// The user changed a setting; store these so the next start has them.
+    SaveSettings(Settings),
 }
 
 /// What an event led to.
@@ -247,6 +255,7 @@ macro_rules! rows_of {
             matched: &$app.matched,
             shown: &$app.shown,
             tree_mode: $tree_mode,
+            steady: Some(&$app.steady),
         }
     };
 }
@@ -356,6 +365,8 @@ impl SearchBox {
 /// process's ancestry, the search field, and the process count.
 #[derive(Debug, Default)]
 struct Toolbar {
+    /// Why the table is standing still, if it is: shown before the search field.
+    status: Option<(&'static str, Color)>,
     /// Segment rectangles from the last paint, in [`SEGMENTS`] order.
     segments: [Rect; 2],
     hover: Option<usize>,
@@ -366,6 +377,8 @@ struct Toolbar {
 const SEGMENTS: [(ViewMode, &str); 2] = [(ViewMode::List, "List"), (ViewMode::Tree, "Tree")];
 const SEGMENT_W: f32 = 60.0;
 const COUNT_W: f32 = 130.0;
+/// The toolbar's "Paused" / "Order held" note.
+const STATUS_W: f32 = 150.0;
 
 impl Toolbar {
     fn segment_at(&self, p: Point) -> Option<usize> {
@@ -422,6 +435,24 @@ impl Toolbar {
         let search_w = theme.search_w.min(middle.w);
         let (crumb, search) = middle.split_left((middle.w - search_w - theme.pad).max(0.0));
         let (_, search) = search.split_left(theme.pad.min(search.w));
+        // Why the table is not moving, when it is not: at the end of the crumb's
+        // space.
+        let crumb = match self.status {
+            Some((text, color)) => {
+                let (crumb, slot) = crumb.split_left((crumb.w - STATUS_W).max(0.0));
+                dl.text(
+                    text,
+                    slot,
+                    theme.small,
+                    color,
+                    HAlign::Right,
+                    VAlign::Middle,
+                    true,
+                );
+                crumb
+            }
+            None => crumb,
+        };
 
         buf.clear();
         if rows.filtered() {
@@ -452,6 +483,17 @@ impl Toolbar {
     }
 }
 
+/// The display, frozen. Samples keep arriving and are recorded; the screen shows
+/// the moment of the pause until it ends.
+#[derive(Debug)]
+struct Paused {
+    /// History as of the pause, for the charts. The live timeline keeps
+    /// recording, so resuming loses nothing.
+    timeline: Timeline,
+    /// The newest snapshot that arrived during the pause, shown on resume.
+    latest: Option<Arc<Snapshot>>,
+}
+
 /// The whole application view. One per window.
 #[derive(Debug)]
 pub struct App {
@@ -473,6 +515,16 @@ pub struct App {
     page: Page,
     nav: NavRail,
     perf: PerfPage,
+    /// Sort keys with hysteresis, so noise does not reorder the table. Held while
+    /// the pointer is over the table.
+    steady: Steady,
+    /// Set while the display is paused.
+    paused: Option<Paused>,
+    settings: Settings,
+    settings_page: SettingsPage,
+    /// Whether the platform has animation effects on; row slides need both this
+    /// and the setting.
+    system_animations: bool,
     /// Search results per process; empty when there is no search.
     matched: Vec<bool>,
     /// What the table lists: matches, plus their ancestors in tree mode.
@@ -487,7 +539,7 @@ pub struct App {
 impl App {
     #[must_use]
     pub fn new(theme: Theme) -> Self {
-        Self {
+        let mut app = Self {
             theme,
             backdrop: false,
             size: Size::new(800.0, 600.0),
@@ -503,13 +555,20 @@ impl App {
             page: Page::default(),
             nav: NavRail::default(),
             perf: PerfPage::default(),
+            steady: Steady::default(),
+            paused: None,
+            settings: Settings::default(),
+            settings_page: SettingsPage::default(),
+            system_animations: true,
             matched: Vec::new(),
             shown: Vec::new(),
             mouse: None,
             buf: String::with_capacity(64),
             pid_buf: String::with_capacity(12),
             subtree: Vec::new(),
-        }
+        };
+        app.apply_animation();
+        app
     }
 
     /// Whether the shell composites us over a system backdrop. When true, the view
@@ -555,7 +614,95 @@ impl App {
     fn relayout(&mut self) {
         self.layout
             .rebuild(&self.snap, self.attribution.as_deref(), self.sampling);
-        self.table.invalidate_order();
+        self.update_steady();
+        self.table.refresh();
+    }
+
+    /// Fold the rows' current values into the sticky sort keys.
+    fn update_steady(&mut self) {
+        let tree = self.table.tree();
+        let column = self.table.sort_col;
+        // The rows borrow the app; the keys are taken out while they are updated.
+        let mut steady = std::mem::take(&mut self.steady);
+        {
+            let rows = ProcessRows {
+                steady: None,
+                ..rows_of!(self, tree)
+            };
+            steady.update(
+                column,
+                tree,
+                process_rows::band(column),
+                (0..rows.len()).filter_map(|r| rows.raw_key(r, column).map(|v| (rows.id(r), v))),
+            );
+        }
+        self.steady = steady;
+    }
+
+    /// Hold the order while the pointer is over the table; let it go, re-sorting
+    /// at once, when it leaves. Returns whether anything is to be repainted.
+    fn hold_order(&mut self, on: bool) -> bool {
+        if !self.steady.set_held(on) {
+            return false;
+        }
+        if !on && self.paused.is_none() {
+            self.update_steady();
+            self.table.refresh();
+        }
+        true
+    }
+
+    /// Whether the display is paused.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.paused.is_some()
+    }
+
+    fn toggle_pause(&mut self) -> Reaction {
+        match self.paused.take() {
+            None => {
+                self.paused = Some(Paused {
+                    timeline: self.timeline.clone(),
+                    latest: None,
+                });
+            }
+            Some(p) => {
+                if let Some(snap) = p.latest {
+                    self.show_snapshot(snap);
+                }
+            }
+        }
+        Reaction::REPAINT
+    }
+
+    /// The settings as they stand.
+    #[must_use]
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+
+    /// Apply settings, as loaded at start or changed on the Settings page.
+    pub fn set_settings(&mut self, settings: Settings) {
+        self.settings = settings;
+        self.apply_animation();
+    }
+
+    /// Whether the platform has animation effects on (Windows: "Animation
+    /// effects" in Accessibility > Visual effects). Row slides need it.
+    pub fn set_system_animations(&mut self, on: bool) {
+        self.system_animations = on;
+        self.apply_animation();
+    }
+
+    fn apply_animation(&mut self) {
+        self.table
+            .set_animate(self.settings.animates_rows(self.system_animations));
+    }
+
+    /// Whether something is moving, so the shell should paint another frame soon.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        self.page == Page::Processes && self.table.animating()
     }
 
     /// A CPU sample finished: show it under its process. Returns true if the
@@ -614,11 +761,22 @@ impl App {
     }
 
     /// Offer the newest snapshot. Returns true if it was new and a repaint is due.
+    /// While paused it is recorded but not shown, and no repaint is due.
     pub fn set_snapshot(&mut self, snap: Arc<Snapshot>) -> bool {
         if snap.is_empty() || (!self.snap.is_empty() && snap.tick == self.snap.tick) {
             return false;
         }
         self.timeline.observe(&snap);
+        if let Some(p) = &mut self.paused {
+            p.latest = Some(snap);
+            return false;
+        }
+        self.show_snapshot(snap);
+        true
+    }
+
+    /// Make `snap` the one on screen. Its history is already in the timeline.
+    fn show_snapshot(&mut self, snap: Arc<Snapshot>) {
         self.tree.rebuild(&snap.processes);
         self.snap = snap;
         // A finished sample outlives its process only until the next snapshot.
@@ -629,7 +787,6 @@ impl App {
         }
         self.relayout();
         self.refilter(self.table.tree());
-        true
     }
 
     /// Recompute the search results against the current snapshot.
@@ -665,7 +822,13 @@ impl App {
         if page != self.page {
             let _ = self.charts.hover(None);
             self.table.hover = None;
+            let _ = self.hold_order(false);
             let _ = self.perf.handle(UiEvent::MouseLeave);
+            let _ = self.settings_page.handle(
+                UiEvent::MouseLeave,
+                &mut self.settings,
+                self.system_animations,
+            );
             self.page = page;
         }
     }
@@ -713,6 +876,10 @@ impl App {
                 self.set_page(self.page.step(n));
                 return Reaction::REPAINT;
             }
+            // Space pauses, as in Process Explorer, on any page; typed into the
+            // search field it is just a space.
+            UiEvent::Command(Command::TogglePause) => return self.toggle_pause(),
+            UiEvent::Char(' ') if !self.toolbar.search.focused => return self.toggle_pause(),
             // Search belongs to the process table: typing, or Ctrl+F, on another page
             // goes there, the way Task Manager's search box does.
             UiEvent::Char(_) | UiEvent::Command(Command::Find) => self.set_page(Page::Processes),
@@ -721,6 +888,15 @@ impl App {
         let r = match self.page {
             Page::Processes => self.handle_processes(ev),
             Page::Performance => self.perf.handle(ev),
+            Page::Settings => {
+                let r = self
+                    .settings_page
+                    .handle(ev, &mut self.settings, self.system_animations);
+                if matches!(r.effect, Some(Effect::SaveSettings(_))) {
+                    self.apply_animation();
+                }
+                r
+            }
         };
         Reaction {
             repaint: r.repaint || rail_moved,
@@ -746,10 +922,12 @@ impl App {
                 let segment = self.toolbar.segment_at(p);
                 let clear = self.toolbar.search.clear_rect.contains(p);
                 let crosshair = self.charts.hover(Some(p));
+                let held = self.hold_order(self.table.rect().contains(p));
                 let changed = hover != self.table.hover
                     || segment != self.toolbar.hover
                     || clear != self.toolbar.search.hover_clear
-                    || crosshair;
+                    || crosshair
+                    || held;
                 self.table.hover = hover;
                 self.toolbar.hover = segment;
                 self.toolbar.search.hover_clear = clear;
@@ -761,7 +939,8 @@ impl App {
                 let segment = self.toolbar.hover.take().is_some();
                 let clear = std::mem::take(&mut self.toolbar.search.hover_clear);
                 let crosshair = self.charts.hover(None);
-                Reaction::painted(row || segment || clear || crosshair)
+                let held = self.hold_order(false);
+                Reaction::painted(row || segment || clear || crosshair || held)
             }
             UiEvent::MouseDown {
                 at,
@@ -913,7 +1092,7 @@ impl App {
             }
             Command::Menu(action) => self.menu_action(action),
             // Handled in `handle` before a page sees them.
-            Command::SetPage(_) | Command::StepPage(_) => Reaction::NONE,
+            Command::SetPage(_) | Command::StepPage(_) | Command::TogglePause => Reaction::NONE,
         }
     }
 
@@ -1025,6 +1204,12 @@ impl App {
 
     /// Produce this frame.
     pub fn paint(&mut self, dl: &mut DisplayList) {
+        self.paint_at(dl, Instant::now());
+    }
+
+    /// Produce the frame for time `now`, which paces the row slides.
+    pub fn paint_at(&mut self, dl: &mut DisplayList, now: Instant) {
+        self.table.tick(now);
         dl.clear();
         let theme = &self.theme;
         dl.clear_to(if self.backdrop {
@@ -1038,11 +1223,24 @@ impl App {
         let (rail, content) = window.split_left(self.nav.width(self.size.w));
         self.nav.paint(dl, rail, self.page, expanded, theme);
         let full = content.inset(theme.gap, theme.gap);
-        if self.page == Page::Performance {
-            let snap = Arc::clone(&self.snap);
-            self.perf
-                .paint(dl, full, &snap, &self.timeline, theme, &mut self.buf);
-            return;
+        // While paused, the charts show history as of the pause.
+        let timeline = match &self.paused {
+            Some(p) => &p.timeline,
+            None => &self.timeline,
+        };
+        match self.page {
+            Page::Processes => {}
+            Page::Performance => {
+                let snap = Arc::clone(&self.snap);
+                self.perf
+                    .paint(dl, full, &snap, timeline, theme, &mut self.buf);
+                return;
+            }
+            Page::Settings => {
+                self.settings_page
+                    .paint(dl, full, self.settings, self.system_animations, theme);
+                return;
+            }
         }
         let (cards, rest) = full.split_top(CARD_H);
         let (_, rest) = rest.split_top(theme.gap);
@@ -1058,8 +1256,7 @@ impl App {
             Self::paint_mem_card(dl, mem_card, &snap, theme, &mut self.buf),
         ];
         // Both summary charts share one hover.
-        let tl = &self.timeline;
-        let series = [&tl.cpu_total, &tl.mem_in_use];
+        let series = [&timeline.cpu_total, &timeline.mem_in_use];
         let max = [100.0, snap.memory.total.get() as f32];
         let colors = [theme.cpu, theme.memory];
         let values: [charts::ValueFmt; 2] = [charts::percent_value, charts::bytes_value];
@@ -1087,11 +1284,19 @@ impl App {
             matched: &self.matched,
             shown: &self.shown,
             tree_mode: self.table.tree(),
+            steady: Some(&self.steady),
         };
         // The table first: the toolbar reads its state, and the order must be
         // current before the ancestry lookup.
         self.table
             .paint(dl, table_rect, &rows, theme, &mut self.buf);
+        self.toolbar.status = if self.paused.is_some() {
+            Some(("Paused \u{b7} Space resumes", theme.accent))
+        } else if self.steady.held() {
+            Some(("Order held", theme.text_dim))
+        } else {
+            None
+        };
         self.toolbar
             .paint(dl, toolbar, &self.table, &rows, theme, &mut self.buf);
     }
@@ -1298,7 +1503,10 @@ mod tests {
         painted_rows(app).into_iter().map(|(n, _)| n).collect()
     }
 
+    /// Sized and painted once. Rows jump rather than slide, so a frame shows the
+    /// order as it is; the slide has tests of its own.
     fn ready(app: &mut App) {
+        app.set_system_animations(false);
         app.handle(UiEvent::Resize(Size::new(900.0, 700.0)));
         let mut dl = DisplayList::new();
         app.paint(&mut dl);
@@ -1927,7 +2135,11 @@ mod tests {
         assert!(!strings.iter().any(|s| s == "Name"), "no process table");
 
         cmd(&mut app, Command::StepPage(1));
+        assert_eq!(app.page(), Page::Settings);
+        cmd(&mut app, Command::StepPage(1));
         assert_eq!(app.page(), Page::Processes, "wraps around");
+        cmd(&mut app, Command::StepPage(-1));
+        assert_eq!(app.page(), Page::Settings);
         cmd(&mut app, Command::StepPage(-1));
         assert_eq!(app.page(), Page::Performance);
         cmd(&mut app, Command::SetPage(Page::Processes));
@@ -1992,5 +2204,144 @@ mod tests {
         assert!(strings.iter().any(|s| s == "Performance"), "{strings:?}");
         assert!(strings.iter().any(|s| s == "Processes"), "{strings:?}");
         assert_eq!(app.page(), Page::Processes, "the toggle is not a page");
+    }
+
+    fn two(tick: u64, cpu1: f32, cpu2: f32) -> Arc<Snapshot> {
+        snapshot(tick, vec![proc(1, None, cpu1), proc(2, None, cpu2)])
+    }
+
+    #[test]
+    fn pointing_at_the_table_holds_its_order() {
+        let mut app = App::default();
+        app.set_snapshot(two(1, 10.0, 50.0));
+        ready(&mut app);
+        assert_eq!(painted_names(&mut app), ["p2.exe", "p1.exe"]);
+        let inside = app.table.rect().center();
+        assert!(app.handle(UiEvent::MouseMove(inside)).repaint);
+        assert!(painted_strings(&mut app).iter().any(|s| s == "Order held"));
+
+        // The numbers swap places; the rows do not, but show the new numbers.
+        app.set_snapshot(two(2, 90.0, 5.0));
+        assert_eq!(painted_names(&mut app), ["p2.exe", "p1.exe"]);
+        assert!(painted_strings(&mut app).iter().any(|s| s == "90"));
+        // A process that appears still takes its place by value.
+        app.set_snapshot(snapshot(
+            3,
+            vec![proc(1, None, 90.0), proc(2, None, 5.0), proc(3, None, 30.0)],
+        ));
+        assert_eq!(painted_names(&mut app), ["p2.exe", "p3.exe", "p1.exe"]);
+
+        // Leaving lets go at once.
+        assert!(app.handle(UiEvent::MouseLeave).repaint);
+        assert_eq!(painted_names(&mut app), ["p1.exe", "p3.exe", "p2.exe"]);
+        assert!(!painted_strings(&mut app).iter().any(|s| s == "Order held"));
+    }
+
+    #[test]
+    fn noise_does_not_reorder_rows() {
+        let mut app = App::default();
+        app.set_snapshot(two(1, 5.0, 5.5));
+        ready(&mut app);
+        assert_eq!(painted_names(&mut app), ["p2.exe", "p1.exe"]);
+        // Within a point of each other: they trade numbers, not places.
+        app.set_snapshot(two(2, 5.9, 5.1));
+        assert_eq!(painted_names(&mut app), ["p2.exe", "p1.exe"]);
+        // A clear lead moves the row.
+        app.set_snapshot(two(3, 12.0, 5.1));
+        assert_eq!(painted_names(&mut app), ["p1.exe", "p2.exe"]);
+    }
+
+    #[test]
+    fn space_pauses_the_display_and_resuming_catches_up() {
+        let mut app = App::default();
+        with_history(&mut app);
+        ready(&mut app);
+        assert!(app.handle(UiEvent::Char(' ')).repaint);
+        assert!(app.paused());
+        assert!(painted_strings(&mut app)
+            .iter()
+            .any(|s| s == "Paused \u{b7} Space resumes"));
+
+        let newer = snapshot(21, vec![proc(1, None, 1.0), proc(3, None, 50.0)]);
+        assert!(!app.set_snapshot(newer), "nothing to repaint while paused");
+        assert!(!painted_names(&mut app).contains(&"p3.exe".to_owned()));
+        // Recorded underneath, but the charts show the moment of the pause.
+        assert_eq!(app.timeline.cpu_total.len(), 21);
+        assert_eq!(
+            app.paused.as_ref().map(|p| p.timeline.cpu_total.len()),
+            Some(20)
+        );
+
+        // Space on another page pauses (and resumes) there too.
+        cmd(&mut app, Command::SetPage(Page::Performance));
+        assert!(app.handle(UiEvent::Char(' ')).repaint);
+        assert_eq!(app.page(), Page::Performance, "Space is not a search");
+        assert!(!app.paused());
+        cmd(&mut app, Command::SetPage(Page::Processes));
+        assert!(painted_names(&mut app).contains(&"p3.exe".to_owned()));
+        assert!(!painted_strings(&mut app)
+            .iter()
+            .any(|s| s.starts_with("Paused")));
+    }
+
+    #[test]
+    fn space_in_the_search_field_is_a_space() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        type_str(&mut app, "p1 ");
+        assert_eq!(app.search(), "p1 ");
+        assert!(!app.paused());
+        key(&mut app, Key::Enter); // leaves the field, keeping the text
+        app.handle(UiEvent::Char(' '));
+        assert!(app.paused());
+        assert_eq!(app.search(), "p1 ");
+    }
+
+    #[test]
+    fn a_reorder_slides_unless_animation_is_off() {
+        let mut app = App::default();
+        app.set_snapshot(two(1, 10.0, 50.0));
+        ready(&mut app);
+        app.set_system_animations(true);
+        let t0 = Instant::now();
+        let mut dl = DisplayList::new();
+        app.paint_at(&mut dl, t0);
+        app.set_snapshot(two(2, 90.0, 5.0));
+        app.paint_at(&mut dl, t0);
+        assert!(app.animating());
+        app.paint_at(&mut dl, t0 + Duration::from_millis(500));
+        assert!(!app.animating());
+
+        // Windows' animation effects off: rows jump.
+        app.set_system_animations(false);
+        app.set_snapshot(two(3, 5.0, 90.0));
+        app.paint_at(&mut dl, t0 + Duration::from_millis(600));
+        assert!(!app.animating());
+        app.set_system_animations(true);
+
+        // Turned off in Settings: rows jump, and the shell is asked to store it.
+        cmd(&mut app, Command::SetPage(Page::Settings));
+        let strings = painted_strings(&mut app);
+        assert!(strings
+            .iter()
+            .any(|s| s == "Animate rows as the order changes"));
+        let card = app.settings_page.card(0).center();
+        let r = app.handle(UiEvent::MouseDown {
+            at: card,
+            button: MouseButton::Left,
+        });
+        assert_eq!(
+            r.effect,
+            Some(Effect::SaveSettings(Settings {
+                animate_rows: Some(false)
+            }))
+        );
+        assert_eq!(app.settings().animate_rows, Some(false));
+        cmd(&mut app, Command::SetPage(Page::Processes));
+        app.paint_at(&mut dl, t0 + Duration::from_millis(700));
+        app.set_snapshot(two(4, 90.0, 5.0));
+        app.paint_at(&mut dl, t0 + Duration::from_millis(700));
+        assert!(!app.animating());
     }
 }

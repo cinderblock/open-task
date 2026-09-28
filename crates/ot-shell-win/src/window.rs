@@ -45,18 +45,19 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-    HCURSOR, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SIZE_MINIMIZED,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_APP, WM_CHAR, WM_CONTEXTMENU, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE,
-    WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    PostQuitMessage, RegisterClassW, SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES, MB_DEFBUTTON2,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+    SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_APP, WM_CHAR, WM_CONTEXTMENU,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
+    WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::gfx::Gfx;
+use crate::prefs;
 use crate::{ShellError, ShellOptions, ThemePreference};
 
 /// Posted by the sampler thread after each publish.
@@ -72,6 +73,8 @@ struct SampleOutcome {
 }
 
 const CLASS_NAME: PCWSTR = w!("OpenTaskMainWindow");
+const TITLE: &str = "open-task";
+const TITLE_PAUSED: &str = "open-task (paused)";
 const INITIAL_SIZE: (i32, i32) = (1180, 760);
 
 /// Virtual-key codes for letters are their upper-case ASCII values.
@@ -104,6 +107,8 @@ struct State {
     /// First half of a UTF-16 surrogate pair from `WM_CHAR`, awaiting the second.
     high_surrogate: Option<u16>,
     cursors: Cursors,
+    /// The window title as last set; it says when the display is paused.
+    title: &'static str,
 }
 
 /// What a message handler decided. The borrow on [`State`] ends before anything
@@ -205,6 +210,8 @@ pub fn run(
 
     let mut app = App::new(theme_for(dark));
     app.set_backdrop(backdrop);
+    app.set_settings(prefs::load());
+    app.set_system_animations(prefs::system_animations());
     app.set_view(options.view);
     app.set_page(options.page);
     let _ = app.handle(UiEvent::Resize(to_dips_size(size_px, dpi)));
@@ -239,6 +246,7 @@ pub fn run(
         dark,
         high_surrogate: None,
         cursors,
+        title: TITLE,
     }));
     let state_ptr = Box::into_raw(state);
     // SAFETY: hwnd is valid; the pointer stays alive until after the loop below.
@@ -419,6 +427,11 @@ fn repaint(st: &mut State) {
             st.gfx = None;
             invalidate(st.hwnd);
         }
+    }
+    // Rows are sliding: ask for the next frame. `Present` waits for the vertical
+    // blank, so this runs at the display's rate and stops when the slide lands.
+    if st.app.animating() {
+        invalidate(st.hwnd);
     }
 }
 
@@ -692,7 +705,8 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             Outcome::Done(LRESULT(0))
         }
         WM_SETTINGCHANGE => {
-            // Sent for any system setting; re-reading one registry value is cheap.
+            // Sent for any system setting; re-reading these is cheap.
+            st.app.set_system_animations(prefs::system_animations());
             if st.theme_pref == ThemePreference::System {
                 let dark = system_prefers_dark();
                 if dark != st.dark {
@@ -720,7 +734,7 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn dispatch(cell: &RefCell<State>, hwnd: HWND, ev: UiEvent) {
     let mut next = Some(ev);
     while let Some(ev) = next.take() {
-        let effect = {
+        let (effect, title) = {
             let Ok(mut st) = cell.try_borrow_mut() else {
                 return;
             };
@@ -728,8 +742,17 @@ fn dispatch(cell: &RefCell<State>, hwnd: HWND, ev: UiEvent) {
             if reaction.repaint {
                 invalidate(hwnd);
             }
-            reaction.effect
+            let title = if st.app.paused() { TITLE_PAUSED } else { TITLE };
+            let changed = std::mem::replace(&mut st.title, title) != title;
+            (reaction.effect, changed.then_some(title))
         };
+        // Setting the title sends WM_SETTEXT, so only with the state released.
+        if let Some(title) = title {
+            // SAFETY: hwnd is valid; the string outlives the call.
+            unsafe {
+                let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
+            }
+        }
         if let Some(effect) = effect {
             next = perform(cell, hwnd, effect);
         }
@@ -751,6 +774,10 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
         }
         Effect::SampleCpu { target, seconds } => {
             sample_cpu(cell, hwnd, target, seconds);
+            None
+        }
+        Effect::SaveSettings(settings) => {
+            prefs::save(&settings);
             None
         }
     }

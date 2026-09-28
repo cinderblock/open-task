@@ -7,13 +7,18 @@
 //! 11 Mica backdrop shows through wherever the view leaves pixels transparent.
 //!
 //! Redraws happen only when something changed: a new snapshot (the sampler posts a
-//! message), input, resize, or DPI change. Idle cost is zero frames per second.
+//! message), input, resize, or DPI change, plus the frames of a row slide after a
+//! re-sort (150 ms, paced by the display). Idle cost is zero frames per second.
+//!
+//! The user's settings are read from and written to the registry by `prefs`.
 //!
 //! On other platforms this crate compiles to a stub that returns
 //! [`ShellError::Unsupported`], so the workspace builds everywhere.
 
 #[cfg(windows)]
 mod gfx;
+#[cfg(windows)]
+mod prefs;
 #[cfg(windows)]
 mod window;
 

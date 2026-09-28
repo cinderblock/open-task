@@ -14,9 +14,16 @@ pub enum Icon {
     Processes,
     /// A pulse line: live performance graphs.
     Performance,
+    /// A gear: the app's settings.
+    Settings,
 }
 
 impl Icon {
     /// Every icon, for backends that want to check their mapping is complete.
-    pub const ALL: [Self; 3] = [Self::Menu, Self::Processes, Self::Performance];
+    pub const ALL: [Self; 4] = [
+        Self::Menu,
+        Self::Processes,
+        Self::Performance,
+        Self::Settings,
+    ];
 }

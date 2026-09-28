@@ -11,12 +11,15 @@ pub mod format;
 mod nav;
 mod perf;
 mod process_rows;
+mod settings;
 pub mod sparkline;
+mod steady;
 pub mod table;
 pub mod theme;
 pub mod view;
 
 pub use nav::Page;
+pub use settings::Settings;
 pub use theme::Theme;
 pub use view::{
     App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Reaction, UiEvent,

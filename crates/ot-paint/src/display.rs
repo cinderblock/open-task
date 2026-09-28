@@ -60,6 +60,13 @@ pub enum DrawCmd {
         color: Color,
         width: f32,
     },
+    /// A rounded outline, inside `rect` like [`DrawCmd::StrokeRect`].
+    StrokeRoundRect {
+        rect: Rect,
+        radius: f32,
+        color: Color,
+        width: f32,
+    },
     Line {
         from: Point,
         to: Point,
@@ -167,6 +174,17 @@ impl DisplayList {
     pub fn stroke_rect(&mut self, rect: Rect, color: Color, width: f32) {
         if !rect.is_empty() && color.a > 0.0 {
             self.cmds.push(DrawCmd::StrokeRect { rect, color, width });
+        }
+    }
+
+    pub fn stroke_round_rect(&mut self, rect: Rect, radius: f32, color: Color, width: f32) {
+        if !rect.is_empty() && color.a > 0.0 {
+            self.cmds.push(DrawCmd::StrokeRoundRect {
+                rect,
+                radius,
+                color,
+                width,
+            });
         }
     }
 

@@ -87,6 +87,12 @@ Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks.
     convenience (no prompt day to day) and capability (elevate on demand). Not built
     yet; it belongs in the Options menu that `plans/replace-task-manager.md`
     introduces, next to "Replace Task Manager".
+11. **App settings live on a Settings page** at the bottom of the navigation rail
+    (2026-09-28, Windows 11 Task Manager's layout), `ot-ui/src/settings.rs`, stored
+    per user in `HKCU\Software\open-task` by `ot-shell-win/src/prefs.rs`. First
+    setting: row animation (`plans/charts-log-time-and-live-table.md`). Options
+    that need a page rather than a menu go there; the plan for "Replace Task
+    Manager" and "run as administrator" predates it and should use it too.
 
 ## Why not a webview (the decisive argument)
 

@@ -25,6 +25,7 @@ use ot_model::thread::{ServiceTag, ThreadSample, ThreadState};
 use ot_model::{Bytes, ProcessKey};
 
 use crate::format;
+use crate::steady::{Band, Steady};
 use crate::table::{Column, RowId, RowSource};
 
 /// Process table columns, in display order.
@@ -608,9 +609,109 @@ pub(crate) struct ProcessRows<'a> {
     pub shown: &'a [bool],
     /// Tree mode: the rows beneath a process are listed. In list mode they are not.
     pub tree_mode: bool,
+    /// Sticky sort keys; `None` sorts by the exact values.
+    pub steady: Option<&'a Steady>,
+}
+
+/// The dead band a numeric column's sort keys get, so noise does not reorder rows
+/// (see [`Steady`]). `None` for the text columns and PID, which sort exactly.
+#[must_use]
+pub(crate) fn band(column: usize) -> Option<Band> {
+    const MIB: f64 = 1024.0 * 1024.0;
+    match column {
+        col::CPU => Some(Band {
+            abs: 1.0,
+            rel: 0.15,
+        }),
+        // Bytes per interval; I/O is bursty, so a wide relative band.
+        col::DISK_READ | col::DISK_WRITE => Some(Band {
+            abs: 64.0 * 1024.0,
+            rel: 0.25,
+        }),
+        col::MEMORY | col::WORKING_SET => Some(Band {
+            abs: MIB,
+            rel: 0.02,
+        }),
+        col::THREADS | col::HANDLES => Some(Band {
+            abs: 2.0,
+            rel: 0.02,
+        }),
+        _ => None,
+    }
 }
 
 impl ProcessRows<'_> {
+    /// The exact number `row` sorts by in a numeric column: a process's own figure
+    /// in the list, its whole subtree's in the tree; for a service, thread group,
+    /// thread or sample module its one number (CPU %, or its share of the samples)
+    /// in the CPU column and its thread or sample count in the Threads column. CPU
+    /// sample rows are pinned above their siblings with `INFINITY`. `None` where the
+    /// row has no figure for the column, and for the text columns and PID.
+    #[must_use]
+    pub fn raw_key(&self, row: usize, column: usize) -> Option<f64> {
+        let r = self.row(row);
+        match r.kind {
+            RowKind::Process => {
+                let v = if self.tree_mode {
+                    let ru = self.tree.rollup(row);
+                    match column {
+                        col::CPU => f64::from(ru.cpu),
+                        col::MEMORY => ru.private_bytes as f64,
+                        col::WORKING_SET => ru.working_set as f64,
+                        col::DISK_READ => ru.disk_read as f64,
+                        col::DISK_WRITE => ru.disk_write as f64,
+                        col::THREADS => f64::from(ru.threads),
+                        col::HANDLES => f64::from(ru.handles),
+                        _ => return None,
+                    }
+                } else {
+                    let p = &self.procs[r.proc as usize];
+                    match column {
+                        col::CPU => f64::from(p.cpu.get()),
+                        col::MEMORY => p.private_bytes.get() as f64,
+                        col::WORKING_SET => p.working_set.get() as f64,
+                        col::DISK_READ => p.disk_read.get() as f64,
+                        col::DISK_WRITE => p.disk_write.get() as f64,
+                        col::THREADS => f64::from(p.threads),
+                        col::HANDLES => f64::from(p.handles),
+                        _ => return None,
+                    }
+                };
+                Some(v)
+            }
+            RowKind::Sampling | RowKind::Sample | RowKind::Clients => {
+                band(column).map(|_| f64::INFINITY)
+            }
+            _ => match column {
+                col::CPU => Some(f64::from(r.value)),
+                col::THREADS => Some(f64::from(r.count)),
+                _ => None,
+            },
+        }
+    }
+
+    /// What `row` sorts by in `column`: its sticky key if the table is steadied,
+    /// else [`ProcessRows::raw_key`].
+    fn key(&self, row: usize, column: usize) -> Option<f64> {
+        let v = self.raw_key(row, column)?;
+        Some(
+            self.steady
+                .map_or(v, |s| s.key(self.id(row), column, self.tree_mode, v)),
+        )
+    }
+
+    /// Order by [`ProcessRows::key`] in a numeric column: a row with a figure above
+    /// one without. `None` for the columns that are not numeric.
+    fn compare_keys(&self, a: usize, b: usize, column: usize) -> Option<Ordering> {
+        band(column)?;
+        Some(match (self.key(a, column), self.key(b, column)) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        })
+    }
+
     /// Real processes in the snapshot, whether or not the search shows them.
     #[must_use]
     pub fn population(&self) -> usize {
@@ -930,6 +1031,9 @@ impl RowSource for ProcessRows<'_> {
     }
 
     fn compare(&self, a: usize, b: usize, col: usize) -> Ordering {
+        if let Some(o) = self.compare_keys(a, b, col) {
+            return o;
+        }
         let (ra, rb) = (self.row(a), self.row(b));
         if ra.kind == RowKind::Process && rb.kind == RowKind::Process {
             let (a, b) = (&self.procs[ra.proc as usize], &self.procs[rb.proc as usize]);
@@ -941,18 +1045,11 @@ impl RowSource for ProcessRows<'_> {
                     b.statics.command_line.as_deref(),
                 ),
                 col::PID => a.key().pid.cmp(&b.key().pid),
-                col::CPU => a.cpu.get().total_cmp(&b.cpu.get()),
-                col::MEMORY => a.private_bytes.cmp(&b.private_bytes),
-                col::WORKING_SET => a.working_set.cmp(&b.working_set),
-                col::DISK_READ => a.disk_read.cmp(&b.disk_read),
-                col::DISK_WRITE => a.disk_write.cmp(&b.disk_write),
-                col::THREADS => a.threads.cmp(&b.threads),
-                col::HANDLES => a.handles.cmp(&b.handles),
                 _ => Ordering::Equal,
             };
         }
-        // Rows beneath a process, or a mix: order by the one number each has, or
-        // by name. Threads sort by id in the PID column.
+        // Rows beneath a process, or a mix: by name. Threads sort by id in the PID
+        // column.
         match col {
             col::NAME => {
                 let (mut na, mut nb) = (String::new(), String::new());
@@ -966,10 +1063,6 @@ impl RowSource for ProcessRows<'_> {
                     .cmp(&self.threads[y as usize].tid),
                 _ => Ordering::Equal,
             },
-            col::THREADS => ra.count.cmp(&rb.count),
-            col::CPU | col::MEMORY | col::WORKING_SET | col::DISK_READ | col::DISK_WRITE => {
-                self.value_of(a).total_cmp(&self.value_of(b))
-            }
             _ => Ordering::Equal,
         }
     }
@@ -1031,32 +1124,17 @@ impl RowSource for ProcessRows<'_> {
     }
 
     fn compare_subtree(&self, a: usize, b: usize, col: usize) -> Ordering {
-        let (ra, rb) = (self.row(a), self.row(b));
-        if ra.kind == RowKind::Process && rb.kind == RowKind::Process {
-            let (ra, rb) = (self.tree.rollup(a), self.tree.rollup(b));
-            return match col {
-                col::CPU => ra.cpu.total_cmp(&rb.cpu),
-                col::MEMORY => ra.private_bytes.cmp(&rb.private_bytes),
-                col::WORKING_SET => ra.working_set.cmp(&rb.working_set),
-                col::DISK_READ => ra.disk_read.cmp(&rb.disk_read),
-                col::DISK_WRITE => ra.disk_write.cmp(&rb.disk_write),
-                col::THREADS => ra.threads.cmp(&rb.threads),
-                col::HANDLES => ra.handles.cmp(&rb.handles),
-                _ => self.compare(a, b, col),
-            };
-        }
-        match col {
-            col::CPU
-            | col::MEMORY
-            | col::WORKING_SET
-            | col::DISK_READ
-            | col::DISK_WRITE
-            | col::THREADS
-            | col::HANDLES => self
-                .value_of(a)
-                .total_cmp(&self.value_of(b))
-                .then_with(|| self.tie_break(a, b)),
-            _ => self.compare(a, b, col),
+        // `key` already gives processes their subtree figure in the tree. Every
+        // numeric comparison goes through it, so the order is transitive even
+        // among a mix of child processes, services and threads.
+        let Some(o) = self.compare_keys(a, b, col) else {
+            return self.compare(a, b, col);
+        };
+        let procs = self.row(a).kind == RowKind::Process && self.row(b).kind == RowKind::Process;
+        if procs {
+            o
+        } else {
+            o.then_with(|| self.tie_break(a, b))
         }
     }
 
@@ -1069,18 +1147,6 @@ impl RowSource for ProcessRows<'_> {
 }
 
 impl ProcessRows<'_> {
-    /// The sortable number of any row when siblings of mixed kinds are compared: a
-    /// process's subtree CPU, an inner row's own value. The rows of a CPU sample
-    /// the user asked for sort above everything else in their process.
-    fn value_of(&self, row: usize) -> f32 {
-        let r = self.row(row);
-        match r.kind {
-            RowKind::Process => self.tree.rollup(row).cpu,
-            RowKind::Sampling | RowKind::Sample | RowKind::Clients => f32::INFINITY,
-            _ => r.value,
-        }
-    }
-
     /// Order among siblings whose numbers tie, so a host's idle services do not
     /// shuffle: sample rows, child processes, services, the thread group, threads,
     /// each group by name. Expressed *reversed*, because the numeric columns sort
@@ -1225,6 +1291,7 @@ pub(crate) mod tests {
             matched: &[],
             shown: &[],
             tree_mode,
+            steady: None,
         }
     }
 
@@ -1429,8 +1496,80 @@ pub(crate) mod tests {
         assert_eq!(s, "p3.exe", "a leaf process shows no count");
         r.cell_collapsed(0, col::PID, &mut s);
         assert_eq!(s, "1", "identity columns never aggregate");
+        // The tree orders by subtree totals (7 > 4); the list by own figures (1 < 4).
         assert_eq!(r.compare_subtree(0, 2, col::CPU), Ordering::Greater);
-        assert_eq!(r.compare(0, 2, col::CPU), Ordering::Less);
+        let list = rows(&snap, &t, &l, None, false);
+        assert_eq!(list.compare(0, 2, col::CPU), Ordering::Less);
+    }
+
+    #[test]
+    fn mixed_siblings_sort_transitively_by_memory() {
+        // Under the host: child 8 (5 MB, 40 % CPU), child 9 (10 MB, 1 %), and the
+        // service Alpha (30 % CPU, no memory figure). Comparing processes by
+        // memory but a process against a service by CPU made a cycle:
+        // 9 > 8 (memory), 8 > Alpha (40 > 30), Alpha > 9 (30 > 1).
+        let mut snap = host_snapshot();
+        let mut nine = proc(9, Some(7), 1.0);
+        nine.private_bytes = Bytes(10 << 20);
+        snap.processes[1].cpu = Percent(40.0);
+        snap.processes[1].private_bytes = Bytes(5 << 20);
+        snap.processes.push(nine);
+        let t = tree_of(&snap.processes);
+        let l = layout_of(&snap, None);
+        let r = rows(&snap, &t, &l, None, true);
+        let alpha = (0..l.rows.len())
+            .find(|&i| r.kind(i) == RowKind::Service(0))
+            .unwrap();
+        let (eight, nine) = (1, 2);
+        let m = col::MEMORY;
+        assert_eq!(r.compare_subtree(nine, eight, m), Ordering::Greater);
+        assert_eq!(r.compare_subtree(eight, alpha, m), Ordering::Greater);
+        assert_eq!(r.compare_subtree(nine, alpha, m), Ordering::Greater);
+        assert_eq!(r.raw_key(alpha, m), None, "a service has no memory figure");
+        assert_eq!(r.raw_key(alpha, col::CPU), Some(30.0));
+        assert_eq!(r.raw_key(nine, col::NAME), None);
+    }
+
+    #[test]
+    fn steady_keys_decide_the_order_within_the_dead_band() {
+        let mut snap = Snapshot {
+            processes: vec![proc(1, None, 5.0), proc(2, None, 5.5)],
+            ..Default::default()
+        };
+        let mut steady = Steady::default();
+        let fold = |snap: &Snapshot, steady: &mut Steady| {
+            let t = tree_of(&snap.processes);
+            let l = layout_of(snap, None);
+            let r = rows(snap, &t, &l, None, false);
+            steady.update(
+                col::CPU,
+                false,
+                band(col::CPU),
+                (0..2).map(|i| (r.id(i), r.raw_key(i, col::CPU).unwrap())),
+            );
+        };
+        fold(&snap, &mut steady);
+        // The numbers cross, but by less than a point: the order stays.
+        snap.processes[0].cpu = Percent(5.8);
+        snap.processes[1].cpu = Percent(5.2);
+        fold(&snap, &mut steady);
+        let t = tree_of(&snap.processes);
+        let l = layout_of(&snap, None);
+        let exact = rows(&snap, &t, &l, None, false);
+        assert_eq!(exact.compare(0, 1, col::CPU), Ordering::Greater);
+        let steadied = ProcessRows {
+            steady: Some(&steady),
+            ..rows(&snap, &t, &l, None, false)
+        };
+        assert_eq!(steadied.compare(0, 1, col::CPU), Ordering::Less);
+        // A real move gets through.
+        snap.processes[0].cpu = Percent(9.0);
+        fold(&snap, &mut steady);
+        let steadied = ProcessRows {
+            steady: Some(&steady),
+            ..rows(&snap, &t, &l, None, false)
+        };
+        assert_eq!(steadied.compare(0, 1, col::CPU), Ordering::Greater);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! The rail follows the Windows 11 Task Manager and `NavigationView`: icons and
 //! labels when the window is wide enough, icons alone when it is not, and a
 //! hamburger button at the top that overrides the automatic choice. Only pages that
-//! exist are listed.
+//! exist are listed. Settings sits apart at the bottom, as in Task Manager.
 
 use ot_paint::{DisplayList, Icon, Rect};
 
@@ -17,17 +17,20 @@ pub enum Page {
     Processes,
     /// Devices (CPU, memory) with a chart and the numbers for each.
     Performance,
+    /// The app's settings, at the bottom of the rail.
+    Settings,
 }
 
 impl Page {
-    /// In rail order.
-    pub const ALL: [Self; 2] = [Self::Processes, Self::Performance];
+    /// In rail order. Settings is last and drawn at the bottom.
+    pub const ALL: [Self; 3] = [Self::Processes, Self::Performance, Self::Settings];
 
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Processes => "Processes",
             Self::Performance => "Performance",
+            Self::Settings => "Settings",
         }
     }
 
@@ -36,6 +39,7 @@ impl Page {
         match self {
             Self::Processes => Icon::Processes,
             Self::Performance => Icon::Performance,
+            Self::Settings => Icon::Settings,
         }
     }
 
@@ -64,9 +68,14 @@ impl Page {
     }
 
     /// The page at 1-based position `n` on the rail, as Ctrl+1..9 picks it.
+    /// Settings has no number.
     #[must_use]
     pub fn nth(n: usize) -> Option<Self> {
-        n.checked_sub(1).and_then(|i| Self::ALL.get(i).copied())
+        let i = n.checked_sub(1)?;
+        Self::ALL
+            .into_iter()
+            .filter(|&p| p != Self::Settings)
+            .nth(i)
     }
 }
 
@@ -163,8 +172,15 @@ impl NavRail {
             theme,
         );
         for (i, page) in Page::ALL.into_iter().enumerate() {
-            let (r, next) = below.split_top(ITEM_H);
-            below = next;
+            let r = if page == Page::Settings {
+                let (r, remaining) = below.split_bottom(ITEM_H);
+                below = remaining;
+                r
+            } else {
+                let (r, remaining) = below.split_top(ITEM_H);
+                below = remaining;
+                r
+            };
             self.items[i] = r;
             let label = expanded.then(|| page.label());
             let hovered = self.hover == Some(NavHit::Page(page));
@@ -213,10 +229,13 @@ mod tests {
         assert_eq!(Page::parse(""), None);
         assert_eq!(Page::parse("services"), None);
         assert_eq!(Page::Processes.step(1), Page::Performance);
-        assert_eq!(Page::Performance.step(1), Page::Processes, "wraps");
-        assert_eq!(Page::Processes.step(-1), Page::Performance, "wraps back");
+        assert_eq!(Page::Performance.step(1), Page::Settings);
+        assert_eq!(Page::Settings.step(1), Page::Processes, "wraps");
+        assert_eq!(Page::Processes.step(-1), Page::Settings, "wraps back");
+        assert_eq!(Page::parse("set"), Some(Page::Settings));
         assert_eq!(Page::nth(1), Some(Page::Processes));
         assert_eq!(Page::nth(2), Some(Page::Performance));
+        assert_eq!(Page::nth(3), None, "Settings has no number");
         assert_eq!(Page::nth(0), None);
         assert_eq!(Page::nth(9), None);
     }
@@ -259,7 +278,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(icons, [Icon::Menu, Icon::Processes, Icon::Performance]);
+        assert_eq!(
+            icons,
+            [
+                Icon::Menu,
+                Icon::Processes,
+                Icon::Performance,
+                Icon::Settings
+            ]
+        );
         assert!(!dl.cmds().iter().any(|c| matches!(c, DrawCmd::Text(_))));
 
         let theme = Theme::dark();
@@ -274,6 +301,11 @@ mod tests {
             Some(NavHit::Page(Page::Performance))
         );
         assert_eq!(nav.hit(Point::new(20.0, y0 + 3.0 * ITEM_H)), None);
+        // Settings is at the bottom of the rail.
+        assert_eq!(
+            nav.hit(Point::new(20.0, 600.0 - theme.gap - ITEM_H * 0.5)),
+            Some(NavHit::Page(Page::Settings))
+        );
         assert!(nav.set_hover(Some(Point::new(20.0, y0))));
         assert!(!nav.set_hover(Some(Point::new(21.0, y0))), "same item");
         assert!(nav.set_hover(None));
@@ -287,6 +319,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(labels, ["Processes", "Performance"]);
+        assert_eq!(labels, ["Processes", "Performance", "Settings"]);
     }
 }

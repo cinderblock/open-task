@@ -31,6 +31,14 @@ The user's feedback on 2026-09-28, five items:
   60 ms and 1.5 s after each resize.
 - `plans/replace-task-manager.md` is another thread's untracked plan (dormant since
   2026-09-26). Not ours; do not stage it.
+- **An active peer thread** (`plans/performance-view.md`) shares this tree. It
+  added the navigation rail (`nav.rs`), the Performance page (`perf.rs`) and turned
+  the summary charts into a general `ChartGroup` (`charts.rs`), commits `df83a78`,
+  `b7ce60a`. It has uncommitted work in `charts.rs`, `theme.rs`, `format.rs`,
+  `timeline.rs`, the probe and the model (disks, network). Its plan asks this
+  thread to keep `view.rs` edits small and put new pages in their own modules, and
+  says not to push while this thread's commits are unpushed. **Do not edit files
+  it has uncommitted changes in**; stage only our own files.
 
 ## Decisions already made (don't re-ask)
 
@@ -55,11 +63,63 @@ The user's feedback on 2026-09-28, five items:
    replacing the tick labels while hovering. (First cut centered it in a fixed
    260-DIP box; near an edge that pushed the text far from the line. The view has
    no text measurement, so anchoring to the line is the robust choice.)
-   The hovered age is held fixed while the pointer is still, so data slides under
-   the line as new samples arrive.
+   The pointer is re-snapped every frame, so as new samples slide under a still
+   pointer the line stays on a sample.
 5. **Resize fix:** render synchronously inside `WM_SIZE` (then validate the window
    so the queued `WM_PAINT` does not draw the same frame again), instead of
    relying on `WM_PAINT`, which a live drag starves.
+6. **Item 4, user's pick (2026-09-28): A, B, E, F, and G with an enable toggle in
+   settings.** C and D not wanted.
+7. **B is per-row sticky sort keys, not a fuzzy comparator.** Each row keeps the
+   key it last sorted by and only takes its new value when the value leaves a dead
+   band around the old key: `max(abs, rel * |key|)` per column (CPU 1 point / 15 %;
+   disk rates 64 KiB per interval / 25 %; memory and working set 1 MiB / 2 %;
+   threads and handles 2 / 2 %; text and PID exact). The table then sorts exactly
+   by those keys, which is a total order, so Rust's sort cannot panic, and two rows
+   are out of order only when their values are within the two dead bands. Keys
+   reset to exact values when the sort column or the arrangement changes. Pinned
+   rows (a CPU sample in progress or done) keep `INFINITY`.
+8. **Every numeric comparison in `ProcessRows` goes through one `key(row, col)`.**
+   The old `compare_subtree` compared two processes by their rollup of the column
+   but a process against a service by CPU, which is not transitive when sorting
+   by memory with services expanded (possible sort panic). Rows without a figure
+   for a column (services and threads outside the CPU column) now have none and
+   sort below those that do, then by the existing kind-and-name tie-break.
+9. **A = hold the keys.** While the pointer is over the table (header or body)
+   the keys do not move at all; new rows get their exact key, gone rows drop out.
+   When the pointer leaves, the keys update at once and the table re-sorts
+   (animated if G is on). The toolbar says "Order held" meanwhile.
+10. **E applies to data-driven re-sorts only** (a snapshot, a CPU sample row
+    appearing): if the selected row was on screen, the scroll moves so it keeps its
+    screen position. Sort clicks, list/tree switches, collapsing and the search
+    behave as before.
+11. **F = Space pauses the display, not the sampler.** The table, the cards, the
+    charts and the Performance page freeze on the snapshot and history of the
+    moment; sampling and history recording continue behind it (the charts paint
+    from a clone of the timeline taken at the pause, about 1 MB at most), so
+    resuming loses nothing. Space pauses only when the search field does not have
+    focus; with focus it types a space. The toolbar shows "Paused" and the window
+    title gets " (paused)".
+12. **G = rows slide to their new place (150 ms, ease-out)** after a data-driven
+    re-sort. Rows coming from far away enter from just outside the visible edge;
+    rows leaving slide out to it. The shell keeps painting while the view reports
+    it is animating (vsync-paced by `Present(1)`), then goes back to event-driven.
+    **Default follows Windows' "Animation effects"** (`SPI_GETCLIENTAREAANIMATION`,
+    re-read on `WM_SETTINGCHANGE`) until the user flips the switch in Settings;
+    from then on the explicit choice wins (`Settings::animate_rows:
+    Option<bool>`, `None` = follow Windows, not written to the registry). Changed
+    from "system off always wins" on finding this machine has animation effects
+    off: the user asked for G and would never have seen it.
+13. **Settings live on a Settings page** at the bottom of the navigation rail (the
+    Windows 11 Task Manager layout), in its own module `settings.rs`. Persisted per
+    user in `HKCU\Software\open-task` (DWORD values) by the Windows shell; `ot-ui`
+    only describes the settings and emits an effect when one changes. Later
+    options (theme, update speed, replace Task Manager, run as administrator) go
+    on the same page.
+14. **Item 5, user (2026-09-28): "I like the treemap idea. The icicle strip sounds
+    cool too."** Both, after item 4: the treemap as a "Map" arrangement, the icicle
+    as a strip. Needs cumulative per-process CPU time published in
+    `ProcessSample` (probe and model files the peer thread is editing: coordinate).
 
 ## Plan / steps
 
@@ -73,8 +133,25 @@ The user's feedback on 2026-09-28, five items:
 6. ~~`format::ago` for the readout.~~
 7. ~~README (charts paragraph), architecture plan (decision 8 status), this plan.~~
 8. ~~Checks and screenshots.~~
-9. **[current]** Items 4 and 5: options put to the user (below); build what they
-   pick.
+9. ~~Items 4 and 5: options put to the user.~~ Picks in decisions 6 and 14.
+10. ~~Item 4~~ (all of a to f done; commit after this plan update):
+    a. `ProcessRows::key` / `raw_key`, one numeric key per row and column; sticky
+       keys (`steady.rs`), held while pointing. Tests.
+    b. `Table`: remember row ids with the order; `refresh()` for data-driven
+       re-sorts keeps the selection's screen position (E) and records slide
+       animations (G); `tick(now)` / `animating()`. Tests.
+    c. `App`: hold on pointer over the table; pause (Space, `Command::TogglePause`),
+       frozen snapshot and timeline; toolbar status; settings; `paint_at(now)`.
+       Tests.
+    d. `settings.rs` Settings page; `Page::Settings` pinned to the rail's bottom.
+    e. Shell: settings in the registry, animation frame loop, system animation
+       setting, window title while paused.
+    f. README, plans; checks on three targets; screenshots; commit.
+11. **[current]** Item 5: treemap "Map" arrangement, then the icicle strip. Needs
+    its own design pass first (data: cumulative CPU per process; layout: squarified
+    and stable; interaction: shared selection). The peer thread is idle in the
+    probe and model now (its work is committed), so publishing cumulative CPU
+    time in `ProcessSample` no longer collides.
 
 ## Findings / gotchas
 
@@ -111,6 +188,31 @@ The user's feedback on 2026-09-28, five items:
   `history()` yields only buckets wholly older than everything yielded so far, so
   the seam has a gap of up to one bucket (one or two DIPs at ten minutes' age)
   and never an overlap.
+- **Latent sort panic, fixed on the way (item 4):** the old `compare_subtree`
+  compared two processes by the column's rollup but a process against a service
+  by CPU. Sorting the tree by memory with a service host expanded could therefore
+  hand `sort_unstable_by` a cycle (9 > 8 by memory, 8 > Alpha by CPU, Alpha > 9 by
+  CPU), and Rust's sort may panic on a comparator that is not a total order.
+  Every numeric comparison now goes through `ProcessRows::key`; the test
+  `mixed_siblings_sort_transitively_by_memory` pins the cycle case.
+- **This machine has Windows' animation effects off** (`SPI_GETCLIENTAREAANIMATION`
+  returns 0; `HKCU\Control Panel\Desktop\WindowMetrics\MinAnimate` is 0).
+- **`cargo fmt --all` reformats the peer thread's uncommitted files too.** In a
+  shared tree run `rustfmt --edition 2021 <own files>` instead. Happened once here
+  (formatting only; the peer committed afterwards).
+- **Git Bash rewrites `/f` into a path** (`reg delete ... /f` fails with "Invalid
+  syntax"). Use the PowerShell tool for `reg`, or `//f`.
+- **`PrintWindow(PW_RENDERFULLCONTENT)` takes about 300 ms a frame here**, too slow
+  to time a 150 ms slide; one burst frame still caught rows mid-slide
+  (`target/drive/burst-1-crop.png`), which shows the frame loop runs.
+- **Mid-slide, crossing rows overlap visibly**: row backgrounds are translucent
+  (over Mica), so a row sliding past another does not hide it. Could give moving
+  rows an opaque backing (`bg_solid`); not done, to be raised with the user.
+- Driving the app without touching the real cursor: `target/drive.ps1` (steps
+  `move`, `click`, `char`, `wait`, `shot`, `title`; client pixels), plus the
+  scratch `SCRATCH-HOVER-SHOT` build (above) for anything needing the pointer to
+  stay over the window. Rail expanded at the default window width, so the
+  Settings card centre is about (678, 108).
 
 ## Progress log
 
@@ -124,7 +226,14 @@ The user's feedback on 2026-09-28, five items:
 - [x] Checks: workspace tests, clippy `-D warnings` on windows / linux / macOS
       targets, fmt; screenshots `target/charts-20s.png`, `target/hover2-cards.png`.
 - [x] Options for items 4 and 5 put to the user (below).
-- [ ] Build whatever the user picks for items 4 and 5.
+- [x] Item 4 (A, B, E, F, G + Settings page): `steady.rs`, `ProcessRows::key`,
+      `Table::refresh`/slide, pause, hold, `settings.rs`, `Page::Settings`,
+      `Icon::Settings`, `DrawCmd::StrokeRoundRect`, shell `prefs.rs`, frame loop,
+      title. 98 `ot-ui` tests; clippy clean on three targets. Checked in the app:
+      Settings page off/on and the registry value (then removed again; the key did
+      not exist before), pause (title, status, table unchanged pixel for pixel over
+      2.5 s), "Order held" with rows staying put, a mid-slide frame.
+- [ ] Item 5: treemap, then icicle strip.
 
 ## Item 4: keeping the table from jumping (options put to the user)
 
@@ -190,12 +299,15 @@ CPU card for the "when" question.
 ## Open questions for the user
 
 1. Item 1: does a live drag-resize now redraw smoothly on your monitor?
-2. Item 4: which of A-G to build (recommendation: A + B + E, plus F).
-3. Item 5: which form, and where it lives (recommendation: treemap "Map" view
-   first, stacked area over time second).
+2. Mid-slide overlap: give moving rows an opaque backing, or leave the rows
+   translucent? (Recommendation: try the backing; it reads as rows lifting.)
 
 ## Things not to do
 
 - Do not synthesize mouse drags with `SendInput` to test live resize: it moves the
   user's real cursor on the desktop they are using.
 - Do not stage `plans/replace-task-manager.md` (another thread's).
+- Do not run `cargo fmt --all` while another thread has uncommitted files; format
+  only our own with `rustfmt --edition 2021 <files>`.
+- Do not leave test values in the user's registry: `HKCU\Software\open-task` did
+  not exist before this thread; tests that write it must remove it again.

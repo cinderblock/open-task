@@ -11,9 +11,15 @@
 //! In tree mode the display order is a pre-order walk of the hierarchy, with the
 //! children of every node ordered by the active sort column. Collapsed subtrees are
 //! skipped when the order is built, so they cost nothing per frame.
+//!
+//! A re-sort because the data changed ([`Table::refresh`]) is gentler than one the
+//! user asked for: the selected row keeps its place on screen, scrolling the rest
+//! around it, and with animation on, rows slide from where they were to where they
+//! now belong instead of jumping.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
@@ -173,6 +179,44 @@ struct TreeScratch {
 /// dropped on the next rebuild. Collapsing is rare, so this almost never runs.
 const COLLAPSED_PRUNE_AT: usize = 4096;
 
+/// How long rows take to slide to their new places after a re-sort.
+const SLIDE: Duration = Duration::from_millis(150);
+
+/// Rows in motion after a re-sort. Positions are in rows relative to the top of
+/// the body ("screen rows"), so scrolling during a slide moves everything together.
+#[derive(Debug, Default)]
+struct Slide {
+    /// When the slide began: the first frame painted after the re-sort.
+    start: Option<Instant>,
+    /// Rows on screen now that were somewhere else: how far above (negative) or
+    /// below their place they start, in rows. A row that came from off screen
+    /// starts just outside the edge it came from.
+    offsets: HashMap<RowId, f32>,
+    /// Rows that were on screen and no longer are: their new display position and
+    /// the screen row they leave from. They slide out over the nearer edge.
+    leaving: Vec<(usize, f32)>,
+}
+
+impl Slide {
+    fn is_empty(&self) -> bool {
+        self.offsets.is_empty() && self.leaving.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.start = None;
+        self.offsets.clear();
+        self.leaving.clear();
+    }
+}
+
+/// Ease-out cubic: quick to leave, gentle to land.
+fn ease(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+// Sort direction, dirtiness, refresh, animation and tree mode are independent
+// switches; folding them into an enum or bit set would only obscure them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct Table {
     pub columns: Vec<Column>,
@@ -185,8 +229,26 @@ pub struct Table {
     resize: Option<Resize>,
     /// Source row indices in display order.
     order: Vec<usize>,
+    /// The ids of `order`, as of when it was built, so the next rebuild can tell
+    /// where each row was after the source has changed underneath.
+    order_ids: Vec<RowId>,
+    /// The previous `order_ids`, during a rebuild; kept for its allocation.
+    prev_ids: Vec<RowId>,
+    /// Row height at the last paint, for the refresh bookkeeping that happens
+    /// between paints.
+    row_h: f32,
     meta: Vec<RowMeta>,
     order_dirty: bool,
+    /// The next rebuild is a re-sort because the data changed ([`Table::refresh`]).
+    refreshing: bool,
+    /// Slide rows to their new places on a refresh.
+    animate: bool,
+    slide: Slide,
+    /// The frame time [`Table::tick`] last gave; `None` never animates.
+    now: Option<Instant>,
+    /// Scratch for a rebuild: where each row was, and where it is now.
+    was_at: HashMap<RowId, usize>,
+    is_at: HashMap<RowId, usize>,
     /// Source length when `order` was built; a silent length change forces a rebuild
     /// so stale indices can never reach the source.
     order_src_len: usize,
@@ -213,8 +275,17 @@ impl Table {
             scroll_x: 0.0,
             resize: None,
             order: Vec::new(),
+            order_ids: Vec::new(),
+            prev_ids: Vec::new(),
+            row_h: 0.0,
             meta: Vec::new(),
             order_dirty: true,
+            refreshing: false,
+            animate: false,
+            slide: Slide::default(),
+            now: None,
+            was_at: HashMap::new(),
+            is_at: HashMap::new(),
             order_src_len: 0,
             hover: None,
             selected: None,
@@ -229,6 +300,45 @@ impl Table {
     /// Call whenever the source's rows may have changed.
     pub fn invalidate_order(&mut self) {
         self.order_dirty = true;
+    }
+
+    /// The data changed (a new sample): re-sort, keeping the selected row where it
+    /// is on screen if it is on screen, and sliding rows to their new places if
+    /// animation is on.
+    pub fn refresh(&mut self) {
+        self.order_dirty = true;
+        self.refreshing = true;
+    }
+
+    /// Whether a refresh slides rows rather than jumping them. Turning it off stops
+    /// a slide in progress.
+    pub fn set_animate(&mut self, on: bool) {
+        self.animate = on;
+        if !on {
+            self.slide.clear();
+        }
+    }
+
+    /// The time of the frame about to be painted, for the slide.
+    pub fn tick(&mut self, now: Instant) {
+        self.now = Some(now);
+    }
+
+    /// Whether rows are still sliding, so the shell should paint another frame.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        !self.slide.is_empty()
+    }
+
+    /// Where the header and body were painted last.
+    #[must_use]
+    pub fn rect(&self) -> Rect {
+        Rect::new(
+            self.header.x,
+            self.header.y,
+            self.header.w,
+            self.body.bottom() - self.header.y,
+        )
     }
 
     /// Sort by `col`; clicking the active column flips direction.
@@ -257,6 +367,10 @@ impl Table {
     pub fn set_tree<S: RowSource>(&mut self, on: bool, src: &S, theme: &Theme) {
         self.tree = on;
         self.order_dirty = true;
+        // A different arrangement is a jump, not a re-sort: nothing to keep in
+        // place and nothing to slide.
+        self.refreshing = false;
+        self.slide.clear();
         self.hover = None;
         if !self.reveal_selected(src, theme) {
             self.scroll = 0.0;
@@ -572,6 +686,18 @@ impl Table {
         if !self.order_dirty && self.order_src_len == src.len() {
             return;
         }
+        let refreshing = std::mem::take(&mut self.refreshing);
+        // Before the old order goes: where the selection sat on screen, and where
+        // every row was.
+        let anchor = if refreshing {
+            self.selected_screen_row()
+        } else {
+            None
+        };
+        let old_scroll = self.scroll;
+        std::mem::swap(&mut self.order_ids, &mut self.prev_ids);
+        let slide = refreshing && self.animate && self.row_h > 0.0 && !self.prev_ids.is_empty();
+
         self.order.clear();
         self.meta.clear();
         self.order_src_len = src.len();
@@ -581,6 +707,71 @@ impl Table {
             self.build_flat_order(src);
         }
         self.order_dirty = false;
+        self.order_ids.clear();
+        self.order_ids.extend(self.order.iter().map(|&r| src.id(r)));
+
+        if let Some(screen) = anchor {
+            let id = self.selected;
+            if let Some(pos) = self.order_ids.iter().position(|&x| Some(x) == id) {
+                self.scroll = (pos as f32 - screen).max(0.0);
+            }
+        }
+        if slide {
+            self.record_slide(old_scroll);
+        }
+    }
+
+    /// The selected row's position relative to the top of the body, in rows, if it
+    /// is on screen in the order as last built.
+    fn selected_screen_row(&self) -> Option<f32> {
+        let id = self.selected?;
+        let pos = self.order_ids.iter().position(|&x| x == id)?;
+        let screen = pos as f32 - self.scroll;
+        let rows = if self.row_h > 0.0 {
+            self.body.h / self.row_h
+        } else {
+            0.0
+        };
+        (screen > -1.0 && screen < rows).then_some(screen)
+    }
+
+    /// After a refresh rebuilt the order: start sliding every row on screen from
+    /// where it was (`prev_ids`, scrolled by `old_scroll`) to where it is now, and
+    /// every row that was on screen and no longer is off over the nearer edge.
+    fn record_slide(&mut self, old_scroll: f32) {
+        self.slide.clear();
+        let view = self.body.h / self.row_h;
+        let span = view.ceil() as usize + 1;
+        self.was_at.clear();
+        self.was_at
+            .extend(self.prev_ids.iter().enumerate().map(|(i, &id)| (id, i)));
+        self.is_at.clear();
+        self.is_at
+            .extend(self.order_ids.iter().enumerate().map(|(i, &id)| (id, i)));
+
+        let first = self.scroll.max(0.0).floor() as usize;
+        let now_shown = first..(first + span).min(self.order_ids.len());
+        for pos in now_shown.clone() {
+            let id = self.order_ids[pos];
+            // A row that is new appears in place.
+            let Some(&was) = self.was_at.get(&id) else {
+                continue;
+            };
+            let from = (was as f32 - old_scroll).clamp(-1.0, view);
+            let to = pos as f32 - self.scroll;
+            if (from - to).abs() > 0.01 {
+                self.slide.offsets.insert(id, from - to);
+            }
+        }
+        let first_old = old_scroll.max(0.0).floor() as usize;
+        for was in first_old..(first_old + span).min(self.prev_ids.len()) {
+            // A row that is gone just goes.
+            if let Some(&pos) = self.is_at.get(&self.prev_ids[was]) {
+                if !now_shown.contains(&pos) {
+                    self.slide.leaving.push((pos, was as f32 - old_scroll));
+                }
+            }
+        }
     }
 
     fn build_flat_order<S: RowSource>(&mut self, src: &S) {
@@ -731,6 +922,122 @@ impl Table {
         Some((depth - 1, parent + 1..end))
     }
 
+    /// How far the slide has come, `0.0..=1.0` (eased); `1.0` when nothing is
+    /// sliding. The first frame painted after a refresh starts the clock. Without a
+    /// frame time (no [`Table::tick`]) a slide finishes at once.
+    fn slide_progress(&mut self) -> f32 {
+        if self.slide.is_empty() {
+            return 1.0;
+        }
+        let Some(now) = self.now else {
+            return 1.0;
+        };
+        let start = *self.slide.start.get_or_insert(now);
+        ease(now.saturating_duration_since(start).as_secs_f32() / SLIDE.as_secs_f32())
+    }
+
+    /// One row at `y`, display position `pos`: background, heat, cells, and in
+    /// the tree its guides and chevron.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row<S: RowSource>(
+        &self,
+        dl: &mut DisplayList,
+        src: &S,
+        theme: &Theme,
+        buf: &mut String,
+        pos: usize,
+        y: f32,
+        active: Option<&(u16, std::ops::Range<usize>)>,
+    ) {
+        let body = self.body;
+        let row_h = theme.row_h;
+        let ox = -self.scroll_x;
+        let row = self.order[pos];
+        let rr = Rect::new(body.x, y, body.w, row_h);
+        let id = src.id(row);
+        let meta = if self.tree {
+            self.meta.get(pos).copied().unwrap_or_default()
+        } else {
+            RowMeta::default()
+        };
+        let collapsed =
+            meta.has_children && (src.collapsed_by_default(row) != self.collapsed.contains(&id));
+
+        if self.selected == Some(id) {
+            dl.fill_rect(rr, theme.row_selected);
+        } else if self.hover == Some(pos) {
+            dl.fill_rect(rr, theme.row_hover);
+        } else if pos % 2 == 1 {
+            dl.fill_rect(rr, theme.row_alt);
+        }
+        let text_color = if src.muted(row) {
+            theme.text_dim
+        } else {
+            theme.text
+        };
+
+        let mut x = body.x + ox;
+        for (ci, col) in self.columns.iter().enumerate() {
+            let cr = Rect::new(x, y, col.width, row_h);
+            let heat = if collapsed {
+                src.heat_collapsed(row, ci)
+            } else {
+                src.heat(row, ci)
+            };
+            if let Some(h) = heat {
+                dl.fill_rect(cr, theme.heat.with_alpha(0.04 + 0.45 * h.clamp(0.0, 1.0)));
+            }
+            if collapsed {
+                src.cell_collapsed(row, ci, buf);
+            } else {
+                src.cell(row, ci, buf);
+            }
+            let mut text_rect = cr.inset(theme.pad, 0.0);
+            if self.tree && ci == 0 {
+                let x0 = cr.x + theme.pad;
+                for level in 0..meta.depth {
+                    let gx = x0 + f32::from(level) * theme.indent + theme.expander_w * 0.5;
+                    let is_active = active
+                        .as_ref()
+                        .is_some_and(|(l, range)| *l == level && range.contains(&pos));
+                    let color = if is_active {
+                        theme.tree_guide_active
+                    } else {
+                        theme.tree_guide
+                    };
+                    dl.fill_rect(Rect::new(gx.round() - 0.5, y, 1.0, row_h), color);
+                }
+                let indent = f32::from(meta.depth) * theme.indent;
+                if meta.has_children {
+                    let center = Point::new(x0 + indent + theme.expander_w * 0.5, y + row_h * 0.5);
+                    chevron(dl, center, collapsed, theme.text_dim);
+                }
+                let shift = indent + theme.expander_w;
+                text_rect = Rect::new(
+                    text_rect.x + shift,
+                    text_rect.y,
+                    (text_rect.w - shift).max(0.0),
+                    text_rect.h,
+                );
+            }
+            let (style, align) = if col.numeric {
+                (theme.cell_num, HAlign::Right)
+            } else {
+                (theme.cell, HAlign::Left)
+            };
+            dl.text(
+                buf,
+                text_rect,
+                style,
+                text_color,
+                align,
+                VAlign::Middle,
+                true,
+            );
+            x += col.width;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn paint<S: RowSource>(
         &mut self,
@@ -743,6 +1050,7 @@ impl Table {
         let (header, body) = rect.split_top(theme.header_h);
         self.header = header;
         self.body = body;
+        self.row_h = theme.row_h;
         self.ensure_order(src);
         self.clamp_scroll(theme);
         // Columns slide left by the horizontal scroll; rows and their backgrounds
@@ -797,98 +1105,37 @@ impl Table {
         let first = first as usize;
         let visible = (body.h / row_h).ceil() as usize + 1;
         let active = self.active_block(src);
+        let settle = self.slide_progress();
+        if settle >= 1.0 {
+            // Landed: this frame draws everything at rest.
+            self.slide.clear();
+        }
 
         dl.push_clip(body);
-        for vi in 0..visible {
-            let pos = first + vi;
-            let Some(&row) = self.order.get(pos) else {
-                break;
-            };
-            let y = body.y + (vi as f32 - frac) * row_h;
-            let rr = Rect::new(body.x, y, body.w, row_h);
-            let id = src.id(row);
-            let meta = if self.tree {
-                self.meta.get(pos).copied().unwrap_or_default()
-            } else {
-                RowMeta::default()
-            };
-            let collapsed = meta.has_children
-                && (src.collapsed_by_default(row) != self.collapsed.contains(&id));
-
-            if self.selected == Some(id) {
-                dl.fill_rect(rr, theme.row_selected);
-            } else if self.hover == Some(pos) {
-                dl.fill_rect(rr, theme.row_hover);
-            } else if pos % 2 == 1 {
-                dl.fill_rect(rr, theme.row_alt);
-            }
-            let text_color = if src.muted(row) {
-                theme.text_dim
-            } else {
-                theme.text
-            };
-
-            let mut x = body.x + ox;
-            for (ci, col) in self.columns.iter().enumerate() {
-                let cr = Rect::new(x, y, col.width, row_h);
-                let heat = if collapsed {
-                    src.heat_collapsed(row, ci)
-                } else {
-                    src.heat(row, ci)
+        // Rows at rest first, rows in motion over them.
+        for moving in [false, true] {
+            for vi in 0..visible {
+                let pos = first + vi;
+                let Some(&row) = self.order.get(pos) else {
+                    break;
                 };
-                if let Some(h) = heat {
-                    dl.fill_rect(cr, theme.heat.with_alpha(0.04 + 0.45 * h.clamp(0.0, 1.0)));
+                let offset = self.slide.offsets.get(&src.id(row)).copied();
+                if offset.is_some() != moving {
+                    continue;
                 }
-                if collapsed {
-                    src.cell_collapsed(row, ci, buf);
-                } else {
-                    src.cell(row, ci, buf);
-                }
-                let mut text_rect = cr.inset(theme.pad, 0.0);
-                if self.tree && ci == 0 {
-                    let x0 = cr.x + theme.pad;
-                    for level in 0..meta.depth {
-                        let gx = x0 + f32::from(level) * theme.indent + theme.expander_w * 0.5;
-                        let is_active = active
-                            .as_ref()
-                            .is_some_and(|(l, range)| *l == level && range.contains(&pos));
-                        let color = if is_active {
-                            theme.tree_guide_active
-                        } else {
-                            theme.tree_guide
-                        };
-                        dl.fill_rect(Rect::new(gx.round() - 0.5, y, 1.0, row_h), color);
-                    }
-                    let indent = f32::from(meta.depth) * theme.indent;
-                    if meta.has_children {
-                        let center =
-                            Point::new(x0 + indent + theme.expander_w * 0.5, y + row_h * 0.5);
-                        chevron(dl, center, collapsed, theme.text_dim);
-                    }
-                    let shift = indent + theme.expander_w;
-                    text_rect = Rect::new(
-                        text_rect.x + shift,
-                        text_rect.y,
-                        (text_rect.w - shift).max(0.0),
-                        text_rect.h,
-                    );
-                }
-                let (style, align) = if col.numeric {
-                    (theme.cell_num, HAlign::Right)
-                } else {
-                    (theme.cell, HAlign::Left)
-                };
-                dl.text(
-                    buf,
-                    text_rect,
-                    style,
-                    text_color,
-                    align,
-                    VAlign::Middle,
-                    true,
-                );
-                x += col.width;
+                let screen = vi as f32 - frac + offset.unwrap_or(0.0) * (1.0 - settle);
+                let y = body.y + screen * row_h;
+                self.paint_row(dl, src, theme, buf, pos, y, active.as_ref());
             }
+        }
+        let view = body.h / row_h;
+        for &(pos, from) in &self.slide.leaving {
+            if pos >= self.order.len() {
+                continue;
+            }
+            let to = (pos as f32 - self.scroll).clamp(-1.0, view);
+            let y = body.y + (from + (to - from) * settle) * row_h;
+            self.paint_row(dl, src, theme, buf, pos, y, active.as_ref());
         }
         dl.pop_clip();
 
@@ -1382,6 +1629,145 @@ mod tests {
         // Right of the name there is only the row.
         assert_eq!(t.hit(Point::new(200.0, row_y(1)), &theme), Hit::Row(1));
         assert_eq!(dl.clip_depth(), 0);
+    }
+
+    /// Rows whose values change under stable ids (the row index).
+    struct Live(Vec<u32>);
+
+    impl RowSource for Live {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn id(&self, row: usize) -> RowId {
+            RowId(row as u64)
+        }
+        fn cell(&self, row: usize, _col: usize, out: &mut String) {
+            out.clear();
+            out.push_str(&self.0[row].to_string());
+        }
+        fn compare(&self, a: usize, b: usize, _col: usize) -> Ordering {
+            self.0[a].cmp(&self.0[b])
+        }
+    }
+
+    /// Ten rows high; descending, so row `r` of `0..50` starts at position 49 - r.
+    fn live_view(t: &mut Table, src: &Live, theme: &Theme) -> DisplayList {
+        let mut dl = DisplayList::new();
+        let rect = Rect::new(0.0, 0.0, 100.0, theme.header_h + theme.row_h * 10.0);
+        t.paint(&mut dl, rect, src, theme, &mut String::new());
+        dl
+    }
+
+    /// Where the text `s` was painted, as a screen row of the body.
+    fn row_of_text(dl: &DisplayList, s: &str, theme: &Theme) -> Option<f32> {
+        dl.cmds().iter().find_map(|c| match c {
+            ot_paint::DrawCmd::Text(t) if dl.str(t.text) == s => {
+                Some((t.rect.y - theme.header_h) / theme.row_h)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_selection_where_it_is_on_screen() {
+        let theme = Theme::dark();
+        let mut src = Live((0..50).collect());
+        let mut t = table();
+        live_view(&mut t, &src, &theme);
+        t.selected = Some(RowId(45)); // position 4
+                                      // It drops to 20: behind the 28 larger values and row 20 (same value,
+                                      // lower id), so position 29.
+        src.0[45] = 20;
+        t.refresh();
+        live_view(&mut t, &src, &theme);
+        let r = t.selected_rect(&src, &theme).expect("still on screen");
+        assert!((r.y - (theme.header_h + 4.0 * theme.row_h)).abs() < 1e-3);
+        assert!(
+            (t.scroll - 25.0).abs() < 1e-3,
+            "the rest scrolled around it"
+        );
+
+        // A re-sort the user asked for does not chase it.
+        t.set_sort(0);
+        live_view(&mut t, &src, &theme);
+        assert!((t.scroll - 25.0).abs() < 1e-3);
+        // Off screen, a refresh leaves the scroll alone too.
+        t.scroll = 0.0;
+        t.set_sort(0);
+        live_view(&mut t, &src, &theme);
+        src.0[45] = 21;
+        t.refresh();
+        live_view(&mut t, &src, &theme);
+        assert!(t.scroll.abs() < 1e-3);
+    }
+
+    #[test]
+    fn with_animation_rows_slide_to_their_new_places() {
+        let theme = Theme::dark();
+        let mut src = Live((0..50).collect());
+        let mut t = table();
+        t.set_animate(true);
+        let t0 = Instant::now();
+        t.tick(t0);
+        live_view(&mut t, &src, &theme);
+        assert!(!t.animating());
+
+        // Row 40 (position 9, the last on screen) jumps to the top.
+        src.0[40] = 100;
+        t.refresh();
+        let dl = live_view(&mut t, &src, &theme);
+        assert!(t.animating());
+        let at = |dl: &DisplayList, s| row_of_text(dl, s, &theme).unwrap();
+        assert!((at(&dl, "100") - 9.0).abs() < 1e-3, "starts where it was");
+        assert!((at(&dl, "49") - 0.0).abs() < 1e-3, "and the top row too");
+
+        t.tick(t0 + SLIDE / 2);
+        let dl = live_view(&mut t, &src, &theme);
+        let mid = at(&dl, "100");
+        assert!(
+            mid > 0.0 && mid < 9.0 * 0.5,
+            "past halfway (ease-out): {mid}"
+        );
+        let one_down = at(&dl, "49");
+        assert!(one_down > 0.5 && one_down < 1.0, "{one_down}");
+
+        t.tick(t0 + SLIDE);
+        let dl = live_view(&mut t, &src, &theme);
+        assert!(at(&dl, "100").abs() < 1e-3, "landed");
+        assert!((at(&dl, "49") - 1.0).abs() < 1e-3);
+        assert!(!t.animating(), "done");
+
+        // Without animation nothing is in motion.
+        t.set_animate(false);
+        src.0[40] = 0;
+        t.refresh();
+        live_view(&mut t, &src, &theme);
+        assert!(!t.animating());
+    }
+
+    #[test]
+    fn a_row_leaving_the_view_slides_out_over_the_edge() {
+        let theme = Theme::dark();
+        let mut src = Live((0..50).collect());
+        let mut t = table();
+        t.set_animate(true);
+        let t0 = Instant::now();
+        t.tick(t0);
+        live_view(&mut t, &src, &theme);
+        // Row 49 (position 0) sinks to the bottom of the list, far below the view.
+        src.0[49] = 0;
+        t.refresh();
+        let dl = live_view(&mut t, &src, &theme);
+        assert_eq!(t.slide.leaving.len(), 1);
+        assert!(
+            row_of_text(&dl, "0", &theme).is_some_and(|y| y.abs() < 1e-3),
+            "drawn where it was"
+        );
+        t.tick(t0 + SLIDE);
+        let dl = live_view(&mut t, &src, &theme);
+        assert!(!t.animating());
+        // At rest it is back to being an ordinary off-screen row.
+        assert!(row_of_text(&dl, "0", &theme).is_none());
     }
 
     #[test]

@@ -17,10 +17,11 @@ and measure nothing yet.
 ## Using it
 
 **Pages:** the rail down the left edge switches between **Processes** and
-**Performance**. It shows labels when the window is wide and icons alone when it is
-narrow; the button at its top flips that. **Ctrl+Tab** and **Ctrl+Shift+Tab** step
-through the pages, and **Ctrl+1**, **Ctrl+2** jump to one. Typing (or **Ctrl+F**) on
-any page goes to the process search.
+**Performance**, with **Settings** at its bottom. It shows labels when the window is
+wide and icons alone when it is narrow; the button at its top flips that.
+**Ctrl+Tab** and **Ctrl+Shift+Tab** step through the pages, and **Ctrl+1**,
+**Ctrl+2** jump to one. Typing (or **Ctrl+F**) on any page goes to the process
+search. Settings are kept per user, in `HKCU\Software\open-task`.
 
 **Performance** lists the devices down its left side, each with a small live graph
 and its headline number; Up and Down, or a click, pick one. The CPU pane shows its
@@ -76,6 +77,24 @@ and the tree read as one thing.
 Parent links are real identities, not just parent PIDs: a process whose parent
 exited, and whose PID was then recycled by a stranger, is shown as a root rather than
 adopted by the stranger.
+
+**A table that holds still.** Sorting by numbers that change every second would
+reshuffle the rows every second, so the order has some give. A row changes place
+only when its value moves clearly away from the one it was last sorted by: for CPU
+by more than a point or 15 %, whichever is more; for memory by 2 %. Rows at 0.8 %
+and 1.1 % no longer trade places on noise, at the price that neighbours within that
+margin can show slightly out of order. While the pointer is over the table the order
+does not change at all ("Order held" shows above it), so a row cannot move out from
+under a click; new processes still appear where they belong, exited ones go, and the
+table re-sorts the moment the pointer leaves. When a re-sort moves the selected
+row, the table scrolls with it so it stays where it was on screen. Rows slide to
+their new places instead of jumping; that follows Windows' animation effects setting
+until you set it yourself on the **Settings** page.
+
+**Space** pauses the display, as in Process Explorer: the table, the cards and every
+graph stay as they were, and the title says "(paused)". Sampling carries on
+underneath, so when Space resumes nothing is missing from the graphs. In the search
+field Space is just a space.
 
 **Search:** just type. Printable keys go to the filter field above the table whether
 or not it has focus; **Ctrl+F** puts the caret there, **Escape** clears it, and the

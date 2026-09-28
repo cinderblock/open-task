@@ -334,6 +334,21 @@ impl Gfx {
                         self.dc
                             .DrawRectangle(&raw const r, &self.brush, width, None);
                     }
+                    DrawCmd::StrokeRoundRect {
+                        rect,
+                        radius,
+                        color: c,
+                        width,
+                    } => {
+                        self.set_color(c);
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: rectf(rect.inset(width * 0.5, width * 0.5)),
+                            radiusX: radius,
+                            radiusY: radius,
+                        };
+                        self.dc
+                            .DrawRoundedRectangle(&raw const rr, &self.brush, width, None);
+                    }
                     DrawCmd::Line {
                         from,
                         to,
@@ -629,6 +644,7 @@ fn glyph(icon: Icon) -> char {
         Icon::Menu => '\u{E700}',        // GlobalNavigationButton
         Icon::Processes => '\u{E71D}',   // AllApps, drawn as a checklist
         Icon::Performance => '\u{E9D9}', // Diagnostic, a pulse in a box
+        Icon::Settings => '\u{E713}',    // Setting, a gear
     }
 }
 
