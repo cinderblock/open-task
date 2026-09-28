@@ -176,8 +176,11 @@ goes." Same for a future headless/remote mode.
    context menu (End task, End process tree, Open file location) are done
    (2026-09-26; see `plans/process-details-actions.md`). The summary charts moved
    to the log-scale time axis with a shared hover (2026-09-28; see
-   `plans/charts-log-time-and-live-table.md`). Next: the Performance view
-   (per-core graphs, memory breakdown), then column reorder and persisted layout.
+   `plans/charts-log-time-and-live-table.md`). A navigation rail and the
+   Performance page (CPU overall and per logical processor with clock and hardware
+   facts; memory with its lists and pools; each disk; each network connection) are
+   done (2026-09-28; see `plans/performance-view.md`). Next: the other ten views,
+   then column reorder and persisted layout.
 7. Diagnostics engine ("why is my computer slow"). First piece done 2026-09-27:
    services, threads and per-service CPU under every process, and an on-demand
    ETW CPU sample with module and client attribution; see
@@ -283,7 +286,9 @@ goes." Same for a future headless/remote mode.
       under a 20 ms per-pass budget; `SystemProcessIdInformation` fallback for
       processes that refuse to open. `ProcessControl::terminate` with the creation
       time check (2026-09-26, `d3d666c`; details in `plans/process-details-actions.md`).
-- [ ] Windows probe: per-core frequency via PDH `% Processor Performance`.
+- [x] Windows probe: per-core frequency via PDH `% Processor Performance`, and the
+      memory lists, disks and network connections (2026-09-28;
+      `plans/performance-view.md`).
 - [ ] Windows probe: processor groups > 0.
 - [x] `ot-paint`: DIP geometry, colors, text styles, arena-backed `DisplayList`.
 - [x] `ot-ui`: theme, allocation-free number formatting, virtualized sortable `Table`
@@ -329,6 +334,10 @@ goes." Same for a future headless/remote mode.
       process tree, Open file location; Delete / Shift+Delete; confirmation box.
       Verified end to end against a throwaway process (2026-09-26; see
       `plans/process-details-actions.md`).
+- [x] Navigation rail (Processes, Performance; Ctrl+Tab, Ctrl+1..9) and the
+      Performance page with CPU, memory, disks and network connections; static
+      hardware facts; PDH counters; a general chart group sharing one hover per page
+      (2026-09-28; see `plans/performance-view.md`).
 - [x] Windows installer (Inno Setup, per-user by default, x64 + ARM64 in one file,
       optional PATH) built by the release workflow and shipped from v0.2.1
       (2026-09-26). Verified from the published asset. `plans/windows-installer.md`.

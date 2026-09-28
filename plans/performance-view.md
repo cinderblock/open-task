@@ -80,8 +80,9 @@ line shared across every chart on the page.
    and capacity) and network adapters (`GetIfTable2`, filtered by the rules in
    Findings); model, timeline series, device list entries and detail panes.
    Commit.~~
-8. **[current]** Measure the probe's cost with disks and adapters on a quiet
-   machine; README, parent plan, this plan; commit.
+8. ~~Measure the probe's cost with disks and adapters; README, parent plan, this
+   plan; commit.~~ The network read was the expensive part and was split into
+   discovery and sampling (see Findings).
 
 ## Findings / gotchas
 
@@ -143,6 +144,17 @@ line shared across every chart on the page.
   read access). Here: `Samsung SSD 970 EVO Plus 1TB`, SSD, 931.5 GiB. Not yet run
   from an unelevated process (this session is elevated).
 - **PDH `PhysicalDisk` instances** are named `N letters` (`0 C:`), plus `_Total`.
+- **What a pass costs, piece by piece** (`cargo test -p ot-probe --release
+  pass_costs -- --ignored --nocapture`, an opt-in test kept for this). First cut:
+  `GetIfTable2` with statistics took **3.5 ms a pass**, because on this Hyper-V host
+  it walks sixty-odd interfaces; the PDH collection for CPU clock, memory lists and
+  disks took 0.16 ms, and reading the results microseconds. Measured alternatives:
+  `GetIfEntry2` for just the twelve listed interfaces 0.68 ms; `GetIfTable2Ex`
+  without statistics 0.63 ms. Now discovery (table without statistics plus the
+  address table) runs every 5 s and each pass reads only the listed interfaces:
+  1.2 ms mean with the machine 27% busy; a whole pass 7.5 ms (446 processes, 5,895
+  threads, 1 disk, 12 adapters). A connection that comes up is listed within 5 s;
+  one that goes down drops out at once and triggers a fresh discovery.
 - **The working tree stopped building mid-cycle** because the table-jitter thread
   (`plans/charts-log-time-and-live-table.md`) was halfway through an edit
   (`ProcessRows` gained a field `view.rs` did not set yet). This cycle's changes
@@ -174,7 +186,19 @@ line shared across every chart on the page.
       data-driven device list with scrolling, disk and network panes with
       two-line, self-scaling rate charts. Screenshots `target/perf-disk.png`,
       `target/perf-net.png`.
-- [ ] README and plans; verified; committed.
+- [x] Network read split into discovery and sampling; opt-in `pass_costs` test.
+- [x] README and plans; verified; committed.
+
+## Status
+
+Done 2026-09-28, three commits plus a follow-up: `df83a78` (rail, Performance
+page with CPU and memory), `b7ce60a` (PDH clock and memory lists), `f9928bd`
+(disks and network connections), and the network cost split. **Not pushed**: the
+charts thread's `2ccdd44` and `06779d7` sit underneath, unpushed, and that thread
+was mid-edit at the end of this cycle (settings, table steadiness), so pushing is
+left to whoever finishes last, with CI then run over the lot. Not verified
+unelevated: the storage query and PDH were designed for it and documented to work
+without elevation, but this session is elevated.
 
 ## Open questions for the user
 

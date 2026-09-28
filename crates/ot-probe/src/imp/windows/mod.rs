@@ -990,3 +990,53 @@ pub(super) fn unicode_to_string(u: &UNICODE_STRING) -> String {
     let units = unsafe { std::slice::from_raw_parts(u.Buffer.0, usize::from(u.Length) / 2) };
     String::from_utf16_lossy(units)
 }
+
+#[cfg(test)]
+mod cost {
+    //! What a sampling pass costs, piece by piece. Ignored by default because it
+    //! measures the machine it runs on; run it when changing the probe:
+    //!
+    //! ```text
+    //! cargo test -p ot-probe --release pass_costs -- --ignored --nocapture
+    //! ```
+    use super::*;
+
+    fn time(label: &str, n: u32, mut f: impl FnMut()) {
+        f();
+        let mut worst = 0f64;
+        let start = Instant::now();
+        for _ in 0..n {
+            let t = Instant::now();
+            f();
+            worst = worst.max(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mean = start.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+        println!("{label:<28} mean {mean:>7.3} ms   worst {worst:>7.3} ms");
+    }
+
+    #[test]
+    #[ignore = "measures this machine; run by hand"]
+    fn pass_costs() {
+        let mut net = network::NetProbe::default();
+        let mut adapters = Vec::new();
+        time("network adapters", 30, || net.sample(&mut adapters));
+        let mut c = PerfCounters::open().expect("PDH");
+        time("performance counters", 30, || {
+            c.collect();
+        });
+        let mut probe = WindowsProbe::new().expect("probe");
+        let mut out = ProbeOutput::default();
+        probe.sample(&mut out).expect("first pass");
+        std::thread::sleep(Duration::from_millis(300));
+        time("whole pass", 20, || {
+            probe.sample(&mut out).expect("pass");
+        });
+        println!(
+            "({} processes, {} threads, {} disks, {} adapters)",
+            out.processes.len(),
+            out.threads.len(),
+            out.disks.len(),
+            out.adapters.len()
+        );
+    }
+}
