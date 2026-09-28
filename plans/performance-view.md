@@ -74,10 +74,10 @@ line shared across every chart on the page.
 4. ~~`ot-ui`: `charts.rs` (N-chart group), `nav.rs` (rail), `perf.rs` (Performance
    page: device list, CPU and memory detail), `App` page switching. Tests.~~
 5. ~~Shell: Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1..9. Screenshots. Commit.~~
-6. **[current]** Probe: PDH counters (clock, memory lists). Model and page use
-   them. Commit. (Pools already come from `GetPerformanceInfo`.)
-7. Probe: disks and network adapters from PDH; model, timeline series, device list
-   entries and detail panes. Commit.
+6. ~~Probe: PDH counters (clock, memory lists). Model and page use them. Commit.
+   (Pools already come from `GetPerformanceInfo`.)~~
+7. **[current]** Probe: disks and network adapters from PDH; model, timeline series,
+   device list entries and detail panes. Commit.
 8. README, parent plan, this plan; verify on three targets; commit.
 
 ## Findings / gotchas
@@ -104,6 +104,23 @@ line shared across every chart on the page.
 - `ot-probe/Cargo.toml` had duplicate `Win32_System_Diagnostics_Etw` and
   `Win32_System_Time` entries in HEAD (another thread's); removed while adding
   `Win32_System_Power`.
+- **PDH works unelevated and is cheap.** One query with `\Processor
+  Information(*)\% Processor Performance` and five `\Memory` list counters, collected
+  once per pass: steady-state probe cost stayed at 5 to 6 ms a pass here (first
+  pass about 21 ms, as before). Checked against `Get-Counter` a moment apart:
+  modified 151 MB vs 153 MB, free 157 MB vs 165 MB; standby 37.6 GB plus free equals
+  `GlobalMemoryStatusEx` available (37.8 GB). The clock read 3.5 to 3.8 GHz on a
+  1.61 GHz base, which is this chip boosting.
+- **`PDH_FMT_NOCAP100` is missing from the `windows` crate metadata** (0x8000).
+  Without it `% Processor Performance` is clamped at 100 and a boosting core would
+  read as its base clock. Declared by hand in `counters.rs`.
+- **The probe already had a private `Counters` type** (per-process CPU and I/O
+  tallies); the PDH wrapper is `PerfCounters`.
+- **"In use" versus the composition bar.** `MemorySample::in_use` is
+  `total - available`, which includes the modified list (modified pages are not
+  available). The bar splits them out, so its "In use" segment is `in_use - modified`.
+  Left that way on purpose: `In use + Available = Total` holds for the stats, which
+  lets a reader check them, and the chart and summary card keep one meaning.
 - **Posted input drives the GUI for screenshots without touching the user's
   desktop:** `target/drive-perf.ps1` posts `WM_KEYDOWN` Down to pick Memory, and a
   `WM_LBUTTONDOWN`/`UP` pair at the "Logical processors" segment (client pixels at
@@ -121,7 +138,9 @@ line shared across every chart on the page.
       `MemorySample`; first-pass fix in `Timeline`.
 - [x] Keyboard navigation; `--page`; screenshots; verified (fmt, clippy on three
       targets, 108 tests); committed.
-- [ ] PDH: clock, memory composition, pools.
+- [x] PDH: clock and memory lists (`counters.rs`); speed in the list headline and
+      stats; four-part composition bar; headless prints them. 111 tests; clippy on
+      three targets; screenshots.
 - [ ] Disks and network adapters.
 - [ ] README and plans; verified; committed.
 

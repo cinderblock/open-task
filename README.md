@@ -25,12 +25,16 @@ any page goes to the process search.
 and its headline number; Up and Down, or a click, pick one. The CPU pane shows its
 utilization, either as one graph or as one small graph per logical processor (the
 **Overall / Logical processors** switch; on a processor with performance and
-efficiency cores the two kinds get different colors), then utilization, speed where
-the clock can be read, processes, threads, handles and up time, next to the
-processor's name, base speed, sockets, cores, logical processors and cache sizes.
-The Memory pane shows memory in use over time, how physical memory divides up, and
-in use, available, committed against the commit limit, cached, and the paged and
-non-paged kernel pools. Every graph on the page, the small ones in the list
+efficiency cores the two kinds get different colors), then utilization, the current
+clock speed, processes, threads, handles and up time, next to the processor's name,
+base speed, sockets, cores, logical processors and cache sizes. The current speed is
+the base clock scaled by each processor's performance counter, the way Task Manager
+computes it, so a boosting chip reads well above its base. The Memory pane shows
+memory in use over time; how physical memory divides into in use, modified (written,
+waiting to reach disk), standby (cached, reclaimable) and free; and in use,
+available, committed against the commit limit, cached, and the paged and non-paged
+kernel pools. "In use" counts modified pages, since they are not available; the bar
+shows them separately. Every graph on the page, the small ones in the list
 included, shares one hover line.
 
 **Charts:** the CPU and memory graphs share a log-scale time axis, labeled

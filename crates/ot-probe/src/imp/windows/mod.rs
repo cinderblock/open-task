@@ -35,7 +35,7 @@ use ot_model::memory::MemorySample;
 use ot_model::process::{Integrity, ProcessSample, ProcessStatic};
 use ot_model::service::ServiceInfo;
 use ot_model::thread::{ServiceTag, ThreadSample, ThreadState, WaitReason};
-use ot_model::{Bytes, Percent, ProcessKey};
+use ot_model::{Bytes, Hertz, Percent, ProcessKey};
 
 use windows::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemProcessInformation, SystemProcessorPerformanceInformation,
@@ -54,6 +54,7 @@ use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INF
 use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
 
 mod control;
+mod counters;
 mod details;
 mod hardware;
 mod nt;
@@ -62,6 +63,7 @@ mod services;
 mod tags;
 
 pub use control::WindowsControl;
+use counters::PerfCounters;
 use details::DetailProbe;
 use nt::{SystemProcessInformation, SystemThreadInformation};
 pub use profile::WindowsSampler;
@@ -188,6 +190,12 @@ pub struct WindowsProbe {
     /// Physical core index and class for each logical processor, computed once.
     topology: Vec<(u32, CoreKind)>,
     logical_count: u32,
+    /// Static facts, read once.
+    hardware: ot_model::hardware::Hardware,
+    /// Performance counters for the clock and the memory lists, if PDH works here.
+    counters: Option<PerfCounters>,
+    /// Each logical processor's performance as a percentage of base, this pass.
+    performance: Vec<Option<f64>>,
     last_pass: Option<Instant>,
     pass: u64,
 }
@@ -220,6 +228,9 @@ impl WindowsProbe {
             prev_cores: vec![CoreTimes::default(); logical_count as usize],
             topology,
             logical_count,
+            hardware: hardware::read(logical_count),
+            counters: PerfCounters::open(),
+            performance: vec![None; logical_count as usize],
             last_pass: None,
             pass: 0,
         })
@@ -291,12 +302,21 @@ impl WindowsProbe {
                 .get(i)
                 .copied()
                 .unwrap_or((i as u32, CoreKind::Unknown));
+            // The clock is the base clock scaled by the processor's performance
+            // counter, as Task Manager computes "Speed".
+            let frequency = self
+                .performance
+                .get(i)
+                .copied()
+                .flatten()
+                .zip(self.hardware.base_frequency)
+                .map(|(pct, base)| Hertz((base.0 as f64 * pct / 100.0) as u64));
             out.cores.push(LogicalCore {
                 index: i as u32,
                 physical,
                 kind,
                 usage,
-                frequency: None,
+                frequency,
             });
         }
 
@@ -580,7 +600,7 @@ impl WindowsProbe {
 
 impl SystemProbe for WindowsProbe {
     fn hardware(&self) -> ot_model::hardware::Hardware {
-        hardware::read(self.logical_count)
+        self.hardware.clone()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -590,7 +610,8 @@ impl SystemProbe for WindowsProbe {
             per_process_network: false,
             per_process_gpu: false,
             per_process_power: false,
-            core_frequency: false,
+            core_frequency: self.hardware.base_frequency.is_some()
+                && self.counters.as_ref().is_some_and(PerfCounters::has_clock),
             package_power: false,
             thermals: false,
             hybrid_core_kinds: self.topology.iter().any(|(_, k)| *k != CoreKind::Unknown),
@@ -607,9 +628,24 @@ impl SystemProbe for WindowsProbe {
             .last_pass
             .map_or(0, |prev| (now.duration_since(prev).as_nanos() / 100) as u64);
 
+        // Counters first: the core loop reads this pass's clock from them.
+        self.performance.fill(None);
+        let collected = self.counters.as_mut().is_some_and(PerfCounters::collect);
+        if collected {
+            if let Some(c) = self.counters.as_mut() {
+                c.processor_performance(&mut self.performance);
+            }
+        }
+
         self.sample_cores(&mut out.cpu)?;
         self.sample_processes(&mut out.processes, &mut out.threads, wall_100ns)?;
         out.memory = sample_memory()?;
+        if let Some(c) = self.counters.as_ref().filter(|_| collected) {
+            let lists = c.memory();
+            out.memory.modified = lists.modified;
+            out.memory.standby = lists.standby;
+            out.memory.free = lists.free;
+        }
 
         self.last_pass = Some(now);
         Ok(())
@@ -775,6 +811,10 @@ fn sample_memory() -> Result<MemorySample, ProbeError> {
         commit_limit: Bytes(pi.CommitLimit as u64 * page),
         compressed: None,
         swap_used: None,
+        // The memory lists come from the performance counters, filled in by `sample`.
+        modified: None,
+        standby: None,
+        free: None,
         paged_pool: Some(Bytes(pi.KernelPaged as u64 * page)),
         nonpaged_pool: Some(Bytes(pi.KernelNonpaged as u64 * page)),
     })

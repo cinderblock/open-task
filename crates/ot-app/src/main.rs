@@ -286,6 +286,33 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
         })
         .collect();
     println!("  cores: {}", cores.join(" "));
+    let clocks: Vec<u64> = snap
+        .cpu
+        .cores
+        .iter()
+        .filter_map(|c| c.frequency)
+        .map(|f| f.0)
+        .collect();
+    let mut extra = String::new();
+    if !clocks.is_empty() {
+        let avg = clocks.iter().sum::<u64>() / clocks.len() as u64;
+        let _ = write!(extra, "clock {:.2} GHz", avg as f64 / 1e9);
+    }
+    for (name, b) in [
+        ("modified", mem.modified),
+        ("standby", mem.standby),
+        ("free", mem.free),
+        ("paged pool", mem.paged_pool),
+        ("non-paged pool", mem.nonpaged_pool),
+    ] {
+        if let Some(b) = b {
+            let sep = if extra.is_empty() { "" } else { "  " };
+            let _ = write!(extra, "{sep}{name} {}", human(b));
+        }
+    }
+    if !extra.is_empty() {
+        println!("  {extra}");
+    }
 
     let mut procs: Vec<_> = snap.processes.iter().collect();
     procs.sort_by(|a, b| b.cpu.get().total_cmp(&a.cpu.get()));

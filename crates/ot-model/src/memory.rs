@@ -23,6 +23,14 @@ pub struct MemorySample {
     pub compressed: Option<Bytes>,
     /// Bytes currently paged out to disk.
     pub swap_used: Option<Bytes>,
+    /// The modified list: pages written to that must reach disk before the memory
+    /// can be reused. Not available, and counted in [`MemorySample::in_use`].
+    pub modified: Option<Bytes>,
+    /// The standby list: cached pages not in use, handed out when needed. Part of
+    /// `available`.
+    pub standby: Option<Bytes>,
+    /// Free and zeroed pages. The rest of `available`.
+    pub free: Option<Bytes>,
     /// Kernel memory that can be paged out.
     pub paged_pool: Option<Bytes>,
     /// Kernel memory that must stay resident. A leak here (usually a driver) is one

@@ -679,16 +679,17 @@ fn paint_composition(
     if rect.is_empty() || m.total.get() == 0 {
         return;
     }
-    let parts = [
-        ("In use", m.in_use(), theme.memory),
-        ("Available", m.available, theme.memory.with_alpha(0.22)),
-    ];
+    let (parts, n) = composition(m, theme);
+    let parts = &parts[..n];
     let (caption, below) = rect.split_top(18.0);
     let (bar, legend) = below.split_top(18.0);
     dl.label("Memory composition", caption, theme.small, theme.text_dim);
-    let total = m.total.get() as f32;
+    // The lists are read a moment apart from the total, so they can add up to a
+    // little more than it; scale by whichever is larger so the bar never overflows.
+    let sum: u64 = parts.iter().map(|p| p.1.get()).sum();
+    let total = m.total.get().max(sum) as f32;
     let mut x = bar.x;
-    for (_, bytes, color) in parts {
+    for &(_, bytes, color) in parts {
         let w = bar.w * (bytes.get() as f32 / total).clamp(0.0, 1.0);
         dl.fill_rect(Rect::new(x, bar.y, w, bar.h), color);
         x += w;
@@ -696,8 +697,9 @@ fn paint_composition(
     dl.stroke_rect(bar, theme.memory.with_alpha(0.6), 1.0);
 
     let (_, legend) = legend.split_top(4.0);
+    let item_w = legend.w / parts.len() as f32;
     let mut x = legend.x;
-    for (label, bytes, color) in parts {
+    for &(label, bytes, color) in parts {
         let swatch = Rect::new(x, legend.y + (legend.h - 8.0) * 0.5, 8.0, 8.0);
         dl.fill_rect(swatch, color);
         dl.stroke_rect(swatch, theme.memory.with_alpha(0.6), 1.0);
@@ -706,11 +708,41 @@ fn paint_composition(
         let _ = write!(text, "{label} {buf}");
         dl.label(
             &text,
-            Rect::new(x + 12.0, legend.y, 150.0, legend.h),
+            Rect::new(x + 12.0, legend.y, item_w - 16.0, legend.h),
             theme.small,
             theme.text_dim,
         );
-        x += 160.0;
+        x += item_w;
+    }
+}
+
+/// The segments of the composition bar, left to right, and how many there are.
+/// With the memory lists: in use (less modified), modified, standby, free, the
+/// division Task Manager draws. Without them: in use and available.
+fn composition(
+    m: &ot_model::memory::MemorySample,
+    theme: &Theme,
+) -> ([(&'static str, ot_model::Bytes, Color); 4], usize) {
+    let empty = ("", ot_model::Bytes::ZERO, Color::TRANSPARENT);
+    match (m.modified, m.standby, m.free) {
+        (Some(modified), Some(standby), Some(free)) => (
+            [
+                ("In use", m.in_use().saturating_sub(modified), theme.memory),
+                ("Modified", modified, theme.memory_modified),
+                ("Standby", standby, theme.memory.with_alpha(0.4)),
+                ("Free", free, theme.memory.with_alpha(0.1)),
+            ],
+            4,
+        ),
+        _ => (
+            [
+                ("In use", m.in_use(), theme.memory),
+                ("Available", m.available, theme.memory.with_alpha(0.22)),
+                empty,
+                empty,
+            ],
+            2,
+        ),
     }
 }
 
@@ -972,6 +1004,42 @@ mod tests {
         // The graph switch belongs to the CPU; it does nothing here.
         let stale = page.toggle[1];
         assert_eq!(stale, Rect::ZERO);
+    }
+
+    #[test]
+    fn with_the_memory_lists_the_bar_splits_four_ways_and_the_clock_shows() {
+        let (tl, mut s) = timeline(2);
+        s.memory.modified = Some(Bytes(GB));
+        s.memory.standby = Some(Bytes(4 * GB));
+        s.memory.free = Some(Bytes(2 * GB));
+        for c in &mut s.cpu.cores {
+            c.frequency = Some(Hertz::from_mhz(3000));
+        }
+        let mut page = PerfPage::default();
+        let mut dl = DisplayList::new();
+        let mut buf = String::new();
+        let theme = Theme::dark();
+        let rect = Rect::new(0.0, 0.0, 1000.0, 640.0);
+        page.paint(&mut dl, rect, &s, &tl, &theme, &mut buf);
+        let t = texts(&dl);
+        assert!(
+            t.iter().any(|x| x == "25%  3.00 GHz"),
+            "list headline: {t:?}"
+        );
+        assert!(t.iter().any(|x| x == "Speed") && t.iter().any(|x| x == "3.00 GHz"));
+
+        page.handle(UiEvent::Key(Key::Down));
+        let mut dl = DisplayList::new();
+        page.paint(&mut dl, rect, &s, &tl, &theme, &mut buf);
+        let t = texts(&dl);
+        for want in [
+            "In use 9.00 GB",
+            "Modified 1.00 GB",
+            "Standby 4.00 GB",
+            "Free 2.00 GB",
+        ] {
+            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
+        }
     }
 
     #[test]
