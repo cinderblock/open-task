@@ -209,11 +209,14 @@ installer, which closes open-task, updates it (with an administrator prompt for 
 usual all-users install) and starts the new version. The Settings page has the same
 button with the full version and a sentence on what it is doing.
 
-By default open-task checks when it starts and then once a day, and only says so: it
-downloads on its own only if you turn on **Download updates automatically**, and it
-installs only when you click. **Check for updates automatically** turns the checks
-off. A check fetches two small files from github.com, the latest release's signed
-checksums, and sends nothing but the request for them.
+By default open-task checks when it starts and then once a day, and only says so.
+Settings has three switches, each building on the one before: **Check for updates
+automatically** (on), **Download updates automatically** (off), and **Install updates
+automatically** (off), which installs a downloaded release when you close open-task,
+so the next start is the new version. It never restarts itself to update while you
+use it, since that would throw away the history it has gathered. A check fetches two
+small files from github.com, the latest release's signed checksums, and sends nothing
+but the request for them.
 
 Every release's `SHA256SUMS` is signed with
 [minisign](https://jedisct1.github.io/minisign/), and open-task has the public key

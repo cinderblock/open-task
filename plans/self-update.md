@@ -47,6 +47,14 @@ the update if it downloads a new one".
    release, the commit for anything else (`25c2e9c-dirty`), because the full describe
    string does not fit the 184 DIP rail. The Settings card, `--version`, the log and
    the exe's ProductVersion carry the full string.
+9. **"Install updates automatically" installs when open-task closes** (user,
+   2026-09-28: "have a settings option for automatic updates too"; when is Claude's
+   call). Off by default. Never a restart while it runs: that would lose the history
+   it has gathered, and a task manager is often left open for days. The close hides
+   the window and keeps the process until Setup's Restart Manager ends it, so the
+   installer stays locked through elevation. The switches chain: install needs
+   download needs check. A close from logoff, shutdown or Restart Manager never
+   installs.
 
 ## Design
 
@@ -189,6 +197,14 @@ the update if it downloads a new one".
   5. The feed saw only: `latest/download/SHA256SUMS.minisig`,
      `download/v0.3.0/SHA256SUMS`, the installer once.
   6. Uninstalled silently: no HKCU key, folder or Start Menu entry left.
+- **Install on close passed end to end (2026-09-28)**, same per-user setup with
+  `06876ea`, `InstallUpdates`/`DownloadUpdates`/`CheckForUpdates` set to 1 for the
+  test and removed after (the `HKCU\Software\open-task` key did not exist before and
+  was removed again): the scheduled check 10 s after start downloaded and verified
+  on its own; `WM_CLOSE` logged "installing the update as open-task closes", Setup
+  ran without `/RELAUNCH`, Restart Manager ended the hidden process (reason 1), no
+  instance was started, the installed exe was the new build, DisplayVersion 0.3.0.
+  Scripts: `%TEMP%\e2e\e2e-close.ps1` with `e2e-lib.ps1`.
 - **Not exercised end to end:** the all-users (`/ALLUSERS`) path, to keep the user's
   install and running windows out of it (same code, different flag; the flag is unit
   tested); a declined UAC prompt (this session is elevated, so there is none: the
