@@ -3,11 +3,13 @@
 //! The rail follows the Windows 11 Task Manager and `NavigationView`: icons and
 //! labels when the window is wide enough, icons alone when it is not, and a
 //! hamburger button at the top that overrides the automatic choice. Only pages that
-//! exist are listed. Settings sits apart at the bottom, as in Task Manager.
+//! exist are listed. Settings sits apart at the bottom, as in Task Manager, with the
+//! update button above it: the version, and what the updater is doing.
 
-use ot_paint::{DisplayList, Icon, Rect};
+use ot_paint::{DisplayList, HAlign, Icon, Rect, VAlign};
 
 use crate::theme::Theme;
+use crate::update::UpdateView;
 
 /// A top-level page of the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -90,12 +92,16 @@ const ICON_SIZE: f32 = 16.0;
 /// The selected item's accent mark, at its left edge.
 const PILL_W: f32 = 3.0;
 const PILL_H: f32 = 16.0;
+/// The update button's attention dot.
+const DOT: f32 = 6.0;
 
 /// What is under the pointer on the rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NavHit {
     Toggle,
     Page(Page),
+    /// The version, which is the update button.
+    Update,
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +110,7 @@ pub(crate) struct NavRail {
     expanded: Option<bool>,
     toggle: Rect,
     items: [Rect; Page::ALL.len()],
+    update: Rect,
     hover: Option<NavHit>,
 }
 
@@ -132,6 +139,9 @@ impl NavRail {
         if self.toggle.contains(p) {
             return Some(NavHit::Toggle);
         }
+        if self.update.contains(p) {
+            return Some(NavHit::Update);
+        }
         Page::ALL
             .iter()
             .zip(&self.items)
@@ -145,19 +155,28 @@ impl NavRail {
         self.items[page.index()]
     }
 
+    /// Where the update button was painted last.
+    #[cfg(test)]
+    pub fn update_rect(&self) -> Rect {
+        self.update
+    }
+
     /// Follow the pointer. Returns whether the highlight moved.
     pub fn set_hover(&mut self, p: Option<ot_paint::Point>) -> bool {
         let hit = p.and_then(|p| self.hit(p));
         std::mem::replace(&mut self.hover, hit) != hit
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
         dl: &mut DisplayList,
         rect: Rect,
         current: Page,
         expanded: bool,
+        update: &UpdateView,
         theme: &Theme,
+        buf: &mut String,
     ) {
         let inner = rect.inset(4.0, theme.gap);
         let (toggle, mut below) = inner.split_top(ITEM_H);
@@ -185,6 +204,67 @@ impl NavRail {
             let label = expanded.then(|| page.label());
             let hovered = self.hover == Some(NavHit::Page(page));
             self.item(dl, r, page.icon(), label, page == current, hovered, theme);
+        }
+        // Above Settings.
+        let (r, _) = below.split_bottom(ITEM_H);
+        self.update = r;
+        let hovered = self.hover == Some(NavHit::Update) && update.action().is_some();
+        Self::update_item(dl, r, update, expanded, hovered, theme, buf);
+    }
+
+    /// The update button: the icon, with a dot when a release is waiting or the
+    /// last try failed; when expanded, the version over what the updater is doing.
+    fn update_item(
+        dl: &mut DisplayList,
+        r: Rect,
+        update: &UpdateView,
+        expanded: bool,
+        hovered: bool,
+        theme: &Theme,
+        buf: &mut String,
+    ) {
+        if hovered {
+            dl.fill_round_rect(r.inset(0.0, 2.0), theme.card_radius, theme.button_hover);
+        }
+        let icon_box = Rect::new(r.x, r.y, COMPACT_W - 8.0, r.h);
+        let icon_color = if update.busy() {
+            theme.text_dim
+        } else {
+            theme.text
+        };
+        dl.icon(Icon::Update, icon_box, ICON_SIZE, icon_color);
+        if update.attention() {
+            let c = icon_box.center();
+            let dot = Rect::new(c.x + 4.0, c.y - 10.0, DOT, DOT);
+            dl.fill_round_rect(dot, DOT * 0.5, theme.accent);
+        }
+        if expanded {
+            let (_, text) = r.split_left(COMPACT_W - 8.0);
+            let (top, bottom) = text.split_top(text.h * 0.5);
+            dl.text(
+                update.short(),
+                top.offset(0.0, 2.0),
+                theme.cell,
+                theme.text,
+                HAlign::Left,
+                VAlign::Bottom,
+                true,
+            );
+            update.rail_status(buf);
+            let color = if update.attention() {
+                theme.accent
+            } else {
+                theme.text_dim
+            };
+            dl.text(
+                buf,
+                bottom.offset(0.0, 1.0),
+                theme.small,
+                color,
+                HAlign::Left,
+                VAlign::Top,
+                true,
+            );
         }
     }
 
@@ -254,6 +334,10 @@ mod tests {
     }
 
     fn painted(nav: &mut NavRail, expanded: bool) -> DisplayList {
+        painted_with(nav, expanded, &UpdateView::new("0.2.1", true))
+    }
+
+    fn painted_with(nav: &mut NavRail, expanded: bool, update: &UpdateView) -> DisplayList {
         let mut dl = DisplayList::new();
         let w = if expanded { EXPANDED_W } else { COMPACT_W };
         nav.paint(
@@ -261,9 +345,21 @@ mod tests {
             Rect::new(0.0, 0.0, w, 600.0),
             Page::Performance,
             expanded,
+            update,
             &Theme::dark(),
+            &mut String::new(),
         );
         dl
+    }
+
+    fn texts(dl: &DisplayList) -> Vec<&str> {
+        dl.cmds()
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text(t) => Some(dl.str(t.text)),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -284,7 +380,8 @@ mod tests {
                 Icon::Menu,
                 Icon::Processes,
                 Icon::Performance,
-                Icon::Settings
+                Icon::Settings,
+                Icon::Update,
             ]
         );
         assert!(!dl.cmds().iter().any(|c| matches!(c, DrawCmd::Text(_))));
@@ -301,24 +398,54 @@ mod tests {
             Some(NavHit::Page(Page::Performance))
         );
         assert_eq!(nav.hit(Point::new(20.0, y0 + 3.0 * ITEM_H)), None);
-        // Settings is at the bottom of the rail.
+        // Settings is at the bottom of the rail, the update button above it.
         assert_eq!(
             nav.hit(Point::new(20.0, 600.0 - theme.gap - ITEM_H * 0.5)),
             Some(NavHit::Page(Page::Settings))
+        );
+        assert_eq!(
+            nav.hit(Point::new(20.0, 600.0 - theme.gap - ITEM_H * 1.5)),
+            Some(NavHit::Update)
         );
         assert!(nav.set_hover(Some(Point::new(20.0, y0))));
         assert!(!nav.set_hover(Some(Point::new(21.0, y0))), "same item");
         assert!(nav.set_hover(None));
 
         let dl = painted(&mut nav, true);
-        let labels: Vec<&str> = dl
-            .cmds()
-            .iter()
-            .filter_map(|c| match c {
-                DrawCmd::Text(t) => Some(dl.str(t.text)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels, ["Processes", "Performance", "Settings"]);
+        assert_eq!(
+            texts(&dl),
+            [
+                "Processes",
+                "Performance",
+                "Settings",
+                "v0.2.1",
+                "Check for updates"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_update_button_shows_the_build_and_flags_a_waiting_release() {
+        let mut nav = NavRail::default();
+        let dots = |dl: &DisplayList| {
+            dl.cmds()
+                .iter()
+                .filter(|c| matches!(c, DrawCmd::FillRoundRect { color, .. } if *color == Theme::dark().accent))
+                .count()
+        };
+        let mut update = UpdateView::new("0.2.1-20-gdbfe022-dirty", true);
+        let dl = painted_with(&mut nav, true, &update);
+        assert_eq!(texts(&dl)[3..], ["dbfe022-dirty", "Check for updates"]);
+        // The Performance page's pill is the only accent so far.
+        let before = dots(&dl);
+
+        update.set_status(ot_update::Status::Ready {
+            version: ot_update::Version::parse("0.3.0").unwrap(),
+        });
+        let dl = painted_with(&mut nav, false, &update);
+        assert!(texts(&dl).is_empty(), "compact: icons only");
+        assert_eq!(dots(&dl), before + 1, "a dot on the icon");
+        let dl = painted_with(&mut nav, true, &update);
+        assert_eq!(texts(&dl)[4], "Install v0.3.0");
     }
 }

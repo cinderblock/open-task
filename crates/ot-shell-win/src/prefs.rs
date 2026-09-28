@@ -1,9 +1,9 @@
 //! The user's settings, kept in the registry, and the system settings the view
 //! follows.
 //!
-//! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each, per user
-//! like every other per-user preference on Windows. A missing key or value means
-//! the default. Nothing here is fatal: a value that cannot be read or written is
+//! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each
+//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`), per user like every other
+//! per-user preference on Windows. A missing key or value means the default. Nothing here is fatal: a value that cannot be read or written is
 //! logged and the app carries on with what it has.
 
 use std::ffi::c_void;
@@ -20,20 +20,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const KEY: PCWSTR = w!(r"Software\open-task");
 const ANIMATE_ROWS: PCWSTR = w!("AnimateRows");
+const CHECK_UPDATES: PCWSTR = w!("CheckForUpdates");
+const DOWNLOAD_UPDATES: PCWSTR = w!("DownloadUpdates");
 
 /// The settings as last saved, defaults for anything never saved.
 pub fn load() -> Settings {
+    let defaults = Settings::default();
+    let flag = |name, default| read_dword(name).map_or(default, |v| v != 0);
     Settings {
         animate_rows: read_dword(ANIMATE_ROWS).map(|v| v != 0),
+        check_updates: flag(CHECK_UPDATES, defaults.check_updates),
+        download_updates: flag(DOWNLOAD_UPDATES, defaults.download_updates),
     }
 }
 
 /// Store the settings for the next start. A setting still following the system
 /// (never chosen) is not written.
 pub fn save(s: &Settings) {
-    let Some(animate_rows) = s.animate_rows else {
-        return;
-    };
+    let values = [
+        (ANIMATE_ROWS, s.animate_rows),
+        (CHECK_UPDATES, Some(s.check_updates)),
+        (DOWNLOAD_UPDATES, Some(s.download_updates)),
+    ];
     let mut key = HKEY::default();
     // SAFETY: the out-pointer is a local; the strings are static.
     let status = unsafe {
@@ -53,13 +61,19 @@ pub fn save(s: &Settings) {
         tracing::warn!(?status, "could not open the settings key");
         return;
     }
-    let value = u32::from(animate_rows).to_le_bytes();
-    // SAFETY: `key` was just opened with KEY_SET_VALUE; the data outlives the call.
-    unsafe {
-        let status = RegSetValueExW(key, ANIMATE_ROWS, None, REG_DWORD, Some(&value));
+    for (name, value) in values {
+        let Some(value) = value else {
+            continue;
+        };
+        let data = u32::from(value).to_le_bytes();
+        // SAFETY: `key` was just opened with KEY_SET_VALUE; the data outlives the call.
+        let status = unsafe { RegSetValueExW(key, name, None, REG_DWORD, Some(&data)) };
         if status.is_err() {
             tracing::warn!(?status, "could not save a setting");
         }
+    }
+    // SAFETY: opened above, closed once.
+    unsafe {
         let _ = RegCloseKey(key);
     }
 }

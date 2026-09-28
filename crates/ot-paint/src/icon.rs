@@ -16,14 +16,17 @@ pub enum Icon {
     Performance,
     /// A gear: the app's settings.
     Settings,
+    /// Two arrows in a circle: updates, as Windows draws Windows Update.
+    Update,
 }
 
 impl Icon {
     /// Every icon, for backends that want to check their mapping is complete.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Menu,
         Self::Processes,
         Self::Performance,
         Self::Settings,
+        Self::Update,
     ];
 }

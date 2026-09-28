@@ -10,7 +10,9 @@
 //! message), input, resize, or DPI change, plus the frames of a row slide after a
 //! re-sort (150 ms, paced by the display). Idle cost is zero frames per second.
 //!
-//! The user's settings are read from and written to the registry by `prefs`.
+//! The user's settings are read from and written to the registry by `prefs`. The
+//! updater (`ot_update`) runs on its own threads and posts its progress back; the
+//! installer it starts closes the window through Restart Manager (`WM_ENDSESSION`).
 //!
 //! On other platforms this crate compiles to a stub that returns
 //! [`ShellError::Unsupported`], so the workspace builds everywhere.
@@ -57,6 +59,9 @@ pub struct ShellOptions {
     pub view: ViewMode,
     /// The page shown first; the rail and Ctrl+Tab switch at runtime.
     pub page: Page,
+    /// This build's version, as `crates/ot-app/build.rs` made it: shown on the
+    /// update button, and what updates are compared with.
+    pub version: &'static str,
 }
 
 /// Why the shell could not run.

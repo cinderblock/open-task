@@ -645,6 +645,7 @@ fn glyph(icon: Icon) -> char {
         Icon::Processes => '\u{E71D}',   // AllApps, drawn as a checklist
         Icon::Performance => '\u{E9D9}', // Diagnostic, a pulse in a box
         Icon::Settings => '\u{E713}',    // Setting, a gear
+        Icon::Update => '\u{E895}',      // Sync, Windows Update's own
     }
 }
 

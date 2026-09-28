@@ -20,10 +20,11 @@ use crate::format;
 use crate::nav::{NavHit, NavRail, Page};
 use crate::perf::PerfPage;
 use crate::process_rows::{self, col, columns, process_matches, Layout, ProcessRows, ProcessTree};
-use crate::settings::{Settings, SettingsPage};
+use crate::settings::{Context, Settings, SettingsPage};
 use crate::steady::Steady;
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
+use crate::update::{UpdateAction, UpdateView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -180,6 +181,9 @@ pub enum Effect {
     SampleCpu { target: ProcessKey, seconds: u32 },
     /// The user changed a setting; store these so the next start has them.
     SaveSettings(Settings),
+    /// The update button was pressed: take the step it names. The updater's new
+    /// status comes back through [`App::set_update_status`].
+    Update(UpdateAction),
 }
 
 /// What an event led to.
@@ -208,7 +212,7 @@ impl Reaction {
         }
     }
 
-    fn effect(effect: Effect) -> Self {
+    pub(crate) fn effect(effect: Effect) -> Self {
         Self {
             repaint: true,
             effect: Some(effect),
@@ -522,6 +526,8 @@ pub struct App {
     paused: Option<Paused>,
     settings: Settings,
     settings_page: SettingsPage,
+    /// The version and the update button, on the rail and the Settings page.
+    update: UpdateView,
     /// Whether the platform has animation effects on; row slides need both this
     /// and the setting.
     system_animations: bool,
@@ -559,6 +565,7 @@ impl App {
             paused: None,
             settings: Settings::default(),
             settings_page: SettingsPage::default(),
+            update: UpdateView::default(),
             system_animations: true,
             matched: Vec::new(),
             shown: Vec::new(),
@@ -685,6 +692,24 @@ impl App {
     pub fn set_settings(&mut self, settings: Settings) {
         self.settings = settings;
         self.apply_animation();
+    }
+
+    /// The running build and whether it can install updates, for the update
+    /// button. Set once at start.
+    pub fn set_update(&mut self, update: UpdateView) {
+        self.update = update;
+    }
+
+    /// The updater's latest status. Returns whether the button changed, so a
+    /// repaint is due.
+    pub fn set_update_status(&mut self, status: ot_update::Status) -> bool {
+        self.update.set_status(status)
+    }
+
+    /// The update button as it stands.
+    #[must_use]
+    pub fn update(&self) -> &UpdateView {
+        &self.update
     }
 
     /// Whether the platform has animation effects on (Windows: "Animation
@@ -830,11 +855,13 @@ impl App {
             self.table.hover = None;
             let _ = self.hold_order(false);
             let _ = self.perf.handle(UiEvent::MouseLeave);
-            let _ = self.settings_page.handle(
-                UiEvent::MouseLeave,
-                &mut self.settings,
-                self.system_animations,
-            );
+            let cx = Context {
+                system_animations: self.system_animations,
+                update: &self.update,
+            };
+            let _ = self
+                .settings_page
+                .handle(UiEvent::MouseLeave, &mut self.settings, cx);
             self.page = page;
         }
     }
@@ -872,6 +899,12 @@ impl App {
                     self.set_page(page);
                     return Reaction::REPAINT;
                 }
+                Some(NavHit::Update) => {
+                    return self
+                        .update
+                        .action()
+                        .map_or(Reaction::NONE, |a| Reaction::effect(Effect::Update(a)));
+                }
                 None => {}
             },
             UiEvent::Command(Command::SetPage(page)) => {
@@ -895,9 +928,11 @@ impl App {
             Page::Processes => self.handle_processes(ev),
             Page::Performance => self.perf.handle(ev),
             Page::Settings => {
-                let r = self
-                    .settings_page
-                    .handle(ev, &mut self.settings, self.system_animations);
+                let cx = Context {
+                    system_animations: self.system_animations,
+                    update: &self.update,
+                };
+                let r = self.settings_page.handle(ev, &mut self.settings, cx);
                 if matches!(r.effect, Some(Effect::SaveSettings(_))) {
                     self.apply_animation();
                 }
@@ -1227,7 +1262,15 @@ impl App {
         let window = Rect::from_size(self.size);
         let expanded = self.nav.is_expanded(self.size.w);
         let (rail, content) = window.split_left(self.nav.width(self.size.w));
-        self.nav.paint(dl, rail, self.page, expanded, theme);
+        self.nav.paint(
+            dl,
+            rail,
+            self.page,
+            expanded,
+            &self.update,
+            theme,
+            &mut self.buf,
+        );
         let full = content.inset(theme.gap, theme.gap);
         // While paused, the charts show history as of the pause.
         let timeline = match &self.paused {
@@ -1243,8 +1286,12 @@ impl App {
                 return;
             }
             Page::Settings => {
+                let cx = Context {
+                    system_animations: self.system_animations,
+                    update: &self.update,
+                };
                 self.settings_page
-                    .paint(dl, full, self.settings, self.system_animations, theme);
+                    .paint(dl, full, self.settings, cx, theme, &mut self.buf);
                 return;
             }
         }
@@ -2340,7 +2387,8 @@ mod tests {
         assert_eq!(
             r.effect,
             Some(Effect::SaveSettings(Settings {
-                animate_rows: Some(false)
+                animate_rows: Some(false),
+                ..Settings::default()
             }))
         );
         assert_eq!(app.settings().animate_rows, Some(false));
@@ -2349,5 +2397,41 @@ mod tests {
         app.set_snapshot(two(4, 90.0, 5.0));
         app.paint_at(&mut dl, t0 + Duration::from_millis(700));
         assert!(!app.animating());
+    }
+
+    #[test]
+    fn the_version_on_the_rail_is_the_update_button() {
+        let mut app = App::new(Theme::dark());
+        let _ = app.handle(UiEvent::Resize(Size::new(1200.0, 700.0)));
+        app.set_update(UpdateView::new("0.2.1", true));
+        let strings = painted_strings(&mut app);
+        assert!(strings.iter().any(|s| s == "v0.2.1"));
+        assert!(strings.iter().any(|s| s == "Check for updates"));
+
+        let at = app.nav.update_rect().center();
+        let click = |app: &mut App| {
+            app.handle(UiEvent::MouseDown {
+                at,
+                button: MouseButton::Left,
+            })
+        };
+        assert_eq!(
+            click(&mut app).effect,
+            Some(Effect::Update(UpdateAction::Check))
+        );
+        assert_eq!(app.page(), Page::Processes, "no page change");
+
+        assert!(app.set_update_status(ot_update::Status::Checking));
+        assert_eq!(click(&mut app), Reaction::NONE, "busy: nothing to do");
+        assert!(painted_strings(&mut app)
+            .iter()
+            .any(|s| s == "Checking\u{2026}"));
+
+        let v = ot_update::Version::parse("0.3.0").unwrap();
+        app.set_update_status(ot_update::Status::Ready { version: v });
+        assert_eq!(
+            click(&mut app).effect,
+            Some(Effect::Update(UpdateAction::Install))
+        );
     }
 }

@@ -1,12 +1,18 @@
 # Launch the app, wait for its window, screenshot it, and kill it.
 # Dev-time visual smoke test. Usage: pwsh -File scripts/screenshot.ps1 [-Exe path] [-Out path]
+#   [-Click "x,y;x,y"] [-AfterClickMs 3000]
 param(
     [string]$Exe = "target\debug\open-task.exe",
     [string]$Out = "target\screenshot.png",
     [int]$WaitMs = 5000,
     [int]$SettleMs = 2500,
     # Extra command-line arguments for the app, as one string, e.g. "--theme light".
-    [string]$AppArgs = ""
+    [string]$AppArgs = "",
+    # Left clicks before the shot, "x,y" separated by ";", in the coordinates of the
+    # screenshot itself (so a point can be read off an earlier shot).
+    [string]$Click = "",
+    # How long to wait after the last click before the shot.
+    [int]$AfterClickMs = 1000
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -19,6 +25,9 @@ public static class Native {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
 
     public delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
@@ -66,6 +75,24 @@ try {
     $rd = [Native+RECT]::new()
     # DWMWA_EXTENDED_FRAME_BOUNDS (9): the visible frame, without invisible resize borders.
     [Native]::DwmGetWindowAttribute($h, 9, [ref]$rd, 16) | Out-Null
+
+    if ($Click -ne "") {
+        foreach ($xy in $Click -split ";") {
+            $x, $y = $xy -split "," | ForEach-Object { [int]$_ }
+            # Screenshot coordinates start at the visible frame's corner.
+            $pt = [Native+POINT]::new()
+            $pt.X = $rd.L + $x
+            $pt.Y = $rd.T + $y
+            [Native]::ScreenToClient($h, [ref]$pt) | Out-Null
+            $l = [IntPtr](($pt.Y -shl 16) -bor ($pt.X -band 0xFFFF))
+            # WM_MOUSEMOVE, WM_LBUTTONDOWN (MK_LBUTTON), WM_LBUTTONUP.
+            [Native]::PostMessageW($h, 0x0200, [IntPtr]::Zero, $l) | Out-Null
+            [Native]::PostMessageW($h, 0x0201, [IntPtr]1, $l) | Out-Null
+            [Native]::PostMessageW($h, 0x0202, [IntPtr]::Zero, $l) | Out-Null
+            Start-Sleep -Milliseconds 200
+        }
+        Start-Sleep -Milliseconds $AfterClickMs
+    }
 
     # PrintWindow with PW_RENDERFULLCONTENT (2) renders DirectComposition content
     # straight from the window, so it works whatever is on top of it.

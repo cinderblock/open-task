@@ -16,11 +16,13 @@ pub mod sparkline;
 mod steady;
 pub mod table;
 pub mod theme;
+mod update;
 pub mod view;
 
 pub use nav::Page;
 pub use settings::Settings;
 pub use theme::Theme;
+pub use update::{UpdateAction, UpdateView};
 pub use view::{
     App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Reaction, UiEvent,
     ViewMode,

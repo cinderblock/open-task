@@ -137,6 +137,7 @@ fn run_gui(
         theme: ot_shell_win::ThemePreference::parse(theme),
         view: ot_shell_win::ViewMode::parse(view),
         page: ot_shell_win::Page::parse(page).unwrap_or_default(),
+        version: VERSION,
     };
     if let Err(e) = ot_shell_win::run(probe, config, options) {
         fail(&format!("shell failed: {e}"), 1, true);

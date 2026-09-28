@@ -12,6 +12,7 @@ authors.workspace = true
 ot-model.workspace = true
 ot-core.workspace = true
 ot-paint.workspace = true
+ot-update.workspace = true
 
 [lints]
 workspace = true

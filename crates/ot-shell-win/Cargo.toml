@@ -14,6 +14,7 @@ ot-model.workspace = true
 ot-probe.workspace = true
 ot-paint.workspace = true
 ot-ui.workspace = true
+ot-update.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

@@ -20,7 +20,9 @@ use ot_probe::{ControlError, PlatformControl, ProcessControl, SystemProbe};
 use ot_probe::{CpuSampler, PlatformSampler};
 use ot_ui::{
     App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Page, Theme, UiEvent,
+    UpdateAction, UpdateView,
 };
+use ot_update::Updater;
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -45,15 +47,16 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES, MB_DEFBUTTON2,
-    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
-    SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_APP, WM_CHAR, WM_CONTEXTMENU,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
-    WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    PostQuitMessage, RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES,
+    MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MSG, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWDEFAULT, SW_SHOWNORMAL,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
+    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::gfx::Gfx;
@@ -64,6 +67,16 @@ use crate::{ShellError, ShellOptions, ThemePreference};
 const WM_APP_SNAPSHOT: u32 = WM_APP + 1;
 /// A CPU sample finished on its worker thread; `lparam` is a `Box<SampleOutcome>`.
 const WM_APP_SAMPLE: u32 = WM_APP + 2;
+/// The updater's status changed; read it with `Updater::status`.
+const WM_APP_UPDATE: u32 = WM_APP + 3;
+
+/// The timer for scheduled update checks: first shortly after start, so it does
+/// not compete with the first frames, then hourly to see whether a day has passed.
+const TIMER_UPDATE: usize = 1;
+const FIRST_CHECK_MS: u32 = 10_000;
+const CHECK_TICK_MS: u32 = 3_600_000;
+/// How often a scheduled check runs.
+const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
 
 /// What a sampling thread hands back to the window.
 struct SampleOutcome {
@@ -109,6 +122,9 @@ struct State {
     cursors: Cursors,
     /// The window title as last set; it says when the display is paused.
     title: &'static str,
+    /// `None` if this build's version does not parse, which a build from this
+    /// repository never produces.
+    updater: Option<Updater>,
 }
 
 /// What a message handler decided. The borrow on [`State`] ends before anything
@@ -215,6 +231,9 @@ pub fn run(
     app.set_view(options.view);
     app.set_page(options.page);
     let _ = app.handle(UiEvent::Resize(to_dips_size(size_px, dpi)));
+    let updater = start_updater(options.version, hwnd);
+    let can_install = updater.as_ref().is_some_and(Updater::can_install);
+    app.set_update(UpdateView::new(options.version, can_install));
 
     // The sampler posts a message per publish. HWND is a pointer and therefore not
     // Send, so it crosses the thread as an integer.
@@ -247,12 +266,14 @@ pub fn run(
         high_surrogate: None,
         cursors,
         title: TITLE,
+        updater,
     }));
     let state_ptr = Box::into_raw(state);
     // SAFETY: hwnd is valid; the pointer stays alive until after the loop below.
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
+        SetTimer(Some(hwnd), TIMER_UPDATE, FIRST_CHECK_MS, None);
     }
 
     tracing::info!(backdrop, dark, dpi, ?size_px, "window up");
@@ -281,6 +302,41 @@ pub fn run(
         drop(state);
     }
     Ok(())
+}
+
+/// The updater, posting `WM_APP_UPDATE` to the window after every change. It
+/// installs updates only if the installer put this copy where it runs.
+fn start_updater(version: &str, hwnd: HWND) -> Option<Updater> {
+    let build = match ot_update::Build::parse(version) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "no updates for a build whose version does not parse");
+            return None;
+        }
+    };
+    let installation = ot_update::installation();
+    tracing::info!(?installation, "updates");
+    let config = ot_update::Config {
+        build,
+        feed: ot_update::Feed::official(),
+        download_dir: ot_update::default_download_dir(),
+        installation,
+    };
+    let platform = ot_update::native(&format!("open-task/{version}"));
+    // HWND is a pointer and therefore not Send, so it crosses as an integer.
+    let hwnd_bits = hwnd.0 as isize;
+    Some(Updater::new(config, platform, move || {
+        // SAFETY: posting to a window handle is thread-safe; if the window is gone
+        // the call fails harmlessly.
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(hwnd_bits as *mut c_void)),
+                WM_APP_UPDATE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }))
 }
 
 /// Windows' "Choose your default app mode" setting. A missing value means light,
@@ -704,6 +760,42 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             Outcome::Done(LRESULT(0))
         }
+        WM_APP_UPDATE => {
+            if let Some(u) = &st.updater {
+                if st.app.set_update_status(u.status()) {
+                    invalidate(hwnd);
+                }
+            }
+            Outcome::Done(LRESULT(0))
+        }
+        WM_TIMER if wparam.0 == TIMER_UPDATE => {
+            // After the first tick, look hourly; the updater decides whether a day
+            // has passed since the last check.
+            // SAFETY: hwnd is valid; re-arming an existing timer replaces it.
+            unsafe {
+                SetTimer(Some(hwnd), TIMER_UPDATE, CHECK_TICK_MS, None);
+            }
+            let settings = st.app.settings();
+            if let Some(u) = &st.updater {
+                if settings.check_updates && u.due(CHECK_EVERY) {
+                    u.check(false, settings.download_updates && u.can_install());
+                }
+            }
+            Outcome::Done(LRESULT(0))
+        }
+        // Restart Manager (the installer replacing this exe) and logoff end the
+        // session this way. Close as the user would; posting keeps it out of this
+        // handler, and the message loop ends with the window.
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                tracing::info!(reason = lparam.0, "session ending; closing");
+                // SAFETY: posting to our own window.
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+            Outcome::Done(LRESULT(0))
+        }
         WM_SETTINGCHANGE => {
             // Sent for any system setting; re-reading these is cheap. The Settings
             // page shows Windows' animation effects, so a change repaints.
@@ -783,8 +875,58 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
         }
         Effect::SaveSettings(settings) => {
             prefs::save(&settings);
+            // Downloading was just turned on with a release waiting: start now.
+            let updater = cell.try_borrow().ok().and_then(|st| st.updater.clone());
+            if let Some(u) = updater {
+                let waiting = matches!(u.status(), ot_update::Status::Available { .. });
+                if settings.download_updates && waiting && u.can_install() {
+                    u.download();
+                }
+            }
             None
         }
+        Effect::Update(action) => {
+            update(cell, hwnd, action);
+            None
+        }
+    }
+}
+
+/// The update button was pressed. The updater works on its own threads and
+/// reports back with `WM_APP_UPDATE`.
+fn update(cell: &RefCell<State>, hwnd: HWND, action: UpdateAction) {
+    let Some(u) = cell.try_borrow().ok().and_then(|st| st.updater.clone()) else {
+        return;
+    };
+    match action {
+        // Asked for: download straight away if this copy can install it.
+        UpdateAction::Check => u.check(true, u.can_install()),
+        UpdateAction::Download => u.download(),
+        UpdateAction::Install => u.install(),
+        UpdateAction::OpenReleasePage => {
+            if let Some(url) = u.release_page() {
+                open_url(hwnd, &url);
+            }
+        }
+    }
+}
+
+/// The default browser at `url`.
+fn open_url(hwnd: HWND, url: &str) {
+    // SAFETY: strings outlive the call; hwnd is valid.
+    let r = unsafe {
+        ShellExecuteW(
+            Some(hwnd),
+            w!("open"),
+            &HSTRING::from(url),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Values up to 32 are error codes, by the API's odd convention.
+    if r.0 as usize <= 32 {
+        tracing::warn!(url, code = r.0 as usize, "could not open the release page");
     }
 }
 
