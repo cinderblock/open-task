@@ -21,12 +21,21 @@ use ot_core::{Sampler, SamplerConfig};
 use ot_model::Bytes;
 use ot_probe::{CpuSampler, PlatformProbe, PlatformSampler, SystemProbe};
 
+/// This build's version: the release (`0.2.1`), or where it stands relative to one
+/// (`0.2.1-19-g892159c`, `-dirty` with uncommitted changes). Set by `build.rs`.
+const VERSION: &str = env!("OT_VERSION");
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let version = args.iter().any(|a| a == "--version" || a == "-V");
     let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
-    if headless {
+    if headless || version {
         #[cfg(windows)]
         ot_shell_win::attach_parent_console();
+    }
+    if version {
+        println!("open-task v{VERSION}");
+        return;
     }
 
     tracing_subscriber::fmt()
@@ -36,6 +45,7 @@ fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+    tracing::info!(version = VERSION, "open-task");
 
     let theme = arg_value(&args, "--theme").unwrap_or("system");
     let view = arg_value(&args, "--view").unwrap_or("list");
