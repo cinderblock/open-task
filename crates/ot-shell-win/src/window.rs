@@ -28,7 +28,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
+    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, ValidateRect, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -110,6 +110,12 @@ enum Outcome {
     Done(LRESULT),
     Default,
     Event(UiEvent),
+    /// `WM_SIZE`: hand the view its new size and draw the frame right away, rather
+    /// than leaving it to `WM_PAINT`. During a live drag the modal sizing loop only
+    /// synthesizes `WM_PAINT` when its queue is empty, and the mouse keeps it busy,
+    /// so the window would show the last frame at its old size (or nothing, since
+    /// `ResizeBuffers` leaves the new buffers blank) until the pointer rests.
+    Resized(UiEvent),
     /// `WM_DPICHANGED`: move to the suggested rectangle, which re-enters with `WM_SIZE`.
     Rescale(RECT),
     /// Tell the user something in a message box, once the state is released.
@@ -433,6 +439,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             dispatch(cell, hwnd, ev);
             LRESULT(0)
         }
+        Outcome::Resized(ev) => {
+            dispatch(cell, hwnd, ev);
+            if let Ok(mut st) = cell.try_borrow_mut() {
+                repaint(&mut st);
+            }
+            // The frame just presented is current; drop the invalidation that the
+            // class styles and the view queued, so `WM_PAINT` does not draw it twice.
+            // SAFETY: hwnd is valid; a null rectangle means the whole client area.
+            unsafe {
+                let _ = ValidateRect(Some(hwnd), None);
+            }
+            LRESULT(0)
+        }
         Outcome::Rescale(r) => {
             // SAFETY: hwnd is valid; flags are standard.
             unsafe {
@@ -486,7 +505,7 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     st.gfx = None;
                 }
             }
-            Outcome::Event(UiEvent::Resize(to_dips_size(px, st.dpi)))
+            Outcome::Resized(UiEvent::Resize(to_dips_size(px, st.dpi)))
         }
         WM_DPICHANGED => {
             let new_dpi = ((wparam.0 >> 16) & 0xFFFF) as f32;
