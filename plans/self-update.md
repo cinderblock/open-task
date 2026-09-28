@@ -123,8 +123,10 @@ the update if it downloads a new one".
    **Stage** `gh secret set` for the user's explicit yes (third-party account setting).
 7. ~~End-to-end locally: test key + local feed build, per-user install, update it to
    a newer local build, relaunch.~~ Passed; see findings.
-8. **[current]** Merge into `master` (fast-forward from the shared tree when my files
-   are clean there). Release is the user's call.
+8. ~~Merge into `master`~~: fast-forwarded 2026-09-28 (`00fe878`), not pushed:
+   `master` also carries nine unpushed commits from other threads.
+9. **[current, waiting on the user]** The secret, then the first signed release (see
+   open questions). The branch `self-update` and its worktree stay until then.
 
 ## Findings / gotchas
 
@@ -215,12 +217,20 @@ the update if it downloads a new one".
 - [x] Installer relaunch, workflow signing, README (`9efd436`).
 - [x] Key generated. [ ] Secret staged for approval.
 - [x] Local end-to-end update (per-user; see findings).
-- [ ] Merged to `master`.
+- [x] Merged to `master` (fast-forward, 2026-09-28). Not pushed.
+- [ ] `MINISIGN_SECRET_KEY` set on `cinderblock/open-task` (none set as of
+      2026-09-28; staged, waiting for the user's yes).
+- [ ] First signed release; then install it by hand once, since the copy now in
+      Program Files predates the updater.
 
 ## Open questions for the user
 
-1. Approve `gh secret set MINISIGN_SECRET_KEY` on `cinderblock/open-task` (step 7).
-2. When to cut the first signed release (the first one the updater can see).
+1. Approve, exactly: `gh secret set MINISIGN_SECRET_KEY --repo
+   cinderblock/open-task < "$USERPROFILE/.minisign/open-task.key"` (Git Bash). Until
+   it is set, every release fails at "Sign the checksums", on purpose.
+2. Push `master` (15 ahead of `origin/master`, 9 of them other threads') and cut
+   the first signed release: which version? `plans/replace-task-manager.md`
+   (untracked, another thread) claims v0.3.0 for its work.
 
 ## Things not to do
 
