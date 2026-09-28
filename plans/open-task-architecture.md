@@ -93,6 +93,14 @@ Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks.
     setting: row animation (`plans/charts-log-time-and-live-table.md`). Options
     that need a page rather than a menu go there; the plan for "Replace Task
     Manager" and "run as administrator" predates it and should use it too.
+12. **Self-update, signed in CI** (user, 2026-09-28: "build it all. Use tags like
+    "v0.1.0" (semver) ... dirty/non tagged builds get the hash (and a -dirty
+    suffix) ... the version number on the app should also be a button"). The
+    version on the rail is the update button; releases carry a minisign
+    signature of `SHA256SUMS` made by the release workflow from the repository
+    secret `MINISIGN_SECRET_KEY` (user's choice over signing locally, knowing it
+    does not protect against someone who can push to the repo); the key has no
+    password (user's choice). See `plans/self-update.md`.
 
 ## Why not a webview (the decisive argument)
 
@@ -192,7 +200,8 @@ goes." Same for a future headless/remote mode.
    ETW CPU sample with module and client attribution; see
    `plans/service-host-attribution.md`.
 8. Flight Recorder.
-9. Self-updater + signed releases.
+9. ~~Self-updater + signed releases~~ (2026-09-28, `plans/self-update.md`; code
+   signing of the binaries is still open question 3).
 10. Linux (Qt 6 or GTK 4 — decide later) and macOS shells.
 
 ## Findings / gotchas
@@ -348,6 +357,13 @@ goes." Same for a future headless/remote mode.
       optional PATH) built by the release workflow and shipped from v0.2.1
       (2026-09-26). Verified from the published asset. `plans/windows-installer.md`.
       Follow-ups there: code signing, winget manifest, an app icon.
+- [x] Build identity and self-update (2026-09-28, `plans/self-update.md`): the
+      version from `git describe` (`--version`, the exe's version resource, the
+      rail), `ot-update` (signed feed, WinHTTP, download held open, Setup with
+      `/RELAUNCH=1`), the rail button and the Settings page's Updates section, a
+      signing step in `release.yml`. Verified end to end with a per-user install
+      and a local signed feed. The first release the updater can see is the first
+      one signed, which needs the `MINISIGN_SECRET_KEY` secret.
 
 ## Open questions for the user
 
@@ -355,11 +371,8 @@ goes." Same for a future headless/remote mode.
 2. ~~Repo name / GitHub org.~~ Resolved: `cinderblock/open-task`, public.
 3. **Code signing.** Releases are far more useful signed (SmartScreen). That needs a
    certificate and secrets. Unsigned for now.
-   Separately, the **self-updater must verify a detached signature** on every download
-   with a public key compiled into the binary, so a compromised GitHub account cannot
-   push a malicious update to every user. Recommend minisign. Generating that keypair
-   is a user action; the private key must never be in the repo. Until it exists, the
-   updater can check for and *announce* new versions but should not auto-install.
+   ~~The self-updater must verify a detached signature.~~ Done with minisign
+   (decision 12); the user chose signing in CI over the stronger local signing.
 4. **Linux toolkit.** Qt 6 (TMOG's choice, better dense-table story, better on KDE) vs
    GTK 4 + libadwaita (much better Rust bindings, more "native" on GNOME). Only a stub is
    needed now, so this is deferred, not blocking.
