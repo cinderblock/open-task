@@ -81,6 +81,42 @@ pub fn uptime(out: &mut String, secs: u64) {
     let _ = write!(out, "{d}:{h:02}:{m:02}:{s:02}");
 }
 
+/// A network rate in bits per second, decimal like every link speed: `850 Kbps`,
+/// `5.60 Mbps`, `1.00 Gbps`. Takes bits.
+pub fn bits(out: &mut String, bits_per_sec: f64) {
+    const UNITS: [&str; 5] = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+    out.clear();
+    let mut v = bits_per_sec.max(0.0);
+    let mut u = 0;
+    while v >= 1000.0 && u < UNITS.len() - 1 {
+        v /= 1000.0;
+        u += 1;
+    }
+    let _ = if u == 0 || v >= 100.0 {
+        write!(out, "{v:.0} {}", UNITS[u])
+    } else if v >= 10.0 {
+        write!(out, "{v:.1} {}", UNITS[u])
+    } else {
+        write!(out, "{v:.2} {}", UNITS[u])
+    };
+}
+
+/// A byte rate: `1.50 MB/s`, `0 B/s`.
+pub fn bytes_per_sec(out: &mut String, b: Bytes) {
+    bytes(out, b);
+    out.push_str("/s");
+}
+
+/// A short duration in milliseconds: `0.4 ms`, `12 ms`.
+pub fn ms(out: &mut String, ms: f32) {
+    out.clear();
+    let _ = if ms < 10.0 {
+        write!(out, "{ms:.1} ms")
+    } else {
+        write!(out, "{ms:.0} ms")
+    };
+}
+
 /// A clock speed: `3.61 GHz`, or `800 MHz` below one gigahertz.
 pub fn clock(out: &mut String, hz: ot_model::Hertz) {
     out.clear();
@@ -151,6 +187,17 @@ mod tests {
             s(|b| bytes_of(b, Bytes(52 * gb + gb / 3), Bytes(64 * gb))),
             "52.3 / 64.0 GB"
         );
+    }
+
+    #[test]
+    fn rates_and_durations() {
+        assert_eq!(s(|b| bits(b, 0.0)), "0 bps");
+        assert_eq!(s(|b| bits(b, 850_000.0)), "850 Kbps");
+        assert_eq!(s(|b| bits(b, 5_600_000.0)), "5.60 Mbps");
+        assert_eq!(s(|b| bits(b, 1e9)), "1.00 Gbps");
+        assert_eq!(s(|b| bytes_per_sec(b, Bytes(1536))), "1.50 KB/s");
+        assert_eq!(s(|b| ms(b, 0.42)), "0.4 ms");
+        assert_eq!(s(|b| ms(b, 12.3)), "12 ms");
     }
 
     #[test]

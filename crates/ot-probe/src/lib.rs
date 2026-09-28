@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CpuSample;
+use ot_model::device::{AdapterSample, DiskSample};
 use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
@@ -60,6 +61,10 @@ pub struct ProbeOutput {
     pub processes: Vec<ProcessSample>,
     /// Every sampled thread, grouped by process: each process names its range.
     pub threads: Vec<ThreadSample>,
+    /// Physical disks, by number.
+    pub disks: Vec<DiskSample>,
+    /// Connected network adapters, physical ones first.
+    pub adapters: Vec<AdapterSample>,
 }
 
 impl ProbeOutput {
@@ -67,6 +72,8 @@ impl ProbeOutput {
     pub fn clear(&mut self) {
         self.processes.clear();
         self.threads.clear();
+        self.disks.clear();
+        self.adapters.clear();
         self.cpu.cores.clear();
         self.memory = MemorySample::default();
     }

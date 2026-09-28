@@ -167,6 +167,9 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                 let cores = std::mem::replace(&mut out.cpu.cores, Vec::with_capacity(core_cap));
                 let mut cpu = out.cpu.clone();
                 cpu.cores = cores;
+                // Few entries; taking them is cheaper than keeping capacity around.
+                let disks = std::mem::take(&mut out.disks);
+                let adapters = std::mem::take(&mut out.adapters);
 
                 shared.current.store(Arc::new(Snapshot {
                     tick,
@@ -177,6 +180,8 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                     memory: out.memory,
                     processes,
                     threads,
+                    disks,
+                    adapters,
                     capabilities,
                     hardware: Arc::clone(&hardware),
                 }));

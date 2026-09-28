@@ -70,6 +70,12 @@ pub struct Theme {
 
     /// Efficiency cores on a hybrid processor; performance cores use `cpu`.
     pub cpu_efficiency: Color,
+    /// Disk activity and reads; writes use the lighter `disk_write`.
+    pub disk: Color,
+    pub disk_write: Color,
+    /// Network traffic received; sent uses the lighter `network_send`.
+    pub network: Color,
+    pub network_send: Color,
     /// Modified memory: written, waiting to reach disk before it can be reused.
     pub memory_modified: Color,
     /// A headline number in a page's statistics.
@@ -116,7 +122,11 @@ impl Theme {
             button_active: Color::hex(0x60_CD_FF).with_alpha(0.22),
             input_bg: Color::rgba(0.0, 0.0, 0.0, 0.18),
             search_w: 220.0,
-            cpu_efficiency: Color::hex(0x6C_CB_5F),
+            cpu_efficiency: Color::hex(0x4F_C3_C0),
+            disk: Color::hex(0x6C_CB_5F),
+            disk_write: Color::hex(0xB8_E8_B0),
+            network: Color::hex(0xF0_A0_4B),
+            network_send: Color::hex(0xF8_D4_A8),
             memory_modified: Color::hex(0xFF_B4_54),
             stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
         }
@@ -161,7 +171,11 @@ impl Theme {
             button_active: Color::hex(0x00_5F_B8).with_alpha(0.16),
             input_bg: Color::rgba(1.0, 1.0, 1.0, 0.75),
             search_w: 220.0,
-            cpu_efficiency: Color::hex(0x0F_7B_0F),
+            cpu_efficiency: Color::hex(0x03_83_87),
+            disk: Color::hex(0x10_7C_10),
+            disk_write: Color::hex(0x6B_B8_6B),
+            network: Color::hex(0xC2_5E_00),
+            network_send: Color::hex(0xE8_A8_65),
             memory_modified: Color::hex(0xC2_5E_00),
             stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
         }

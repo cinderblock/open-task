@@ -39,6 +39,18 @@ pub(super) struct MemoryLists {
     pub free: Option<Bytes>,
 }
 
+/// One physical disk's counters for this pass.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct DiskRates {
+    pub number: u32,
+    /// The volumes on it, as the counter instance names them: `C: D:`.
+    pub letters: String,
+    pub idle_pct: Option<f64>,
+    pub read_per_sec: Option<f64>,
+    pub write_per_sec: Option<f64>,
+    pub sec_per_transfer: Option<f64>,
+}
+
 /// An open PDH query and the counters in it.
 #[derive(Debug)]
 pub(super) struct PerfCounters {
@@ -48,6 +60,9 @@ pub(super) struct PerfCounters {
     /// Core, normal priority, reserve: standby is their sum.
     standby: [Option<PDH_HCOUNTER>; 3],
     free: Option<PDH_HCOUNTER>,
+    /// Physical disks: idle time, read and write bytes per second, seconds per
+    /// transfer, in that order.
+    disk: [Option<PDH_HCOUNTER>; 4],
     /// Scratch for instance arrays, reused every pass.
     items: AlignedBuf,
 }
@@ -81,6 +96,7 @@ impl PerfCounters {
             modified: None,
             standby: [None; 3],
             free: None,
+            disk: [None; 4],
             items: AlignedBuf::default(),
         };
         c.performance = c.add(w!(r"\Processor Information(*)\% Processor Performance"));
@@ -91,6 +107,12 @@ impl PerfCounters {
             c.add(w!(r"\Memory\Standby Cache Reserve Bytes")),
         ];
         c.free = c.add(w!(r"\Memory\Free & Zero Page List Bytes"));
+        c.disk = [
+            c.add(w!(r"\PhysicalDisk(*)\% Idle Time")),
+            c.add(w!(r"\PhysicalDisk(*)\Disk Read Bytes/sec")),
+            c.add(w!(r"\PhysicalDisk(*)\Disk Write Bytes/sec")),
+            c.add(w!(r"\PhysicalDisk(*)\Avg. Disk sec/Transfer")),
+        ];
         Some(c)
     }
 
@@ -154,6 +176,52 @@ impl PerfCounters {
         }
     }
 
+    /// Each physical disk's counters, by disk number. A disk appears once any of its
+    /// counters has a value; rate counters have none until the second pass.
+    pub fn disks(&mut self, out: &mut Vec<DiskRates>) {
+        out.clear();
+        let format = PDH_FMT(PDH_FMT_DOUBLE.0 | PDH_FMT_NOCAP100);
+        for (which, counter) in self.disk.into_iter().enumerate() {
+            let Some(counter) = counter else {
+                continue;
+            };
+            let Some(items) = self.array(counter, format) else {
+                continue;
+            };
+            for item in items {
+                if !valid(item.FmtValue.CStatus) {
+                    continue;
+                }
+                // SAFETY: PDH points `szName` at a string inside the same buffer.
+                let name = unsafe { item.szName.to_string() }.unwrap_or_default();
+                let Some((number, letters)) = disk_instance(&name) else {
+                    continue;
+                };
+                // SAFETY: a DOUBLE format fills the `doubleValue` member.
+                let v = Some(unsafe { item.FmtValue.Anonymous.doubleValue });
+                let i = out
+                    .iter()
+                    .position(|d| d.number == number)
+                    .unwrap_or_else(|| {
+                        out.push(DiskRates {
+                            number,
+                            letters: letters.to_owned(),
+                            ..DiskRates::default()
+                        });
+                        out.len() - 1
+                    });
+                let d = &mut out[i];
+                match which {
+                    0 => d.idle_pct = v,
+                    1 => d.read_per_sec = v,
+                    2 => d.write_per_sec = v,
+                    _ => d.sec_per_transfer = v,
+                }
+            }
+        }
+        out.sort_by_key(|d| d.number);
+    }
+
     /// A wildcard counter's instances, in the reused scratch buffer.
     fn array(
         &mut self,
@@ -204,6 +272,13 @@ fn large(counter: PDH_HCOUNTER) -> Option<i64> {
     Some(unsafe { value.Anonymous.largeValue })
 }
 
+/// `PhysicalDisk` names its instances `number letters`: `0 C:`, `1 D: E:`, `2` for
+/// a disk with no lettered volume, and `_Total`.
+fn disk_instance(name: &str) -> Option<(u32, &str)> {
+    let (number, letters) = name.split_once(' ').unwrap_or((name, ""));
+    Some((number.parse().ok()?, letters.trim()))
+}
+
 /// `Processor Information` names its instances `group,number`, plus totals such as
 /// `_Total` and `0,_Total`. Only group 0 maps onto our processor list for now (the
 /// probe samples one processor group; see the module docs of `windows`).
@@ -229,6 +304,14 @@ mod tests {
     }
 
     #[test]
+    fn disk_instances_parse() {
+        assert_eq!(disk_instance("0 C:"), Some((0, "C:")));
+        assert_eq!(disk_instance("1 D: E:"), Some((1, "D: E:")));
+        assert_eq!(disk_instance("2"), Some((2, "")));
+        assert_eq!(disk_instance("_Total"), None);
+    }
+
+    #[test]
     fn this_machine_has_clock_and_memory_list_counters() {
         let mut c = PerfCounters::open().expect("PDH opens a query");
         assert!(c.has_clock());
@@ -248,5 +331,8 @@ mod tests {
             m.standby.is_some() && m.free.is_some() && m.modified.is_some(),
             "{m:?}"
         );
+        let mut disks = Vec::new();
+        c.disks(&mut disks);
+        assert!(disks.iter().any(|d| d.idle_pct.is_some()), "{disks:?}");
     }
 }

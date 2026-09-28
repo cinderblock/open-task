@@ -57,14 +57,17 @@ mod control;
 mod counters;
 mod details;
 mod hardware;
+mod network;
 mod nt;
 mod profile;
 mod services;
+mod storage;
 mod tags;
 
 pub use control::WindowsControl;
-use counters::PerfCounters;
+use counters::{DiskRates, PerfCounters};
 use details::DetailProbe;
+use network::NetProbe;
 use nt::{SystemProcessInformation, SystemThreadInformation};
 pub use profile::WindowsSampler;
 use services::ServiceProbe;
@@ -196,6 +199,11 @@ pub struct WindowsProbe {
     counters: Option<PerfCounters>,
     /// Each logical processor's performance as a percentage of base, this pass.
     performance: Vec<Option<f64>>,
+    /// This pass's disk counters, reused.
+    disk_rates: Vec<DiskRates>,
+    /// Facts per disk number, read once per disk.
+    disk_infos: HashMap<u32, Arc<ot_model::device::DiskInfo>>,
+    net: NetProbe,
     last_pass: Option<Instant>,
     pass: u64,
 }
@@ -231,6 +239,9 @@ impl WindowsProbe {
             hardware: hardware::read(logical_count),
             counters: PerfCounters::open(),
             performance: vec![None; logical_count as usize],
+            disk_rates: Vec::new(),
+            disk_infos: HashMap::new(),
+            net: NetProbe::default(),
             last_pass: None,
             pass: 0,
         })
@@ -509,6 +520,38 @@ impl WindowsProbe {
         Ok(())
     }
 
+    /// Turn this pass's disk counters into samples, reading each disk's facts the
+    /// first time it is seen (or when its volumes change).
+    fn sample_disks(&mut self, out: &mut Vec<ot_model::device::DiskSample>) {
+        out.clear();
+        for r in &self.disk_rates {
+            let Some(idle) = r.idle_pct else {
+                continue;
+            };
+            let name = storage::display_name(r.number, &r.letters);
+            let info = self
+                .disk_infos
+                .entry(r.number)
+                .and_modify(|i| {
+                    if i.name != name {
+                        *i = Arc::new(storage::disk_info(r.number, &r.letters));
+                    }
+                })
+                .or_insert_with(|| Arc::new(storage::disk_info(r.number, &r.letters)))
+                .clone();
+            let per_sec = |v: Option<f64>| Bytes(v.unwrap_or(0.0).max(0.0) as u64);
+            out.push(ot_model::device::DiskSample {
+                info,
+                active: Percent((100.0 - idle).clamp(0.0, 100.0) as f32),
+                read_per_sec: per_sec(r.read_per_sec),
+                write_per_sec: per_sec(r.write_per_sec),
+                response_ms: r.sec_per_transfer.map(|s| (s * 1000.0) as f32),
+            });
+        }
+        let present: Vec<u32> = out.iter().map(|d| d.info.number).collect();
+        self.disk_infos.retain(|n, _| present.contains(n));
+    }
+
     /// Refill `by_pid` for this pass's output. PIDs are unique within one pass.
     fn index_by_pid(&mut self, out: &[ProcessSample]) {
         if self.by_pid_pass == self.pass {
@@ -640,12 +683,15 @@ impl SystemProbe for WindowsProbe {
         self.sample_cores(&mut out.cpu)?;
         self.sample_processes(&mut out.processes, &mut out.threads, wall_100ns)?;
         out.memory = sample_memory()?;
-        if let Some(c) = self.counters.as_ref().filter(|_| collected) {
+        if let Some(c) = self.counters.as_mut().filter(|_| collected) {
             let lists = c.memory();
             out.memory.modified = lists.modified;
             out.memory.standby = lists.standby;
             out.memory.free = lists.free;
+            c.disks(&mut self.disk_rates);
+            self.sample_disks(&mut out.disks);
         }
+        self.net.sample(&mut out.adapters);
 
         self.last_pass = Some(now);
         Ok(())

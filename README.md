@@ -9,7 +9,8 @@ it is measuring.
 
 **Status: early, but real.** On Windows it opens a native window with two pages: live
 CPU and memory graphs over a sortable process table (a flat list or a process tree),
-and a Performance page with a chart and the numbers for the CPU and memory. Everything
+and a Performance page with a chart and the numbers for the CPU, memory, each disk
+and each network connection. Everything
 is drawn with Direct2D over a Mica backdrop. Linux and macOS compile, run headless,
 and measure nothing yet.
 
@@ -34,8 +35,15 @@ memory in use over time; how physical memory divides into in use, modified (writ
 waiting to reach disk), standby (cached, reclaimable) and free; and in use,
 available, committed against the commit limit, cached, and the paged and non-paged
 kernel pools. "In use" counts modified pages, since they are not available; the bar
-shows them separately. Every graph on the page, the small ones in the list
-included, shares one hover line.
+shows them separately. Each **disk** gets its active time (the share of time it
+had work outstanding) and its read and write rates on one chart, with average
+response time, capacity, and whether it is an SSD; each **network connection** gets
+what it received and sent, with its link speed. Connections are the ones a person
+would call connections: physical adapters, Hyper-V `vEthernet` ports and VPNs such
+as Tailscale, not the WAN miniports and virtual-switch internals Windows keeps
+underneath. Rate charts scale themselves to the busiest moment of the last hour.
+The list scrolls when there are more devices than fit. Every graph on the page, the
+small ones in the list included, shares one hover line.
 
 **Charts:** the CPU and memory graphs share a log-scale time axis, labeled
 `1h 10m 1m 10s now` underneath. The newest sample is on the right edge; the last

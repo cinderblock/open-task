@@ -76,9 +76,12 @@ line shared across every chart on the page.
 5. ~~Shell: Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1..9. Screenshots. Commit.~~
 6. ~~Probe: PDH counters (clock, memory lists). Model and page use them. Commit.
    (Pools already come from `GetPerformanceInfo`.)~~
-7. **[current]** Probe: disks and network adapters from PDH; model, timeline series,
-   device list entries and detail panes. Commit.
-8. README, parent plan, this plan; verify on three targets; commit.
+7. ~~Probe: disks (PDH counters, plus a zero-access storage query for model, SSD
+   and capacity) and network adapters (`GetIfTable2`, filtered by the rules in
+   Findings); model, timeline series, device list entries and detail panes.
+   Commit.~~
+8. **[current]** Measure the probe's cost with disks and adapters on a quiet
+   machine; README, parent plan, this plan; commit.
 
 ## Findings / gotchas
 
@@ -121,6 +124,31 @@ line shared across every chart on the page.
   available). The bar splits them out, so its "In use" segment is `in_use - modified`.
   Left that way on purpose: `In use + Available = Total` holds for the stats, which
   lets a reader check them, and the chart and summary card keep one meaning.
+- **Which network interfaces are connections.** `GetIfTable2` on this machine
+  lists about sixty "up" interfaces: every adapter's filter-driver shadows (flag
+  bit 1: `-WFP Native MAC Layer LightWeight Filter-0000`, `-QoS Packet
+  Scheduler-0000`), three WAN miniports (`Local Area Connection* 8/9/10`, access
+  type point-to-point), the Hyper-V switch's internal `vSwitch (...)` adapters,
+  ten `vEthernet` ports, Tailscale (type 53), loopback. The `vSwitch` internals and
+  the `vEthernet` ports are identical in every row field (type 6, flags 0, access
+  2, same network GUID). What separates them is an IP address: `vEthernet` ports and
+  Tailscale have one, the plumbing does not (`Get-NetIPAddress` confirmed). But the
+  physical `Ethernet` adapter has none either, because the external virtual switch
+  took over its IP binding while all the traffic still crosses it. Rule: up, not a
+  filter, of an Ethernet, Wi-Fi, cellular, PPP or software-link type, and physical
+  or addressed. Result here: Ethernet, Tailscale and the ten `vEthernet` ports.
+- **Disk facts need no elevation**: `\\.\PhysicalDriveN` opened with access 0
+  answers `IOCTL_STORAGE_QUERY_PROPERTY` (model, seek penalty) and
+  `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` (size; `IOCTL_DISK_GET_LENGTH_INFO` would need
+  read access). Here: `Samsung SSD 970 EVO Plus 1TB`, SSD, 931.5 GiB. Not yet run
+  from an unelevated process (this session is elevated).
+- **PDH `PhysicalDisk` instances** are named `N letters` (`0 C:`), plus `_Total`.
+- **The working tree stopped building mid-cycle** because the table-jitter thread
+  (`plans/charts-log-time-and-live-table.md`) was halfway through an edit
+  (`ProcessRows` gained a field `view.rs` did not set yet). This cycle's changes
+  were verified in a temporary worktree at HEAD with only this cycle's files copied
+  in (`target/verify-wt`, separate `CARGO_TARGET_DIR`): fmt, clippy on three
+  targets, 122 tests, headless run. That is exactly what the commit contains.
 - **Posted input drives the GUI for screenshots without touching the user's
   desktop:** `target/drive-perf.ps1` posts `WM_KEYDOWN` Down to pick Memory, and a
   `WM_LBUTTONDOWN`/`UP` pair at the "Logical processors" segment (client pixels at
@@ -141,7 +169,11 @@ line shared across every chart on the page.
 - [x] PDH: clock and memory lists (`counters.rs`); speed in the list headline and
       stats; four-part composition bar; headless prints them. 111 tests; clippy on
       three targets; screenshots.
-- [ ] Disks and network adapters.
+- [x] Disks and network adapters: probe (`storage.rs`, `network.rs`, disk
+      counters in `counters.rs`), model (`ot-model::device`), timeline series,
+      data-driven device list with scrolling, disk and network panes with
+      two-line, self-scaling rate charts. Screenshots `target/perf-disk.png`,
+      `target/perf-net.png`.
 - [ ] README and plans; verified; committed.
 
 ## Open questions for the user

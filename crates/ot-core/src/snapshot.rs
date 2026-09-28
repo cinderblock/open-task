@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 use std::sync::Arc;
 
 use ot_model::cpu::CpuSample;
+use ot_model::device::{AdapterSample, DiskSample};
 use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
@@ -34,6 +35,10 @@ pub struct Snapshot {
     /// Every sampled thread; each process names its own range with
     /// [`ProcessSample::thread_range`]. Empty on platforms without thread sampling.
     pub threads: Vec<ThreadSample>,
+    /// Physical disks, by number. Empty where the platform cannot report them.
+    pub disks: Vec<DiskSample>,
+    /// Connected network adapters, physical ones first.
+    pub adapters: Vec<AdapterSample>,
     /// What the probe behind this snapshot can measure, so the UI can explain a
     /// missing column or attribution rather than show a blank.
     pub capabilities: Capabilities,

@@ -53,6 +53,7 @@ impl ChartGroup {
     }
 
     /// Charts in the current frame.
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
@@ -158,6 +159,16 @@ pub(crate) fn percent_value(out: &mut String, v: f32) {
 
 pub(crate) fn bytes_value(out: &mut String, v: f32) {
     format::bytes(out, Bytes(v.max(0.0) as u64));
+}
+
+/// A series of bytes per second, shown as such.
+pub(crate) fn byte_rate_value(out: &mut String, v: f32) {
+    format::bytes_per_sec(out, Bytes(v.max(0.0) as u64));
+}
+
+/// A series of bytes per second, shown in bits per second, as networks are.
+pub(crate) fn bit_rate_value(out: &mut String, v: f32) {
+    format::bits(out, f64::from(v.max(0.0)) * 8.0);
 }
 
 /// What a chart says at the crosshair: `34% · 12 s ago`. Where the point summarizes

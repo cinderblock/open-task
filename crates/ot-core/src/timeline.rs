@@ -263,6 +263,30 @@ impl Iterator for History<'_> {
     }
 }
 
+/// History for one disk.
+#[derive(Debug, Clone)]
+pub struct DiskSeries {
+    /// The disk's number, as in [`ot_model::device::DiskInfo::number`].
+    pub number: u32,
+    /// Active time, percent `0..=100`.
+    pub active: Series,
+    /// Bytes read per second.
+    pub read: Series,
+    /// Bytes written per second.
+    pub write: Series,
+}
+
+/// History for one network adapter.
+#[derive(Debug, Clone)]
+pub struct AdapterSeries {
+    /// As in [`ot_model::device::AdapterInfo::id`].
+    pub id: u64,
+    /// Bytes received per second.
+    pub rx: Series,
+    /// Bytes sent per second.
+    pub tx: Series,
+}
+
 /// All system-wide series the UI graphs.
 #[derive(Debug, Clone)]
 pub struct Timeline {
@@ -273,6 +297,10 @@ pub struct Timeline {
     pub cores: Vec<Series>,
     /// Physical memory in use, bytes.
     pub mem_in_use: Series,
+    /// One entry per disk the latest snapshot listed, in its order.
+    pub disks: Vec<DiskSeries>,
+    /// One entry per adapter the latest snapshot listed, in its order.
+    pub adapters: Vec<AdapterSeries>,
     retention: Retention,
     last_tick: Option<Tick>,
 }
@@ -284,6 +312,8 @@ impl Timeline {
             cpu_total: Series::new(retention),
             cores: Vec::new(),
             mem_in_use: Series::new(retention),
+            disks: Vec::new(),
+            adapters: Vec::new(),
             retention,
             last_tick: None,
         }
@@ -320,6 +350,67 @@ impl Timeline {
         for (series, core) in self.cores.iter_mut().zip(&snap.cpu.cores) {
             series.push(at, core.usage.get());
         }
+
+        let retention = self.retention;
+        for d in &snap.disks {
+            let n = d.info.number;
+            let i = self
+                .disks
+                .iter()
+                .position(|s| s.number == n)
+                .unwrap_or_else(|| {
+                    self.disks.push(DiskSeries {
+                        number: n,
+                        active: Series::new(retention),
+                        read: Series::new(retention),
+                        write: Series::new(retention),
+                    });
+                    self.disks.len() - 1
+                });
+            let s = &mut self.disks[i];
+            s.active.push(at, d.active.get());
+            s.read.push(at, d.read_per_sec.get() as f32);
+            s.write.push(at, d.write_per_sec.get() as f32);
+        }
+        for a in &snap.adapters {
+            let id = a.info.id;
+            let i = self
+                .adapters
+                .iter()
+                .position(|s| s.id == id)
+                .unwrap_or_else(|| {
+                    self.adapters.push(AdapterSeries {
+                        id,
+                        rx: Series::new(retention),
+                        tx: Series::new(retention),
+                    });
+                    self.adapters.len() - 1
+                });
+            let s = &mut self.adapters[i];
+            s.rx.push(at, a.rx_per_sec.get() as f32);
+            s.tx.push(at, a.tx_per_sec.get() as f32);
+        }
+        // A device that is gone takes its history with it. An empty list is more
+        // likely a failed read than every disk (or every adapter) vanishing at once,
+        // so it prunes nothing.
+        if !snap.disks.is_empty() {
+            self.disks
+                .retain(|s| snap.disks.iter().any(|d| d.info.number == s.number));
+        }
+        if !snap.adapters.is_empty() {
+            self.adapters
+                .retain(|s| snap.adapters.iter().any(|a| a.info.id == s.id));
+        }
+    }
+
+    #[must_use]
+    pub fn disk(&self, number: u32) -> Option<&DiskSeries> {
+        self.disks.iter().find(|s| s.number == number)
+    }
+
+    #[must_use]
+    pub fn adapter(&self, id: u64) -> Option<&AdapterSeries> {
+        self.adapters.iter().find(|s| s.id == id)
     }
 
     /// The tick most recently folded in, if any.
@@ -364,6 +455,8 @@ mod tests {
             },
             processes: Vec::new(),
             threads: Vec::new(),
+            disks: Vec::new(),
+            adapters: Vec::new(),
             capabilities: ot_model::Capabilities::default(),
             hardware: std::sync::Arc::default(),
         }
@@ -391,6 +484,53 @@ mod tests {
         assert_eq!(t.last_tick(), Some(Tick(1)));
         t.observe(&snap(2, 30.0, 2));
         assert_eq!(t.cpu_total.len(), 1);
+    }
+
+    #[test]
+    fn disks_and_adapters_get_series_that_follow_the_devices() {
+        use ot_model::device::{AdapterInfo, AdapterSample, DiskInfo, DiskSample};
+        use std::sync::Arc;
+        let disk = |n: u32, active: f32| DiskSample {
+            info: Arc::new(DiskInfo {
+                number: n,
+                ..DiskInfo::default()
+            }),
+            active: Percent(active),
+            read_per_sec: Bytes(100),
+            write_per_sec: Bytes(200),
+            response_ms: None,
+        };
+        let nic = |id: u64| AdapterSample {
+            info: Arc::new(AdapterInfo {
+                id,
+                ..AdapterInfo::default()
+            }),
+            rx_per_sec: Bytes(5),
+            tx_per_sec: Bytes(6),
+            link_bps: None,
+        };
+        let mut t = Timeline::new(Retention::raw(10));
+        let mut s = snap(1, 1.0, 1);
+        s.disks = vec![disk(0, 10.0), disk(1, 20.0)];
+        s.adapters = vec![nic(7)];
+        t.observe(&s);
+        assert_eq!(
+            t.disk(1).map(|d| d.active.latest().unwrap().value),
+            Some(20.0)
+        );
+        assert_eq!(
+            t.disk(0).map(|d| d.write.latest().unwrap().value),
+            Some(200.0)
+        );
+        assert_eq!(t.adapter(7).map(|a| a.tx.len()), Some(1));
+
+        // Disk 1 is unplugged; the adapter read failed this pass.
+        let mut s = snap(2, 1.0, 1);
+        s.disks = vec![disk(0, 30.0)];
+        t.observe(&s);
+        assert!(t.disk(1).is_none());
+        assert_eq!(t.disk(0).map(|d| d.active.len()), Some(2));
+        assert!(t.adapter(7).is_some(), "an empty list prunes nothing");
     }
 
     #[test]

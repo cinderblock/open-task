@@ -258,6 +258,69 @@ fn print_hardware(hw: &ot_model::hardware::Hardware) {
     println!("{line}");
 }
 
+/// The clock, the memory lists, and each disk and network adapter.
+fn print_devices(snap: &ot_core::Snapshot) {
+    let mem = &snap.memory;
+    let clocks: Vec<u64> = snap
+        .cpu
+        .cores
+        .iter()
+        .filter_map(|c| c.frequency)
+        .map(|f| f.0)
+        .collect();
+    let mut extra = String::new();
+    if !clocks.is_empty() {
+        let avg = clocks.iter().sum::<u64>() / clocks.len() as u64;
+        let _ = write!(extra, "clock {:.2} GHz", avg as f64 / 1e9);
+    }
+    for (name, b) in [
+        ("modified", mem.modified),
+        ("standby", mem.standby),
+        ("free", mem.free),
+        ("paged pool", mem.paged_pool),
+        ("non-paged pool", mem.nonpaged_pool),
+    ] {
+        if let Some(b) = b {
+            let sep = if extra.is_empty() { "" } else { "  " };
+            let _ = write!(extra, "{sep}{name} {}", human(b));
+        }
+    }
+    if !extra.is_empty() {
+        println!("  {extra}");
+    }
+    for d in &snap.disks {
+        let kind = match d.info.ssd {
+            Some(true) => "SSD",
+            Some(false) => "HDD",
+            None => "disk",
+        };
+        println!(
+            "  {:<16} {:>5.1}% active  read {:>8}/s  write {:>8}/s  {}  {}{}",
+            d.info.name,
+            d.active.get(),
+            human(d.read_per_sec),
+            human(d.write_per_sec),
+            kind,
+            d.info.model.as_deref().unwrap_or(""),
+            d.info
+                .capacity
+                .map(|c| format!(" ({})", human(c)))
+                .unwrap_or_default(),
+        );
+    }
+    for a in &snap.adapters {
+        println!(
+            "  {:<28} rx {:>8}/s  tx {:>8}/s  {:?}{}  {}",
+            a.info.name,
+            human(a.rx_per_sec),
+            human(a.tx_per_sec),
+            a.info.kind,
+            if a.info.hardware { "" } else { " (virtual)" },
+            a.info.adapter,
+        );
+    }
+}
+
 fn print_snapshot(snap: &ot_core::Snapshot) {
     let mem = &snap.memory;
     println!(
@@ -286,33 +349,7 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
         })
         .collect();
     println!("  cores: {}", cores.join(" "));
-    let clocks: Vec<u64> = snap
-        .cpu
-        .cores
-        .iter()
-        .filter_map(|c| c.frequency)
-        .map(|f| f.0)
-        .collect();
-    let mut extra = String::new();
-    if !clocks.is_empty() {
-        let avg = clocks.iter().sum::<u64>() / clocks.len() as u64;
-        let _ = write!(extra, "clock {:.2} GHz", avg as f64 / 1e9);
-    }
-    for (name, b) in [
-        ("modified", mem.modified),
-        ("standby", mem.standby),
-        ("free", mem.free),
-        ("paged pool", mem.paged_pool),
-        ("non-paged pool", mem.nonpaged_pool),
-    ] {
-        if let Some(b) = b {
-            let sep = if extra.is_empty() { "" } else { "  " };
-            let _ = write!(extra, "{sep}{name} {}", human(b));
-        }
-    }
-    if !extra.is_empty() {
-        println!("  {extra}");
-    }
+    print_devices(snap);
 
     let mut procs: Vec<_> = snap.processes.iter().collect();
     procs.sort_by(|a, b| b.cpu.get().total_cmp(&a.cpu.get()));

@@ -9,6 +9,7 @@
 
 pub mod attribution;
 pub mod cpu;
+pub mod device;
 pub mod hardware;
 pub mod identity;
 pub mod memory;
