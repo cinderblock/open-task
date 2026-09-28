@@ -2,6 +2,7 @@
 
 use crate::color::Color;
 use crate::geom::{Point, Rect};
+use crate::icon::Icon;
 use crate::text::{HAlign, TextStyle, VAlign};
 
 /// A range into one of the list's arenas.
@@ -77,6 +78,13 @@ pub enum DrawCmd {
         color: Color,
     },
     Text(TextCmd),
+    /// A symbolic icon, `size` DIPs tall, centered in `rect`.
+    Icon {
+        icon: Icon,
+        rect: Rect,
+        size: f32,
+        color: Color,
+    },
     /// Everything until the matching [`DrawCmd::PopClip`] is clipped to `rect`.
     PushClip(Rect),
     PopClip,
@@ -261,6 +269,18 @@ impl DisplayList {
             len: text.len() as u32,
         };
         self.cmds.push(DrawCmd::Text(cmd));
+    }
+
+    /// Draw `icon` `size` DIPs tall, centered in `rect`.
+    pub fn icon(&mut self, icon: Icon, rect: Rect, size: f32, color: Color) {
+        if !rect.is_empty() && size > 0.0 && color.a > 0.0 {
+            self.cmds.push(DrawCmd::Icon {
+                icon,
+                rect,
+                size,
+                color,
+            });
+        }
     }
 
     pub fn push_clip(&mut self, rect: Rect) {

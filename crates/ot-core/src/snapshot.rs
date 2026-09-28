@@ -2,7 +2,10 @@
 
 use std::time::{Duration, SystemTime};
 
+use std::sync::Arc;
+
 use ot_model::cpu::CpuSample;
+use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
 use ot_model::thread::ThreadSample;
@@ -34,6 +37,8 @@ pub struct Snapshot {
     /// What the probe behind this snapshot can measure, so the UI can explain a
     /// missing column or attribution rather than show a blank.
     pub capabilities: Capabilities,
+    /// Static facts about the machine, shared by every snapshot of a session.
+    pub hardware: Arc<Hardware>,
 }
 
 impl Snapshot {

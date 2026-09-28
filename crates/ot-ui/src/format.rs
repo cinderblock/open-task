@@ -74,6 +74,24 @@ pub fn bytes_of(out: &mut String, used: Bytes, total: Bytes) {
     let _ = write!(out, "{a:.1} / {b:.1} {}", UNITS[u]);
 }
 
+/// Task Manager's up time: `d:hh:mm:ss`, e.g. `3:04:12:09`.
+pub fn uptime(out: &mut String, secs: u64) {
+    out.clear();
+    let (d, h, m, s) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    let _ = write!(out, "{d}:{h:02}:{m:02}:{s:02}");
+}
+
+/// A clock speed: `3.61 GHz`, or `800 MHz` below one gigahertz.
+pub fn clock(out: &mut String, hz: ot_model::Hertz) {
+    out.clear();
+    let mhz = hz.as_mhz();
+    let _ = if mhz >= 1000.0 {
+        write!(out, "{:.2} GHz", mhz / 1000.0)
+    } else {
+        write!(out, "{mhz:.0} MHz")
+    };
+}
+
 /// How long ago, for a chart readout: `now`, `12 s ago`, `2 min 15 s ago`,
 /// `25 min ago`, `1 h 5 min ago`. Coarser as it gets older, like the time axis.
 pub fn ago(out: &mut String, ms: f32) {
@@ -133,6 +151,17 @@ mod tests {
             s(|b| bytes_of(b, Bytes(52 * gb + gb / 3), Bytes(64 * gb))),
             "52.3 / 64.0 GB"
         );
+    }
+
+    #[test]
+    fn uptime_and_clock() {
+        assert_eq!(s(|b| uptime(b, 0)), "0:00:00:00");
+        assert_eq!(
+            s(|b| uptime(b, 3 * 86_400 + 4 * 3600 + 12 * 60 + 9)),
+            "3:04:12:09"
+        );
+        assert_eq!(s(|b| clock(b, ot_model::Hertz::from_mhz(1608))), "1.61 GHz");
+        assert_eq!(s(|b| clock(b, ot_model::Hertz::from_mhz(800))), "800 MHz");
     }
 
     #[test]

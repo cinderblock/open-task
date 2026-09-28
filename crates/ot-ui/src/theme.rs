@@ -67,6 +67,13 @@ pub struct Theme {
     pub input_bg: Color,
     /// Width of the search field in the toolbar.
     pub search_w: f32,
+
+    /// Efficiency cores on a hybrid processor; performance cores use `cpu`.
+    pub cpu_efficiency: Color,
+    /// Modified memory: written, waiting to reach disk before it can be reused.
+    pub memory_modified: Color,
+    /// A headline number in a page's statistics.
+    pub stat: TextStyle,
 }
 
 impl Theme {
@@ -109,6 +116,9 @@ impl Theme {
             button_active: Color::hex(0x60_CD_FF).with_alpha(0.22),
             input_bg: Color::rgba(0.0, 0.0, 0.0, 0.18),
             search_w: 220.0,
+            cpu_efficiency: Color::hex(0x6C_CB_5F),
+            memory_modified: Color::hex(0xFF_B4_54),
+            stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
         }
     }
 
@@ -151,6 +161,9 @@ impl Theme {
             button_active: Color::hex(0x00_5F_B8).with_alpha(0.16),
             input_bg: Color::rgba(1.0, 1.0, 1.0, 0.75),
             search_w: 220.0,
+            cpu_efficiency: Color::hex(0x0F_7B_0F),
+            memory_modified: Color::hex(0xC2_5E_00),
+            stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
         }
     }
 }

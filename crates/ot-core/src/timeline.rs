@@ -296,6 +296,12 @@ impl Timeline {
             return;
         }
         self.last_tick = Some(snap.tick);
+        // The first pass of a session has no previous pass to measure against, so
+        // its rates (CPU above all) read as zero. Charting that draws a cliff from
+        // 0% into the first real sample; leave it out.
+        if snap.interval.is_zero() {
+            return;
+        }
 
         let at = snap
             .taken_at
@@ -359,6 +365,7 @@ mod tests {
             processes: Vec::new(),
             threads: Vec::new(),
             capabilities: ot_model::Capabilities::default(),
+            hardware: std::sync::Arc::default(),
         }
     }
 
@@ -372,6 +379,18 @@ mod tests {
         assert_eq!(t.cores.len(), 2);
         assert_eq!(t.cores[0].len(), 1);
         assert_eq!(t.mem_in_use.latest().map(|s| s.value), Some(60.0));
+    }
+
+    #[test]
+    fn the_first_pass_has_no_rates_and_is_not_charted() {
+        let mut t = Timeline::new(Retention::raw(10));
+        let mut first = snap(1, 0.0, 2);
+        first.interval = Duration::ZERO;
+        t.observe(&first);
+        assert!(t.cpu_total.is_empty());
+        assert_eq!(t.last_tick(), Some(Tick(1)));
+        t.observe(&snap(2, 30.0, 2));
+        assert_eq!(t.cpu_total.len(), 1);
     }
 
     #[test]

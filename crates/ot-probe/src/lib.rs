@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CpuSample;
+use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
 use ot_model::thread::ThreadSample;
@@ -78,6 +79,12 @@ impl ProbeOutput {
 pub trait SystemProbe: Send + std::fmt::Debug {
     /// What this platform can measure. Constant for the life of the probe.
     fn capabilities(&self) -> Capabilities;
+
+    /// Facts about the machine that do not change while it runs. Asked for once,
+    /// when sampling starts.
+    fn hardware(&self) -> Hardware {
+        Hardware::default()
+    }
 
     /// Take one pass, refilling `out`.
     ///

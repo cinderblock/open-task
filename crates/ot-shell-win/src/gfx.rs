@@ -9,8 +9,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::ManuallyDrop;
 
 use ot_paint::{
-    Color, DisplayList, DrawCmd, FontFamily, FontWeight, HAlign, Point, Rect, TextCmd, TextStyle,
-    VAlign,
+    Color, DisplayList, DrawCmd, FontFamily, FontWeight, HAlign, Icon, Point, Rect, Span, TextCmd,
+    TextStyle, VAlign,
 };
 use windows::core::{Interface, Result, BOOL, HSTRING};
 use windows::Win32::Foundation::{HMODULE, HWND};
@@ -93,6 +93,7 @@ pub struct Gfx {
     tabular: IDWriteTypography,
     ui_family: HSTRING,
     mono_family: HSTRING,
+    icon_family: HSTRING,
     fonts: HashMap<TextStyle, FontSet>,
     layouts: HashMap<u64, CachedLayout>,
     utf16: Vec<u16>,
@@ -172,7 +173,7 @@ impl Gfx {
 
         // SAFETY: the DirectWrite factory is process-wide shared; typography and
         // collection objects are valid for the calls made.
-        let (dwrite, tabular, ui_family, mono_family) = unsafe {
+        let (dwrite, tabular, ui_family, mono_family, icon_family) = unsafe {
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let tabular = dwrite.CreateTypography()?;
             tabular.AddFontFeature(DWRITE_FONT_FEATURE {
@@ -200,7 +201,10 @@ impl Gfx {
             };
             let ui = pick(&["Segoe UI Variable", "Segoe UI"]);
             let mono = pick(&["Cascadia Mono", "Consolas"]);
-            (dwrite, tabular, ui, mono)
+            // Windows 11 ships Fluent; Windows 10 has MDL2, with the same codepoints
+            // for every icon `glyph` maps.
+            let icons = pick(&["Segoe Fluent Icons", "Segoe MDL2 Assets"]);
+            (dwrite, tabular, ui, mono, icons)
         };
 
         let mut gfx = Self {
@@ -218,6 +222,7 @@ impl Gfx {
             tabular,
             ui_family,
             mono_family,
+            icon_family,
             fonts: HashMap::new(),
             layouts: HashMap::with_capacity(1024),
             utf16: Vec::with_capacity(128),
@@ -397,6 +402,42 @@ impl Gfx {
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         );
                     }
+                    DrawCmd::Icon {
+                        icon,
+                        rect,
+                        size,
+                        color: c,
+                    } => {
+                        let mut utf8 = [0u8; 4];
+                        let text = glyph(icon).encode_utf8(&mut utf8);
+                        let t = TextCmd {
+                            text: Span::default(),
+                            rect,
+                            style: TextStyle {
+                                family: FontFamily::Icons,
+                                size,
+                                weight: FontWeight::Regular,
+                                tabular_numbers: false,
+                            },
+                            color: c,
+                            halign: HAlign::Center,
+                            valign: VAlign::Middle,
+                            ellipsis: false,
+                            field: false,
+                            caret: false,
+                        };
+                        let layout = self.layout_for(text, &t)?;
+                        self.set_color(c);
+                        self.dc.DrawTextLayout(
+                            Vector2 {
+                                X: rect.x,
+                                Y: rect.y,
+                            },
+                            &layout,
+                            &self.brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        );
+                    }
                     DrawCmd::PushClip(rect) => {
                         let r = rectf(rect);
                         self.dc
@@ -449,6 +490,7 @@ impl Gfx {
             let family = match style.family {
                 FontFamily::Ui => &self.ui_family,
                 FontFamily::Mono => &self.mono_family,
+                FontFamily::Icons => &self.icon_family,
             };
             let weight = match style.weight {
                 FontWeight::Regular => DWRITE_FONT_WEIGHT_NORMAL,
@@ -578,6 +620,16 @@ fn create_d3d_device() -> Result<ID3D11Device> {
     }
     Err(last
         .unwrap_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)))
+}
+
+/// The Segoe Fluent Icons / MDL2 Assets codepoint for each icon, picked by
+/// rendering the candidates (see `plans/performance-view.md`).
+fn glyph(icon: Icon) -> char {
+    match icon {
+        Icon::Menu => '\u{E700}',        // GlobalNavigationButton
+        Icon::Processes => '\u{E71D}',   // AllApps, drawn as a checklist
+        Icon::Performance => '\u{E9D9}', // Diagnostic, a pulse in a box
+    }
 }
 
 fn layout_key(text: &str, t: &TextCmd) -> u64 {

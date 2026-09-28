@@ -14,6 +14,7 @@
     windows_subsystem = "windows"
 )]
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use ot_core::{Sampler, SamplerConfig};
@@ -38,6 +39,7 @@ fn main() {
 
     let theme = arg_value(&args, "--theme").unwrap_or("system");
     let view = arg_value(&args, "--view").unwrap_or("list");
+    let page = arg_value(&args, "--page").unwrap_or("processes");
     let passes: usize = args
         .iter()
         .position(|a| a == "--passes")
@@ -63,7 +65,7 @@ fn main() {
     } else if headless {
         run_headless(Box::new(probe), config, passes);
     } else {
-        run_gui(Box::new(probe), config, theme, view);
+        run_gui(Box::new(probe), config, theme, view, page);
     }
 }
 
@@ -76,10 +78,17 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 #[cfg(windows)]
-fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str, view: &str) {
+fn run_gui(
+    probe: Box<dyn SystemProbe>,
+    config: SamplerConfig,
+    theme: &str,
+    view: &str,
+    page: &str,
+) {
     let options = ot_shell_win::ShellOptions {
         theme: ot_shell_win::ThemePreference::parse(theme),
         view: ot_shell_win::ViewMode::parse(view),
+        page: ot_shell_win::Page::parse(page).unwrap_or_default(),
     };
     if let Err(e) = ot_shell_win::run(probe, config, options) {
         fail(&format!("shell failed: {e}"), 1, true);
@@ -100,8 +109,14 @@ fn fail(message: &str, code: i32, gui: bool) -> ! {
 }
 
 #[cfg(not(windows))]
-fn run_gui(probe: Box<dyn SystemProbe>, config: SamplerConfig, theme: &str, view: &str) {
-    let _ = (probe, config, theme, view);
+fn run_gui(
+    probe: Box<dyn SystemProbe>,
+    config: SamplerConfig,
+    theme: &str,
+    view: &str,
+    page: &str,
+) {
+    let _ = (probe, config, theme, view, page);
     eprintln!("no GUI shell on this platform yet; use --headless");
     std::process::exit(3);
 }
@@ -125,6 +140,9 @@ fn run_headless(probe: Box<dyn SystemProbe>, config: SamplerConfig, passes: usiz
         // The first pass has no interval to compute rates over; skip it.
         if snap.tick.0 < 2 {
             continue;
+        }
+        if printed == 0 {
+            print_hardware(&snap.hardware);
         }
         print_snapshot(&snap);
         printed += 1;
@@ -214,6 +232,30 @@ fn print_attribution_result(a: &ot_model::attribution::Attribution) {
     for n in &a.notes {
         println!("  note: {n}");
     }
+}
+
+/// One line of static facts, printed before the first snapshot.
+fn print_hardware(hw: &ot_model::hardware::Hardware) {
+    let mut line = format!(
+        "hardware  {}  {} socket(s), {} cores, {} logical",
+        hw.cpu_name.as_deref().unwrap_or("unknown CPU"),
+        hw.sockets,
+        hw.physical_cores,
+        hw.logical_processors,
+    );
+    if let Some(f) = hw.base_frequency {
+        let _ = write!(line, ", base {:.2} GHz", f.as_mhz() / 1000.0);
+    }
+    for (name, size) in [
+        ("L1", hw.cache_l1),
+        ("L2", hw.cache_l2),
+        ("L3", hw.cache_l3),
+    ] {
+        if let Some(b) = size {
+            let _ = write!(line, ", {name} {}", human(b));
+        }
+    }
+    println!("{line}");
 }
 
 fn print_snapshot(snap: &ot_core::Snapshot) {

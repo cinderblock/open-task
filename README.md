@@ -7,12 +7,31 @@ paywalls, with the depth of Sysinternals Process Explorer and TMOG's "why is my
 computer slow?" diagnostics, in a native app that stays out of the way of the machine
 it is measuring.
 
-**Status: early, but real.** On Windows it opens a native window with live CPU and
-memory graphs over a sortable process table, as a flat list or a process tree, drawn
-with Direct2D over a Mica backdrop. Linux and macOS compile, run headless, and measure
-nothing yet.
+**Status: early, but real.** On Windows it opens a native window with two pages: live
+CPU and memory graphs over a sortable process table (a flat list or a process tree),
+and a Performance page with a chart and the numbers for the CPU and memory. Everything
+is drawn with Direct2D over a Mica backdrop. Linux and macOS compile, run headless,
+and measure nothing yet.
 
 ## Using it
+
+**Pages:** the rail down the left edge switches between **Processes** and
+**Performance**. It shows labels when the window is wide and icons alone when it is
+narrow; the button at its top flips that. **Ctrl+Tab** and **Ctrl+Shift+Tab** step
+through the pages, and **Ctrl+1**, **Ctrl+2** jump to one. Typing (or **Ctrl+F**) on
+any page goes to the process search.
+
+**Performance** lists the devices down its left side, each with a small live graph
+and its headline number; Up and Down, or a click, pick one. The CPU pane shows its
+utilization, either as one graph or as one small graph per logical processor (the
+**Overall / Logical processors** switch; on a processor with performance and
+efficiency cores the two kinds get different colors), then utilization, speed where
+the clock can be read, processes, threads, handles and up time, next to the
+processor's name, base speed, sockets, cores, logical processors and cache sizes.
+The Memory pane shows memory in use over time, how physical memory divides up, and
+in use, available, committed against the commit limit, cached, and the paged and
+non-paged kernel pools. Every graph on the page, the small ones in the list
+included, shares one hover line.
 
 **Charts:** the CPU and memory graphs share a log-scale time axis, labeled
 `1h 10m 1m 10s now` underneath. The newest sample is on the right edge; the last
@@ -114,7 +133,7 @@ class: tens of megabytes, not hundreds.
 | `ot-probe` | Platform sampling. Windows is real; Linux and macOS are stubs. |
 | `ot-core` | Sampling thread, multi-resolution history, lock-free snapshot publication. |
 | `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
-| `ot-ui` | UI-agnostic view models: theme, virtualized table, sparklines, root view. |
+| `ot-ui` | UI-agnostic view models: theme, pages, navigation rail, virtualized table, charts. |
 | `ot-record` | Flight Recorder: record and replay a session (planned). |
 | `ot-update` | Self-updater. Automatic updates are opt-in (planned). |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
@@ -156,9 +175,11 @@ cargo run --release
 
 Opens the window on Windows. The theme and title bar follow the Windows app mode
 setting, including live changes; `--theme dark` or `--theme light` overrides it.
-`--view tree` starts with the process tree instead of the list.
+`--view tree` starts with the process tree instead of the list, and
+`--page performance` on the Performance page.
 `--headless --passes 5` prints a few passes of live system state to the terminal
-instead and exits (the top processes by CPU with their owning user, the busiest
+instead and exits (the processor and its caches, the top processes by CPU with
+their owning user, the busiest
 service hosts with the services they run, and the hottest threads with the service
 each works for); that is the only mode on Linux and macOS for now, where it exits
 with code 3 ("no probe on this platform yet"). `--headless --sample <pid>
@@ -176,7 +197,8 @@ terminal.
 
 `scripts/screenshot.ps1` launches the app, screenshots its window to
 `target/screenshot.png`, and closes it. Handy for checking a rendering change;
-`-AppArgs "--view tree"` captures the tree. It only ever captures and closes the
+`-AppArgs "--view tree"` captures the tree and `-AppArgs "--page performance"` the
+Performance page. It only ever captures and closes the
 instance it launched, so an installed copy can keep running.
 
 ## Releases

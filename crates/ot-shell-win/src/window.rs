@@ -19,7 +19,7 @@ use ot_paint::{DisplayList, Point, Size};
 use ot_probe::{ControlError, PlatformControl, ProcessControl, SystemProbe};
 use ot_probe::{CpuSampler, PlatformSampler};
 use ot_ui::{
-    App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Theme, UiEvent,
+    App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Page, Theme, UiEvent,
 };
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -39,7 +39,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
-    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -77,6 +77,9 @@ const INITIAL_SIZE: (i32, i32) = (1180, 760);
 /// Virtual-key codes for letters are their upper-case ASCII values.
 const VK_F: u16 = b'F' as u16;
 const VK_T: u16 = b'T' as u16;
+/// The digit keys above the letters, `1` to `9`.
+const VK_1: u16 = b'1' as u16;
+const VK_9: u16 = b'9' as u16;
 
 #[derive(Clone, Copy)]
 struct Cursors {
@@ -203,6 +206,7 @@ pub fn run(
     let mut app = App::new(theme_for(dark));
     app.set_backdrop(backdrop);
     app.set_view(options.view);
+    app.set_page(options.page);
     let _ = app.handle(UiEvent::Resize(to_dips_size(size_px, dpi)));
 
     // The sampler posts a message per publish. HWND is a pointer and therefore not
@@ -622,6 +626,15 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Ctrl+T: Process Explorer's binding for the process tree.
                 VK_T if ctrl => UiEvent::Command(Command::ToggleView),
                 VK_F if ctrl => UiEvent::Command(Command::Find),
+                // Ctrl+Tab and Ctrl+Shift+Tab walk the pages, as in classic Task
+                // Manager; Ctrl+1..9 jump to one.
+                v if v == VK_TAB.0 && ctrl => {
+                    UiEvent::Command(Command::StepPage(if shift { -1 } else { 1 }))
+                }
+                v @ VK_1..=VK_9 if ctrl => match Page::nth(usize::from(v - VK_1) + 1) {
+                    Some(page) => UiEvent::Command(Command::SetPage(page)),
+                    None => return Outcome::Default,
+                },
                 _ => return Outcome::Default,
             };
             Outcome::Event(ev)

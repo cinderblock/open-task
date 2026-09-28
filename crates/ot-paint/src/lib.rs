@@ -19,11 +19,13 @@
 pub mod color;
 pub mod display;
 pub mod geom;
+pub mod icon;
 pub mod text;
 
 pub use color::Color;
 pub use display::{DisplayList, DrawCmd, Span, TextCmd};
 pub use geom::{Point, Rect, Size};
+pub use icon::Icon;
 pub use text::{FontFamily, FontWeight, HAlign, TextStyle, VAlign};
 
 /// A backend that can rasterize a display list into a window.

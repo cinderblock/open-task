@@ -140,6 +140,7 @@ type Notify = Box<dyn Fn() + Send>;
 fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn() + Send)>) {
     let mut out = ProbeOutput::default();
     let capabilities = probe.capabilities();
+    let hardware = Arc::new(probe.hardware());
     let mut tick = Tick::default();
     let mut last_start: Option<Instant> = None;
 
@@ -177,6 +178,7 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                     processes,
                     threads,
                     capabilities,
+                    hardware: Arc::clone(&hardware),
                 }));
                 if let Some(n) = notify {
                     n();

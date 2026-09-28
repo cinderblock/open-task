@@ -55,6 +55,7 @@ use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
 
 mod control;
 mod details;
+mod hardware;
 mod nt;
 mod profile;
 mod services;
@@ -578,6 +579,10 @@ impl WindowsProbe {
 }
 
 impl SystemProbe for WindowsProbe {
+    fn hardware(&self) -> ot_model::hardware::Hardware {
+        hardware::read(self.logical_count)
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             per_process_cpu: true,
@@ -770,6 +775,8 @@ fn sample_memory() -> Result<MemorySample, ProbeError> {
         commit_limit: Bytes(pi.CommitLimit as u64 * page),
         compressed: None,
         swap_used: None,
+        paged_pool: Some(Bytes(pi.KernelPaged as u64 * page)),
+        nonpaged_pool: Some(Bytes(pi.KernelNonpaged as u64 * page)),
     })
 }
 

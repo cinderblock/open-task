@@ -23,6 +23,11 @@ pub struct MemorySample {
     pub compressed: Option<Bytes>,
     /// Bytes currently paged out to disk.
     pub swap_used: Option<Bytes>,
+    /// Kernel memory that can be paged out.
+    pub paged_pool: Option<Bytes>,
+    /// Kernel memory that must stay resident. A leak here (usually a driver) is one
+    /// of the few ways to run a machine out of RAM with no process to blame.
+    pub nonpaged_pool: Option<Bytes>,
 }
 
 impl MemorySample {

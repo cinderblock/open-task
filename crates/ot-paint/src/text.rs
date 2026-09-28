@@ -14,6 +14,9 @@ pub enum FontFamily {
     Ui,
     /// A monospace font for paths, command lines and hex.
     Mono,
+    /// The platform's icon font. Backends use it to draw [`crate::Icon`]s; views
+    /// draw icons with [`crate::DisplayList::icon`], never with this directly.
+    Icons,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

@@ -11,12 +11,14 @@ use std::sync::Arc;
 use ot_core::{Resolution, Retention, Snapshot, Timeline};
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
-use ot_model::{Bytes, ProcessKey};
+use ot_model::ProcessKey;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
 
+use crate::charts::{self, ChartGroup};
 use crate::format;
+use crate::nav::{NavHit, NavRail, Page};
+use crate::perf::PerfPage;
 use crate::process_rows::{col, columns, process_matches, Layout, ProcessRows, ProcessTree};
-use crate::sparkline::{self, Plot, PlotPoint, SparkStyle, TimeAxis};
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
 
@@ -115,6 +117,10 @@ pub enum Command {
     Find,
     /// A context-menu item was chosen, by mouse or by its shortcut.
     Menu(MenuAction),
+    /// Show a page (Ctrl+1..9, or a click on the rail).
+    SetPage(Page),
+    /// Move along the rail, wrapping (Ctrl+Tab is 1, Ctrl+Shift+Tab is -1).
+    StepPage(isize),
 }
 
 /// Input from the shell, in DIPs.
@@ -187,7 +193,7 @@ impl Reaction {
         effect: None,
     };
 
-    fn painted(repaint: bool) -> Self {
+    pub(crate) fn painted(repaint: bool) -> Self {
         Self {
             repaint,
             effect: None,
@@ -223,138 +229,7 @@ const HISTORY: Retention = Retention {
         capacity: 720,
     }],
 };
-/// The time axis every summary chart shares, so one hover lines up across them.
-const AXIS: TimeAxis = TimeAxis::DEFAULT;
-/// Height of the time labels (or the hover readout) under each chart.
-const AXIS_BAND_H: f32 = 14.0;
 const CARD_H: f32 = 96.0;
-
-/// The summary charts between frames: their plots, where they are, and the hover
-/// they share. Index 0 is CPU, 1 is memory.
-#[derive(Debug, Default)]
-struct Charts {
-    plots: [Plot; 2],
-    /// Each chart's whole area, plot and labels, for hit-testing.
-    areas: [Rect; 2],
-    /// The pointer over a chart: which one, and its x.
-    pointer: Option<(usize, f32)>,
-    /// The age the crosshair marks in every chart: the pointer snapped to the
-    /// nearest plotted point of the chart under it.
-    hover_age: Option<f32>,
-    scratch: Vec<Point>,
-    readout: String,
-}
-
-impl Charts {
-    fn snapped(&self) -> Option<f32> {
-        let (i, x) = self.pointer?;
-        self.plots[i].nearest_x(x).map(|p| p.age_ms)
-    }
-
-    /// Follow the pointer, `None` when it left the window. Returns whether the
-    /// crosshair moved.
-    fn hover(&mut self, at: Option<Point>) -> bool {
-        self.pointer = at.and_then(|p| {
-            self.areas
-                .iter()
-                .position(|r| r.contains(p))
-                .map(|i| (i, p.x))
-        });
-        let age = self.snapped();
-        std::mem::replace(&mut self.hover_age, age) != age
-    }
-
-    /// Plot both series into the graph areas the cards left, then draw them with
-    /// their time labels, or with the crosshair and readouts while hovered.
-    fn paint(
-        &mut self,
-        dl: &mut DisplayList,
-        graphs: [Rect; 2],
-        snap: &Snapshot,
-        tl: &Timeline,
-        theme: &Theme,
-        buf: &mut String,
-    ) {
-        let series = [&tl.cpu_total, &tl.mem_in_use];
-        let max = [100.0, snap.memory.total.get() as f32];
-        let color = [theme.cpu, theme.memory];
-        let value: [fn(&mut String, f32); 2] = [percent_value, bytes_value];
-        let mut bands = [Rect::ZERO; 2];
-        for i in 0..2 {
-            self.areas[i] = graphs[i];
-            let (band, plot) = graphs[i].split_bottom(AXIS_BAND_H);
-            bands[i] = band;
-            self.plots[i].build(series[i], plot, max[i], &AXIS);
-        }
-        // Re-snap against what is on screen now: new samples slide under a pointer
-        // that stays put, and the line should sit on one of them.
-        self.hover_age = self.snapped();
-
-        for i in 0..2 {
-            let style = SparkStyle {
-                line: color[i],
-                wash: color[i].with_alpha(0.12),
-                envelope: color[i].with_alpha(0.2),
-                grid: theme.grid,
-                crosshair: theme.crosshair,
-                width: 1.5,
-            };
-            let plot = &self.plots[i];
-            plot.paint(dl, &style, &AXIS, &mut self.scratch);
-            if let Some(age) = self.hover_age {
-                let point = plot.paint_crosshair(dl, age, &style, &AXIS);
-                readout(&mut self.readout, buf, value[i], point.as_ref(), age);
-                let x = AXIS.x(plot.rect(), age);
-                sparkline::paint_readout(dl, bands[i], x, &self.readout, theme.small, theme.text);
-            } else {
-                sparkline::paint_axis(
-                    dl,
-                    plot.rect(),
-                    bands[i],
-                    &AXIS,
-                    theme.small,
-                    theme.text_dim,
-                );
-            }
-        }
-    }
-}
-
-fn percent_value(out: &mut String, v: f32) {
-    format::percent(out, v);
-    out.push('%');
-}
-
-fn bytes_value(out: &mut String, v: f32) {
-    format::bytes(out, Bytes(v.max(0.0) as u64));
-}
-
-/// What a chart says at the crosshair: `34% · 12 s ago`. Where the point summarizes
-/// several samples and their peak reads differently from their mean, both:
-/// `12% avg · 80% peak · 25 min ago`, so a spike the envelope shows is also named.
-fn readout(
-    out: &mut String,
-    tmp: &mut String,
-    value: fn(&mut String, f32),
-    point: Option<&PlotPoint>,
-    age_ms: f32,
-) {
-    out.clear();
-    if let Some(p) = point {
-        value(tmp, p.mean);
-        out.push_str(tmp);
-        let mean_len = out.len();
-        value(tmp, p.max);
-        if p.count > 1 && tmp.as_str() != &out[..mean_len] {
-            out.push_str(" avg \u{b7} ");
-            out.push_str(tmp);
-            out.push_str(" peak");
-        }
-        out.push_str(" \u{b7} ");
-    }
-    format::ago(tmp, age_ms);
-    out.push_str(tmp);
-}
 
 /// Build a [`ProcessRows`] from an [`App`]'s fields without borrowing the table,
 /// so the table can be mutated while the rows are in use. A macro rather than a
@@ -593,7 +468,11 @@ pub struct App {
     /// A sample in progress, shown as a marker row under its process.
     sampling: Option<ProcessKey>,
     timeline: Timeline,
-    charts: Charts,
+    /// The summary charts above the process table.
+    charts: ChartGroup,
+    page: Page,
+    nav: NavRail,
+    perf: PerfPage,
     /// Search results per process; empty when there is no search.
     matched: Vec<bool>,
     /// What the table lists: matches, plus their ancestors in tree mode.
@@ -620,7 +499,10 @@ impl App {
             attribution: None,
             sampling: None,
             timeline: Timeline::new(HISTORY),
-            charts: Charts::default(),
+            charts: ChartGroup::default(),
+            page: Page::default(),
+            nav: NavRail::default(),
+            perf: PerfPage::default(),
             matched: Vec::new(),
             shown: Vec::new(),
             mouse: None,
@@ -712,6 +594,9 @@ impl App {
     /// Which pointer to show at the last known mouse position.
     #[must_use]
     pub fn cursor(&self) -> Cursor {
+        if self.page != Page::Processes {
+            return Cursor::Arrow;
+        }
         if self.table.resizing() {
             return Cursor::ResizeColumn;
         }
@@ -775,8 +660,75 @@ impl App {
         Reaction::REPAINT
     }
 
+    /// Show `page`, dropping hover state the page being left would otherwise keep.
+    pub fn set_page(&mut self, page: Page) {
+        if page != self.page {
+            let _ = self.charts.hover(None);
+            self.table.hover = None;
+            let _ = self.perf.handle(UiEvent::MouseLeave);
+            self.page = page;
+        }
+    }
+
+    #[must_use]
+    pub fn page(&self) -> Page {
+        self.page
+    }
+
     /// Handle input. Says whether to repaint and what else to do.
     pub fn handle(&mut self, ev: UiEvent) -> Reaction {
+        let mut rail_moved = false;
+        match ev {
+            UiEvent::Resize(s) => {
+                self.size = s;
+                return Reaction::REPAINT;
+            }
+            UiEvent::MouseMove(p) => {
+                self.mouse = Some(p);
+                rail_moved = self.nav.set_hover(Some(p));
+            }
+            UiEvent::MouseLeave => {
+                self.mouse = None;
+                rail_moved = self.nav.set_hover(None);
+            }
+            UiEvent::MouseDown {
+                at,
+                button: MouseButton::Left,
+            } => match self.nav.hit(at) {
+                Some(NavHit::Toggle) => {
+                    self.nav.toggle(self.size.w);
+                    return Reaction::REPAINT;
+                }
+                Some(NavHit::Page(page)) => {
+                    self.set_page(page);
+                    return Reaction::REPAINT;
+                }
+                None => {}
+            },
+            UiEvent::Command(Command::SetPage(page)) => {
+                self.set_page(page);
+                return Reaction::REPAINT;
+            }
+            UiEvent::Command(Command::StepPage(n)) => {
+                self.set_page(self.page.step(n));
+                return Reaction::REPAINT;
+            }
+            // Search belongs to the process table: typing, or Ctrl+F, on another page
+            // goes there, the way Task Manager's search box does.
+            UiEvent::Char(_) | UiEvent::Command(Command::Find) => self.set_page(Page::Processes),
+            _ => {}
+        }
+        let r = match self.page {
+            Page::Processes => self.handle_processes(ev),
+            Page::Performance => self.perf.handle(ev),
+        };
+        Reaction {
+            repaint: r.repaint || rail_moved,
+            ..r
+        }
+    }
+
+    fn handle_processes(&mut self, ev: UiEvent) -> Reaction {
         match ev {
             UiEvent::Resize(s) => {
                 self.size = s;
@@ -960,6 +912,8 @@ impl App {
                 Reaction::REPAINT
             }
             Command::Menu(action) => self.menu_action(action),
+            // Handled in `handle` before a page sees them.
+            Command::SetPage(_) | Command::StepPage(_) => Reaction::NONE,
         }
     }
 
@@ -1079,7 +1033,17 @@ impl App {
             theme.bg_solid
         });
 
-        let full = Rect::from_size(self.size).inset(theme.gap, theme.gap);
+        let window = Rect::from_size(self.size);
+        let expanded = self.nav.is_expanded(self.size.w);
+        let (rail, content) = window.split_left(self.nav.width(self.size.w));
+        self.nav.paint(dl, rail, self.page, expanded, theme);
+        let full = content.inset(theme.gap, theme.gap);
+        if self.page == Page::Performance {
+            let snap = Arc::clone(&self.snap);
+            self.perf
+                .paint(dl, full, &snap, &self.timeline, theme, &mut self.buf);
+            return;
+        }
         let (cards, rest) = full.split_top(CARD_H);
         let (_, rest) = rest.split_top(theme.gap);
         let (toolbar, rest) = rest.split_top(theme.toolbar_h);
@@ -1093,8 +1057,24 @@ impl App {
             Self::paint_cpu_card(dl, cpu_card, &snap, theme, &mut self.buf),
             Self::paint_mem_card(dl, mem_card, &snap, theme, &mut self.buf),
         ];
-        self.charts
-            .paint(dl, graphs, &snap, &self.timeline, theme, &mut self.buf);
+        // Both summary charts share one hover.
+        let tl = &self.timeline;
+        let series = [&tl.cpu_total, &tl.mem_in_use];
+        let max = [100.0, snap.memory.total.get() as f32];
+        let colors = [theme.cpu, theme.memory];
+        let values: [charts::ValueFmt; 2] = [charts::percent_value, charts::bytes_value];
+        self.charts.begin(2);
+        for i in 0..2 {
+            self.charts
+                .build(i, graphs[i], charts::AXIS_BAND_H, series[i], max[i]);
+        }
+        self.charts.snap();
+        for i in 0..2 {
+            let style = charts::style(colors[i], theme);
+            let _ = self
+                .charts
+                .paint(i, dl, &style, values[i], theme, &mut self.buf);
+        }
 
         let rows = ProcessRows {
             procs: &snap.processes,
@@ -1241,7 +1221,7 @@ mod tests {
     use crate::process_rows::tests::proc;
     use ot_model::memory::MemorySample;
     use ot_model::process::{ProcessSample, ProcessStatic};
-    use ot_model::{Percent, ProcessKey, Tick};
+    use ot_model::{Bytes, Percent, ProcessKey, Tick};
     use ot_paint::DrawCmd;
     use std::time::{Duration, SystemTime};
 
@@ -1497,6 +1477,12 @@ mod tests {
         assert_eq!(app.toolbar.hover, None);
     }
 
+    /// The table's left edge: right of the rail, which is compact in the 900-wide
+    /// test window.
+    fn table_left(theme: &Theme) -> f32 {
+        crate::nav::COMPACT_W + theme.gap
+    }
+
     fn table_top(theme: &Theme) -> f32 {
         theme.gap + CARD_H + theme.gap + theme.toolbar_h + theme.gap * 0.5
     }
@@ -1512,7 +1498,7 @@ mod tests {
         let theme = app.theme.clone();
         // First row is p4.exe at depth 0; its expander box starts at the padding.
         let at = Point::new(
-            theme.gap + theme.pad + theme.expander_w * 0.5,
+            table_left(&theme) + theme.pad + theme.expander_w * 0.5,
             table_top(&theme) + theme.header_h + theme.row_h * 0.5,
         );
         assert_eq!(app.table.hit(at, &theme), Hit::Expander(0));
@@ -1788,7 +1774,10 @@ mod tests {
         ready(&mut app);
         let theme = app.theme.clone();
         let name_w = app.table.columns[0].width;
-        let edge = Point::new(theme.gap + name_w, table_top(&theme) + theme.header_h * 0.5);
+        let edge = Point::new(
+            table_left(&theme) + name_w,
+            table_top(&theme) + theme.header_h * 0.5,
+        );
         app.handle(UiEvent::MouseMove(edge));
         assert_eq!(app.cursor(), Cursor::ResizeColumn);
         assert_eq!(
@@ -1844,10 +1833,10 @@ mod tests {
         }
 
         // Point at the CPU chart, a little off the sample 3 s old: it snaps.
-        let cpu = app.charts.plots[0].rect();
-        let at = Point::new(AXIS.x(cpu, 3000.0) + 1.5, cpu.center().y);
+        let cpu = app.charts.plot(0).rect();
+        let at = Point::new(charts::AXIS.x(cpu, 3000.0) + 1.5, cpu.center().y);
         assert!(app.handle(UiEvent::MouseMove(at)).repaint);
-        assert_eq!(app.charts.hover_age, Some(3000.0));
+        assert_eq!(app.charts.hover_age(), Some(3000.0));
         let nudge = Point::new(at.x + 0.5, at.y);
         assert!(
             !app.handle(UiEvent::MouseMove(nudge)).repaint,
@@ -1860,43 +1849,21 @@ mod tests {
         assert!(!strings.iter().any(|s| s == "10s"), "{strings:?}");
 
         // Hovering the memory chart drives the CPU chart's line too.
-        let mem = app.charts.plots[1].rect();
+        let mem = app.charts.plot(1).rect();
         app.handle(UiEvent::MouseMove(Point::new(
             mem.right() - 1.0,
             mem.center().y,
         )));
-        assert_eq!(app.charts.hover_age, Some(0.0));
+        assert_eq!(app.charts.hover_age(), Some(0.0));
         assert!(painted_strings(&mut app).iter().any(|s| s == "95% · now"));
 
         assert!(app.handle(UiEvent::MouseLeave).repaint);
-        assert_eq!(app.charts.hover_age, None);
+        assert_eq!(app.charts.hover_age(), None);
         let n = painted_strings(&mut app)
             .iter()
             .filter(|s| *s == "1m")
             .count();
         assert_eq!(n, 2, "labels are back");
-    }
-
-    #[test]
-    fn a_summarized_point_names_its_peak() {
-        let mut out = String::new();
-        let mut tmp = String::new();
-        let p = PlotPoint {
-            x: 0.0,
-            age_ms: 1_500_000.0,
-            mean: 12.0,
-            min: 3.0,
-            max: 80.0,
-            count: 60,
-        };
-        readout(&mut out, &mut tmp, percent_value, Some(&p), p.age_ms);
-        assert_eq!(out, "12% avg · 80% peak · 25 min ago");
-        // A summary whose peak reads the same as its mean does not repeat it.
-        let flat = PlotPoint { max: 12.2, ..p };
-        readout(&mut out, &mut tmp, percent_value, Some(&flat), p.age_ms);
-        assert_eq!(out, "12% · 25 min ago");
-        readout(&mut out, &mut tmp, percent_value, None, 4000.0);
-        assert_eq!(out, "4 s ago");
     }
 
     #[test]
@@ -1918,19 +1885,112 @@ mod tests {
         let theme = app.theme.clone();
         // The first header cell moved left by the wheel step.
         assert_eq!(
-            app.table
-                .hit(Point::new(theme.gap + 2.0, table_top(&theme) + 5.0), &theme),
+            app.table.hit(
+                Point::new(table_left(&theme) + 2.0, table_top(&theme) + 5.0),
+                &theme
+            ),
             Hit::Header(0)
         );
         assert!(matches!(
             app.table.hit(
                 Point::new(
-                    theme.gap + app.table.columns[0].width - 30.0,
+                    table_left(&theme) + app.table.columns[0].width - 30.0,
                     table_top(&theme) + 5.0
                 ),
                 &theme
             ),
             Hit::Header(1) | Hit::Divider(0)
         ));
+    }
+
+    #[test]
+    fn the_rail_switches_pages_and_the_keys_cycle_them() {
+        let mut app = App::default();
+        with_history(&mut app);
+        ready(&mut app);
+        assert_eq!(app.page(), Page::Processes);
+        let perf = app.nav.item_rect(Page::Performance).center();
+        assert!(
+            app.handle(UiEvent::MouseMove(perf)).repaint,
+            "hover highlight"
+        );
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at: perf,
+                button: MouseButton::Left
+            })
+            .repaint
+        );
+        assert_eq!(app.page(), Page::Performance);
+        let strings = painted_strings(&mut app);
+        assert!(strings.iter().any(|s| s == "Utilization"), "{strings:?}");
+        assert!(!strings.iter().any(|s| s == "Name"), "no process table");
+
+        cmd(&mut app, Command::StepPage(1));
+        assert_eq!(app.page(), Page::Processes, "wraps around");
+        cmd(&mut app, Command::StepPage(-1));
+        assert_eq!(app.page(), Page::Performance);
+        cmd(&mut app, Command::SetPage(Page::Processes));
+        assert_eq!(app.page(), Page::Processes);
+    }
+
+    #[test]
+    fn typing_on_another_page_searches_the_process_table() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        app.set_page(Page::Performance);
+        type_str(&mut app, "p13");
+        assert_eq!(app.page(), Page::Processes);
+        assert_eq!(app.search(), "p13");
+        assert_eq!(painted_names(&mut app), ["p13.exe"]);
+        app.set_page(Page::Performance);
+        cmd(&mut app, Command::Find);
+        assert_eq!(app.page(), Page::Processes);
+        assert!(app.toolbar.search.focused);
+    }
+
+    #[test]
+    fn process_actions_do_nothing_off_the_processes_page() {
+        let mut app = App::default();
+        app.set_snapshot(family());
+        ready(&mut app);
+        app.table.selected = Some(id(4));
+        app.set_page(Page::Performance);
+        // Delete, Shift+Delete and the menu key must not reach a process the user
+        // cannot see.
+        assert_eq!(
+            cmd(&mut app, Command::Menu(MenuAction::EndTask)),
+            Reaction::NONE
+        );
+        assert_eq!(
+            cmd(&mut app, Command::Menu(MenuAction::EndTree)),
+            Reaction::NONE
+        );
+        assert_eq!(
+            app.handle(UiEvent::ContextMenu { at: None }),
+            Reaction::NONE
+        );
+        assert_eq!(app.cursor(), Cursor::Arrow);
+    }
+
+    #[test]
+    fn the_hamburger_shows_and_hides_labels() {
+        let mut app = App::default();
+        ready(&mut app);
+        assert!(!painted_strings(&mut app).iter().any(|s| s == "Performance"));
+        let theme = app.theme.clone();
+        let toggle = Point::new(crate::nav::COMPACT_W * 0.5, theme.gap + 20.0);
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at: toggle,
+                button: MouseButton::Left
+            })
+            .repaint
+        );
+        let strings = painted_strings(&mut app);
+        assert!(strings.iter().any(|s| s == "Performance"), "{strings:?}");
+        assert!(strings.iter().any(|s| s == "Processes"), "{strings:?}");
+        assert_eq!(app.page(), Page::Processes, "the toggle is not a page");
     }
 }

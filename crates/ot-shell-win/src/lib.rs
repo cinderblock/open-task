@@ -20,7 +20,7 @@ mod window;
 use ot_core::SamplerConfig;
 use ot_probe::SystemProbe;
 
-pub use ot_ui::ViewMode;
+pub use ot_ui::{Page, ViewMode};
 
 /// Which theme to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,6 +50,8 @@ pub struct ShellOptions {
     pub theme: ThemePreference,
     /// How the process table starts out; Ctrl+T switches at runtime.
     pub view: ViewMode,
+    /// The page shown first; the rail and Ctrl+Tab switch at runtime.
+    pub page: Page,
 }
 
 /// Why the shell could not run.

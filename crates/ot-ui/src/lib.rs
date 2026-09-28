@@ -6,13 +6,17 @@
 
 #![forbid(unsafe_code)]
 
+mod charts;
 pub mod format;
+mod nav;
+mod perf;
 mod process_rows;
 pub mod sparkline;
 pub mod table;
 pub mod theme;
 pub mod view;
 
+pub use nav::Page;
 pub use theme::Theme;
 pub use view::{
     App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Reaction, UiEvent,
