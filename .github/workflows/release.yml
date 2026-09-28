@@ -188,10 +188,13 @@ jobs:
             echo "::error::the MINISIGN_SECRET_KEY secret is not set; the updater could not verify this release"
             exit 1
           fi
+          # Ubuntu 24.04 has minisign 0.11, the first to read a key without a
+          # password (-W), which is how the key was made.
           sudo apt-get update -qq
           sudo apt-get install -y -qq minisign > /dev/null
           key="$RUNNER_TEMP/minisign.key"
-          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          # The key was made on Windows; its line endings must not matter.
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" | tr -d '\r' > "$key")
           minisign -S -s "$key" -m SHA256SUMS -x SHA256SUMS.minisig -t "open-task $TAG" < /dev/null
           rm -f "$key"
           cat SHA256SUMS.minisig

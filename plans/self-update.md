@@ -117,14 +117,14 @@ the update if it downloads a new one".
    `--check-update`.~~ `25c2e9c`.
 4. ~~UI: rail button, Settings section, prefs, shell wiring, `WM_ENDSESSION`.~~
    `d7967da`.
-5. **[current]** Installer `[Run]` relaunch; release workflow: full-history
-   checkout, `--version` check, signing; README. Commit.
+5. ~~Installer `[Run]` relaunch; release workflow: full-history checkout,
+   `--version` check, signing; README.~~ `9efd436`.
 6. ~~Key: minisign installed (winget `jedisct1.minisign` 0.12), keypair generated.~~
    **Stage** `gh secret set` for the user's explicit yes (third-party account setting).
-7. End-to-end locally: test key + local feed build, per-user install, update it to a
-   newer local build, relaunch.
-8. Merge into `master` (fast-forward from the shared tree when my files are clean
-   there). Release is the user's call.
+7. ~~End-to-end locally: test key + local feed build, per-user install, update it to
+   a newer local build, relaunch.~~ Passed; see findings.
+8. **[current]** Merge into `master` (fast-forward from the shared tree when my files
+   are clean there). Release is the user's call.
 
 ## Findings / gotchas
 
@@ -158,6 +158,40 @@ the update if it downloads a new one".
   through GitHub's redirect, and gets 404 and the size limit right.
 - Inno's `setup.exe` stub is `asInvoker` (checked in a built installer's manifest), so
   `std::process::Command` starts it and Setup elevates itself.
+- **A command-line `/CURRENTUSER` wins over an existing all-users install** (Inno
+  source, `Setup.MainFunc.pas`, `HandlePrivilegesRequiredOverrides`: with
+  `PrivilegesRequiredOverridesAllowed=commandline` the command line sets the mode;
+  `UsePreviousPrivileges` only applies to the dialog). So a per-user test install
+  never touches the Program Files copy.
+- Ubuntu 24.04 (`ubuntu-latest`) has minisign 0.11-1 in universe; 0.11 is the first
+  version with password-less keys (`-W`). The workflow strips `\r` from the secret,
+  since the key file was written on Windows.
+- **End-to-end update passed (2026-09-28)**, per-user, on this machine, with the user's
+  Program Files install and its two running instances untouched:
+  1. Two release builds of `9efd436` with `OT_UPDATE_FEED=http://127.0.0.1:8765/releases`
+     (the second with a trailing `/`, so its bytes differ) and `OT_UPDATE_PUBLIC_KEY`
+     = the test key, `CARGO_TARGET_DIR=target/e2e`. Installers from each (0.2.1 and
+     0.3.0) with the portable Inno 6.7.3 (`INNO_SETUP_DIR=...\target\tools\innosetup6`).
+  2. Feed in `%TEMP%\e2e\feed\releases\{latest,download/v0.3.0}` with `SHA256SUMS`
+     and its signature (test key, comment `open-task v0.3.0`), served by
+     `python -m http.server 8765 --bind 127.0.0.1`.
+  3. Old installer `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER`:
+     `--check-update` said "installed for User in ...\Programs\open-task\" and "v0.3.0
+     is available".
+  4. `%TEMP%\e2e\e2e.ps1` (scratch) launched it, posted a click on the rail button:
+     check, download and verify in 0.23 s, "Install v0.3.0". Second click: Setup
+     started, the app logged `WM_ENDSESSION` reason 1 (`ENDSESSION_CLOSEAPP`) and
+     exited 0, Setup installed and started the new build (new PID) with
+     `/RELAUNCH=1`. Installed exe hash = the new build's; HKCU DisplayVersion 0.3.0;
+     the download folder was empty afterwards.
+  5. The feed saw only: `latest/download/SHA256SUMS.minisig`,
+     `download/v0.3.0/SHA256SUMS`, the installer once.
+  6. Uninstalled silently: no HKCU key, folder or Start Menu entry left.
+- **Not exercised end to end:** the all-users (`/ALLUSERS`) path, to keep the user's
+  install and running windows out of it (same code, different flag; the flag is unit
+  tested); a declined UAC prompt (this session is elevated, so there is none: the
+  updater treats Setup's exit codes 2 and 5 as cancelled and offers the install
+  again, unit tested); and a real GitHub release, which needs the secret and a tag.
 
 - Existing tags `v0.2.0`, `v0.2.1` are annotated; `--tags` covers lightweight ones too.
 - This Claude session runs elevated (High integrity): installs here never show UAC,
@@ -178,9 +212,9 @@ the update if it downloads a new one".
 - [x] `ot-update` Windows + `--check-update` (`25c2e9c`).
 - [x] UI + shell (`d7967da`): screenshots of the rail and Settings; a posted click on
       "Check now" reaches GitHub and shows the failure.
-- [ ] Installer relaunch, workflow signing, README.
+- [x] Installer relaunch, workflow signing, README (`9efd436`).
 - [x] Key generated. [ ] Secret staged for approval.
-- [ ] Local end-to-end update.
+- [x] Local end-to-end update (per-user; see findings).
 - [ ] Merged to `master`.
 
 ## Open questions for the user

@@ -559,13 +559,11 @@ fn exclusive(path: &Path) -> std::io::Result<std::fs::File> {
 /// Setup is done with it, it stops anything swapping the file between this check
 /// and the (elevated) run. Setup can still start: running an exe only reads it.
 fn hold(path: &Path, sha256: &[u8; 32]) -> Result<std::fs::File, UpdateError> {
-    const FILE_SHARE_READ: u32 = 1;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // FILE_SHARE_READ: others may read, nobody may write, delete or rename.
     #[cfg(windows)]
-    std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, FILE_SHARE_READ);
-    #[cfg(not(windows))]
-    let _ = FILE_SHARE_READ;
+    std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 1);
     let mut file = options
         .open(path)
         .map_err(UpdateError::io("open the download"))?;
