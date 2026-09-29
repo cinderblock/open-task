@@ -141,7 +141,9 @@ the update if it downloads a new one".
     green; https://github.com/cinderblock/open-task/releases/tag/v0.3.0.
 11. ~~A real update from GitHub~~: passed (findings).
 12. ~~Update the Program Files install to v0.3.0~~: done (findings).
-13. Remove the worktree and the `self-update` branch (last, from outside it).
+13. ~~Remove the worktree and the `self-update` branch~~: done. `git worktree remove`
+    dropped the registration but could not delete the folder while a shell sat in
+    it (as the memory note warns); `Remove-Item` from the main root finished it.
 
 ## Findings / gotchas
 
@@ -274,7 +276,7 @@ the update if it downloads a new one".
 - [x] CI green on `8eb735f`; v0.3.0 released and signed.
 - [x] Real update from GitHub (per-user).
 - [x] Program Files install updated to v0.3.0.
-- [ ] Worktree and branch removed.
+- [x] Worktree and branch removed (2026-09-28).
 
 ## Open questions for the user
 
