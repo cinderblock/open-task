@@ -20,7 +20,8 @@ use std::fmt::Write as _;
 
 use ot_core::Snapshot;
 use ot_model::attribution::Attribution;
-use ot_model::process::ProcessSample;
+use ot_model::process::{ProcessSample, ProcessStatic};
+use ot_model::service::ServiceInfo;
 use ot_model::thread::{ServiceTag, ThreadSample, ThreadState};
 use ot_model::{Bytes, ProcessKey};
 
@@ -71,10 +72,20 @@ pub(crate) fn contains_ci(hay: &str, needle: &str) -> bool {
 /// line, or the name of a service it hosts. `pid_buf` is caller-owned scratch so
 /// the PID needs no allocation.
 pub(crate) fn process_matches(p: &ProcessSample, needle: &str, pid_buf: &mut String) -> bool {
+    statics_match(&p.statics, &p.services, needle, pid_buf)
+}
+
+/// [`process_matches`] on a process's facts alone, for one that is no longer in the
+/// snapshot (its services, if any, are passed empty).
+pub(crate) fn statics_match(
+    s: &ProcessStatic,
+    services: &[ServiceInfo],
+    needle: &str,
+    pid_buf: &mut String,
+) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let s = &p.statics;
     format::count(pid_buf, s.key.pid);
     let opt = |v: &Option<String>| v.as_deref().is_some_and(|v| contains_ci(v, needle));
     contains_ci(&s.name, needle)
@@ -82,7 +93,7 @@ pub(crate) fn process_matches(p: &ProcessSample, needle: &str, pid_buf: &mut Str
         || opt(&s.user)
         || opt(&s.image_path)
         || opt(&s.command_line)
-        || p.services
+        || services
             .iter()
             .any(|svc| contains_ci(&svc.name, needle) || contains_ci(&svc.display_name, needle))
 }

@@ -16,7 +16,9 @@ pub mod sparkline;
 mod steady;
 pub mod table;
 pub mod theme;
+pub mod treemap;
 mod update;
+mod usage_map;
 pub mod view;
 
 pub use nav::Page;

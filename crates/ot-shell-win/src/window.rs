@@ -20,7 +20,7 @@ use ot_probe::{ControlError, PlatformControl, ProcessControl, SystemProbe};
 use ot_probe::{CpuSampler, PlatformSampler};
 use ot_ui::{
     App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Page, Theme, UiEvent,
-    UpdateAction, UpdateView,
+    UpdateAction, UpdateView, ViewMode,
 };
 use ot_update::Updater;
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
@@ -97,6 +97,7 @@ const INITIAL_SIZE: (i32, i32) = (1180, 760);
 
 /// Virtual-key codes for letters are their upper-case ASCII values.
 const VK_F: u16 = b'F' as u16;
+const VK_M: u16 = b'M' as u16;
 const VK_T: u16 = b'T' as u16;
 /// The digit keys above the letters, `1` to `9`.
 const VK_1: u16 = b'1' as u16;
@@ -763,6 +764,8 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 v if v == VK_DELETE.0 => UiEvent::Command(Command::Menu(MenuAction::EndTask)),
                 // Ctrl+T: Process Explorer's binding for the process tree.
                 VK_T if ctrl => UiEvent::Command(Command::ToggleView),
+                // Ctrl+M: the Map, the process table's area as a treemap.
+                VK_M if ctrl => UiEvent::Command(Command::SetView(ViewMode::Map)),
                 VK_F if ctrl => UiEvent::Command(Command::Find),
                 // Ctrl+Tab and Ctrl+Shift+Tab walk the pages, as in classic Task
                 // Manager; Ctrl+1..9 jump to one.

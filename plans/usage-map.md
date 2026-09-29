@@ -57,23 +57,44 @@ with the open items", which is the go-ahead on the recommended choices below.
 
 1. ~~Model and probe: `ProcessSample::cpu_time` (cumulative).~~
 2. ~~`ot-core::usage`: window accounting with ghosts. Tests.~~
-3. **[current]** `ot-ui::treemap`: squarified layout, nested layout. Tests.
-4. Map arrangement in `App`: toolbar segment, painting, hover readout, click to
-   select, search dimming, caption. Tests.
-5. Icicle strip between the charts and the toolbar. Tests.
+3. ~~`ot-ui::treemap`: squarified layout, nested layout. Tests.~~
+4. ~~Map arrangement in `App`: toolbar segment, painting, hover readout, click to
+   select, search dimming, caption. Tests.~~
+5. **[current]** Icicle strip between the charts and the toolbar. Tests.
 6. README, plans; checks on three targets; screenshots; commits.
 
 ## Findings / gotchas
 
-- (filled in as work proceeds)
+- **A young session inflated the total** (56% of the machine over 20 s while the
+  chart averaged about a third of that): a process started in the minute before
+  the session counted from zero, bringing in CPU used before anyone was watching.
+  The window's start is now clamped to the first snapshot, so the numbers and
+  `span()` agree (fix folded into `7fd946b`; test
+  `a_process_started_just_before_the_session_counts_from_when_it_was_seen`).
+- **Chains of launchers nested frame in frame** (pwsh > vp > vp > node > node >
+  electron, each with a name strip and padding). A process with one busy child and
+  under 2% of its subtree's time to itself now folds into the child's frame,
+  labelled `a.exe › b.exe`; the percentage has its own right-aligned slot so a
+  long chain's ellipsis never hides it.
+- **Only busy children count** (over 2% of the parent's subtree): an idle sibling
+  (a conhost next to the real child) no longer breaks a chain, and a process whose
+  children barely ran is one tile instead of a frame around its own time.
+- The Map is drawn in the table's area and the table's own rectangles are stale
+  while it shows: hover, the column-resize cursor and "hold the order" are all off
+  in Map mode.
+- **Bash heredocs eat backslashes** in Python source (`\u{b7}`, Windows paths):
+  write patch scripts with the Write tool and run them from a file.
 
 ## Progress log
 
 - [x] Model and probe: `ProcessSample::cpu_time` (Windows: kernel + user, 100 ns).
 - [x] Usage accounting: `ot-core::Usage` (window, `span()` while the session is
       younger, started-inside-the-window from zero, interpolation, ghosts).
-- [ ] Treemap layout.
-- [ ] Map arrangement.
+- [x] Treemap layout: `ot-ui::treemap::squarify` (the paper's example lays out
+      exactly; no allocation once `out` is sized).
+- [x] Map arrangement: `ot-ui/src/usage_map.rs`, `ViewMode::Map`, the toolbar's
+      third segment, Ctrl+M, `--view map`; checked in the app
+      (`target/drive/map-25s-b.png`).
 - [ ] Icicle strip.
 - [ ] Docs, checks, screenshots.
 

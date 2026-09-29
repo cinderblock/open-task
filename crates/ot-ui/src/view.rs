@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ot_core::{Resolution, Retention, Snapshot, Timeline};
+use ot_core::{Resolution, Retention, Snapshot, Timeline, Usage};
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
 use ot_model::ProcessKey;
@@ -25,6 +25,7 @@ use crate::steady::Steady;
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
 use crate::update::{UpdateAction, UpdateView};
+use crate::usage_map::UsageMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -62,6 +63,8 @@ pub enum ViewMode {
     List,
     /// Parent-child hierarchy; siblings sorted by the active column.
     Tree,
+    /// The processes as a treemap of the CPU time they used over the last minute.
+    Map,
 }
 
 impl ViewMode {
@@ -70,15 +73,18 @@ impl ViewMode {
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "tree" => Self::Tree,
+            "map" => Self::Map,
             _ => Self::List,
         }
     }
 
+    /// The other table arrangement, for Ctrl+T. The Map has none of its own; the
+    /// view goes back to the table (see [`Command::ToggleView`]).
     #[must_use]
     pub fn other(self) -> Self {
         match self {
             Self::List => Self::Tree,
-            Self::Tree => Self::List,
+            Self::Tree | Self::Map => Self::List,
         }
     }
 }
@@ -242,6 +248,8 @@ const HISTORY: Retention = Retention {
     }],
 };
 const CARD_H: f32 = 96.0;
+/// What the Map sizes processes by: CPU time over this much of the recent past.
+const USAGE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Build a [`ProcessRows`] from an [`App`]'s fields without borrowing the table,
 /// so the table can be mutated while the rows are in use. A macro rather than a
@@ -371,14 +379,20 @@ impl SearchBox {
 struct Toolbar {
     /// Why the table is standing still, if it is: shown before the search field.
     status: Option<(&'static str, Color)>,
+    /// The arrangement shown, for the segment control.
+    mode: ViewMode,
     /// Segment rectangles from the last paint, in [`SEGMENTS`] order.
-    segments: [Rect; 2],
+    segments: [Rect; 3],
     hover: Option<usize>,
     chain: Vec<u32>,
     search: SearchBox,
 }
 
-const SEGMENTS: [(ViewMode, &str); 2] = [(ViewMode::List, "List"), (ViewMode::Tree, "Tree")];
+const SEGMENTS: [(ViewMode, &str); 3] = [
+    (ViewMode::List, "List"),
+    (ViewMode::Tree, "Tree"),
+    (ViewMode::Map, "Map"),
+];
 const SEGMENT_W: f32 = 60.0;
 const COUNT_W: f32 = 130.0;
 /// The toolbar's "Paused" / "Order held" note.
@@ -398,12 +412,13 @@ impl Toolbar {
         theme: &Theme,
         buf: &mut String,
     ) {
-        let current = if table.tree() {
-            ViewMode::Tree
-        } else {
-            ViewMode::List
-        };
-        let group = Rect::new(rect.x, rect.y + 2.0, SEGMENT_W * 2.0, rect.h - 4.0);
+        let current = self.mode;
+        let group = Rect::new(
+            rect.x,
+            rect.y + 2.0,
+            SEGMENT_W * SEGMENTS.len() as f32,
+            rect.h - 4.0,
+        );
         dl.fill_round_rect(group, theme.card_radius, theme.surface);
         dl.stroke_rect(group, theme.surface_border, 1.0);
         for (i, (mode, label)) in SEGMENTS.iter().enumerate() {
@@ -494,6 +509,8 @@ struct Paused {
     /// History as of the pause, for the charts. The live timeline keeps
     /// recording, so resuming loses nothing.
     timeline: Timeline,
+    /// CPU use per process as of the pause, for the Map.
+    usage: Usage,
     /// The newest snapshot that arrived during the pause, shown on resume.
     latest: Option<Arc<Snapshot>>,
 }
@@ -514,6 +531,12 @@ pub struct App {
     /// A sample in progress, shown as a marker row under its process.
     sampling: Option<ProcessKey>,
     timeline: Timeline,
+    /// CPU time per process over [`USAGE_WINDOW`], and the Map drawn from it.
+    usage: Usage,
+    map: UsageMap,
+    /// The Map is shown in the table's place. The table keeps its own List or Tree
+    /// mode, which Ctrl+T goes back to.
+    map_on: bool,
     /// The summary charts above the process table.
     charts: ChartGroup,
     page: Page,
@@ -557,6 +580,9 @@ impl App {
             attribution: None,
             sampling: None,
             timeline: Timeline::new(HISTORY),
+            usage: Usage::new(USAGE_WINDOW),
+            map: UsageMap::default(),
+            map_on: false,
             charts: ChartGroup::default(),
             page: Page::default(),
             nav: NavRail::default(),
@@ -595,7 +621,9 @@ impl App {
 
     #[must_use]
     pub fn view(&self) -> ViewMode {
-        if self.table.tree() {
+        if self.map_on {
+            ViewMode::Map
+        } else if self.table.tree() {
             ViewMode::Tree
         } else {
             ViewMode::List
@@ -604,6 +632,12 @@ impl App {
 
     /// Switch the process table's arrangement, keeping the selection in view.
     pub fn set_view(&mut self, mode: ViewMode) {
+        self.map_on = mode == ViewMode::Map;
+        if self.map_on {
+            let _ = self.hold_order(false);
+            self.table.hover = None;
+            return;
+        }
         // The filter's ancestor rule depends on the mode, and the reveal that
         // follows needs the order the new mode will actually show.
         self.refilter(mode == ViewMode::Tree);
@@ -670,6 +704,7 @@ impl App {
             None => {
                 self.paused = Some(Paused {
                     timeline: self.timeline.clone(),
+                    usage: self.usage.clone(),
                     latest: None,
                 });
             }
@@ -782,7 +817,7 @@ impl App {
             return Cursor::Arrow;
         };
         let search = &self.toolbar.search;
-        if self.table.divider_at(p).is_some() {
+        if !self.map_on && self.table.divider_at(p).is_some() {
             Cursor::ResizeColumn
         } else if search.rect.contains(p) && !search.clear_rect.contains(p) {
             Cursor::Text
@@ -798,6 +833,7 @@ impl App {
             return false;
         }
         self.timeline.observe(&snap);
+        self.usage.observe(&snap);
         if let Some(p) = &mut self.paused {
             p.latest = Some(snap);
             return false;
@@ -956,19 +992,22 @@ impl App {
                 if self.table.resizing() {
                     return Reaction::painted(self.table.resize_to(p));
                 }
+                // The table's rectangles are stale while the Map is shown.
                 let hover = match self.table.hit(p, &self.theme) {
-                    Hit::Row(i) | Hit::Expander(i) => Some(i),
+                    Hit::Row(i) | Hit::Expander(i) if !self.map_on => Some(i),
                     _ => None,
                 };
                 let segment = self.toolbar.segment_at(p);
                 let clear = self.toolbar.search.clear_rect.contains(p);
                 let crosshair = self.charts.hover(Some(p));
-                let held = self.hold_order(self.table.rect().contains(p));
+                let held = self.hold_order(!self.map_on && self.table.rect().contains(p));
+                let tile = self.map_on && self.map.set_hover(Some(p));
                 let changed = hover != self.table.hover
                     || segment != self.toolbar.hover
                     || clear != self.toolbar.search.hover_clear
                     || crosshair
-                    || held;
+                    || held
+                    || tile;
                 self.table.hover = hover;
                 self.toolbar.hover = segment;
                 self.toolbar.search.hover_clear = clear;
@@ -981,7 +1020,8 @@ impl App {
                 let clear = std::mem::take(&mut self.toolbar.search.hover_clear);
                 let crosshair = self.charts.hover(None);
                 let held = self.hold_order(false);
-                Reaction::painted(row || segment || clear || crosshair || held)
+                let tile = self.map.set_hover(None);
+                Reaction::painted(row || segment || clear || crosshair || held || tile)
             }
             UiEvent::MouseDown {
                 at,
@@ -1007,6 +1047,7 @@ impl App {
                 Reaction::painted(self.select_at(at))
             }
             UiEvent::MouseUp { .. } => Reaction::NONE,
+            UiEvent::Wheel { .. } if self.map_on => Reaction::NONE,
             UiEvent::Wheel {
                 lines, horizontal, ..
             } => {
@@ -1046,6 +1087,9 @@ impl App {
             return Reaction::REPAINT;
         }
         search.focused = false;
+        if self.map_on {
+            return Reaction::painted(self.select_at(at));
+        }
         let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, theme) {
             Hit::Divider(c) => {
@@ -1067,6 +1111,15 @@ impl App {
 
     /// Select the row under `at`, if there is one. Returns whether anything changed.
     fn select_at(&mut self, at: Point) -> bool {
+        if self.map_on {
+            // Only a running process can be selected: an exited one can be neither
+            // ended nor opened.
+            let Some((key, true)) = self.map.key_at(at) else {
+                return false;
+            };
+            let id = Some(process_rows::row_id(key));
+            return std::mem::replace(&mut self.table.selected, id) != id;
+        }
         let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, &self.theme) {
             Hit::Row(pos) | Hit::Expander(pos) => {
@@ -1120,7 +1173,12 @@ impl App {
     fn command(&mut self, c: Command) -> Reaction {
         match c {
             Command::ToggleView => {
-                self.set_view(self.view().other());
+                // From the Map, back to whichever table arrangement it replaced.
+                let next = match self.view() {
+                    ViewMode::Map if self.table.tree() => ViewMode::Tree,
+                    v => v.other(),
+                };
+                self.set_view(next);
                 Reaction::REPAINT
             }
             Command::SetView(m) => {
@@ -1150,10 +1208,24 @@ impl App {
     fn context_menu(&mut self, at: Option<Point>) -> Reaction {
         let anchor = if let Some(p) = at {
             self.select_at(p);
-            match self.table.hit(p, &self.theme) {
-                Hit::Row(_) | Hit::Expander(_) => p,
-                _ => return Reaction::NONE,
+            let over_process = if self.map_on {
+                self.map.key_at(p).is_some_and(|(_, alive)| alive)
+            } else {
+                matches!(
+                    self.table.hit(p, &self.theme),
+                    Hit::Row(_) | Hit::Expander(_)
+                )
+            };
+            if !over_process {
+                return Reaction::NONE;
             }
+            p
+        } else if self.map_on {
+            // From the keyboard: inside the selected process's tile.
+            let Some(r) = self.table.selected.and_then(|id| self.map.tile_rect(id)) else {
+                return Reaction::NONE;
+            };
+            Point::new(r.x + self.theme.pad, r.y + self.theme.pad)
         } else {
             // From the keyboard: just under the selected row's name.
             let rows = self.rows();
@@ -1326,13 +1398,25 @@ impl App {
                 .paint(i, dl, &style, values[i], theme, &mut self.buf);
         }
 
+        self.paint_processes(dl, table_rect, toolbar, &snap);
+    }
+
+    /// The process table, or the Map in its place, and the toolbar above them.
+    fn paint_processes(
+        &mut self,
+        dl: &mut DisplayList,
+        table_rect: Rect,
+        toolbar: Rect,
+        snap: &Arc<Snapshot>,
+    ) {
+        let theme = &self.theme;
         let rows = ProcessRows {
             procs: &snap.processes,
             threads: &snap.threads,
             tree: &self.tree,
             layout: &self.layout,
             attribution: self.attribution.as_deref(),
-            interval_secs: interval_secs(&snap),
+            interval_secs: interval_secs(snap),
             mem_total: snap.memory.total.get() as f32,
             matched: &self.matched,
             shown: &self.shown,
@@ -1340,9 +1424,33 @@ impl App {
             steady: Some(&self.steady),
         };
         // The table first: the toolbar reads its state, and the order must be
-        // current before the ancestry lookup.
-        self.table
-            .paint(dl, table_rect, &rows, theme, &mut self.buf);
+        // current before the ancestry lookup. In its place, the Map.
+        if self.map_on {
+            let usage = match &self.paused {
+                Some(p) => &p.usage,
+                None => &self.usage,
+            };
+            self.map.paint(
+                dl,
+                table_rect,
+                usage,
+                snap,
+                &self.toolbar.search.needle,
+                self.table.selected,
+                theme,
+                &mut self.buf,
+            );
+        } else {
+            self.table
+                .paint(dl, table_rect, &rows, theme, &mut self.buf);
+        }
+        self.toolbar.mode = if self.map_on {
+            ViewMode::Map
+        } else if self.table.tree() {
+            ViewMode::Tree
+        } else {
+            ViewMode::List
+        };
         self.toolbar.status = if self.paused.is_some() {
             Some(("Paused \u{b7} Space resumes", theme.accent))
         } else if self.steady.held() {
@@ -2438,6 +2546,112 @@ mod tests {
         assert_eq!(
             click(&mut app).effect,
             Some(Effect::Update(UpdateAction::Install))
+        );
+    }
+
+    /// The family, twice a minute apart, having used this much CPU in between:
+    /// p11 30 s, p12 6 s, p20 12 s.
+    fn busy_minute(app: &mut App) {
+        for (tick, busy) in [(1u64, false), (61, true)] {
+            let mut procs = family().processes.clone();
+            for p in &mut procs {
+                let used = match p.key().pid {
+                    11 => 30,
+                    12 => 6,
+                    20 => 12,
+                    _ => 0,
+                };
+                p.cpu_time = Duration::from_secs(if busy { 100 + used } else { 100 });
+            }
+            app.set_snapshot(snapshot(tick, procs));
+        }
+    }
+
+    #[test]
+    fn the_map_shows_cpu_time_as_a_treemap_and_shares_the_selection() {
+        let mut app = App::default();
+        busy_minute(&mut app);
+        ready(&mut app);
+        assert_eq!(ViewMode::parse("MAP"), ViewMode::Map);
+        let map = app.toolbar.segments[2].center();
+        app.handle(UiEvent::MouseDown {
+            at: map,
+            button: MouseButton::Left,
+        });
+        assert_eq!(app.view(), ViewMode::Map);
+        let strings = painted_strings(&mut app);
+        assert!(
+            strings
+                .iter()
+                .any(|s| s.starts_with("CPU used over the last minute: ")),
+            "{strings:?}"
+        );
+        assert!(!strings.iter().any(|s| s == "PID"), "no table: {strings:?}");
+
+        // A click on p11's tile selects it, and the ancestry strip follows.
+        let tile = app.map.tile_rect(id(11)).expect("p11 has a tile");
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at: tile.center(),
+                button: MouseButton::Left,
+            })
+            .repaint
+        );
+        assert_eq!(app.table.selected, Some(id(11)));
+        let crumb = "p4.exe \u{203a} p10.exe \u{203a} p11.exe";
+        assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
+
+        // Right-click gives the process menu, and so does the keyboard.
+        let r = app.handle(UiEvent::ContextMenu {
+            at: Some(tile.center()),
+        });
+        assert!(matches!(r.effect, Some(Effect::Menu { .. })), "{r:?}");
+        let r = app.handle(UiEvent::ContextMenu { at: None });
+        assert!(
+            matches!(r.effect, Some(Effect::Menu { .. })),
+            "keyboard: {r:?}"
+        );
+
+        // Ctrl+T goes back to the table the Map replaced, selection kept.
+        cmd(&mut app, Command::ToggleView);
+        assert_eq!(app.view(), ViewMode::List);
+        assert_eq!(app.table.selected, Some(id(11)));
+        cmd(&mut app, Command::SetView(ViewMode::Tree));
+        cmd(&mut app, Command::SetView(ViewMode::Map));
+        cmd(&mut app, Command::ToggleView);
+        assert_eq!(app.view(), ViewMode::Tree, "back to the tree it came from");
+    }
+
+    #[test]
+    fn a_paused_map_stays_as_it_was() {
+        let mut app = App::default();
+        busy_minute(&mut app);
+        ready(&mut app);
+        cmd(&mut app, Command::SetView(ViewMode::Map));
+        painted_strings(&mut app);
+        let before = app.map.tile_rect(id(11)).expect("p11 has a tile");
+        app.handle(UiEvent::Char(' '));
+        assert!(app.paused());
+        // p20 goes on to use a great deal more; the paused Map does not move.
+        let mut procs = family().processes.clone();
+        for p in &mut procs {
+            let used = match p.key().pid {
+                11 => 30,
+                12 => 6,
+                20 => 90,
+                _ => 0,
+            };
+            p.cpu_time = Duration::from_secs(100 + used);
+        }
+        app.set_snapshot(snapshot(62, procs));
+        painted_strings(&mut app);
+        assert_eq!(app.map.tile_rect(id(11)), Some(before));
+        app.handle(UiEvent::Char(' '));
+        painted_strings(&mut app);
+        assert_ne!(
+            app.map.tile_rect(id(11)),
+            Some(before),
+            "and moves on resume"
         );
     }
 }

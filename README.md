@@ -63,8 +63,9 @@ line and keeps its width as the pointer moves: `2m 05s ago`, `25m ago`,
 come back only once the pointer is well short of those, so a readout resting near
 a boundary does not flicker between the two.
 
-The process table has two arrangements, switched with the **List / Tree** control
-above it or with **Ctrl+T** (Process Explorer's binding):
+The process table has three arrangements, switched with the **List / Tree / Map**
+control above it; **Ctrl+T** toggles List and Tree (Process Explorer's binding) and
+**Ctrl+M** opens the Map:
 
 - **List** is one flat list sorted by the column you click. It starts sorted by CPU.
 - **Tree** nests children under their parents. Siblings are sorted by the same
@@ -73,6 +74,19 @@ above it or with **Ctrl+T** (Process Explorer's binding):
   **Right**, to collapse and expand; a collapsed row shows the totals of everything
   underneath it and how many processes that is. Left on a leaf moves to its parent;
   Right on an expanded row moves to its first child.
+- **Map** answers a different question: not who is busy this second, but who has
+  been using the CPU. Every process is a tile whose area is the CPU time it used in
+  the last minute (while open-task has been running less than a minute, what it has
+  seen), nested by the process tree: a process whose children used a real share of
+  its time is a frame around them, with one more tile for its own time. A chain of
+  processes that only launched the next (a shell, a runtime, an app) folds into one
+  frame, `pwsh.exe › node.exe › electron.exe`. Color is the table's heat: how busy the
+  process is right now. A process that exited in the last minute stays, dimmed and
+  marked, until the minute passes it. Pointing at a tile names it and gives its
+  average CPU and seconds used; a click selects it (the ancestry strip and the other
+  arrangements keep the selection), right-click gives the process menu, and the
+  search dims what does not match. The line under the map says how much of the
+  machine was used over the minute.
 
 Switching keeps the selected process: pick the hottest thing in the list, press
 Ctrl+T, and the tree opens with that process revealed and centered, ancestors
@@ -253,8 +267,8 @@ cargo run --release
 
 Opens the window on Windows. The theme and title bar follow the Windows app mode
 setting, including live changes; `--theme dark` or `--theme light` overrides it.
-`--view tree` starts with the process tree instead of the list, and
-`--page performance` on the Performance page.
+`--view tree` starts with the process tree instead of the list (`--view map` with the
+Map), and `--page performance` on the Performance page.
 `--headless --passes 5` prints a few passes of live system state to the terminal
 instead and exits (the processor and its caches, the top processes by CPU with
 their owning user, the busiest
