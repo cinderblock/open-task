@@ -6,8 +6,9 @@
 //! how per-service CPU is obtained; there is no other source.
 //!
 //! Reading a tag means reading one machine word of another process's memory, which
-//! needs `PROCESS_VM_READ`, and a SYSTEM-owned host grants that only to an elevated
-//! caller. Everything here is read-only: no thread is suspended, no memory written,
+//! needs `PROCESS_VM_READ`. A SYSTEM-owned host grants that to a caller holding
+//! `SeDebugPrivilege` (an administrator, elevated), so that privilege, actually
+//! enabled, is what decides whether tags are available at all. Everything here is read-only: no thread is suspended, no memory written,
 //! no debugger attached. Tag numbers are turned into names with
 //! `advapi32!I_QueryTagInformation`, the undocumented-but-stable call Process
 //! Explorer and System Informer use for the same purpose.
@@ -19,19 +20,15 @@ use std::sync::Arc;
 
 use windows::core::{s, w, PCWSTR, PWSTR};
 use windows::Wdk::System::Threading::{NtQueryInformationThread, ThreadBasicInformation};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, LUID, STATUS_SUCCESS};
-use windows::Win32::Security::{
-    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation,
-    LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION,
-    TOKEN_PRIVILEGES, TOKEN_QUERY,
-};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, STATUS_SUCCESS};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, OpenThread,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, THREAD_QUERY_LIMITED_INFORMATION,
+    OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    THREAD_QUERY_LIMITED_INFORMATION,
 };
 
+use super::access::enable_privilege;
 use super::nt::{ThreadBasicInformation as Tbi, TEB_SUB_PROCESS_TAG_OFFSET};
 
 /// A handle closed on drop.
@@ -51,66 +48,6 @@ impl Drop for OwnedHandle {
     }
 }
 
-/// Whether this process runs with an elevated (administrator) token.
-pub(super) fn is_elevated() -> bool {
-    let mut token = HANDLE::default();
-    // SAFETY: valid out-pointer; the pseudo-handle needs no closing.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.is_err() {
-        return false;
-    }
-    let token = OwnedHandle(token);
-    let mut info = TOKEN_ELEVATION::default();
-    let mut len = 0u32;
-    // SAFETY: `info` is a valid out-struct of the size passed.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenElevation,
-            Some((&raw mut info).cast()),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &raw mut len,
-        )
-    };
-    ok.is_ok() && info.TokenIsElevated != 0
-}
-
-/// Turn on a privilege the token already holds but has disabled, which is how
-/// administrators' tokens ship. Returns false if the token does not have it.
-pub(super) fn enable_privilege(name: PCWSTR) -> bool {
-    let mut token = HANDLE::default();
-    // SAFETY: valid out-pointer.
-    if unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &raw mut token,
-        )
-    }
-    .is_err()
-    {
-        return false;
-    }
-    let token = OwnedHandle(token);
-    let mut tp = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES {
-            Luid: LUID::default(),
-            Attributes: SE_PRIVILEGE_ENABLED,
-        }],
-    };
-    // SAFETY: valid out-pointer into `tp`.
-    if unsafe { LookupPrivilegeValueW(PCWSTR::null(), name, &raw mut tp.Privileges[0].Luid) }
-        .is_err()
-    {
-        return false;
-    }
-    // SAFETY: `tp` is a valid TOKEN_PRIVILEGES; no previous state requested.
-    let r = unsafe { AdjustTokenPrivileges(token.0, false, Some(&raw const tp), 0, None, None) };
-    // AdjustTokenPrivileges succeeds even when it assigned nothing; the last error
-    // says whether it did. `windows` maps that case to Err, which is what we want.
-    r.is_ok()
-}
-
 /// `I_QueryTagInformation(MachineName, InfoLevel, TagInfo)`.
 type QueryTagFn = unsafe extern "system" fn(PCWSTR, u32, *mut c_void) -> u32;
 
@@ -127,7 +64,8 @@ struct TagInfoNameFromTag {
     name: PWSTR,
 }
 
-/// Reads and names service tags. One per probe; created only when elevated.
+/// Reads and names service tags. One per probe; created only when the process can
+/// read service hosts.
 #[derive(Debug)]
 pub(super) struct TagProbe {
     query: Option<QueryTagFn>,
@@ -136,15 +74,12 @@ pub(super) struct TagProbe {
 }
 
 impl TagProbe {
-    /// Set up tag reading. Returns `None` when the process is not elevated, since
-    /// nothing here would work.
+    /// Set up tag reading. Returns `None` when `SeDebugPrivilege` cannot be enabled,
+    /// since without it no SYSTEM-owned service host can be read.
     pub fn new() -> Option<Self> {
-        if !is_elevated() {
+        if !enable_privilege(w!("SeDebugPrivilege")) {
             return None;
         }
-        // Administrators can usually open SYSTEM processes for reading as-is;
-        // SeDebugPrivilege covers the protected-DACL exceptions. Best effort.
-        let _ = enable_privilege(w!("SeDebugPrivilege"));
         // SAFETY: advapi32 is loaded in every process that touched the SCM; the
         // export has had this signature since Vista.
         let query = unsafe {
@@ -283,7 +218,8 @@ mod tests {
     }
 
     #[test]
-    fn elevation_is_consistent_with_tag_probe_availability() {
-        assert_eq!(TagProbe::new().is_some(), is_elevated());
+    fn tags_are_offered_exactly_when_the_debug_privilege_is_held() {
+        let holds = super::super::access::holds_privilege(w!("SeDebugPrivilege"));
+        assert_eq!(TagProbe::new().is_some(), holds);
     }
 }

@@ -140,9 +140,11 @@ pub enum SampleError {
     /// This platform has no implementation yet.
     #[error("CPU sampling is not implemented on this platform yet")]
     Unsupported,
-    /// Sampling needs an elevated process on this platform.
-    #[error("CPU sampling needs open-task to run as administrator")]
-    NotElevated,
+    /// This process may not sample: on Windows it lacks `SeSystemProfilePrivilege`
+    /// or the right to control trace sessions, which administrators have when
+    /// elevated.
+    #[error("CPU sampling needs open-task to run as administrator (it needs the system profiling privilege)")]
+    NotPermitted,
     /// The process exited, or its PID was recycled, before sampling began.
     #[error("the process is no longer running")]
     Gone,

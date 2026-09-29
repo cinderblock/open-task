@@ -42,10 +42,11 @@ pub struct Capabilities {
     pub threads: bool,
     /// Which services live in which process.
     pub services: bool,
-    /// Which service each thread of a service host works for. Needs elevation on
-    /// Windows.
+    /// Which service each thread of a service host works for. On Windows it needs
+    /// `SeDebugPrivilege`: running as administrator, elevated.
     pub service_tags: bool,
-    /// On-demand CPU sampling of one process by module. Needs elevation.
+    /// On-demand CPU sampling of one process by module. On Windows it needs
+    /// `SeSystemProfilePrivilege` and trace-session rights: administrator, elevated.
     pub cpu_sampling: bool,
 }
 

@@ -53,6 +53,7 @@ use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INF
 
 use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
 
+mod access;
 mod control;
 mod counters;
 mod details;
@@ -183,8 +184,10 @@ pub struct WindowsProbe {
     by_pid_pass: u64,
     details: DetailProbe,
     services: ServiceProbe,
-    /// Present only when elevated; see [`tags`].
+    /// Present only when service hosts can be read; see [`tags`].
     tags: Option<TagProbe>,
+    /// Whether on-demand CPU sampling can run; see [`profile::can_sample`].
+    can_sample: bool,
     /// The shared empty list every non-host process points at.
     no_services: Arc<[ServiceInfo]>,
     /// Processes seen while the details budget was spent; drained on later passes.
@@ -231,6 +234,7 @@ impl WindowsProbe {
             details: DetailProbe::new(),
             services: ServiceProbe::new(),
             tags: TagProbe::new(),
+            can_sample: profile::can_sample(),
             no_services: Vec::new().into(),
             pending_details: Vec::new(),
             prev_cores: vec![CoreTimes::default(); logical_count as usize],
@@ -661,7 +665,7 @@ impl SystemProbe for WindowsProbe {
             threads: true,
             services: self.services.available(),
             service_tags: self.tags.is_some(),
-            cpu_sampling: self.tags.is_some(),
+            cpu_sampling: self.can_sample,
         }
     }
 

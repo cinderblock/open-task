@@ -158,10 +158,9 @@ line shared across every chart on the page.
 - **The ETW sampling test fails under a basic-user token, as it should, but runs
   at all only because that token keeps High integrity**:
   `a_short_sample_of_ourselves_runs_when_elevated` decided it was elevated and got
-  `StartTrace (profile): Access is denied`. Another thread's area
-  (`plans/service-host-attribution.md`); worth checking that the app's own
-  "can I sample?" test looks at the Administrators group or the privilege, not the
-  integrity level. Not changed here.
+  `StartTrace (profile): Access is denied`. The app's own checks had the same
+  flaw, and so did `enable_privilege`. **Fixed 2026-09-28** at the user's request;
+  see `plans/privilege-checks.md`.
 - **The working tree stopped building mid-cycle** because the table-jitter thread
   (`plans/charts-log-time-and-live-table.md`) was halfway through an edit
   (`ProcessRows` gained a field `view.rs` did not set yet). This cycle's changes

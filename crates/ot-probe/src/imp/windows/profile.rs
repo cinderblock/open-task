@@ -15,7 +15,9 @@
 //! that names the client. The same window enables the provider and histograms that
 //! field.
 //!
-//! Both need elevation (`SeSystemProfilePrivilege`, and starting trace sessions).
+//! Both need `SeSystemProfilePrivilege` (the kernel's profile source) and the right to
+//! control trace sessions (Administrators or Performance Log Users by default); see
+//! [`can_sample`]. In practice that means running as administrator, elevated.
 //! Two named sessions are used, never the shared "NT Kernel Logger", so another
 //! tool's session is neither disturbed nor required.
 
@@ -51,7 +53,10 @@ use windows::Win32::System::Threading::{
 
 use super::control::times_of;
 use super::nt::{SystemProcessInformation, SystemThreadInformation};
-use super::tags::{enable_privilege, is_elevated, OwnedHandle};
+use windows::Win32::Security::{WinBuiltinAdministratorsSid, WinBuiltinPerfLoggingUsersSid};
+
+use super::access::{enable_privilege, holds_privilege, in_group};
+use super::tags::OwnedHandle;
 use super::{query_growing, AlignedBuf};
 use crate::{CpuSampler, SampleError};
 
@@ -98,6 +103,17 @@ const PROVIDERS: &[ProviderEntry] = &[
     },
 ];
 
+/// Whether this process can take a CPU sample: its token holds
+/// `SeSystemProfilePrivilege`, which the kernel's profile source demands, and it
+/// may control trace sessions, which by default Administrators and Performance Log
+/// Users may. Asks about the privilege and the groups themselves rather than
+/// "elevated": a basic-user token (`runas /trustlevel:0x20000` from an elevated
+/// prompt) reports elevated and has neither. Changes nothing.
+pub(super) fn can_sample() -> bool {
+    holds_privilege(windows::core::w!("SeSystemProfilePrivilege"))
+        && (in_group(WinBuiltinAdministratorsSid) || in_group(WinBuiltinPerfLoggingUsersSid))
+}
+
 /// The Windows [`CpuSampler`]. Stateless; each call is one complete sample.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsSampler;
@@ -109,10 +125,11 @@ impl CpuSampler for WindowsSampler {
         services: &[String],
         duration: Duration,
     ) -> Result<Attribution, SampleError> {
-        if !is_elevated() {
-            return Err(SampleError::NotElevated);
+        if !can_sample() || !enable_privilege(windows::core::w!("SeSystemProfilePrivilege")) {
+            return Err(SampleError::NotPermitted);
         }
-        let _ = enable_privilege(windows::core::w!("SeSystemProfilePrivilege"));
+        // Opening a SYSTEM-owned target for its module list needs this too; without
+        // it, sampling still works and modules of such a target read as unknown.
         let _ = enable_privilege(windows::core::w!("SeDebugPrivilege"));
 
         let process = open_target(target)?;
@@ -841,8 +858,20 @@ mod tests {
     }
 
     #[test]
-    fn a_short_sample_of_ourselves_runs_when_elevated() {
-        if !is_elevated() {
+    fn without_permission_a_sample_is_refused_before_anything_starts() {
+        if can_sample() {
+            return;
+        }
+        let me = ProcessKey::new(std::process::id(), 1);
+        assert!(matches!(
+            WindowsSampler.sample(me, &[], Duration::from_millis(10)),
+            Err(SampleError::NotPermitted)
+        ));
+    }
+
+    #[test]
+    fn a_short_sample_of_ourselves_runs_when_permitted() {
+        if !can_sample() {
             return;
         }
         // Burn a little CPU on a helper thread so there is something to attribute.

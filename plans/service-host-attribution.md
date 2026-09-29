@@ -163,6 +163,14 @@ All done; kept as the record of what was built.
 
 ## Findings / gotchas
 
+- **Fixed 2026-09-28: tags and sampling were gated on "is the token elevated?"**
+  (`TokenElevation`), which a basic-user token (`runas /trustlevel:0x20000` from an
+  elevated prompt) answers yes while lacking every privilege involved, and
+  `enable_privilege` reported success for privileges the token did not hold. Tags
+  now require `SeDebugPrivilege` to actually enable; sampling requires
+  `SeSystemProfilePrivilege` and Administrators or Performance Log Users. See
+  `plans/privilege-checks.md`.
+
 - Everything in "What actually identified the culprit" above.
 - **Per-thread CPU really is free.** Parsing the thread records that follow each
   process entry in the `SystemProcessInformation` buffer left the probe at ~5 ms

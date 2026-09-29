@@ -464,7 +464,7 @@ fn print_attribution(snap: &ot_core::Snapshot, procs: &[&ot_model::process::Proc
             if snap.capabilities.service_tags {
                 "on"
             } else {
-                "off, not elevated"
+                "off, needs administrator"
             }
         );
         println!(
