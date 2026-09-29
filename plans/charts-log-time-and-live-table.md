@@ -318,8 +318,10 @@ CPU card for the "when" question.
 ## Open questions for the user
 
 1. Item 1: does a live drag-resize now redraw smoothly on your monitor?
-2. Mid-slide overlap: give moving rows an opaque backing, or leave the rows
-   translucent? (Recommendation: try the backing; it reads as rows lifting.)
+2. ~~Mid-slide overlap~~: user, 2026-09-29, "keep going with the open items":
+   done as recommended. A row in motion gets an opaque backing (`bg_solid`, then
+   `surface`) and a hairline along each edge, so rows it crosses no longer show
+   through; checked with a throwaway 3 s slide (`target/drive/slide-pair.png`).
 
 ## Things not to do
 

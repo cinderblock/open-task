@@ -948,6 +948,7 @@ impl Table {
         pos: usize,
         y: f32,
         active: Option<&(u16, std::ops::Range<usize>)>,
+        lifted: bool,
     ) {
         let body = self.body;
         let row_h = theme.row_h;
@@ -963,6 +964,15 @@ impl Table {
         let collapsed =
             meta.has_children && (src.collapsed_by_default(row) != self.collapsed.contains(&id));
 
+        if lifted {
+            // A row in motion slides over the rows it crosses: an opaque backing in
+            // the window's own color so their text does not show through it, and a
+            // hairline along each edge so it reads as a row lifted off the table.
+            dl.fill_rect(rr, theme.bg_solid);
+            dl.fill_rect(rr, theme.surface);
+            dl.fill_rect(Rect::new(rr.x, rr.y, rr.w, 1.0), theme.grid);
+            dl.fill_rect(Rect::new(rr.x, rr.bottom() - 1.0, rr.w, 1.0), theme.grid);
+        }
         if self.selected == Some(id) {
             dl.fill_rect(rr, theme.row_selected);
         } else if self.hover == Some(pos) {
@@ -1125,7 +1135,7 @@ impl Table {
                 }
                 let screen = vi as f32 - frac + offset.unwrap_or(0.0) * (1.0 - settle);
                 let y = body.y + screen * row_h;
-                self.paint_row(dl, src, theme, buf, pos, y, active.as_ref());
+                self.paint_row(dl, src, theme, buf, pos, y, active.as_ref(), moving);
             }
         }
         let view = body.h / row_h;
@@ -1135,7 +1145,7 @@ impl Table {
             }
             let to = (pos as f32 - self.scroll).clamp(-1.0, view);
             let y = body.y + (from + (to - from) * settle) * row_h;
-            self.paint_row(dl, src, theme, buf, pos, y, active.as_ref());
+            self.paint_row(dl, src, theme, buf, pos, y, active.as_ref(), true);
         }
         dl.pop_clip();
 
@@ -1724,6 +1734,21 @@ mod tests {
         t.tick(t0 + SLIDE / 2);
         let dl = live_view(&mut t, &src, &theme);
         let mid = at(&dl, "100");
+        let backing = |dl: &DisplayList| {
+            dl.cmds()
+                .iter()
+                .filter_map(|c| match *c {
+                    ot_paint::DrawCmd::FillRect { rect, color } if color == theme.bg_solid => {
+                        Some((rect.y - theme.header_h) / theme.row_h)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<f32>>()
+        };
+        assert!(
+            backing(&dl).iter().any(|&y| (y - mid).abs() < 1e-3),
+            "the moving row is backed so rows it crosses do not show through"
+        );
         assert!(
             mid > 0.0 && mid < 9.0 * 0.5,
             "past halfway (ease-out): {mid}"
@@ -1734,6 +1759,7 @@ mod tests {
         t.tick(t0 + SLIDE);
         let dl = live_view(&mut t, &src, &theme);
         assert!(at(&dl, "100").abs() < 1e-3, "landed");
+        assert!(backing(&dl).is_empty(), "rows at rest are not lifted");
         assert!((at(&dl, "49") - 1.0).abs() < 1e-3);
         assert!(!t.animating(), "done");
 
