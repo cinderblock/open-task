@@ -1200,6 +1200,7 @@ pub(crate) mod tests {
                 started_unix_ms: None,
             }),
             cpu: Percent(cpu),
+            cpu_time: Duration::ZERO,
             working_set: Bytes(1),
             private_bytes: Bytes(1),
             disk_read: Bytes(0),

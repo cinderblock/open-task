@@ -15,6 +15,7 @@ pub mod history;
 pub mod sampler;
 pub mod snapshot;
 pub mod timeline;
+pub mod usage;
 
 pub use history::Ring;
 pub use sampler::{Sampler, SamplerConfig};
@@ -22,3 +23,4 @@ pub use snapshot::Snapshot;
 pub use timeline::{
     AdapterSeries, Bucket, DiskSeries, History, Resolution, Retention, Sample, Series, Timeline,
 };
+pub use usage::{ProcessUsage, Usage};

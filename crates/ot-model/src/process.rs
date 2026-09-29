@@ -4,6 +4,7 @@ use crate::identity::ProcessKey;
 use crate::service::ServiceInfo;
 use crate::units::{Bytes, Percent, Watts};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Elevation / integrity of a process, as far as we can tell without opening it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -65,6 +66,10 @@ pub struct ProcessSample {
     /// CPU used over the last interval, as a share of one core. 400.0 means four
     /// cores fully saturated.
     pub cpu: Percent,
+    /// CPU time used since the process started, user and kernel, all threads. What
+    /// a process "has been using" over any stretch is the difference of two of
+    /// these.
+    pub cpu_time: Duration,
     /// Private working set: physical memory this process alone is holding.
     pub working_set: Bytes,
     /// Private committed bytes, the closest thing to "how much will I get back".
