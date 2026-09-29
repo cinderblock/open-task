@@ -1,6 +1,6 @@
 # A logo and app icon for open-task
 
-> **Status:** done (awaiting the user's look) · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done, shipped in v0.3.1 (awaiting the user's look) · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md`.
 
 ## Goal
@@ -119,6 +119,12 @@ everywhere Windows shows an icon.
 - [x] Exe icon, window icons, installer icon and wizard image, README.
 - [x] Verified (Explorer extraction, running window, test installer); tests and
       clippy on three targets.
+- [x] **Shipped in v0.3.1** (release commit `7916bf6`, tag pushed 2026-09-29,
+      published 14:51:51 PDT / 21:51:51 UTC; CI and Release green, only the known
+      Node 20 and ubuntu-latest notices). Checked from the published assets:
+      SHA256SUMS match, the minisign signature verifies against `minisign.pub`,
+      the x64 exe reports v0.3.1 and carries the icon at every size, and
+      `setup.exe` has the icon and shows the wizard image (the runner's Inno 6.7.1).
 
 ## Open questions for the user
 
