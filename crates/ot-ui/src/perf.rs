@@ -704,7 +704,7 @@ impl PerfPage {
         theme: &Theme,
         buf: &mut String,
     ) {
-        let hovering = self.charts.hover_age();
+        let hovering = self.charts.crosshair();
         let first = self.detail.first;
         for i in 0..self.detail.cores {
             let core = snap.cpu.cores.get(i);
@@ -742,8 +742,8 @@ impl PerfPage {
         }
         let band = self.detail.grid_band;
         match hovering {
-            Some(age) => {
-                format::ago(buf, age);
+            Some(c) => {
+                c.ago(buf);
                 dl.text(
                     buf,
                     band,
@@ -810,19 +810,23 @@ impl PerfPage {
         ];
         let plot = self.charts.plot(first).rect();
         let band = self.detail.pair_band;
-        match self.charts.hover_age() {
-            Some(age) => {
-                let mut text = String::with_capacity(48);
+        match self.charts.crosshair() {
+            Some(c) => {
+                let mut values = String::with_capacity(48);
                 for (name, p) in names.iter().zip(points) {
                     if let Some(p) = p {
                         fmt(buf, p.mean);
-                        let _ = write!(text, "{name} {buf} \u{b7} ");
+                        if !values.is_empty() {
+                            values.push_str(" \u{b7} ");
+                        }
+                        let _ = write!(values, "{name} {buf}");
                     }
                 }
-                format::ago(buf, age);
-                text.push_str(buf);
-                let x = AXIS.x(plot, age);
-                sparkline::paint_readout(dl, band, x, &text, theme.small, theme.text);
+                c.ago(buf);
+                let mut text = String::with_capacity(64);
+                charts::readout(&mut text, &values, buf, c.side);
+                let x = AXIS.x(plot, c.age_ms);
+                sparkline::paint_readout(dl, band, x, c.side, &text, theme.small, theme.text);
             }
             None => sparkline::paint_axis(dl, plot, band, &AXIS, theme.small, theme.text_dim),
         }
@@ -1570,8 +1574,25 @@ mod tests {
             .filter(|c| matches!(c, DrawCmd::FillRoundRect { rect, .. } if rect.w <= 8.0))
             .count();
         assert_eq!(dots, 3, "a dot on the big chart and on both mini charts");
-        assert!(has(&texts(&dl), "25% · 3 s ago"));
+        assert!(has(&texts(&dl), "25% · \u{2007}3s ago"));
         assert!(page.handle(UiEvent::MouseLeave).repaint);
+    }
+
+    #[test]
+    fn a_two_line_chart_reads_out_both_lines_with_the_time_next_to_the_line() {
+        let (tl, s) = timeline_with(2, &[], &[adapter(7, "Ethernet")]);
+        let mut page = PerfPage::default();
+        let _ = paint_with(&mut page, &tl, &s);
+        page.handle(UiEvent::Key(Key::End));
+        let _ = paint_with(&mut page, &tl, &s);
+        let rx = page.charts().plot(page.detail.first).rect();
+        let at = Point::new(AXIS.x(rx, 3000.0), rx.center().y);
+        assert!(page.handle(UiEvent::MouseMove(at)).repaint);
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        assert!(
+            has(&t, "Receive 5.60 Mbps · Send 100 Kbps · \u{2007}3s ago"),
+            "{t:?}"
+        );
     }
 
     #[test]

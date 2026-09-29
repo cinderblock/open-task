@@ -14,8 +14,8 @@ use ot_core::Series;
 use ot_model::Bytes;
 use ot_paint::{Color, DisplayList, Point, Rect};
 
-use crate::format;
-use crate::sparkline::{self, Plot, PlotPoint, SparkStyle, TimeAxis};
+use crate::format::{self, AgoFields};
+use crate::sparkline::{self, Plot, PlotPoint, Side, SparkStyle, TimeAxis};
 use crate::theme::Theme;
 
 /// The time axis every chart shares, so one hover lines up across all of them.
@@ -25,6 +25,35 @@ pub(crate) const AXIS_BAND_H: f32 = 14.0;
 
 /// Writes a value in a chart's units, for its readout.
 pub(crate) type ValueFmt = fn(&mut String, f32);
+
+/// The moment every chart of a group marks, and how readouts show it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Crosshair {
+    /// The pointer snapped to the nearest plotted point of the chart under it.
+    pub age_ms: f32,
+    /// The units the time is written in.
+    pub fields: AgoFields,
+    /// The side of the line readouts sit on.
+    pub side: Side,
+}
+
+impl Crosshair {
+    /// The crosshair at `age_ms`, following on from `prev`. The units and the side
+    /// change with hysteresis, so a readout keeps its shape and place while the
+    /// pointer, or the chart moving under it, jitters around a boundary.
+    fn follow(prev: Option<Self>, age_ms: f32) -> Self {
+        Self {
+            age_ms,
+            fields: AgoFields::follow(prev.map(|c| c.fields), age_ms),
+            side: Side::follow(prev.map(|c| c.side), AXIS.fraction(age_ms)),
+        }
+    }
+
+    /// How long ago the moment is, into `out`.
+    pub fn ago(self, out: &mut String) {
+        format::ago(out, self.age_ms, self.fields);
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ChartGroup {
@@ -38,10 +67,10 @@ pub(crate) struct ChartGroup {
     len: usize,
     /// The pointer over a chart: which one, and its x.
     pointer: Option<(usize, f32)>,
-    /// The age every chart marks: the pointer snapped to the nearest plotted point
-    /// of the chart under it.
-    hover_age: Option<f32>,
+    /// What every chart marks while the pointer is over one of them.
+    crosshair: Option<Crosshair>,
     scratch: Vec<Point>,
+    ago: String,
     readout: String,
 }
 
@@ -60,9 +89,16 @@ impl ChartGroup {
     }
 
     /// The age the crosshair marks, while the pointer is over a chart.
+    #[cfg(test)]
     #[must_use]
     pub fn hover_age(&self) -> Option<f32> {
-        self.hover_age
+        self.crosshair.map(|c| c.age_ms)
+    }
+
+    /// The crosshair, while the pointer is over a chart.
+    #[must_use]
+    pub fn crosshair(&self) -> Option<Crosshair> {
+        self.crosshair
     }
 
     fn snapped(&self) -> Option<f32> {
@@ -73,12 +109,20 @@ impl ChartGroup {
         self.plots[i].nearest_x(x).map(|p| p.age_ms)
     }
 
+    /// Move the crosshair to where the pointer snaps now. Leaving the charts
+    /// forgets it, so the next hover starts fresh.
+    fn resnap(&mut self) {
+        let prev = self.crosshair;
+        self.crosshair = self.snapped().map(|age| Crosshair::follow(prev, age));
+    }
+
     /// Follow the pointer, `None` when it left. Returns whether the crosshair moved.
     pub fn hover(&mut self, at: Option<Point>) -> bool {
         let areas = &self.areas[..self.len];
         self.pointer = at.and_then(|p| areas.iter().position(|r| r.contains(p)).map(|i| (i, p.x)));
-        let age = self.snapped();
-        std::mem::replace(&mut self.hover_age, age) != age
+        let before = self.crosshair;
+        self.resnap();
+        self.crosshair != before
     }
 
     /// Start a frame of `n` charts.
@@ -107,7 +151,7 @@ impl ChartGroup {
     /// After every chart is built: new samples slide under a pointer that stays
     /// put, and the line should sit on one of them.
     pub fn snap(&mut self) {
-        self.hover_age = self.snapped();
+        self.resnap();
     }
 
     /// Draw chart `i`: its series, then either its time labels or, while hovered,
@@ -124,17 +168,22 @@ impl ChartGroup {
         let plot = &self.plots[i];
         let band = self.bands[i];
         plot.paint(dl, style, &AXIS, &mut self.scratch);
-        let Some(age) = self.hover_age else {
+        let Some(c) = self.crosshair else {
             if !band.is_empty() {
                 sparkline::paint_axis(dl, plot.rect(), band, &AXIS, theme.small, theme.text_dim);
             }
             return None;
         };
-        let point = plot.paint_crosshair(dl, age, style, &AXIS);
+        let point = plot.paint_crosshair(dl, c.age_ms, style, &AXIS);
         if !band.is_empty() {
-            readout(&mut self.readout, buf, value, point.as_ref(), age);
-            let x = AXIS.x(plot.rect(), age);
-            sparkline::paint_readout(dl, band, x, &self.readout, theme.small, theme.text);
+            buf.clear();
+            if let Some(p) = &point {
+                value(buf, p.mean);
+            }
+            c.ago(&mut self.ago);
+            readout(&mut self.readout, buf, &self.ago, c.side);
+            let x = AXIS.x(plot.rect(), c.age_ms);
+            sparkline::paint_readout(dl, band, x, c.side, &self.readout, theme.small, theme.text);
         }
         point
     }
@@ -171,58 +220,38 @@ pub(crate) fn bit_rate_value(out: &mut String, v: f32) {
     format::bits(out, f64::from(v.max(0.0)) * 8.0);
 }
 
-/// What a chart says at the crosshair: `34% · 12 s ago`. Where the point summarizes
-/// several samples and their peak reads differently from their mean, both:
-/// `12% avg · 80% peak · 25 min ago`, so a spike the envelope shows is also named.
-pub(crate) fn readout(
-    out: &mut String,
-    tmp: &mut String,
-    value: ValueFmt,
-    point: Option<&PlotPoint>,
-    age_ms: f32,
-) {
+/// What a chart says at the crosshair: its value at the dot and how long ago, the
+/// time nearer the line. Left of the line `34% · 12s ago`, right of it
+/// `2m 05s ago · 34%`. The time keeps its width while its units stay the same, so
+/// neither part moves as the pointer does. Just the time where the chart has no
+/// value (`value` empty).
+pub(crate) fn readout(out: &mut String, value: &str, ago: &str, side: Side) {
     out.clear();
-    if let Some(p) = point {
-        value(tmp, p.mean);
-        out.push_str(tmp);
-        let mean_len = out.len();
-        value(tmp, p.max);
-        if p.count > 1 && tmp.as_str() != &out[..mean_len] {
-            out.push_str(" avg \u{b7} ");
-            out.push_str(tmp);
-            out.push_str(" peak");
-        }
+    let (first, second) = match side {
+        Side::Left => (value, ago),
+        Side::Right => (ago, value),
+    };
+    out.push_str(first);
+    if !value.is_empty() {
         out.push_str(" \u{b7} ");
     }
-    format::ago(tmp, age_ms);
-    out.push_str(tmp);
+    out.push_str(second);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ot_core::Retention;
+    use ot_core::{Resolution, Retention};
 
     #[test]
-    fn a_summarized_point_names_its_peak() {
+    fn the_time_sits_next_to_the_line() {
         let mut out = String::new();
-        let mut tmp = String::new();
-        let p = PlotPoint {
-            x: 0.0,
-            age_ms: 1_500_000.0,
-            mean: 12.0,
-            min: 3.0,
-            max: 80.0,
-            count: 60,
-        };
-        readout(&mut out, &mut tmp, percent_value, Some(&p), p.age_ms);
-        assert_eq!(out, "12% avg · 80% peak · 25 min ago");
-        // A summary whose peak reads the same as its mean does not repeat it.
-        let flat = PlotPoint { max: 12.2, ..p };
-        readout(&mut out, &mut tmp, percent_value, Some(&flat), p.age_ms);
-        assert_eq!(out, "12% · 25 min ago");
-        readout(&mut out, &mut tmp, percent_value, None, 4000.0);
-        assert_eq!(out, "4 s ago");
+        readout(&mut out, "12%", "25m ago", Side::Left);
+        assert_eq!(out, "12% · 25m ago");
+        readout(&mut out, "12%", "25m ago", Side::Right);
+        assert_eq!(out, "25m ago · 12%");
+        readout(&mut out, "", "\u{2007}4s ago", Side::Right);
+        assert_eq!(out, "\u{2007}4s ago");
     }
 
     fn ramp() -> Series {
@@ -259,17 +288,9 @@ mod tests {
             let p = g.paint(i, &mut dl, &st, percent_value, &theme, &mut buf);
             assert!((p.expect("every chart has that age").mean - 25.0).abs() < 1e-3);
         }
-        let texts: Vec<&str> = dl
-            .cmds()
-            .iter()
-            .filter_map(|c| match c {
-                ot_paint::DrawCmd::Text(t) => Some(dl.str(t.text)),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            texts,
-            ["25% · 4 s ago"],
+            texts(&dl),
+            ["25% · \u{2007}4s ago"],
             "only the chart with a band reads out"
         );
 
@@ -282,5 +303,63 @@ mod tests {
         assert!(g.hover(Some(Point::new(290.0, 20.0))));
         assert!(g.hover(None));
         assert_eq!(g.hover_age(), None);
+    }
+
+    fn texts(dl: &DisplayList) -> Vec<&str> {
+        dl.cmds()
+            .iter()
+            .filter_map(|c| match c {
+                ot_paint::DrawCmd::Text(t) => Some(dl.str(t.text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_summarized_point_reads_out_one_value() {
+        // Forty minutes at 1 Hz with a spike 25 minutes ago, where a column
+        // summarizes several 10 s buckets.
+        const R: Retention = Retention {
+            raw: 600,
+            tiers: &[Resolution {
+                bucket_ms: 10_000,
+                capacity: 720,
+            }],
+        };
+        let seconds = 2400;
+        let mut series = Series::new(R);
+        for t in 0..seconds {
+            let v = if t == seconds - 1 - 1500 { 100.0 } else { 10.0 };
+            series.push(t * 1000, v);
+        }
+        let area = Rect::new(0.0, 0.0, 300.0, 60.0);
+        let mut group = ChartGroup::default();
+        group.begin(1);
+        group.build(0, area, AXIS_BAND_H, &series, 100.0);
+        group.snap();
+        let at = Point::new(AXIS.x(area, 1_500_000.0), 20.0);
+        assert!(group.hover(Some(at)));
+        let crosshair = group.crosshair().expect("over the chart");
+        assert_eq!(
+            crosshair.side,
+            Side::Right,
+            "the older half reads out on the right"
+        );
+
+        let theme = Theme::dark();
+        let mut dl = DisplayList::new();
+        let mut buf = String::new();
+        let st = style(theme.cpu, &theme);
+        let point = group.paint(0, &mut dl, &st, percent_value, &theme, &mut buf);
+        assert!(point.expect("history reaches back that far").count > 1);
+        let mut ago = String::new();
+        crosshair.ago(&mut ago);
+        assert!(ago.ends_with("m ago") && !ago.contains('s'), "{ago}");
+        let texts = texts(&dl);
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(
+            texts[0].starts_with(&format!("{ago} \u{b7} ")) && texts[0].matches('%').count() == 1,
+            "the time next to the line, then one value: {texts:?}"
+        );
     }
 }

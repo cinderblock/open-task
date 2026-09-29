@@ -65,6 +65,9 @@ The user's feedback on 2026-09-28, five items:
    no text measurement, so anchoring to the line is the robust choice.)
    The pointer is re-snapped every frame, so as new samples slide under a still
    pointer the line stays on a sample.
+   **Revised 2026-09-29 (`plans/chart-hover-readout.md`):** one value only (no
+   more "avg · peak"), the time always next to the line in a constant-width
+   format, and hysteresis on the units shown and on the side of the line.
 5. **Resize fix:** render synchronously inside `WM_SIZE` (then validate the window
    so the queued `WM_PAINT` does not draw the same frame again), instead of
    relying on `WM_PAINT`, which a live drag starves.

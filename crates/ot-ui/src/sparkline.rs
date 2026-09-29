@@ -319,28 +319,58 @@ pub fn paint_axis(
     }
 }
 
-/// A readout under a chart, flush against the crosshair at `x` on whichever side
-/// has more room, so it stays next to the line all the way to either edge.
+/// Which side of the crosshair a readout sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+impl Side {
+    /// How far past the middle of the axis the line has to be before a readout
+    /// changes sides, as a fraction of the width.
+    const MARGIN: f32 = 0.05;
+
+    /// The side with more room for a line `fraction` of the way from the right edge
+    /// ([`TimeAxis::fraction`]). Keeps `prev` until the line is clearly past the
+    /// middle, so a line resting there does not swap the readout back and forth.
+    #[must_use]
+    pub fn follow(prev: Option<Self>, fraction: f32) -> Self {
+        match prev {
+            Some(Self::Left) if fraction < 0.5 + Self::MARGIN => Self::Left,
+            Some(Self::Right) if fraction > 0.5 - Self::MARGIN => Self::Right,
+            _ if fraction <= 0.5 => Self::Left,
+            _ => Self::Right,
+        }
+    }
+}
+
+/// A readout under a chart, flush against the crosshair at `x` on `side`, so it
+/// stays next to the line all the way to either edge.
 pub fn paint_readout(
     dl: &mut DisplayList,
     band: Rect,
     x: f32,
+    side: Side,
     text: &str,
     style: TextStyle,
     color: Color,
 ) {
-    let (rect, align) = if x > band.center().x {
-        let right = (x - READOUT_GAP).min(band.right());
-        (
-            Rect::new(band.x, band.y, right - band.x, band.h),
-            HAlign::Right,
-        )
-    } else {
-        let left = (x + READOUT_GAP).max(band.x);
-        (
-            Rect::new(left, band.y, band.right() - left, band.h),
-            HAlign::Left,
-        )
+    let (rect, align) = match side {
+        Side::Left => {
+            let right = (x - READOUT_GAP).min(band.right());
+            (
+                Rect::new(band.x, band.y, (right - band.x).max(0.0), band.h),
+                HAlign::Right,
+            )
+        }
+        Side::Right => {
+            let left = (x + READOUT_GAP).max(band.x);
+            (
+                Rect::new(left, band.y, (band.right() - left).max(0.0), band.h),
+                HAlign::Left,
+            )
+        }
     };
     dl.text(text, rect, style, color, align, VAlign::Middle, true);
 }
@@ -602,15 +632,16 @@ mod tests {
     }
 
     #[test]
-    fn the_readout_sits_against_the_line_on_the_roomier_side() {
+    fn the_readout_sits_against_the_line() {
         let band = Rect::new(0.0, 50.0, 300.0, 14.0);
-        let placed = |x: f32| {
+        let placed = |x: f32, side: Side| {
             let mut dl = DisplayList::new();
             paint_readout(
                 &mut dl,
                 band,
                 x,
-                "35% · 5 s ago",
+                side,
+                "35% · 5s ago",
                 TextStyle::default(),
                 Color::WHITE,
             );
@@ -619,15 +650,38 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         };
-        // Near the right edge: to the left of the line, ending just short of it.
-        let (r, a) = placed(290.0);
+        // To the left of the line, ending just short of it.
+        let (r, a) = placed(290.0, Side::Left);
         assert_eq!(a, HAlign::Right);
         assert!((r.right() - (290.0 - READOUT_GAP)).abs() < 1e-3 && (r.x - band.x).abs() < 1e-3);
-        // Near the left edge: to the right of it.
-        let (r, a) = placed(20.0);
+        // To the right of it.
+        let (r, a) = placed(20.0, Side::Right);
         assert_eq!(a, HAlign::Left);
         assert!(
             (r.x - (20.0 + READOUT_GAP)).abs() < 1e-3 && (r.right() - band.right()).abs() < 1e-3
+        );
+    }
+
+    #[test]
+    fn the_readout_changes_sides_only_clearly_past_the_middle() {
+        use Side::{Left, Right};
+        // A fresh readout takes the roomier side: left of a line in the newer half.
+        assert_eq!(Side::follow(None, 0.3), Side::Left);
+        assert_eq!(Side::follow(None, 0.51), Side::Right);
+        // Once placed, it stays through the middle.
+        let walk = |start: Side, fractions: &[f32]| {
+            let mut side = start;
+            fractions
+                .iter()
+                .map(|&f| {
+                    side = Side::follow(Some(side), f);
+                    side
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            walk(Left, &[0.49, 0.51, 0.49, 0.54, 0.56, 0.51, 0.46, 0.44]),
+            [Left, Left, Left, Left, Right, Right, Right, Left]
         );
     }
 }

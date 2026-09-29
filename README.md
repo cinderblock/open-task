@@ -54,8 +54,12 @@ of the hour is compressed into the left end. Recent history is drawn sample by
 sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point
 at either graph and a hairline marks the same moment in both, with each graph's
-value and how long ago it was; where a point summarizes several samples, the
-readout gives the average and the peak.
+value there and how long ago it was (where a point summarizes several samples, the
+value is their average and the faint band their range). The time sits against the
+line and keeps its width as the pointer moves: `2m 05s ago`, `25m ago`,
+`1h 05m ago`. Seconds drop away from ten minutes and minutes from two hours, and
+come back only once the pointer is well short of those, so a readout resting near
+a boundary does not flicker between the two.
 
 The process table has two arrangements, switched with the **List / Tree** control
 above it or with **Ctrl+T** (Process Explorer's binding):

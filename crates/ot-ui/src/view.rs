@@ -2105,8 +2105,14 @@ mod tests {
         );
         // Both charts read out the same moment; the tick labels make way.
         let strings = painted_strings(&mut app);
-        assert!(strings.iter().any(|s| s == "80% · 3 s ago"), "{strings:?}");
-        assert!(strings.iter().any(|s| s == "60 B · 3 s ago"), "{strings:?}");
+        assert!(
+            strings.iter().any(|s| s == "80% · \u{2007}3s ago"),
+            "{strings:?}"
+        );
+        assert!(
+            strings.iter().any(|s| s == "60 B · \u{2007}3s ago"),
+            "{strings:?}"
+        );
         assert!(!strings.iter().any(|s| s == "10s"), "{strings:?}");
 
         // Hovering the memory chart drives the CPU chart's line too.
