@@ -1,6 +1,6 @@
 # Gate elevated features on what they use, not on "is the token elevated"
 
-> **Status:** active · **Started:** 2026-09-28 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done, CI green 2026-09-28 (`6279d1b`, run 36505270604) · **Started:** 2026-09-28 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plans: `plans/performance-view.md` (where the flaw was found) and
 > `plans/service-host-attribution.md` (which owns the code).
 
@@ -53,8 +53,7 @@ whether they can work by asking `is_elevated()`, which reads `TokenElevation`.
    error; headless wording.~~
 3. ~~Checks (fmt, clippy on three targets, tests); run the probe tests and the
    headless app under all three tokens.~~
-4. **[current]** Plans (this, attribution, performance view); commit; push with CI
-   watched.
+4. ~~Plans (this, attribution, performance view); commit; push with CI watched.~~
 
 ## Findings / gotchas
 
@@ -88,4 +87,7 @@ whether they can work by asking `is_elevated()`, which reads `TokenElevation`.
       `SampleError::NotPermitted`; `Capabilities::cpu_sampling` from `can_sample`;
       headless says "needs administrator".
 - [x] Verified under three tokens (table above); fmt; clippy on three targets.
-- [ ] Committed, pushed, CI green.
+- [x] Committed (`6279d1b`), pushed, CI green on all five jobs (run 36505270604).
+      On both Windows runners the probe suite took the same ~0.7 s as before the
+      fix (0.73 s and 0.69 s, against 0.73 s and 0.71 s at `a3b36ab`), which fits
+      the real 600 ms self-sample still running there rather than skipping.
