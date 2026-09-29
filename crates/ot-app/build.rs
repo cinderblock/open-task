@@ -1,5 +1,5 @@
 //! Build script: the version this build reports, and on Windows the version
-//! resource that Explorer shows under Properties > Details.
+//! resource that Explorer shows under Properties > Details, and the app icon.
 //!
 //! The version comes from git. A clean checkout of a release tag builds as that
 //! release (`0.2.1`); anything else carries the commit, git-describe style
@@ -12,7 +12,9 @@
 //! optional locks off, so a build never collides with a `git add` running beside it.
 //!
 //! The Windows resource is written here as a `.res` file and handed to the linker,
-//! which converts `.res` inputs itself. No resource compiler is needed.
+//! which converts `.res` inputs itself. No resource compiler is needed. The icon
+//! comes from `assets/logo/open-task.ico` (made by `scripts/render-logo.ps1`); a
+//! build without it, such as from a packaged crate, gets a warning and no icon.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -37,10 +39,27 @@ fn main() {
     let windows_msvc = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if windows_msvc {
+        let mut resources = version_res(&build);
+        let ico = workspace(&manifest_dir).join("assets/logo/open-task.ico");
+        match std::fs::read(&ico)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| icon_res(&bytes, &mut resources))
+        {
+            Ok(()) => {}
+            Err(e) => println!("cargo:warning=no app icon ({}): {e}", ico.display()),
+        }
         let res = PathBuf::from(env("OUT_DIR")).join("open-task.res");
-        std::fs::write(&res, version_res(&build)).expect("write the version resource");
+        std::fs::write(&res, resources).expect("write the resources");
         println!("cargo:rustc-link-arg-bins={}", res.display());
     }
+}
+
+/// The workspace root, two levels above this crate.
+fn workspace(manifest_dir: &Path) -> &Path {
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/ot-app sits two levels under the workspace")
 }
 
 fn env(name: &str) -> String {
@@ -126,14 +145,12 @@ fn describe(dir: &Path, cargo_version: &str) -> Option<Build> {
 /// `-dirty` stay true. Paths that do not exist are left out: Cargo would re-run
 /// on every build for them.
 fn watch(manifest_dir: &Path) {
-    let workspace = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/ot-app sits two levels under the workspace");
+    let workspace = workspace(manifest_dir);
     let mut paths = vec![
         workspace.join("crates"),
         workspace.join("Cargo.toml"),
         workspace.join("Cargo.lock"),
+        workspace.join("assets/logo/open-task.ico"),
     ];
     // In a linked worktree HEAD and the index are its own; refs are shared. Asking
     // git for each path gets both right.
@@ -167,6 +184,11 @@ fn numeric(build: &Build) -> [u16; 4] {
 const LANG_EN_US: u16 = 0x0409;
 const CODEPAGE_UNICODE: u16 = 1200;
 const RT_VERSION: u16 = 16;
+const RT_ICON: u16 = 3;
+const RT_GROUP_ICON: u16 = 14;
+/// The app icon's group id. Explorer and the taskbar take a program's first icon
+/// group; the window loads this one by id (`ot-shell-win`'s `APP_ICON`).
+const APP_ICON: u16 = 1;
 const VS_FF_PRERELEASE: u32 = 0x2;
 
 /// A `.res` file holding one `VERSIONINFO` resource.
@@ -241,6 +263,49 @@ fn version_res(build: &Build) -> Vec<u8> {
     // MOVEABLE | PURE, as rc.exe marks a version resource.
     res_entry(&mut res, RT_VERSION, 1, 0x0030, LANG_EN_US, &info);
     res
+}
+
+/// Every image of an `.ico` as an `RT_ICON` (ids 1 to n) and one `RT_GROUP_ICON`
+/// ([`APP_ICON`]) listing them, appended to `res`. An `.ico` holds each image just
+/// as a resource does (a PNG, or a DIB without its file header); only the
+/// directory changes shape: an `.ico` entry ends in the image's file offset, a
+/// group entry in its resource id.
+fn icon_res(ico: &[u8], res: &mut Vec<u8>) -> Result<(), String> {
+    let u16_at = |i: usize| {
+        ico.get(i..i + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or("truncated")
+    };
+    let u32_at = |i: usize| {
+        ico.get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+            .ok_or("truncated")
+    };
+    if u16_at(0)? != 0 || u16_at(2)? != 1 {
+        return Err("not an icon file".into());
+    }
+    let count = u16_at(4)?;
+    let mut group = Vec::new();
+    put_u16(&mut group, 0);
+    put_u16(&mut group, 1);
+    put_u16(&mut group, count);
+    for i in 0..count {
+        let entry = 6 + 16 * usize::from(i);
+        let (size, offset) = (u32_at(entry + 8)?, u32_at(entry + 12)?);
+        let image = ico
+            .get(offset..offset + size)
+            .ok_or("an image lies outside the file")?;
+        let id = i + 1;
+        // MOVEABLE | DISCARDABLE, and MOVEABLE | PURE | DISCARDABLE for the group,
+        // as rc.exe marks them.
+        res_entry(res, RT_ICON, id, 0x1010, LANG_EN_US, image);
+        // Width, height, colors, reserved, planes, bit count and size are the same
+        // twelve bytes in both directories.
+        group.extend_from_slice(&ico[entry..entry + 12]);
+        put_u16(&mut group, id);
+    }
+    res_entry(res, RT_GROUP_ICON, APP_ICON, 0x1030, LANG_EN_US, &group);
+    Ok(())
 }
 
 /// One version-info structure: `wLength`, `wValueLength`, `wType`, the key, padding,

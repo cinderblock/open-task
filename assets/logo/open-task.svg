@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <title>open-task</title>
+  <!-- The open-task logo, for 48 px and up. Smaller sizes have their own drawings
+       (open-task-32.svg, -24, -16); scripts/render-logo.ps1 renders them all.
+
+       An "o" left open on the right, and a pulse running through it and out of the
+       opening into a dot: now. The pulse's older wiggles crowd together on the left
+       and the newest spike stands wide, the way the app's charts lay time out on a
+       log scale. -->
+  <defs>
+    <linearGradient id="ring" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#0A5FC0"/>
+      <stop offset="1" stop-color="#4CC6FF"/>
+    </linearGradient>
+  </defs>
+  <path d="M 196.8 79.8 A 84 84 0 1 0 196.8 176.2" fill="none" stroke="url(#ring)" stroke-width="30" stroke-linecap="round"/>
+  <polyline points="74,128 80,121 86,135 93,117 101,141 111,106 124,162 140,74 156,128 212,128" fill="none" stroke="#FF9A3C" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="226" cy="128" r="14" fill="#FF9A3C"/>
+</svg>

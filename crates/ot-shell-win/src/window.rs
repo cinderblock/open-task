@@ -36,7 +36,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -45,18 +46,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES,
-    MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWDEFAULT,
-    SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA,
-    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
-    WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadImageW,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HICON,
+    HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES, IMAGE_ICON,
+    LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+    WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
+    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::gfx::Gfx;
@@ -86,6 +89,8 @@ struct SampleOutcome {
 }
 
 const CLASS_NAME: PCWSTR = w!("OpenTaskMainWindow");
+/// The app icon's resource id, as `ot-app`'s build script writes it.
+const APP_ICON: u16 = 1;
 const TITLE: &str = "open-task";
 const TITLE_PAUSED: &str = "open-task (paused)";
 const INITIAL_SIZE: (i32, i32) = (1180, 760);
@@ -236,6 +241,7 @@ pub fn run(
 
     // SAFETY: hwnd is valid.
     let dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
+    set_window_icons(hwnd, dpi as u32);
     let size_px = client_size(hwnd);
     let gfx = Gfx::new(hwnd, size_px, dpi).map_err(win("Gfx::new"))?;
 
@@ -373,6 +379,43 @@ fn system_prefers_dark() -> bool {
         )
     };
     status.is_ok() && value == 0
+}
+
+/// Give the window the app icon at the sizes `dpi` wants: the big one for the
+/// taskbar and Alt+Tab, the small one for the title bar. The exe carries a drawing
+/// for each size, so none is scaled. A build without the icon resource keeps the
+/// default icon.
+fn set_window_icons(hwnd: HWND, dpi: u32) {
+    // SAFETY: the module is this exe and the resource name is an integer id, as
+    // MAKEINTRESOURCE makes; the icons replaced were loaded here (the class has
+    // none), so they are ours to destroy.
+    unsafe {
+        let Ok(module) = GetModuleHandleW(None) else {
+            return;
+        };
+        for (which, metric) in [(ICON_BIG, SM_CXICON), (ICON_SMALL, SM_CXSMICON)] {
+            let size = GetSystemMetricsForDpi(metric, dpi);
+            let Ok(icon) = LoadImageW(
+                Some(HINSTANCE(module.0)),
+                PCWSTR(usize::from(APP_ICON) as *const u16),
+                IMAGE_ICON,
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            ) else {
+                continue;
+            };
+            let old = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(which as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            );
+            if old.0 != 0 {
+                let _ = DestroyIcon(HICON(old.0 as *mut c_void));
+            }
+        }
+    }
 }
 
 fn resolve_dark(pref: ThemePreference) -> bool {
@@ -554,6 +597,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
+            // The icons follow the monitor's DPI too.
+            // SAFETY: hwnd is valid.
+            set_window_icons(hwnd, unsafe { GetDpiForWindow(hwnd) });
             invalidate(hwnd);
             LRESULT(0)
         }

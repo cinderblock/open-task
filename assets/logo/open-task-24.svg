@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <title>open-task</title>
+  <!-- The logo drawn for 20 and 24 px. See open-task.svg. -->
+  <defs>
+    <linearGradient id="ring" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#0A5FC0"/>
+      <stop offset="1" stop-color="#4CC6FF"/>
+    </linearGradient>
+  </defs>
+  <path d="M 18.30 7.07 A 8 8 0 1 0 18.30 16.93" fill="none" stroke="url(#ring)" stroke-width="3" stroke-linecap="round"/>
+  <polyline points="7,12 8.5,12 10,7.5 12.5,16.5 14,12 19.5,12" fill="none" stroke="#FF9A3C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="21" cy="12" r="2" fill="#FF9A3C"/>
+</svg>

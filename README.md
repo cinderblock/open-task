@@ -1,3 +1,5 @@
+<img src="assets/logo/open-task.svg" width="96" align="right" alt="The open-task logo: an open ring with a pulse running out through the opening">
+
 # open-task
 
 A fully open source, very high performance, lightweight task manager.
@@ -277,6 +279,13 @@ terminal.
 Performance page. `-Click "x,y"` clicks first, at a point read off an earlier
 screenshot. It only ever captures and closes the
 instance it launched, so an installed copy can keep running.
+
+The logo lives in `assets/logo` as SVG: `open-task.svg` for 48 px and up, and
+separate drawings for the small sizes (`-32`, `-24`, `-16`), where the big one would
+blur. `scripts/render-logo.ps1` turns them into the app icon (`open-task.ico`, every
+size Windows asks for), a 512 px PNG and the installer's wizard images; the build
+embeds the icon in the exe. The rendered files are committed, so building needs no
+SVG renderer; re-rendering needs `resvg` (`cargo install resvg --locked`).
 
 The build names itself from git: a clean checkout of a release tag is that release
 (`0.2.1`); anything else carries the commit, `git describe` style

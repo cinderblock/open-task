@@ -72,6 +72,14 @@ OutputBaseFilename=open-task-v{#AppVersion}-windows-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
+; The logo (assets/logo, made by scripts/render-logo.ps1): Setup's and the
+; uninstaller's icon, and the wizard's corner image in each size Setup uses at
+; 100% to 250% scaling. PNG wizard images need Inno Setup 6.5.2 (GitHub's Windows
+; runners have 6.7.1); an older compiler keeps its built-in image rather than failing.
+SetupIconFile=..\..\assets\logo\open-task.ico
+#if Ver >= EncodeVer(6,5,2)
+WizardSmallImageFile=..\..\assets\logo\installer\wizard-58.png,..\..\assets\logo\installer\wizard-77.png,..\..\assets\logo\installer\wizard-97.png,..\..\assets\logo\installer\wizard-116.png,..\..\assets\logo\installer\wizard-124.png,..\..\assets\logo\installer\wizard-143.png,..\..\assets\logo\installer\wizard-159.png
+#endif
 UninstallDisplayName=open-task
 UninstallDisplayIcon={app}\open-task.exe
 ; Setup and the uninstaller broadcast the environment change when PATH is edited.

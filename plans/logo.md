@@ -1,6 +1,6 @@
 # A logo and app icon for open-task
 
-> **Status:** active · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done (awaiting the user's look) · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md`.
 
 ## Goal
@@ -37,23 +37,65 @@ everywhere Windows shows an icon.
 2. **Small sizes get their own drawing** where the big one would turn to mush
    (16, 20, 24, 32 px), as Microsoft's icon guidance asks, rather than a scaled-down
    256.
+3. **User, 2026-09-29: "let's do the open ring one"** (concept B). Refined as
+   recommended: the pulse's older wiggles crowd to the left and the newest spike
+   stands wide, like the log time axis; a dot at the end is "now".
+4. **Colors:** ring gradient `#0A5FC0` to `#4CC6FF` (bottom left to top right),
+   pulse and dot `#FF9A3C`. No backplate: the silhouette carries it on light and
+   dark taskbars alike.
+5. **Which drawing serves which size:** `open-task-16.svg` for 16; `-24` for 20
+   and 24; `-32` for 30 to 40; `open-task.svg` from 48 up (the log wiggles blur
+   below that). The `.ico` holds all fourteen sizes Windows' guidance lists (16,
+   20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 256), each a PNG.
+6. **The exe icon is written by `build.rs`** into the same hand-made `.res` as the
+   version resource: `RT_ICON` 1..14 plus `RT_GROUP_ICON` 1. The window loads group
+   1 at the sizes its DPI wants (`GetSystemMetricsForDpi`) and sets them with
+   `WM_SETICON`, again after a DPI change.
+7. **Installer:** `SetupIconFile` always; the wizard's corner image
+   (`WizardSmallImageFile`, seven PNGs for 100% to 250%) only when the compiler
+   is Inno Setup 6.5.2 or newer (PNG support), which GitHub's Windows runners
+   (6.7.1) are.
 
 ## Plan / steps
 
-1. **[current]** Draft concepts, render a comparison sheet (256 down to 16 px, on
-   dark and light), put them to the user.
-2. Refine the chosen one; hand-tune the small sizes.
-3. Assets: `assets/logo/` (SVG masters, PNGs, `open-task.ico`), a render script.
-4. Exe icon resource from `build.rs`; window `hIcon`/`hIconSm`; installer
-   `SetupIconFile`; README header.
-5. Verify: Explorer, taskbar, Alt+Tab, title bar, installer, Installed apps;
-   checks on three targets; commit.
+1. ~~Draft concepts, render a comparison sheet, put them to the user.~~
+2. ~~Refine the chosen one; hand-tune the small sizes.~~
+3. ~~Assets: `assets/logo/` (SVGs, `open-task.ico`, `open-task-512.png`,
+   `installer/wizard-*.png`), `scripts/render-logo.ps1`.~~
+4. ~~Exe icon from `build.rs`; window icons; installer icon and wizard image;
+   README.~~
+5. ~~Verify and commit.~~
+6. Later, if wanted: a GitHub social preview image (1280x640; set in the repo's
+   settings page, not through the API); macOS `.icns` and Linux icons with those
+   shells.
 
 ## Findings / gotchas
 
 - Concept drafts live in `target/logo/*.svg` (scratch, untracked); `python
   target/logo/sheet.py` renders `target/logo/sheet.png`, every concept at 256, 64,
   48, 32, 24 and 16 px on the dark and light backgrounds a taskbar can have.
+- **Refining B:** spacing the pulse on the log axis at first made the last stroke
+  a long ramp and lost the heartbeat; the final version keeps a sharp spike and
+  crowds the older wiggles to its left (`target/logo/sheet-ring2.png`).
+- **16 px is its own problem:** with the spike's two strokes 1.6 px apart they
+  merge into a plus sign (or, with the dot, a key); a wide zigzag with no flat
+  lead-in reads as a pulse (`target/logo/zoom-16b.png`).
+- **An `.ico` and an icon resource hold the images identically**; only the
+  directory differs (file offset versus resource id in the last field), so
+  `build.rs` copies the images and rewrites the directory.
+- **Checked in the real thing:** Explorer's extraction of the exe icon gives the
+  drawing made for each size (resource ids 1, 5, 8, 14 at 16, 32, 48, 256); the
+  running window reports a 32 px big and 16 px small icon and shows the logo in the
+  title bar; the test installer (`target/installer-test`, built with the portable
+  Inno 6.7.3) has the icon and shows the wizard image (`target/logo/setup-wizard.png`).
+- **Portable Inno's `ISCC.exe` has no version resource** (0.0.0.0), and `ISCC /?`
+  prints no version either; `#pragma message` is silenced by the build script's
+  `/Qp`. The runner version came from GitHub's runner-image readmes instead.
+- Python patch scripts through a Bash heredoc lose backslashes (`\a` became a
+  BEL character in the `.iss`); write them with the Write tool, and build Windows
+  paths with `chr(92)`.
+- Rendering is deterministic: re-running `render-logo.ps1` reproduces the `.ico`
+  and PNGs byte for byte.
 - First round, five concepts:
   - **A, log bars**: bars whose widths shrink leftward on the charts' log axis,
     one hot bar. Clean but reads as a generic bar-chart icon; the log spacing is
@@ -72,13 +114,16 @@ everywhere Windows shows an icon.
 
 - [x] Concepts drafted (A-E) and rendered; `resvg` 0.48.1 installed with `cargo
       install resvg --locked`.
-- [ ] User picks a direction.
+- [x] User picked B (the open ring).
+- [x] Refined; small sizes drawn by hand; assets and render script.
+- [x] Exe icon, window icons, installer icon and wizard image, README.
+- [x] Verified (Explorer extraction, running window, test installer); tests and
+      clippy on three targets.
 
 ## Open questions for the user
 
-1. Which concept (or which mix)? Recommendation: B, refined so the pulse's
-   spikes sit on the log axis (crowded on the left, spread on the right), which
-   makes the one generic element ours.
+1. Does the refined logo work for you? (Changing it later is a re-render: edit
+   the SVGs, run `scripts/render-logo.ps1`.)
 
 ## Things not to do
 
