@@ -247,7 +247,8 @@ The user's feedback on 2026-09-28, five items:
       means toggling the user's own Windows animation setting.
 - [x] **Shipped.** All four commits (`2ccdd44`, `06779d7`, `e0bb869`, `892159c`)
       are on `origin/master` (pushed by another thread) and in v0.3.0 (published
-      2026-09-29 00:00 UTC); the copy installed in `C:\Program Files\open-task`
+      2026-09-28 17:00:49 PDT, which is 00:00:49 UTC the next day: tag 16:57:33,
+      release workflow 16:57:43 to 17:00:51); the copy installed in `C:\Program Files\open-task`
       reports v0.3.0. Checked on HEAD `200c34f`: nothing of this thread's was
       reverted (the self-update thread extended `settings.rs`, `prefs.rs` and the
       shell around it); tests and clippy on three targets pass.
