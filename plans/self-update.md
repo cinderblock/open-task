@@ -1,7 +1,8 @@
 # Self-update and build identity
 
-> **Status:** active · **Started:** 2026-09-28 · **Branch:** `self-update`, worked in the
-> worktree `.claude/worktrees/self-update` (excluded locally via `.git/info/exclude`)
+> **Status:** done, v0.3.0 released and installed · **Started:** 2026-09-28 · **Branch:**
+> `self-update` (merged into `master`), worked in the worktree
+> `.claude/worktrees/self-update` (excluded locally via `.git/info/exclude`)
 > Parent plan: `plans/open-task-architecture.md` (decision 9, open question 3, roadmap 9).
 
 ## Goal
@@ -133,16 +134,24 @@ the update if it downloads a new one".
    a newer local build, relaunch.~~ Passed; see findings.
 8. ~~Merge into `master`~~: fast-forwarded 2026-09-28 (`00fe878`), not pushed:
    `master` also carries nine unpushed commits from other threads.
-9. **[current, waiting on the user]** The secret, then the first signed release (see
-   open questions). The branch `self-update` and its worktree stay until then.
+9. ~~The secret~~: set 2026-09-28 23:53 UTC with the user's yes. ~~Push `master`~~:
+   `8eb735f`, user's yes ("push CI so it builds our release assets").
+10. ~~v0.3.0~~: CI green on `8eb735f` (run 36500388298, all five jobs); `Release
+    v0.3.0` (`0d9f4af`) pushed, tag `v0.3.0` (annotated); release run 36500691252
+    green; https://github.com/cinderblock/open-task/releases/tag/v0.3.0.
+11. ~~A real update from GitHub~~: passed (findings).
+12. ~~Update the Program Files install to v0.3.0~~: done (findings).
+13. Remove the worktree and the `self-update` branch (last, from outside it).
 
 ## Findings / gotchas
 
 - **The release key:** ID `F458D6C29DBD2C05`, public key
   `RWQFLL2dwtZY9DF+FMseD0gj8++iXgURRbysZlwxPPzFowjJEgtnWcAx` (`minisign.pub`). Secret,
-  unencrypted, only at `C:\Users\camer\.minisign\open-task.key` until it becomes the
-  `MINISIGN_SECRET_KEY` secret. Test fixtures use a separate throwaway key whose
-  secret was never kept (`crates/ot-update/testdata/test.pub`).
+  unencrypted, at `C:\Users\camer\.minisign\open-task.key` and in the
+  `MINISIGN_SECRET_KEY` secret (set 2026-09-28). Test fixtures and the local
+  end-to-end feeds use a separate throwaway key (`crates/ot-update/testdata/test.pub`;
+  its secret is `/tmp/ot-keys/test.key` in Git Bash, i.e. `%TEMP%\ot-keys`, and is
+  trusted only by builds made with `OT_UPDATE_PUBLIC_KEY` set to it).
 - **The hand-written `.res` is byte-identical to `rc.exe`'s** (Windows Kits
   10.0.26100, `/l 0x409`) for the same VERSIONINFO. PowerShell's
   `(Get-Item exe).VersionInfo` reads every field; `IsPreRelease` is set for dev
@@ -205,11 +214,36 @@ the update if it downloads a new one".
   ran without `/RELAUNCH`, Restart Manager ended the hidden process (reason 1), no
   instance was started, the installed exe was the new build, DisplayVersion 0.3.0.
   Scripts: `%TEMP%\e2e\e2e-close.ps1` with `e2e-lib.ps1`.
+- **v0.3.0 released (2026-09-29 00:00 UTC):** every native build's `--version`
+  printed `open-task v0.3.0`; "Sign the checksums" logged "Signature and comment
+  signature verified / Trusted comment: open-task v0.3.0" against `minisign.pub`.
+  Assets: six archives, `open-task-v0.3.0-windows-setup.exe` (3,141,387 bytes),
+  `SHA256SUMS`, `SHA256SUMS.minisig`. Checked here with the README's commands
+  (`minisign -Vm SHA256SUMS -P RWQF...` and `sha256sum --check`): OK.
+- **A real update from GitHub passed:** a release build of `8eb735f` (official
+  feed and key; `0.2.1-28-g8eb735f`) installed per-user found v0.3.0 on a click,
+  downloaded and verified it from GitHub in 0.6 s, a second click installed it,
+  Restart Manager closed the app (reason 1) and Setup started v0.3.0: the rail
+  said `v0.3.0`, `--version` printed `open-task v0.3.0`, `--check-update` said
+  "up to date". Uninstalled after; nothing left in HKCU or the profile.
+- **The Program Files install is v0.3.0** (user's request): from the verified
+  release installer, `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ALLUSERS`, exit 0,
+  DisplayVersion 0.3.0, the exe's ProductVersion `0.3.0`, FileVersion `0.3.0.0`.
+  Restarted through `explorer.exe "<exe>"`, which starts it via Explorer's COM
+  factory: unelevated, on the user's desktop. From here on it updates itself.
+- **The two old Program Files instances (PIDs 15760, 19252) had no windows at
+  all**, on the same desktop this session uses (`WinSta0\Default`, where the new
+  window is visible): processes left running after their windows were gone,
+  still using CPU. They were ended with `Stop-Process`, since there was no window
+  to close. Probably a pre-updater build that did not exit after its window
+  closed; the current build exited cleanly in all four end-to-end runs. Worth a
+  look if it shows up again.
 - **Not exercised end to end:** the all-users (`/ALLUSERS`) path, to keep the user's
   install and running windows out of it (same code, different flag; the flag is unit
-  tested); a declined UAC prompt (this session is elevated, so there is none: the
-  updater treats Setup's exit codes 2 and 5 as cancelled and offers the install
-  again, unit tested); and a real GitHub release, which needs the secret and a tag.
+  tested); and a declined UAC prompt (this session is elevated, so there is none:
+  the updater treats Setup's exit codes 2 and 5 as cancelled and offers the install
+  again, unit tested). The first all-users update will be the one from v0.3.0 to
+  the next release on this machine.
 
 - Existing tags `v0.2.0`, `v0.2.1` are annotated; `--tags` covers lightweight ones too.
 - This Claude session runs elevated (High integrity): installs here never show UAC,
@@ -234,19 +268,22 @@ the update if it downloads a new one".
 - [x] Key generated. [ ] Secret staged for approval.
 - [x] Local end-to-end update (per-user; see findings).
 - [x] Merged to `master` (fast-forward, 2026-09-28). Not pushed.
-- [ ] `MINISIGN_SECRET_KEY` set on `cinderblock/open-task` (none set as of
-      2026-09-28; staged, waiting for the user's yes).
-- [ ] First signed release; then install it by hand once, since the copy now in
-      Program Files predates the updater.
+- [x] `MINISIGN_SECRET_KEY` set on `cinderblock/open-task` (2026-09-28 23:53 UTC).
+- [x] "Install updates automatically" (`06876ea`), verified end to end.
+- [x] `master` pushed (`8eb735f`).
+- [x] CI green on `8eb735f`; v0.3.0 released and signed.
+- [x] Real update from GitHub (per-user).
+- [x] Program Files install updated to v0.3.0.
+- [ ] Worktree and branch removed.
 
 ## Open questions for the user
 
-1. Approve, exactly: `gh secret set MINISIGN_SECRET_KEY --repo
-   cinderblock/open-task < "$USERPROFILE/.minisign/open-task.key"` (Git Bash). Until
-   it is set, every release fails at "Sign the checksums", on purpose.
-2. Push `master` (15 ahead of `origin/master`, 9 of them other threads') and cut
-   the first signed release: which version? `plans/replace-task-manager.md`
-   (untracked, another thread) claims v0.3.0 for its work.
+None open.
+
+1. ~~Approve the secret.~~ Done.
+2. ~~Push and release.~~ Released as v0.3.0 (a minor bump for everything since
+   v0.2.1). `plans/replace-task-manager.md` (untracked, another thread) had
+   planned to ship as v0.3.0; its work will be in a later version.
 
 ## Things not to do
 
