@@ -25,7 +25,7 @@ use crate::steady::Steady;
 use crate::table::{Hit, RowSource, Table};
 use crate::theme::Theme;
 use crate::update::{UpdateAction, UpdateView};
-use crate::usage_map::UsageMap;
+use crate::usage_map::{UsageMap, STRIP_H};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -381,6 +381,9 @@ struct Toolbar {
     status: Option<(&'static str, Color)>,
     /// The arrangement shown, for the segment control.
     mode: ViewMode,
+    /// Shown instead of the selection's ancestry while not empty: what the pointer
+    /// is over in the usage strip above.
+    note: String,
     /// Segment rectangles from the last paint, in [`SEGMENTS`] order.
     segments: [Rect; 3],
     hover: Option<usize>,
@@ -494,9 +497,13 @@ impl Toolbar {
         // Between: where the selected process sits in the hierarchy. The same text in
         // both modes is what ties the sorted list to the tree.
         buf.clear();
-        match table.selected.and_then(|id| rows.row_of(id)) {
-            Some(row) => rows.ancestry(row, buf, &mut self.chain),
-            None => buf.push_str("Ctrl+T switches between list and tree"),
+        if self.note.is_empty() {
+            match table.selected.and_then(|id| rows.row_of(id)) {
+                Some(row) => rows.ancestry(row, buf, &mut self.chain),
+                None => buf.push_str("Ctrl+T switches between list and tree"),
+            }
+        } else {
+            buf.push_str(&self.note);
         }
         dl.label(buf, crumb, theme.small, theme.text_dim);
     }
@@ -1001,7 +1008,8 @@ impl App {
                 let clear = self.toolbar.search.clear_rect.contains(p);
                 let crosshair = self.charts.hover(Some(p));
                 let held = self.hold_order(!self.map_on && self.table.rect().contains(p));
-                let tile = self.map_on && self.map.set_hover(Some(p));
+                // The Map's tiles, or in List and Tree the usage strip's.
+                let tile = self.map.set_hover(Some(p));
                 let changed = hover != self.table.hover
                     || segment != self.toolbar.hover
                     || clear != self.toolbar.search.hover_clear
@@ -1087,7 +1095,7 @@ impl App {
             return Reaction::REPAINT;
         }
         search.focused = false;
-        if self.map_on {
+        if self.map_on || self.map.key_at(at).is_some() {
             return Reaction::painted(self.select_at(at));
         }
         let rows = rows_of!(self, self.table.tree());
@@ -1111,14 +1119,23 @@ impl App {
 
     /// Select the row under `at`, if there is one. Returns whether anything changed.
     fn select_at(&mut self, at: Point) -> bool {
-        if self.map_on {
+        // A tile of the Map, or a segment of the usage strip above the table.
+        if let Some((key, alive)) = self.map.key_at(at) {
             // Only a running process can be selected: an exited one can be neither
             // ended nor opened.
-            let Some((key, true)) = self.map.key_at(at) else {
+            if !alive {
                 return false;
-            };
+            }
             let id = Some(process_rows::row_id(key));
-            return std::mem::replace(&mut self.table.selected, id) != id;
+            let changed = std::mem::replace(&mut self.table.selected, id) != id;
+            if !self.map_on {
+                let rows = rows_of!(self, self.table.tree());
+                self.table.reveal_selected(&rows, &self.theme);
+            }
+            return changed;
+        }
+        if self.map_on {
+            return false;
         }
         let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, &self.theme) {
@@ -1208,14 +1225,12 @@ impl App {
     fn context_menu(&mut self, at: Option<Point>) -> Reaction {
         let anchor = if let Some(p) = at {
             self.select_at(p);
-            let over_process = if self.map_on {
-                self.map.key_at(p).is_some_and(|(_, alive)| alive)
-            } else {
-                matches!(
-                    self.table.hit(p, &self.theme),
-                    Hit::Row(_) | Hit::Expander(_)
-                )
-            };
+            let over_process = self.map.key_at(p).is_some_and(|(_, alive)| alive)
+                || (!self.map_on
+                    && matches!(
+                        self.table.hit(p, &self.theme),
+                        Hit::Row(_) | Hit::Expander(_)
+                    ));
             if !over_process {
                 return Reaction::NONE;
             }
@@ -1369,6 +1384,13 @@ impl App {
         }
         let (cards, rest) = full.split_top(CARD_H);
         let (_, rest) = rest.split_top(theme.gap);
+        // The usage strip, in List and Tree; the Map shows the same thing larger.
+        let (strip, rest) = if self.map_on {
+            (None, rest)
+        } else {
+            let (strip, rest) = rest.split_top(STRIP_H);
+            (Some(strip), rest.split_top(theme.gap * 0.5).1)
+        };
         let (toolbar, rest) = rest.split_top(theme.toolbar_h);
         let (_, table_rect) = rest.split_top(theme.gap * 0.5);
 
@@ -1398,13 +1420,14 @@ impl App {
                 .paint(i, dl, &style, values[i], theme, &mut self.buf);
         }
 
-        self.paint_processes(dl, table_rect, toolbar, &snap);
+        self.paint_processes(dl, strip, table_rect, toolbar, &snap);
     }
 
     /// The process table, or the Map in its place, and the toolbar above them.
     fn paint_processes(
         &mut self,
         dl: &mut DisplayList,
+        strip: Option<Rect>,
         table_rect: Rect,
         toolbar: Rect,
         snap: &Arc<Snapshot>,
@@ -1423,13 +1446,29 @@ impl App {
             tree_mode: self.table.tree(),
             steady: Some(&self.steady),
         };
+        let usage = match &self.paused {
+            Some(p) => &p.usage,
+            None => &self.usage,
+        };
+        if let Some(strip) = strip {
+            self.map.paint_strip(
+                dl,
+                strip,
+                usage,
+                snap,
+                &self.toolbar.search.needle,
+                self.table.selected,
+                theme,
+                &mut self.buf,
+            );
+        }
+        // What the pointer is over in the strip reads out where the ancestry goes.
+        if self.map_on || !self.map.describe_hover(&mut self.toolbar.note) {
+            self.toolbar.note.clear();
+        }
         // The table first: the toolbar reads its state, and the order must be
         // current before the ancestry lookup. In its place, the Map.
         if self.map_on {
-            let usage = match &self.paused {
-                Some(p) => &p.usage,
-                None => &self.usage,
-            };
             self.map.paint(
                 dl,
                 table_rect,
@@ -1853,7 +1892,13 @@ mod tests {
     }
 
     fn table_top(theme: &Theme) -> f32 {
-        theme.gap + CARD_H + theme.gap + theme.toolbar_h + theme.gap * 0.5
+        theme.gap
+            + CARD_H
+            + theme.gap
+            + STRIP_H
+            + theme.gap * 0.5
+            + theme.toolbar_h
+            + theme.gap * 0.5
     }
 
     #[test]
@@ -2653,5 +2698,41 @@ mod tests {
             Some(before),
             "and moves on resume"
         );
+    }
+
+    #[test]
+    fn the_usage_strip_sits_above_the_table_and_selects_into_it() {
+        let mut app = App::default();
+        busy_minute(&mut app);
+        ready(&mut app);
+        let strings = painted_strings(&mut app);
+        // p10 only launched p11, so the two fold into one segment.
+        let chain = "p10.exe \u{203a} p11.exe";
+        assert!(strings.iter().any(|s| s == chain), "{strings:?}");
+        let list_toolbar = app.toolbar.segments[0].y;
+
+        // Pointing at a segment reads it out where the ancestry goes.
+        let seg = app.map.tile_rect(id(20)).expect("p20 has a segment");
+        app.handle(UiEvent::MouseMove(seg.center()));
+        let strings = painted_strings(&mut app);
+        assert!(
+            strings
+                .iter()
+                .any(|s| s.starts_with("p20.exe \u{b7} PID 20 \u{b7} 20% of a core")),
+            "{strings:?}"
+        );
+
+        // A click selects it in the table.
+        app.handle(UiEvent::MouseDown {
+            at: seg.center(),
+            button: MouseButton::Left,
+        });
+        assert_eq!(app.table.selected, Some(id(20)));
+        app.handle(UiEvent::MouseLeave);
+
+        // In the Map the strip gives way, and the toolbar moves up.
+        cmd(&mut app, Command::SetView(ViewMode::Map));
+        painted_strings(&mut app);
+        assert!(app.toolbar.segments[0].y < list_toolbar);
     }
 }

@@ -13,6 +13,12 @@
 //! but by sticky keys ([`Steady`]), so two siblings of about the same size do not
 //! trade places every second. Tiles too small to see are not drawn, and labels go
 //! only where they fit.
+//!
+//! The same accounting also draws the icicle strip above the table in List and
+//! Tree: two rows, the top-level processes across the first, what runs under each
+//! beneath it, every segment as wide as its share of the CPU used over the minute.
+//! It is the Map folded flat, always in view; the strip and the Map are never shown
+//! together, so they share this one struct.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -50,6 +56,12 @@ const HEADER_VALUE_W: f32 = 44.0;
 /// itself is folded into its child's frame: `a.exe \u{203a} b.exe`. Chains of
 /// launchers and wrappers (a shell, a runtime, an app) otherwise nest frame in frame.
 const CHAIN_OWN: f64 = 0.02;
+/// The icicle strip: its height, rows, and the gap between them.
+pub(crate) const STRIP_H: f32 = 30.0;
+const STRIP_ROWS: usize = 2;
+const STRIP_ROW_GAP: f32 = 1.0;
+/// A strip segment gets its name from this width.
+const STRIP_LABEL_W: f32 = 48.0;
 /// Siblings reorder only when one's time changes by more than this: 50 ms or 10 %.
 const ORDER_BAND: Band = Band {
     abs: 0.05,
@@ -113,6 +125,8 @@ pub(crate) struct UsageMap {
     preorder: Vec<usize>,
     stack: Vec<usize>,
     queue: Vec<(Option<usize>, Rect)>,
+    /// The strip's work list: (first and last of a folded chain, x, width, row).
+    strip_queue: Vec<(usize, usize, f32, f32, usize)>,
     items: Vec<Item>,
     values: Vec<f64>,
     rects: Vec<Rect>,
@@ -261,15 +275,7 @@ impl UsageMap {
             }
             // Largest first, by sticky key; the parent's own time goes last so it
             // keeps its corner of the frame.
-            items.sort_by(|a, b| match (*a, *b) {
-                (Item::Child(x), Item::Child(y)) => {
-                    self.sort_key(y).total_cmp(&self.sort_key(x)).then_with(|| {
-                        let key = |i: usize| self.nodes[i].statics.key.pid;
-                        key(x).cmp(&key(y))
-                    })
-                }
-                _ => std::cmp::Ordering::Equal,
-            });
+            self.sort_items(&mut items);
             if let Some(i) = container {
                 items.push(Item::Own(i));
             }
@@ -311,6 +317,143 @@ impl UsageMap {
         items.clear();
         self.items = items;
         self.rects = rects;
+    }
+
+    /// Lay the icicle out across `area`: the top-level processes (chains folded)
+    /// along the first row, as wide as their share of the CPU used; the busy
+    /// children of each beneath it, within its span. A parent's own time is the
+    /// part of its span its children leave empty.
+    fn layout_strip(&mut self, area: Rect) {
+        self.tiles.clear();
+        self.strip_queue.clear();
+        if self.used <= 0.0 || area.is_empty() {
+            return;
+        }
+        let rows = STRIP_ROWS as f32;
+        let row_h = (area.h - STRIP_ROW_GAP * (rows - 1.0)) / rows;
+        let mut items = std::mem::take(&mut self.items);
+        items.clear();
+        items.extend(self.roots.iter().map(|&r| Item::Child(r)));
+        self.sort_items(&mut items);
+        let mut x = area.x;
+        for it in &items {
+            if let Item::Child(c) = *it {
+                let w = area.w * (self.nodes[c].total / self.used) as f32;
+                self.strip_queue.push((c, self.chain_end(c), x, w, 0));
+                x += w;
+            }
+        }
+        while let Some((top, end, x, w, row)) = self.strip_queue.pop() {
+            if w < 1.5 {
+                continue;
+            }
+            let y = area.y + row as f32 * (row_h + STRIP_ROW_GAP);
+            self.tiles.push(Tile {
+                rect: Rect::new(x, y, w, row_h),
+                node: end,
+                top,
+                kind: TileKind::Leaf,
+            });
+            if row + 1 >= STRIP_ROWS {
+                continue;
+            }
+            let span = self.nodes[top].total;
+            items.clear();
+            items.extend(self.busy_children(end).map(Item::Child));
+            self.sort_items(&mut items);
+            let mut cx = x;
+            for it in &items {
+                if let Item::Child(c) = *it {
+                    let cw = w * (self.nodes[c].total / span) as f32;
+                    self.strip_queue
+                        .push((c, self.chain_end(c), cx, cw, row + 1));
+                    cx += cw;
+                }
+            }
+        }
+        items.clear();
+        self.items = items;
+    }
+
+    /// Children largest first, by sticky key, ties by PID.
+    fn sort_items(&self, items: &mut [Item]) {
+        items.sort_by(|a, b| match (*a, *b) {
+            (Item::Child(x), Item::Child(y)) => {
+                self.sort_key(y).total_cmp(&self.sort_key(x)).then_with(|| {
+                    let pid = |i: usize| self.nodes[i].statics.key.pid;
+                    pid(x).cmp(&pid(y))
+                })
+            }
+            _ => std::cmp::Ordering::Equal,
+        });
+    }
+
+    /// Draw the icicle strip in `rect`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_strip(
+        &mut self,
+        dl: &mut DisplayList,
+        rect: Rect,
+        usage: &Usage,
+        snap: &Snapshot,
+        needle: &str,
+        selected: Option<RowId>,
+        theme: &Theme,
+        buf: &mut String,
+    ) {
+        self.build(usage, snap, needle, buf);
+        self.layout_strip(rect);
+        dl.fill_round_rect(rect, 2.0, theme.surface);
+        dl.push_clip(rect);
+        for t in &self.tiles {
+            let n = &self.nodes[t.node];
+            let body = Rect::new(t.rect.x, t.rect.y, (t.rect.w - 1.0).max(0.5), t.rect.h);
+            let muted = n.dim || !n.alive;
+            dl.fill_rect(body, theme.surface);
+            if !muted {
+                let heat = (n.cpu_now / 100.0).clamp(0.0, 1.0);
+                dl.fill_rect(body, theme.heat.with_alpha(0.10 + 0.55 * heat));
+            }
+            if self.hover == Some(n.statics.key) {
+                dl.fill_rect(body, theme.button_hover);
+            }
+            if body.w >= STRIP_LABEL_W {
+                self.chain_name(t.top, t.node, buf);
+                let ink = if muted { theme.text_dim } else { theme.text };
+                dl.label(buf, body.inset(4.0, 0.0), theme.small, ink);
+            }
+            let top_key = self.nodes[t.top].statics.key;
+            if selected == Some(row_id(n.statics.key)) || selected == Some(row_id(top_key)) {
+                dl.stroke_rect(body, theme.accent, 1.5);
+            }
+        }
+        dl.pop_clip();
+    }
+
+    /// What the pointer is over, for a status line: the process, its average CPU
+    /// and seconds used over the window. False, and `out` empty, when nothing is.
+    pub fn describe_hover(&self, out: &mut String) -> bool {
+        out.clear();
+        let Some(&i) = self.hover.and_then(|k| self.index.get(&k)) else {
+            return false;
+        };
+        let n = &self.nodes[i];
+        let _ = write!(
+            out,
+            "{} \u{b7} PID {} \u{b7} ",
+            n.statics.name, n.statics.key.pid
+        );
+        push_percent(out, self.average(n.total));
+        out.push_str("% of a core on average over ");
+        self.window(out);
+        let _ = write!(out, ", {:.1} s of CPU", n.total);
+        if !self.children(i).is_empty() {
+            out.push_str(" with everything under it");
+        }
+        if !n.alive {
+            out.push_str(" \u{b7} exited");
+        }
+        true
     }
 
     /// Follow a chain of single children down from `i` while each link has next to
@@ -534,27 +677,7 @@ impl UsageMap {
 
     /// The line under the map: the tile under the pointer, or what the map shows.
     fn caption(&self, out: &mut String) {
-        out.clear();
-        let hovered = self
-            .hover
-            .and_then(|k| self.index.get(&k))
-            .map(|&i| (i, &self.nodes[i]));
-        if let Some((i, n)) = hovered {
-            let _ = write!(
-                out,
-                "{} \u{b7} PID {} \u{b7} ",
-                n.statics.name, n.statics.key.pid
-            );
-            push_percent(out, self.average(n.total));
-            out.push_str("% of a core on average over ");
-            self.window(out);
-            let _ = write!(out, ", {:.1} s of CPU", n.total);
-            if !self.children(i).is_empty() {
-                out.push_str(" with everything under it");
-            }
-            if !n.alive {
-                out.push_str(" \u{b7} exited");
-            }
+        if self.describe_hover(out) {
             return;
         }
         let lp = self.logical_processors.max(1);
@@ -812,6 +935,52 @@ mod tests {
         assert!(
             strings.iter().any(|s| s == "p1.exe \u{203a} p2.exe"),
             "{strings:?}"
+        );
+    }
+
+    #[test]
+    fn the_strip_is_the_tree_folded_flat() {
+        let (u, snap) = usage_of(&[(1, 6), (2, 30), (3, 12), (4, 12)]);
+        let mut m = UsageMap::default();
+        let mut dl = DisplayList::new();
+        let rect = Rect::new(0.0, 0.0, 600.0, STRIP_H);
+        m.paint_strip(
+            &mut dl,
+            rect,
+            &u,
+            &snap,
+            "",
+            None,
+            &Theme::dark(),
+            &mut String::new(),
+        );
+        assert_eq!(dl.clip_depth(), 0);
+        let seg = |pid: u32| {
+            m.tiles
+                .iter()
+                .find(|t| m.nodes[t.node].statics.key.pid == pid)
+                .map(|t| t.rect)
+                .unwrap()
+        };
+        let (one, four) = (seg(1), seg(4));
+        // Top row: 48 s under p1 and 12 s for p4, across the whole width.
+        assert!((one.y - four.y).abs() < 1e-3 && one.y.abs() < 1e-3);
+        assert!((one.w - 480.0).abs() < 0.5 && (four.w - 120.0).abs() < 0.5);
+        // Second row: p1's children within its span, in proportion to the whole
+        // it spans (30 s and 12 s of 48); its own 6 s is the gap left at the end.
+        let (two, three) = (seg(2), seg(3));
+        assert!(two.y > one.y && (two.y - three.y).abs() < 1e-3);
+        assert!(two.x >= one.x && three.right() <= one.right() + 1e-3);
+        assert!((two.w - 300.0).abs() < 0.5 && (three.w - 120.0).abs() < 0.5);
+        let strings = texts(&dl);
+        assert!(strings.iter().any(|s| s == "p2.exe"), "{strings:?}");
+        // Pointing at a segment describes it.
+        assert!(m.set_hover(Some(two.center())));
+        let mut out = String::new();
+        assert!(m.describe_hover(&mut out));
+        assert!(
+            out.starts_with("p2.exe \u{b7} PID 2 \u{b7} 50% of a core"),
+            "{out}"
         );
     }
 

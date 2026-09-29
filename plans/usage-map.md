@@ -1,6 +1,6 @@
 # A 2D view of who has been using the CPU: treemap ("Map") and icicle strip
 
-> **Status:** active · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done (unpushed) · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Follows `plans/charts-log-time-and-live-table.md` (item 5, decision 14).
 
 ## Goal
@@ -60,8 +60,11 @@ with the open items", which is the go-ahead on the recommended choices below.
 3. ~~`ot-ui::treemap`: squarified layout, nested layout. Tests.~~
 4. ~~Map arrangement in `App`: toolbar segment, painting, hover readout, click to
    select, search dimming, caption. Tests.~~
-5. **[current]** Icicle strip between the charts and the toolbar. Tests.
-6. README, plans; checks on three targets; screenshots; commits.
+5. ~~Icicle strip between the charts and the toolbar. Tests.~~
+6. ~~README, plans; checks on three targets; screenshots; commits.~~
+
+All steps done. Possible follow-ups, not asked for: a window other than the last
+minute (a range dragged on a chart), a memory mode.
 
 ## Findings / gotchas
 
@@ -84,6 +87,15 @@ with the open items", which is the go-ahead on the recommended choices below.
   in Map mode.
 - **Bash heredocs eat backslashes** in Python source (`\u{b7}`, Windows paths):
   write patch scripts with the Write tool and run them from a file.
+- **The strip and the Map share one `UsageMap`** (they are never on screen
+  together), so hover, `key_at` and `tile_rect` work for whichever was painted last.
+  The strip's tiles are all `Leaf`; a child's width is its share of the whole
+  subtree its parent spans, so the parent's own time is the gap left at the end.
+- **The toolbar already had a "strip"**, the ancestry line. The README now calls
+  that the ancestry line, and the new one the usage strip; pointing at a segment
+  shows its readout in the ancestry line's place (`Toolbar::note`).
+- Only x64 Windows, x64 Linux and x64 macOS have the Rust std installed here; the
+  Windows ARM target is CI's (`rustup target list --installed`).
 
 ## Progress log
 
@@ -95,8 +107,12 @@ with the open items", which is the go-ahead on the recommended choices below.
 - [x] Map arrangement: `ot-ui/src/usage_map.rs`, `ViewMode::Map`, the toolbar's
       third segment, Ctrl+M, `--view map`; checked in the app
       (`target/drive/map-25s-b.png`).
-- [ ] Icicle strip.
-- [ ] Docs, checks, screenshots.
+- [x] Icicle strip: `UsageMap::paint_strip` (two rows, chains folded, busy
+      children only), `STRIP_H` 30 px between the graphs and the toolbar in List
+      and Tree; hover reads out in the toolbar, click selects and reveals in the
+      table; checked in the app (`target/drive/strip-list.png`).
+- [x] Docs, checks, screenshots: README paragraph; clippy clean on x64
+      Windows, Linux and macOS; `cargo test --workspace` passes.
 
 ## Open questions for the user
 

@@ -83,17 +83,25 @@ control above it; **Ctrl+T** toggles List and Tree (Process Explorer's binding) 
   frame, `pwsh.exe › node.exe › electron.exe`. Color is the table's heat: how busy the
   process is right now. A process that exited in the last minute stays, dimmed and
   marked, until the minute passes it. Pointing at a tile names it and gives its
-  average CPU and seconds used; a click selects it (the ancestry strip and the other
+  average CPU and seconds used; a click selects it (the ancestry line and the other
   arrangements keep the selection), right-click gives the process menu, and the
   search dims what does not match. The line under the map says how much of the
   machine was used over the minute.
 
+In List and Tree, a thin **usage strip** between the graphs and the table keeps the
+Map's answer in view: the Map folded flat into two rows. The top-level processes run
+across the first row, each as wide as its share of the CPU used over the last minute,
+and what runs under each sits beneath it within its span; the gap a parent's children
+leave is its own time. Chains fold and color is heat, as in the Map. Pointing at a
+segment reads it out in place of the ancestry line, and a click selects that process
+in the table and scrolls to it.
+
 Switching keeps the selected process: pick the hottest thing in the list, press
 Ctrl+T, and the tree opens with that process revealed and centered, ancestors
 expanded. Clicking the control for the arrangement you are already in re-reveals the
-selection. The strip above the table shows the selected process's ancestry
-(`wininit.exe › services.exe › svchost.exe`) in both arrangements, so the flat list
-and the tree read as one thing.
+selection. The line beside the control shows the selected process's ancestry
+(`wininit.exe › services.exe › svchost.exe`) in every arrangement, so the flat list,
+the tree and the map read as one thing.
 
 Parent links are real identities, not just parent PIDs: a process whose parent
 exited, and whose PID was then recycled by a stranger, is shown as a root rather than

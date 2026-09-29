@@ -1,6 +1,6 @@
 # Charts on a log time axis, synced hover, resize repaint, and a calmer live table
 
-> **Status:** active · **Started:** 2026-09-28 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** built; waiting on the user's live-drag check (open question 1) · **Started:** 2026-09-28 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md` (decision 8: log-scale time axis).
 
 ## Goal
@@ -155,11 +155,12 @@ The user's feedback on 2026-09-28, five items:
     e. Shell: settings in the registry, animation frame loop, system animation
        setting, window title while paused.
     f. README, plans; checks on three targets; screenshots; commit.
-11. **[current]** Item 5: treemap "Map" arrangement, then the icicle strip. Needs
-    its own design pass first (data: cumulative CPU per process; layout: squarified
-    and stable; interaction: shared selection). The peer thread is idle in the
-    probe and model now (its work is committed), so publishing cumulative CPU
-    time in `ProcessSample` no longer collides.
+11. ~~Item 5: treemap "Map" arrangement, then the icicle strip.~~ Done in its own
+    plan, `plans/usage-map.md` (`7fd946b`, `bba654e`, then "The usage strip: the
+    Map folded flat above the table").
+
+Nothing left to build; only open question 1 (the live drag) remains, and it is the
+user's to check.
 
 ## Findings / gotchas
 
@@ -213,9 +214,9 @@ The user's feedback on 2026-09-28, five items:
 - **`PrintWindow(PW_RENDERFULLCONTENT)` takes about 300 ms a frame here**, too slow
   to time a 150 ms slide; one burst frame still caught rows mid-slide
   (`target/drive/burst-1-crop.png`), which shows the frame loop runs.
-- **Mid-slide, crossing rows overlap visibly**: row backgrounds are translucent
-  (over Mica), so a row sliding past another does not hide it. Could give moving
-  rows an opaque backing (`bg_solid`); not done, to be raised with the user.
+- **Mid-slide, crossing rows overlapped visibly**: row backgrounds are translucent
+  (over Mica), so a row sliding past another did not hide it. Fixed in `20896bf`:
+  moving rows get an opaque backing (open question 2).
 - Driving the app without touching the real cursor: `target/drive.ps1` (steps
   `move`, `click`, `char`, `wait`, `shot`, `title`; client pixels), plus the
   scratch `SCRATCH-HOVER-SHOT` build (above) for anything needing the pointer to
@@ -252,7 +253,9 @@ The user's feedback on 2026-09-28, five items:
       reports v0.3.0. Checked on HEAD `200c34f`: nothing of this thread's was
       reverted (the self-update thread extended `settings.rs`, `prefs.rs` and the
       shell around it); tests and clippy on three targets pass.
-- [ ] Item 5: treemap, then icicle strip.
+- [x] Moving rows' opaque backing (`20896bf`).
+- [x] Item 5: usage accounting (`7fd946b`), the Map (`bba654e`), the usage strip
+      (the commit after it); see `plans/usage-map.md`. Not pushed yet.
 
 ## Item 4: keeping the table from jumping (options put to the user)
 
