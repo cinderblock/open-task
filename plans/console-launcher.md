@@ -1,6 +1,6 @@
 # A console launcher (`open-task.com`) so command-line modes work from a terminal
 
-> **Status:** active · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done, shipped in v0.4.1 · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Found while checking v0.4.0 (`plans/usage-map.md`, open question 1). Ships as v0.4.1.
 
 ## Goal
@@ -67,7 +67,7 @@ The pipe is being closed. (os error 232)". Fix it properly, and stop the panic.
    installs it; `build-installer.ps1` passes it.~~
 4. ~~README; checks; a local end-to-end with release builds (`cmd /c`, PowerShell
    `>`, `Get-Command` picking the `.com`, a GUI launch returning at once).~~
-5. **[current]** Commit; release v0.4.1 via tag; verify from the published assets.
+5. ~~Commit; release v0.4.1 via tag; verify from the published assets.~~
 
 ## Findings / gotchas
 
@@ -121,11 +121,29 @@ The pipe is being closed. (os error 232)". Fix it properly, and stop the panic.
       macOS; `cargo test --workspace` passes; end-to-end with release builds:
       `cmd /c` redirect, PowerShell redirect, `Get-Command`/`where` pick the
       `.com`, exit code 4 relayed, early reader, window launch 0.17 s, Ctrl+Break.
-- [ ] v0.4.1 released and verified.
+- [x] **Shipped in v0.4.1.** Launcher commit `84a8836` (CI green on all four
+      targets; the launcher tests ran on x64 and ARM64 Windows), release commit
+      `91ecdf8`; tag pushed and published 17:52 PDT (00:52:09 UTC on 09-30).
+      The new release check passed on both Windows builds (`cmd /c` through
+      `open-task.com` got `open-task v0.4.1`). Checked from the published assets
+      in `target/release-check/v0.4.1`: minisign verifies, the x64 zip and
+      `setup.exe` match SHA256SUMS, the zip holds `open-task.com` (171,520 bytes,
+      "open-task console launcher") beside `open-task.exe`, the installer is
+      0.4.1; with the zip's own files, `cmd /c` with a redirect gets the version,
+      an early reader ends with code 0, and a window launch returns in 0.03 s.
+- On the user's machine, found at the end: `open-task` on PATH is a stale
+  `cargo install` copy (`~\.cargo\bin\open-task.exe`, 2026-09-25, no version
+  resource, predates `--version`); the installed copy (Program Files, v0.3.1)
+  is not on PATH. Left alone: theirs to update or remove (see open question 1).
 
 ## Open questions for the user
 
-- None.
+1. Not a blocker, the user's own setup: to get `open-task.com` from a terminal,
+   update the installed copy (the update button, to v0.4.1), put it on PATH (re-run
+   the installer with "Add open-task to PATH", which writes the machine PATH and so
+   comes before `~\.cargo\bin`), and remove the stale cargo copy (`cargo uninstall
+   ot-app`) or refresh it (`cargo install --path crates/ot-app --locked`, which now
+   also installs `open-task-console`).
 
 ## Things not to do
 
