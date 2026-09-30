@@ -7,8 +7,10 @@
 
 #![forbid(unsafe_code)]
 // Release builds are GUI-subsystem so launching the app does not open a terminal.
-// Debug builds keep the console for logs. Headless mode attaches to the parent
-// console at startup so it can still print from a release build.
+// Debug builds keep the console for logs. The command-line modes attach to the
+// parent console at startup so they can still print from a release build, and a
+// terminal waits for them through the console launcher, `open-task.com`
+// (src/console.rs).
 #![cfg_attr(
     all(windows, not(debug_assertions), not(test)),
     windows_subsystem = "windows"
@@ -25,17 +27,44 @@ use ot_probe::{CpuSampler, PlatformProbe, PlatformSampler, SystemProbe};
 /// (`0.2.1-19-g892159c`, `-dirty` with uncommitted changes). Set by `build.rs`.
 const VERSION: &str = env!("OT_VERSION");
 
+/// `println!` for the command-line modes, which must not panic when stdout goes
+/// away: a pipe whose reader stopped early (`| Select-Object -First 3`), or a shell
+/// that did not wait. See [`stdout_line`].
+macro_rules! out {
+    () => {
+        stdout_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        stdout_line(format_args!($($arg)*))
+    };
+}
+
 fn main() {
+    // First, before any other thread exists: the console launcher that started this
+    // process, if one did (it passes an environment variable, which this removes).
+    #[cfg(windows)]
+    let launcher = ot_shell_win::launcher::Launcher::adopt();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let version = args.iter().any(|a| a == "--version" || a == "-V");
     let check_update = args.iter().any(|a| a == "--check-update");
+    let sample = arg_value(&args, "--sample").and_then(|s| s.parse::<u32>().ok());
     let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
-    if headless || version || check_update {
-        #[cfg(windows)]
-        ot_shell_win::attach_parent_console();
+    // Everything but the window is a command-line mode, and prints.
+    let window = !(version || check_update || sample.is_some() || headless);
+    #[cfg(windows)]
+    {
+        if window {
+            // The launcher can give the terminal its prompt back now.
+            if let Some(launcher) = launcher {
+                launcher.release();
+            }
+        } else {
+            ot_shell_win::attach_parent_console();
+        }
     }
     if version {
-        println!("open-task v{VERSION}");
+        out!("open-task v{VERSION}");
         return;
     }
 
@@ -63,7 +92,7 @@ fn main() {
 
     let probe = match PlatformProbe::new() {
         Ok(p) => p,
-        Err(e) => fail(&format!("failed to initialize probe: {e}"), 2, !headless),
+        Err(e) => fail(&format!("failed to initialize probe: {e}"), 2, window),
     };
     tracing::info!(caps = ?probe.capabilities(), "probe capabilities");
 
@@ -71,7 +100,7 @@ fn main() {
         interval: Duration::from_secs(1),
     };
 
-    if let Some(pid) = arg_value(&args, "--sample").and_then(|s| s.parse::<u32>().ok()) {
+    if let Some(pid) = sample {
         let seconds: u64 = arg_value(&args, "--seconds")
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
@@ -93,10 +122,10 @@ fn run_check_update() -> i32 {
             return 1;
         }
     };
-    println!("open-task v{build}");
+    out!("open-task v{build}");
     match ot_update::installation() {
-        Some(i) => println!("installed for {:?} in {}", i.scope, i.dir.display()),
-        None => println!("not installed by the installer: updates are announced, not installed"),
+        Some(i) => out!("installed for {:?} in {}", i.scope, i.dir.display()),
+        None => out!("not installed by the installer: updates are announced, not installed"),
     }
     let feed = ot_update::Feed::official();
     let platform = ot_update::native(&format!("open-task/{VERSION}"));
@@ -104,9 +133,9 @@ fn run_check_update() -> i32 {
         Ok(release) => {
             let v = &release.version;
             if build.is_older_than(v) {
-                println!("v{v} is available: {}", feed.release_page(v));
+                out!("v{v} is available: {}", feed.release_page(v));
             } else {
-                println!("up to date (the latest release is v{v})");
+                out!("up to date (the latest release is v{v})");
             }
             0
         }
@@ -114,6 +143,21 @@ fn run_check_update() -> i32 {
             eprintln!("could not check for updates: {e}");
             1
         }
+    }
+}
+
+/// One line to stdout, for [`out!`]. When stdout has gone away the program ends
+/// quietly rather than panicking: with code 0 on a broken pipe, since the reader
+/// chose to stop (as `head` expects), and 1 on any other failure.
+fn stdout_line(args: std::fmt::Arguments) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = stdout
+        .write_fmt(args)
+        .and_then(|()| stdout.write_all(b"\n"))
+    {
+        let code = i32::from(e.kind() != std::io::ErrorKind::BrokenPipe);
+        std::process::exit(code);
     }
 }
 
@@ -218,7 +262,7 @@ fn run_sample(probe: Box<dyn SystemProbe>, config: SamplerConfig, pid: u32, seco
         std::process::exit(4);
     };
     let services: Vec<String> = p.services.iter().map(|s| s.name.to_string()).collect();
-    println!(
+    out!(
         "sampling {} (PID {pid}) for {seconds} s; services: [{}]",
         p.name(),
         services.join(", ")
@@ -233,22 +277,22 @@ fn run_sample(probe: Box<dyn SystemProbe>, config: SamplerConfig, pid: u32, seco
 }
 
 fn print_attribution_result(a: &ot_model::attribution::Attribution) {
-    println!(
+    out!(
         "{} samples over {:.1} s",
         a.samples,
         a.duration.as_secs_f32()
     );
     let total = a.samples.max(1) as f32;
-    println!("  by module:");
+    out!("  by module:");
     for m in a.modules.iter().take(12) {
-        println!(
+        out!(
             "    {:>5.1}%  {:>7}  {}",
             m.count as f32 / total * 100.0,
             m.count,
             m.label
         );
     }
-    println!("  by thread:");
+    out!("  by thread:");
     for t in a.threads.iter().take(8) {
         let top: Vec<String> = t
             .modules
@@ -262,7 +306,7 @@ fn print_attribution_result(a: &ot_model::attribution::Attribution) {
                 )
             })
             .collect();
-        println!(
+        out!(
             "    tid {:>7}  {:>5.1}%  {}",
             t.tid,
             t.samples as f32 / total * 100.0,
@@ -270,16 +314,20 @@ fn print_attribution_result(a: &ot_model::attribution::Attribution) {
         );
     }
     if let Some(c) = &a.clients {
-        println!(
+        out!(
             "  clients of {} via {} ({} events, {} lost), by {}:",
-            c.service, c.provider, c.events, c.lost, c.field
+            c.service,
+            c.provider,
+            c.events,
+            c.lost,
+            c.field
         );
         for b in c.buckets.iter().take(12) {
-            println!("    {:>7}  {}", b.count, b.label);
+            out!("    {:>7}  {}", b.count, b.label);
         }
     }
     for n in &a.notes {
-        println!("  note: {n}");
+        out!("  note: {n}");
     }
 }
 
@@ -304,7 +352,7 @@ fn print_hardware(hw: &ot_model::hardware::Hardware) {
             let _ = write!(line, ", {name} {}", human(b));
         }
     }
-    println!("{line}");
+    out!("{line}");
 }
 
 /// The clock, the memory lists, and each disk and network adapter.
@@ -335,7 +383,7 @@ fn print_devices(snap: &ot_core::Snapshot) {
         }
     }
     if !extra.is_empty() {
-        println!("  {extra}");
+        out!("  {extra}");
     }
     for d in &snap.disks {
         let kind = match d.info.ssd {
@@ -343,7 +391,7 @@ fn print_devices(snap: &ot_core::Snapshot) {
             Some(false) => "HDD",
             None => "disk",
         };
-        println!(
+        out!(
             "  {:<16} {:>5.1}% active  read {:>8}/s  write {:>8}/s  {}  {}{}",
             d.info.name,
             d.active.get(),
@@ -358,7 +406,7 @@ fn print_devices(snap: &ot_core::Snapshot) {
         );
     }
     for a in &snap.adapters {
-        println!(
+        out!(
             "  {:<28} rx {:>8}/s  tx {:>8}/s  {:?}{}  {}",
             a.info.name,
             human(a.rx_per_sec),
@@ -372,7 +420,7 @@ fn print_devices(snap: &ot_core::Snapshot) {
 
 fn print_snapshot(snap: &ot_core::Snapshot) {
     let mem = &snap.memory;
-    println!(
+    out!(
         "tick {}  interval {:>6.1?}  probe cost {:>7.3?}  procs {}  cpu {:>5.1}%  mem {}/{} ({} avail)",
         snap.tick.0,
         snap.interval,
@@ -397,17 +445,23 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
             format!("{k}{:>3.0}", c.usage.get())
         })
         .collect();
-    println!("  cores: {}", cores.join(" "));
+    out!("  cores: {}", cores.join(" "));
     print_devices(snap);
 
     let mut procs: Vec<_> = snap.processes.iter().collect();
     procs.sort_by(|a, b| b.cpu.get().total_cmp(&a.cpu.get()));
-    println!(
+    out!(
         "  {:>7}  {:>6}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  name",
-        "pid", "cpu%", "ws", "private", "thr", "hnd", "user"
+        "pid",
+        "cpu%",
+        "ws",
+        "private",
+        "thr",
+        "hnd",
+        "user"
     );
     for p in procs.iter().take(12) {
-        println!(
+        out!(
             "  {:>7}  {:>6.1}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  {}",
             p.key().pid,
             p.cpu.get(),
@@ -434,10 +488,10 @@ fn print_attribution(snap: &ot_core::Snapshot, procs: &[&ot_model::process::Proc
         .take(3)
         .collect();
     if !hosts.is_empty() {
-        println!("  service hosts (top 3 by CPU):");
+        out!("  service hosts (top 3 by CPU):");
         for p in hosts {
             let names: Vec<&str> = p.services.iter().map(|s| &*s.name).collect();
-            println!(
+            out!(
                 "    pid {:>6} {:>5.1}%  {}  [{}]",
                 p.key().pid,
                 p.cpu.get(),
@@ -458,7 +512,7 @@ fn print_attribution(snap: &ot_core::Snapshot, procs: &[&ot_model::process::Proc
         .collect();
     threads.sort_by(|a, b| b.1.cpu.get().total_cmp(&a.1.cpu.get()));
     if !threads.is_empty() {
-        println!(
+        out!(
             "  threads ({} sampled; tags {}):",
             snap.threads.len(),
             if snap.capabilities.service_tags {
@@ -467,9 +521,13 @@ fn print_attribution(snap: &ot_core::Snapshot, procs: &[&ot_model::process::Proc
                 "off, needs administrator"
             }
         );
-        println!(
+        out!(
             "  {:>7}  {:>7}  {:>6}  {:<10}  {:<28}  process",
-            "pid", "tid", "cpu%", "state", "service"
+            "pid",
+            "tid",
+            "cpu%",
+            "state",
+            "service"
         );
         for (p, t) in threads.iter().take(8) {
             let service = match t.service {
@@ -479,7 +537,7 @@ fn print_attribution(snap: &ot_core::Snapshot, procs: &[&ot_model::process::Proc
                 ot_model::thread::ServiceTag::None => "-",
                 ot_model::thread::ServiceTag::Unknown => "",
             };
-            println!(
+            out!(
                 "  {:>7}  {:>7}  {:>6.1}  {:<10}  {:<28}  {}",
                 p.key().pid,
                 t.tid,
@@ -490,7 +548,7 @@ fn print_attribution(snap: &ot_core::Snapshot, procs: &[&ot_model::process::Proc
             );
         }
     }
-    println!();
+    out!();
 }
 
 fn human(b: Bytes) -> String {

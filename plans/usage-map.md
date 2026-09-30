@@ -131,7 +131,9 @@ minute (a range dragged on a chart), a memory mode.
 
 ## Open questions for the user
 
-1. Found while checking v0.4.0, older than this work: typed at an interactive
+1. **Answered, 2026-09-29: "ship the --version fix"**; built in
+   `plans/console-launcher.md`, released as v0.4.1. The question as asked:
+   found while checking v0.4.0, older than this work: typed at an interactive
    prompt, `open-task --version` (and `--headless`, `--check-update`) comes back
    to the prompt at once and prints afterwards, because the release exe is a GUI
    program. The README says it "prints the version". Recommendation: ship a

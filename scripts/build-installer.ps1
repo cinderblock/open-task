@@ -1,9 +1,12 @@
-# Build the Windows installer from two already-built binaries.
+# Build the Windows installer from already-built binaries, one set per architecture.
 #
 # Usage:
 #   pwsh -File scripts/build-installer.ps1 -Version 0.2.1 `
 #       -X64Exe path\to\x64\open-task.exe -Arm64Exe path\to\arm64\open-task.exe `
 #       [-OutDir target\installer]
+#
+# Beside each open-task.exe must be its console launcher, open-task.com (the
+# open-task-console binary, renamed), as in the release zips.
 #
 # Finds ISCC.exe in, in order: $env:ISCC, $env:INNO_SETUP_DIR, the standard install
 # locations of Inno Setup 6 and 7, and the repo's portable copies under
@@ -33,11 +36,15 @@ $iscc = @($explicit + $discovered) | Select-Object -First 1
 if (-not $iscc) { throw "ISCC.exe not found; install Inno Setup 6.3+ or set INNO_SETUP_DIR" }
 Write-Host "using $iscc"
 
-foreach ($exe in @($X64Exe, $Arm64Exe)) {
-    if (-not (Test-Path $exe)) { throw "binary not found: $exe" }
+$X64Com = Join-Path (Split-Path -Parent $X64Exe) "open-task.com"
+$Arm64Com = Join-Path (Split-Path -Parent $Arm64Exe) "open-task.com"
+foreach ($file in @($X64Exe, $Arm64Exe, $X64Com, $Arm64Com)) {
+    if (-not (Test-Path $file)) { throw "binary not found: $file" }
 }
 $X64Exe = (Resolve-Path $X64Exe).Path
 $Arm64Exe = (Resolve-Path $Arm64Exe).Path
+$X64Com = (Resolve-Path $X64Com).Path
+$Arm64Com = (Resolve-Path $Arm64Com).Path
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
 
@@ -49,6 +56,8 @@ $numeric = ($Version -split "-")[0]
     "/DVersionInfoVersion=$numeric" `
     "/DX64Exe=$X64Exe" `
     "/DArm64Exe=$Arm64Exe" `
+    "/DX64Com=$X64Com" `
+    "/DArm64Com=$Arm64Com" `
     "/DOutputDir=$OutDir" `
     "/Qp" `
     (Join-Path $repo "installer\windows\open-task.iss")

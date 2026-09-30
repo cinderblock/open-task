@@ -13,6 +13,8 @@
 ;   AppVersion   version string, e.g. 0.2.1 or 0.3.0-pre.1
 ;   X64Exe       path to the x86_64-pc-windows-msvc open-task.exe
 ;   Arm64Exe     path to the aarch64-pc-windows-msvc open-task.exe
+;   X64Com       path to the x86_64-pc-windows-msvc open-task.com (console launcher)
+;   Arm64Com     path to the aarch64-pc-windows-msvc open-task.com
 ; Optional:
 ;   VersionInfoVersion   numeric x.y.z for the file version resource (default AppVersion)
 ;   OutputDir            where the setup .exe goes (default: the script's directory)
@@ -32,6 +34,12 @@
 #endif
 #ifndef Arm64Exe
   #error Pass /DArm64Exe=path\to\arm64\open-task.exe
+#endif
+#ifndef X64Com
+  #error Pass /DX64Com=path\to\x64\open-task.com
+#endif
+#ifndef Arm64Com
+  #error Pass /DArm64Com=path\to\arm64\open-task.com
 #endif
 #ifndef VersionInfoVersion
   #define VersionInfoVersion AppVersion
@@ -95,6 +103,10 @@ Name: "addtopath"; Description: "Add open-task to PATH (for ""open-task --headle
 [Files]
 Source: "{#X64Exe}"; DestDir: "{app}"; DestName: "open-task.exe"; Flags: ignoreversion; Check: not IsArm64
 Source: "{#Arm64Exe}"; DestDir: "{app}"; DestName: "open-task.exe"; Flags: ignoreversion; Check: IsArm64
+; The console launcher: what `open-task` runs from a terminal (.COM comes before .EXE
+; in PATHEXT), so the shell waits for --version, --headless and --check-update.
+Source: "{#X64Com}"; DestDir: "{app}"; DestName: "open-task.com"; Flags: ignoreversion; Check: not IsArm64
+Source: "{#Arm64Com}"; DestDir: "{app}"; DestName: "open-task.com"; Flags: ignoreversion; Check: IsArm64
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 

@@ -11,8 +11,9 @@
 //! Git is only read, never locked: `describe` without `--dirty` and `status` with
 //! optional locks off, so a build never collides with a `git add` running beside it.
 //!
-//! The Windows resource is written here as a `.res` file and handed to the linker,
-//! which converts `.res` inputs itself. No resource compiler is needed. The icon
+//! The Windows resources are written here as a `.res` file per binary (the app and
+//! its console launcher, [`PROGRAMS`]) and handed to the linker, which converts
+//! `.res` inputs itself. No resource compiler is needed. The icon
 //! comes from `assets/logo/open-task.ico` (made by `scripts/render-logo.ps1`); a
 //! build without it, such as from a packaged crate, gets a warning and no icon.
 
@@ -39,20 +40,50 @@ fn main() {
     let windows_msvc = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if windows_msvc {
-        let mut resources = version_res(&build);
+        // The icon's entries, made once and appended to each binary's resources.
         let ico = workspace(&manifest_dir).join("assets/logo/open-task.ico");
-        match std::fs::read(&ico)
+        let mut icon = Vec::new();
+        if let Err(e) = std::fs::read(&ico)
             .map_err(|e| e.to_string())
-            .and_then(|bytes| icon_res(&bytes, &mut resources))
+            .and_then(|bytes| icon_res(&bytes, &mut icon))
         {
-            Ok(()) => {}
-            Err(e) => println!("cargo:warning=no app icon ({}): {e}", ico.display()),
+            println!("cargo:warning=no app icon ({}): {e}", ico.display());
+            icon.clear();
         }
-        let res = PathBuf::from(env("OUT_DIR")).join("open-task.res");
-        std::fs::write(&res, resources).expect("write the resources");
-        println!("cargo:rustc-link-arg-bins={}", res.display());
+        for program in &PROGRAMS {
+            let mut resources = version_res(&build, program);
+            resources.extend_from_slice(&icon);
+            let res = PathBuf::from(env("OUT_DIR")).join(format!("{}.res", program.bin));
+            std::fs::write(&res, resources).expect("write the resources");
+            println!("cargo:rustc-link-arg-bin={}={}", program.bin, res.display());
+        }
     }
 }
+
+/// How a binary names itself in its version resource.
+struct Program {
+    /// The Cargo target.
+    bin: &'static str,
+    /// What Explorer and Task Manager call it.
+    description: &'static str,
+    /// The file name it ships under.
+    file: &'static str,
+}
+
+/// The binaries, each with its own version resource and the app icon.
+const PROGRAMS: [Program; 2] = [
+    Program {
+        bin: "open-task",
+        description: "open-task",
+        file: "open-task.exe",
+    },
+    // Renamed when packaged: Cargo cannot emit a `.com` (src/console.rs).
+    Program {
+        bin: "open-task-console",
+        description: "open-task console launcher",
+        file: "open-task.com",
+    },
+];
 
 /// The workspace root, two levels above this crate.
 fn workspace(manifest_dir: &Path) -> &Path {
@@ -191,13 +222,13 @@ const RT_GROUP_ICON: u16 = 14;
 const APP_ICON: u16 = 1;
 const VS_FF_PRERELEASE: u32 = 0x2;
 
-/// A `.res` file holding one `VERSIONINFO` resource.
+/// A `.res` file holding one `VERSIONINFO` resource, for `program`.
 ///
 /// Layout, from the Win32 docs for `RESOURCEHEADER`, `VS_VERSIONINFO`,
 /// `StringFileInfo`, `StringTable`, `String`, `VarFileInfo` and `Var`: every
 /// structure starts on a 4-byte boundary, its `wLength` covers its header, key,
 /// value and children, and a `.res` file begins with an empty entry.
-fn version_res(build: &Build) -> Vec<u8> {
+fn version_res(build: &Build, program: &Program) -> Vec<u8> {
     let [a, b, c, d] = numeric(build);
     let ms = (u32::from(a) << 16) | u32::from(b);
     let ls = (u32::from(c) << 16) | u32::from(d);
@@ -225,14 +256,14 @@ fn version_res(build: &Build) -> Vec<u8> {
 
     let strings = [
         ("CompanyName", "Cameron Tacklind"),
-        ("FileDescription", "open-task"),
+        ("FileDescription", program.description),
         ("FileVersion", dotted.as_str()),
-        ("InternalName", "open-task"),
+        ("InternalName", program.bin),
         (
             "LegalCopyright",
             "Copyright (c) 2026 Cameron Tacklind. MIT License.",
         ),
-        ("OriginalFilename", "open-task.exe"),
+        ("OriginalFilename", program.file),
         ("ProductName", "open-task"),
         ("ProductVersion", build.version.as_str()),
         ("Comments", "https://github.com/cinderblock/open-task"),

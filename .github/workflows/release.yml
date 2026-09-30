@@ -4,7 +4,8 @@ name: Release
 # release with checksums. The self-updater reads these releases, so the asset naming
 # below is a contract: <name>-<tag>-<target>.<zip|tar.gz>, the Windows installer
 # <name>-<tag>-windows-setup.exe (both architectures in one file), plus SHA256SUMS
-# and SHA256SUMS.minisig.
+# and SHA256SUMS.minisig. A Windows zip holds open-task.exe and its console launcher,
+# open-task.com (crates/ot-app/src/console.rs).
 #
 # The updater trusts a release only through SHA256SUMS.minisig: a minisign signature
 # of SHA256SUMS by the key whose public half is minisign.pub (compiled into the app),
@@ -101,6 +102,32 @@ jobs:
           echo "$got"
           [ "$got" = "open-task $TAG" ] || { echo "::error::the binary says '$got', not 'open-task $TAG'"; exit 1; }
 
+      - name: Verify a terminal waits for the console launcher
+        # The release open-task.exe is a GUI program, which no shell waits for:
+        # `cmd /c "open-task --version > file"` used to leave the file empty. The
+        # console launcher, shipped beside it as open-task.com, is what `open-task`
+        # runs from a terminal (.COM comes before .EXE in PATHEXT), and must bring
+        # the output back before cmd moves on.
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $dir = (Resolve-Path "target/${{ matrix.target }}/release").Path
+          Copy-Item "$dir/${env:BIN}-console.exe" "$dir/${env:BIN}.com"
+          # Found through PATH, as an install with the PATH option is: cmd does not
+          # search the current directory when NoDefaultCurrentDirectoryInExePath is
+          # set, and PowerShell's location is not the process's anyway.
+          $env:PATH = "$dir;$env:PATH"
+          $out = Join-Path $env:RUNNER_TEMP "launcher-version.txt"
+          cmd /c "$env:BIN --version > `"$out`""
+          $code = $LASTEXITCODE
+          # An empty file reads as $null; the string makes it '' for the message.
+          $got = "$(Get-Content $out -Raw)".Trim()
+          Write-Host "exit $code, '$got'"
+          if ($code -ne 0 -or $got -ne "open-task $env:TAG") {
+            Write-Output "::error::through open-task.com, cmd got '$got' (exit $code), not 'open-task $env:TAG'"
+            exit 1
+          }
+
       - name: Package
         shell: bash
         run: |
@@ -109,6 +136,8 @@ jobs:
           mkdir -p "dist/$name"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp "target/${{ matrix.target }}/release/${BIN}.exe" "dist/$name/"
+            # The console launcher, under the name a terminal picks first.
+            cp "target/${{ matrix.target }}/release/${BIN}-console.exe" "dist/$name/${BIN}.com"
           else
             cp "target/${{ matrix.target }}/release/${BIN}" "dist/$name/"
           fi
@@ -153,6 +182,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = $env:TAG.TrimStart("v")
+          # Each open-task.exe has its open-task.com beside it; the script takes both.
           & ./scripts/build-installer.ps1 -Version $ver `
             -X64Exe "unpacked/$env:BIN-$env:TAG-x86_64-pc-windows-msvc/$env:BIN.exe" `
             -Arm64Exe "unpacked/$env:BIN-$env:TAG-aarch64-pc-windows-msvc/$env:BIN.exe" `

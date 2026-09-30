@@ -227,6 +227,16 @@ The bare binaries for every platform are on the same release as `.zip` / `.tar.g
 with a `SHA256SUMS` file. Linux and macOS have no installer because there is nothing
 to install yet beyond the headless probe stub.
 
+On Windows, `open-task.exe` comes with `open-task.com` beside it. The `.exe` is a
+windowed program, and shells do not wait for those, so a command-line mode typed at
+a prompt would print after the prompt had already come back, or not at all under
+`cmd /c` or a redirect. `open-task.com` is a small console program that terminals
+do wait for, and `open-task` finds it first (`.COM` comes before `.EXE` in
+`PATHEXT`). It runs `open-task.exe` with the same arguments and waits while a
+command-line mode prints, passing on its output and exit code. When the arguments
+open the window instead, it returns to the prompt right away. Call it
+`open-task`, not `open-task.exe`, to get this.
+
 ## Updates
 
 The version is at the bottom of the rail, above Settings: `v0.3.0` for a release,
@@ -263,7 +273,8 @@ Only a copy the installer put in place updates itself. Any other copy (a zip,
 the release's page.
 
 From a terminal, `open-task --version` prints the version and
-`open-task --check-update` runs a check and prints what it found.
+`open-task --check-update` runs a check and prints what it found (on Windows through
+`open-task.com`, see [Install](#install)).
 
 ## Build
 
@@ -292,8 +303,13 @@ To install the current tree as `open-task` on your `PATH`:
 cargo install --path crates/ot-app --locked
 ```
 
-Release builds have no console window; `--headless` still prints when run from a
-terminal.
+Release builds have no console window; the command-line modes (`--version`,
+`--headless`, `--check-update`, `--sample`) attach to the terminal they were started
+from and print there. Output piped into something that stops reading early
+(`| Select-Object -First 5`) ends the program quietly. `cargo install` also
+installs `open-task-console`, the console launcher the Windows release ships as
+`open-task.com` (see [Install](#install)). On Windows, run that for the
+command-line modes, or copy it beside `open-task.exe` as `open-task.com`.
 
 `scripts/screenshot.ps1` launches the app, screenshots its window to
 `target/screenshot.png`, and closes it. Handy for checking a rendering change;

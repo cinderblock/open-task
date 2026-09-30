@@ -13,6 +13,12 @@ default-run = "open-task"
 name = "open-task"
 path = "src/main.rs"
 
+# The console launcher, shipped on Windows as `open-task.com` beside `open-task.exe`
+# so a terminal waits for the command-line modes (ot_shell_win::launcher).
+[[bin]]
+name = "open-task-console"
+path = "src/console.rs"
+
 [dependencies]
 ot-model.workspace = true
 ot-probe.workspace = true

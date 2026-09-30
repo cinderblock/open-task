@@ -14,11 +14,16 @@
 //! updater (`ot_update`) runs on its own threads and posts its progress back; the
 //! installer it starts closes the window through Restart Manager (`WM_ENDSESSION`).
 //!
+//! [`launcher`] is the console launcher (`open-task.com`), which lets a terminal
+//! wait for the command-line modes of this GUI program.
+//!
 //! On other platforms this crate compiles to a stub that returns
 //! [`ShellError::Unsupported`], so the workspace builds everywhere.
 
 #[cfg(windows)]
 mod gfx;
+#[cfg(windows)]
+pub mod launcher;
 #[cfg(windows)]
 mod prefs;
 #[cfg(windows)]
