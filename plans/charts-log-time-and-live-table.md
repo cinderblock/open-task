@@ -255,7 +255,8 @@ confirmed on 2026-09-29.
       shell around it); tests and clippy on three targets pass.
 - [x] Moving rows' opaque backing (`20896bf`).
 - [x] Item 5: usage accounting (`7fd946b`), the Map (`bba654e`), the usage strip
-      (the commit after it); see `plans/usage-map.md`. Not pushed yet.
+      (the commit after it); see `plans/usage-map.md`. Shipped in v0.4.0
+      (2026-09-29, 17:08 PDT) with the moving rows' backing.
 
 ## Item 4: keeping the table from jumping (options put to the user)
 

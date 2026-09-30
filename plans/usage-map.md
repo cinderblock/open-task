@@ -1,6 +1,6 @@
 # A 2D view of who has been using the CPU: treemap ("Map") and icicle strip
 
-> **Status:** done (unpushed) · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done, shipped in v0.4.0 · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Follows `plans/charts-log-time-and-live-table.md` (item 5, decision 14).
 
 ## Goal
@@ -96,6 +96,13 @@ minute (a range dragged on a chart), a memory mode.
   shows its readout in the ancestry line's place (`Toolbar::note`).
 - Only x64 Windows, x64 Linux and x64 macOS have the Rust std installed here; the
   Windows ARM target is CI's (`rustup target list --installed`).
+- **Checking a release exe's `--version` from a shell:** release builds are
+  GUI-subsystem, and shells do not wait for those. PowerShell's `& exe --version
+  > file` leaves the file empty (so did v0.3.1's `ver.txt`), and `cmd /c "exe
+  --version"` returns before the exe prints, which then panics with "failed
+  printing to stdout: The pipe is being closed. (os error 232)". Pipe it instead
+  (`& exe --version | Out-String`), which waits. Not new in v0.4.0; see open
+  question 1.
 
 ## Progress log
 
@@ -113,10 +120,26 @@ minute (a range dragged on a chart), a memory mode.
       table; checked in the app (`target/drive/strip-list.png`).
 - [x] Docs, checks, screenshots: README paragraph; clippy clean on x64
       Windows, Linux and macOS; `cargo test --workspace` passes.
+- [x] **Shipped in v0.4.0** (user, 2026-09-29: "yes, you can push and release a
+      new minor version"). Release commit `7c731f3`; tag pushed 17:04:55 PDT,
+      published 17:08:01 PDT (00:08:01 UTC on 09-30); CI and Release green, with
+      only the known Node 20 notices. Checked from the published assets in
+      `target/release-check/v0.4.0`: the minisign signature on SHA256SUMS
+      verifies against `minisign.pub`, the x64 zip and `setup.exe` match their
+      sums, the exe's file version and `--version` say 0.4.0, the installer's
+      product version is 0.4.0, and `--headless --passes 2` runs.
 
 ## Open questions for the user
 
-- None yet; the choices above were the recommendations.
+1. Found while checking v0.4.0, older than this work: typed at an interactive
+   prompt, `open-task --version` (and `--headless`, `--check-update`) comes back
+   to the prompt at once and prints afterwards, because the release exe is a GUI
+   program. The README says it "prints the version". Recommendation: ship a
+   small console-subsystem `open-task.com` beside `open-task.exe` (the
+   `devenv.com` pattern). A shell running `open-task` picks the `.com` first; it
+   runs the command-line modes in place and hands anything else to the `.exe`.
+   Also stop the print from panicking when stdout closes. Waiting on the user's
+   yes.
 
 ## Things not to do
 
