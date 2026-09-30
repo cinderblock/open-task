@@ -1,6 +1,6 @@
 # A logo and app icon for open-task
 
-> **Status:** done, shipped in v0.3.1 (awaiting the user's look) · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done, shipped in v0.3.1 · **Started:** 2026-09-29 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md`.
 
 ## Goal
@@ -128,8 +128,10 @@ everywhere Windows shows an icon.
 
 ## Open questions for the user
 
-1. Does the refined logo work for you? (Changing it later is a re-render: edit
-   the SVGs, run `scripts/render-logo.ps1`.)
+1. ~~Does the refined logo work for you?~~ User, 2026-09-29: "i did tell you the
+   open ring was ok". Picking concept B was the approval; this question should not
+   have stayed open. (Changing it later is a re-render: edit the SVGs, run
+   `scripts/render-logo.ps1`.)
 
 ## Things not to do
 

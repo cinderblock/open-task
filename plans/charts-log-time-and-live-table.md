@@ -1,6 +1,6 @@
 # Charts on a log time axis, synced hover, resize repaint, and a calmer live table
 
-> **Status:** built; waiting on the user's live-drag check (open question 1) · **Started:** 2026-09-28 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done; all five items built, the resize fix confirmed by the user · **Started:** 2026-09-28 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md` (decision 8: log-scale time axis).
 
 ## Goal
@@ -132,8 +132,8 @@ The user's feedback on 2026-09-28, five items:
 ## Plan / steps
 
 1. ~~Read the code, reproduce the resize report.~~
-2. ~~Resize: synchronous render in `WM_SIZE`.~~ Commit `2ccdd44`. The user still
-   has to confirm it with a real drag on their monitor.
+2. ~~Resize: synchronous render in `WM_SIZE`.~~ Commit `2ccdd44`. Confirmed by the
+   user with a real drag, 2026-09-29: "it seems better".
 3. ~~`ot-core`: multi-resolution `Series` + tests. Timeline uses it.~~
 4. ~~`ot-ui`: `TimeAxis` (age <-> x), log-axis painting with envelope, gridlines and
    label band. Tests.~~
@@ -159,8 +159,8 @@ The user's feedback on 2026-09-28, five items:
     plan, `plans/usage-map.md` (`7fd946b`, `bba654e`, then "The usage strip: the
     Map folded flat above the table").
 
-Nothing left to build; only open question 1 (the live drag) remains, and it is the
-user's to check.
+Nothing left to build, and nothing waiting on the user: the live drag was
+confirmed on 2026-09-29.
 
 ## Findings / gotchas
 
@@ -226,7 +226,7 @@ user's to check.
 ## Progress log
 
 - [x] Plan written; code read; resize report narrowed to live drags.
-- [x] Resize fix (`2ccdd44`); awaiting the user's live-drag confirmation.
+- [x] Resize fix (`2ccdd44`); the user confirmed it with a live drag.
 - [x] Multi-resolution series (`ot-core::timeline`: `Retention`, `Resolution`,
       `Bucket`, `Series::history`).
 - [x] Log time axis charts (`ot-ui::sparkline`: `TimeAxis`, `Plot`).
@@ -320,7 +320,8 @@ CPU card for the "when" question.
 
 ## Open questions for the user
 
-1. Item 1: does a live drag-resize now redraw smoothly on your monitor?
+1. ~~Item 1: does a live drag-resize now redraw smoothly on your monitor?~~ User,
+   2026-09-29: "yes. it seems better."
 2. ~~Mid-slide overlap~~: user, 2026-09-29, "keep going with the open items":
    done as recommended. A row in motion gets an opaque backing (`bg_solid`, then
    `surface`) and a hairline along each edge, so rows it crosses no longer show
