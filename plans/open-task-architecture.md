@@ -380,9 +380,13 @@ goes." Same for a future headless/remote mode.
 ## Verify before pushing
 
 Run all of these locally; CI runs the same set on real runners and takes minutes to
-tell you what these say in seconds.
+tell you what these say in seconds. Update the toolchain first: CI installs the
+newest stable Rust, and a new release's clippy lints fail there on code that passes
+here (v0.5.0, 2026-10-01: Rust 1.99 came out that day and run 36921399675 failed on
+seven untouched lines; see `plans/replace-task-manager.md`).
 
 ```
+rustup update stable
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings

@@ -1,6 +1,6 @@
 # Replace Task Manager
 
-> **Status:** built and verified locally, committed; push and release wait on the user · **Started:** 2026-09-26 (planned), resumed and built 2026-09-30 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** shipped in v0.5.0 (2026-10-01); one manual check left for the user (the UAC prompt) · **Started:** 2026-09-26 (planned), resumed and built 2026-09-30 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Parent plan: `plans/open-task-architecture.md`. Follows `plans/windows-installer.md`.
 
 ## Goal
@@ -89,8 +89,8 @@ plan was revised (decisions below).
    **The uninstaller always removes the value if it names the copy being
    uninstalled**, whoever set it; a per-user uninstall does it through the elevated
    helper, and warns if that is declined. Never leave a dangling debugger entry.
-9. **Version: v0.5.0** (a feature, minor bump). Pushing and releasing wait for the
-   user's go-ahead (see Environment).
+9. **Version: v0.5.0** (a feature, minor bump). The user, 2026-10-01: "go ahead and
+   release v0.5.0".
 10. **The Settings page scrolls** (wheel, below the page title). A fourth section put
     the page at about 530 DIP, past the bottom of a 760 px window at 150 %; clipped
     cards would have hidden the new switch. Same pattern as the Performance list.
@@ -113,8 +113,9 @@ plan was revised (decisions below).
 6. ~~Verify here (see Progress log for what ran and how).~~ The one thing not done
    here: the unelevated Settings switch through a **real UAC prompt**, which needs a
    person to click it (UAC is at the default, prompting on the secure desktop).
-7. ~~README, plans; commit.~~ **[current]** Ask the user about pushing and releasing
-   v0.5.0, and to click through the UAC check.
+7. ~~README, plans; commit.~~
+8. ~~Release v0.5.0; check it from the published assets.~~ **[current]** The user's
+   UAC click-through (open question 1).
 
 ## Findings / gotchas
 
@@ -154,6 +155,26 @@ plan was revised (decisions below).
 - `hh.exe -decompile` wrote nothing into a folder whose path has spaces.
 - The ARM64 Windows standard library is not installed for this toolchain, so
   `clippy --target aarch64-pc-windows-msvc` cannot run here; CI covers it.
+- **CI installs the newest stable Rust; this machine's "stable" was two releases
+  behind.** Rust 1.99.0 came out on release day (2026-10-01). The first CI run on
+  the release commit (36921399675) failed clippy on all four build jobs, on seven
+  lines of code this change never touched (`assert_is_empty` on five bare
+  `assert!(x.is_empty())` in tests; `double_must_use` on two functions returning
+  `impl Iterator`), and so never ran the tests. Local clippy (1.97.1) had passed.
+  Fixed by `rustup update stable` and `89e4f66`; nothing was tagged until CI was
+  green. The pre-push list in `plans/open-task-architecture.md` now starts with
+  the toolchain update.
+- **The shared tree was mid-edit by another session during the release**
+  (`plans/cycles-used.md`; the tree did not compile). The lint fix was made and
+  checked in a throwaway worktree (`target/verify-wt`, branch `clippy-1.99`, both
+  removed since) and pushed from there. `git merge --ff-only` then refused in the
+  shared tree, because that session had `crates/ot-ui/src/process_rows.rs` open and
+  the fix changes one line of it. Local master was fast-forwarded by hand
+  (`target/tmp/ff-master.sh`): a `git stash create` snapshot stored first
+  (`stash@{0}` at the time, "before fast-forwarding master to 89e4f66…", theirs
+  to drop), the one line applied on top of their copy, `git update-ref`, the five
+  untouched files checked out, the index entry for the shared file reset. Their
+  diff of that file was 65 added, 7 removed before and after.
 
 ## Progress log
 
@@ -196,17 +217,32 @@ plan was revised (decisions below).
       `open-task.iss` compiles with Inno Setup 6.7.3 and 7.1.0.
 - [x] Machine left as found: no IFEO key for taskmgr, v0.3.1 still installed with
       its Start Menu shortcut, no test installs, no open-task processes.
-- [x] README (Using it, Install), this plan; committed.
+- [x] README (Using it, Install), this plan; committed (`362281e`).
+- [x] **Shipped in v0.5.0.** Release commit `db08e59`, then `89e4f66` for the lints
+      Rust 1.99's clippy added (see Findings); CI green on `89e4f66` on all five
+      jobs (run 36924561876: rustfmt, x64 and ARM64 Windows, Linux, macOS, with
+      tests). Annotated tag `v0.5.0` on `89e4f66`, pushed 13:55 PDT; Release run
+      36925139498 green on all eight jobs; published 13:59 PDT (20:59:00 UTC).
+      Checked from the published assets in `target/release-check/v0.5.0`: minisign
+      verifies (trusted comment `open-task v0.5.0`), the x64 zip and `setup.exe`
+      match SHA256SUMS, the exe and installer say 0.5.0, `--version` and
+      `--headless --passes 2` run, `--restore-task-manager` answers, and the live
+      script passes 17/17 with the published exe (`rtm-drive.ps1 -Exe …`, which
+      now only sees and closes windows of the exe under test). The published
+      installer was not run here: it would upgrade the user's own v0.3.1 install.
+      Its script is the one tested (`git diff 362281e v0.5.0 -- installer` is
+      empty).
+- [x] Machine left as found again: no IFEO key for taskmgr, v0.3.1 installed.
 - [ ] The unelevated switch through a real UAC prompt: needs the user (Yes, and No).
-- [ ] Push and release v0.5.0 (waits for the user).
 
 ## Open questions for the user
 
-1. Push and release as v0.5.0? Recommendation: yes.
-2. Please try the switch once from an ordinary (unelevated) open-task: Settings →
-   Windows → Replace Task Manager → the UAC prompt → Yes (the card goes On, then
-   Ctrl+Shift+Esc opens open-task), and again with No (nothing changes, no message).
-3. Follow-up, not in this change: Task Manager runs elevated for administrators
+1. Please try the switch once from an ordinary (unelevated) open-task v0.5.0:
+   Settings → Windows → Replace Task Manager → the UAC prompt → Yes (the card goes
+   On, then Ctrl+Shift+Esc opens open-task), and again with No (nothing changes, no
+   message). The installed copy here is still v0.3.1; its update button offers
+   v0.5.0.
+2. Follow-up, not in this change: Task Manager runs elevated for administrators
    without a prompt, open-task in its place does not (Findings). A "Run as
    administrator" button (Process Explorer's "Show details for all processes")
    would close that gap. Recommendation: yes, as its own change.
