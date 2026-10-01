@@ -1,6 +1,6 @@
 # Cycles used: a fading total of what each process consumed, and a chart of it
 
-> **Status:** built and committed on `master`, not pushed, not released · **Started:** 2026-10-01 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** released as v0.6.0 (see the progress log for what is checked) · **Started:** 2026-10-01 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Follows `plans/usage-map.md` (the Map and the usage strip, v0.4.0).
 
 ## Goal
@@ -67,6 +67,13 @@ where a process's usage can be seen going up and down.
     hover with the CPU and memory graphs both ways.
 11. **A click on a band selects the program's busiest running process**, so the
     selection, the ancestry line and the context menu work as in the Map.
+13. **A second left click on what is selected deselects**, in the strip, the Map
+    and the History (user, 2026-10-01: "can't deselect tasks in the mini view
+    above List/Tree"). A right click still selects, for the menu. The table itself
+    is unchanged: a click on a row selects it.
+14. **Released as v0.6.0** (user, 2026-10-01: "publish a new version once you're
+    done"), by pushing the tag; CI builds and publishes, nothing is published
+    from a workstation.
 12. **An exited process fades as a ghost** in the Map and strip until its total is
     under 1 M cycles or 0.01 % of everything, whichever is more.
 
@@ -100,6 +107,12 @@ where a process's usage can be seen going up and down.
 - **Clippy pedantic** (CI runs `-D warnings`): a fourth `bool` on `App` trips
   `struct_excessive_bools`, hence the `InPlace` enum instead of `map_on` and
   `history_on` fields.
+- **C: ran out of space mid-check** ("No space left on device", then `link.exe`
+  failing with 1318): `target/debug/incremental` had grown to 11.6 GB. Deleting
+  it is safe (a compiler cache) and was done; checks since run with
+  `CARGO_INCREMENTAL=0`. C: was still 99 % full afterwards (11 GB free of 931).
+- `sed -i` in Git Bash rewrites a CRLF file as LF; fix it up afterwards
+  (`Cargo.toml` on the version bump).
 - `scripts/screenshot.ps1 -AppArgs "--view history" -SettleMs 45000` gives the
   chart time to fill; `-Click "348,224"` switches it to Rate.
 
@@ -112,7 +125,7 @@ where a process's usage can be seen going up and down.
 5. ~~The History chart: both readings, bands, legend, hover, click. Tests.~~
 6. ~~Settings: the fade card with its stepper; registry value.~~
 7. ~~README; checks; screenshots; commit.~~
-8. **Next, the user's call:** push and release (see open questions).
+8. ~~Deselect by a second click; release v0.6.0.~~
 
 ## Progress log
 
@@ -128,13 +141,21 @@ where a process's usage can be seen going up and down.
 - [x] `cargo fmt --all --check`; clippy `-D warnings` on x64 Windows, Linux and
       macOS; `cargo test --workspace` passes.
 - [x] README.
-- [ ] Pushed. Released. (Waiting on the user.)
+- [x] Deselect by a second click (`96f4196`), with tests in the strip, the Map
+      and the History.
+- [x] Pushed; release commit `5b204db`, tag `v0.6.0` pushed 2026-10-01 15:45 PDT.
+- [x] **Shipped in v0.6.0**: published 2026-10-01 15:48:58 PDT (22:48:58 UTC);
+      CI and Release green. Checked from the published assets in
+      `target/release-check/v0.6.0`: the minisign signature on SHA256SUMS
+      verifies against `minisign.pub`, the x64 zip and `setup.exe` match their
+      sums, `open-task.com --version` says v0.6.0, and `--headless --passes 2`
+      runs and prints the cycles column. The installer was not run, and the
+      installed copy on this machine was not updated.
 
 ## Open questions for the user
 
-1. **Push and release?** Committed on `master`, not pushed. It is a feature, so
-   v0.6.0 by the repo's habit. Recommendation: use it for a bit first, the default
-   sort changing is the kind of thing to feel before shipping.
+1. **Answered, 2026-10-01: "publish a new version once you're done"**; released
+   as v0.6.0.
 2. **Is "program" (processes of one name as one band) right for the History?**
    Decision 8 was mine. The alternative is one band per process.
 3. **Should the Cycles column, or the chart, also be offered in core-seconds?**
