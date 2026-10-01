@@ -25,6 +25,15 @@
 ; Setup closes the running app through Restart Manager, which the app answers
 ; (WM_ENDSESSION), installs, and with /RELAUNCH=1 starts the new version. Keep AppId
 ; in step with crates/ot-update/src/imp/windows.rs, which finds the install by it.
+;
+; The "replacetaskmgr" task makes Windows start open-task in Task Manager's place, as
+; the app's Settings page can (crates/ot-shell-win/src/task_manager.rs): a Debugger
+; value under Task Manager's Image File Execution Options key. It is offered only for
+; an all-users install, and its checkbox shows what Windows does now rather than what
+; was chosen last time, since the app may have changed it since. A silent install,
+; which every update is, leaves it alone unless /TASKS or /MERGETASKS names it. The
+; uninstaller removes the value whenever it names this install, whoever set it: a
+; value naming a missing file would leave Ctrl+Shift+Esc doing nothing.
 
 #ifndef AppVersion
   #error Pass /DAppVersion=x.y.z
@@ -99,6 +108,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "addtopath"; Description: "Add open-task to PATH (for ""open-task --headless"" in a terminal)"; GroupDescription: "Command line:"; Flags: unchecked
+Name: "replacetaskmgr"; Description: "Use open-task instead of Task Manager (Ctrl+Shift+Esc, the taskbar, Ctrl+Alt+Del)"; GroupDescription: "Task Manager:"; Flags: unchecked; Check: IsAdminInstallMode
 
 [Files]
 Source: "{#X64Exe}"; DestDir: "{app}"; DestName: "open-task.exe"; Flags: ignoreversion; Check: not IsArm64
@@ -129,6 +139,10 @@ Filename: "{app}\open-task.exe"; Flags: nowait runasoriginaluser; Check: Relaunc
 const
   MachineEnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
   UserEnvKey = 'Environment';
+  TaskManagerKey = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe';
+
+var
+  TasksPageSeen: Boolean;
 
 { The app's updater passes /RELAUNCH=1: start the new version when done. }
 function RelaunchRequested: Boolean;
@@ -197,14 +211,122 @@ begin
     RegWriteExpandStringValue(EnvRootKey, EnvSubkey, 'Path', PathWithout(Path, Dir));
 end;
 
+{ The program a Debugger value names: what is inside the quotes, or the whole value
+  when it is not quoted. open-task always writes its path quoted. }
+function ProgramOf(Value: String): String;
+var
+  P: Integer;
+begin
+  Result := Trim(Value);
+  if Copy(Result, 1, 1) = '"' then
+  begin
+    Delete(Result, 1, 1);
+    P := Pos('"', Result);
+    if P > 0 then
+      Result := Copy(Result, 1, P - 1);
+  end;
+end;
+
+{ Whether Windows starts this install's open-task in Task Manager's place. }
+function TaskManagerIsOurs: Boolean;
+var
+  Value: String;
+begin
+  Result := RegQueryStringValue(HKLM64, TaskManagerKey, 'Debugger', Value) and
+    (CompareText(ProgramOf(Value), ExpandConstant('{app}\open-task.exe')) = 0);
+end;
+
+procedure ReplaceTaskManager;
+begin
+  if not RegWriteStringValue(HKLM64, TaskManagerKey, 'Debugger',
+                             '"' + ExpandConstant('{app}\open-task.exe') + '"') then
+    Log('Could not replace Task Manager');
+end;
+
+{ Only when it is this install: another program's replacement is not ours to undo.
+  The key goes too if nothing else is in it. }
+procedure RestoreTaskManager;
+begin
+  if TaskManagerIsOurs then
+  begin
+    RegDeleteValue(HKLM64, TaskManagerKey, 'Debugger');
+    RegDeleteKeyIfEmpty(HKLM64, TaskManagerKey);
+  end;
+end;
+
+{ Whether /TASKS or /MERGETASKS names the task, for it or against it. }
+function TaskManagerNamed: Boolean;
+begin
+  Result := Pos('replacetaskmgr', Lowercase(ExpandConstant('{param:TASKS|}') + ',' +
+                                            ExpandConstant('{param:MERGETASKS|}'))) > 0;
+end;
+
+{ Whether this run decides the task: an interactive install does, where the checkbox
+  shows the current state; a silent one (every update) only when the command line
+  names the task, so an update never undoes what the user set in the app since. }
+function TaskManagerChoiceGiven: Boolean;
+begin
+  Result := (not WizardSilent) or TaskManagerNamed;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  { The first time the tasks page shows, tick "replacetaskmgr" if and only if Windows
+    starts this install in Task Manager's place now. Only once, so going back and
+    forth keeps the user's own click. Not when the command line chose, and not in a
+    silent install, which steps through the pages too without showing them. }
+  if (CurPageID = wpSelectTasks) and not TasksPageSeen then
+  begin
+    TasksPageSeen := True;
+    if IsAdminInstallMode and not WizardSilent and not TaskManagerNamed then
+    begin
+      if TaskManagerIsOurs then
+        WizardSelectTasks('replacetaskmgr')
+      else
+        WizardSelectTasks('!replacetaskmgr');
+    end;
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if (CurStep = ssPostInstall) and WizardIsTaskSelected('addtopath') then
-    AddToPath(ExpandConstant('{app}'));
+  if CurStep = ssPostInstall then
+  begin
+    if WizardIsTaskSelected('addtopath') then
+      AddToPath(ExpandConstant('{app}'));
+    if IsAdminInstallMode and TaskManagerChoiceGiven then
+    begin
+      if WizardIsTaskSelected('replacetaskmgr') then
+        ReplaceTaskManager
+      else
+        RestoreTaskManager;
+    end;
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Code: Integer;
 begin
+  { Before the files go, whoever set it: a Debugger value that names a missing file
+    leaves Ctrl+Shift+Esc doing nothing, for every user. }
+  if (CurUninstallStep = usUninstall) and TaskManagerIsOurs then
+  begin
+    if IsAdminInstallMode then
+      RestoreTaskManager
+    else
+    begin
+      { A per-user uninstall cannot write HKLM; the app can, as administrator. }
+      if not ShellExec('runas', ExpandConstant('{app}\open-task.exe'), '--restore-task-manager',
+                       '', SW_HIDE, ewWaitUntilTerminated, Code) then
+        Log('Could not start open-task to restore Task Manager: ' + SysErrorMessage(Code));
+      if TaskManagerIsOurs and not UninstallSilent then
+        MsgBox('Windows still starts open-task in Task Manager''s place, and it will be gone, ' +
+               'so Ctrl+Shift+Esc will do nothing. To bring Task Manager back, delete the ' +
+               '"Debugger" value under HKEY_LOCAL_MACHINE\' + TaskManagerKey +
+               ' as administrator.', mbError, MB_OK);
+    end;
+  end;
   if CurUninstallStep = usPostUninstall then
     RemoveFromPath(ExpandConstant('{app}'));
 end;

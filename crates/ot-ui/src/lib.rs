@@ -15,6 +15,7 @@ mod settings;
 pub mod sparkline;
 mod steady;
 pub mod table;
+mod task_manager;
 pub mod theme;
 pub mod treemap;
 mod update;
@@ -23,6 +24,7 @@ pub mod view;
 
 pub use nav::Page;
 pub use settings::Settings;
+pub use task_manager::{Replacement, TaskManager};
 pub use theme::Theme;
 pub use update::{UpdateAction, UpdateView};
 pub use view::{

@@ -23,6 +23,7 @@ use crate::process_rows::{self, col, columns, process_matches, Layout, ProcessRo
 use crate::settings::{Context, Settings, SettingsPage};
 use crate::steady::Steady;
 use crate::table::{Hit, RowSource, Table};
+use crate::task_manager::TaskManager;
 use crate::theme::Theme;
 use crate::update::{UpdateAction, UpdateView};
 use crate::usage_map::{UsageMap, STRIP_H};
@@ -190,6 +191,10 @@ pub enum Effect {
     /// The update button was pressed: take the step it names. The updater's new
     /// status comes back through [`App::set_update_status`].
     Update(UpdateAction),
+    /// Make the system open this copy in its task manager's place (`true`), or
+    /// stop (`false`). What it does afterwards comes back through
+    /// [`App::set_task_manager`].
+    ReplaceTaskManager(bool),
 }
 
 /// What an event led to.
@@ -558,6 +563,9 @@ pub struct App {
     settings_page: SettingsPage,
     /// The version and the update button, on the rail and the Settings page.
     update: UpdateView,
+    /// Whether the system opens this copy in Task Manager's place, for the
+    /// Settings page.
+    task_manager: TaskManager,
     /// Whether the platform has animation effects on; row slides need both this
     /// and the setting.
     system_animations: bool,
@@ -599,6 +607,7 @@ impl App {
             settings: Settings::default(),
             settings_page: SettingsPage::default(),
             update: UpdateView::default(),
+            task_manager: TaskManager::default(),
             system_animations: true,
             matched: Vec::new(),
             shown: Vec::new(),
@@ -754,6 +763,19 @@ impl App {
         &self.update
     }
 
+    /// What the system opens in Task Manager's place, as the shell last read it,
+    /// and whether a change is under way. Returns whether anything changed, so a
+    /// repaint is due.
+    pub fn set_task_manager(&mut self, task_manager: TaskManager) -> bool {
+        std::mem::replace(&mut self.task_manager, task_manager) != self.task_manager
+    }
+
+    /// The Task Manager card's state as it stands.
+    #[must_use]
+    pub fn task_manager(&self) -> &TaskManager {
+        &self.task_manager
+    }
+
     /// Whether the platform has animation effects on (Windows: "Animation
     /// effects" in Accessibility > Visual effects). Row slides need it.
     pub fn set_system_animations(&mut self, on: bool) {
@@ -901,6 +923,7 @@ impl App {
             let cx = Context {
                 system_animations: self.system_animations,
                 update: &self.update,
+                task_manager: &self.task_manager,
             };
             let _ = self
                 .settings_page
@@ -974,6 +997,7 @@ impl App {
                 let cx = Context {
                     system_animations: self.system_animations,
                     update: &self.update,
+                    task_manager: &self.task_manager,
                 };
                 let r = self.settings_page.handle(ev, &mut self.settings, cx);
                 if matches!(r.effect, Some(Effect::SaveSettings(_))) {
@@ -1376,6 +1400,7 @@ impl App {
                 let cx = Context {
                     system_animations: self.system_animations,
                     update: &self.update,
+                    task_manager: &self.task_manager,
                 };
                 self.settings_page
                     .paint(dl, full, self.settings, cx, theme, &mut self.buf);

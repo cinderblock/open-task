@@ -177,6 +177,26 @@ private trace session is opened and closed. The sample rows stay until the next
 sample or until the process exits. The same sample is available from a terminal as
 `open-task --headless --sample <pid> [--seconds 5]`.
 
+**Replace Task Manager.** The switch under **Windows** on the Settings page does what
+Process Explorer's option of the same name does: afterwards **Ctrl+Shift+Esc**, Task
+Manager in the taskbar's menu, the **Ctrl+Alt+Del** screen and `taskmgr` typed
+anywhere all start open-task instead. It works the same way, with a `Debugger` value
+under Task Manager's Image File Execution Options key in `HKLM`, so it applies to
+everyone who uses the PC and changing it needs an administrator prompt (none when
+open-task already runs as administrator). The switch shows what Windows actually
+does, read again whenever you come back to the window: it is on only when Windows
+starts this copy. When another program stands in for Task Manager (Process Explorer,
+another copy of open-task) the card names it; turning the switch on takes over from
+it, and turning it off only ever removes this copy's own entry. The card also says
+when this copy is not installed for all users, since then it cannot stand in for
+everyone. With an open-task window already open, Ctrl+Shift+Esc brings it forward,
+restoring it if it was minimized, instead of opening another, as Task Manager does.
+One difference: Windows starts the replacement with your ordinary rights, where Task
+Manager would have elevated itself, so the administrator-only details above need
+open-task run as administrator. From an elevated terminal, `open-task
+--replace-task-manager` and `open-task --restore-task-manager` do the same as the
+switch. Uninstalling always puts Task Manager back if it was starting that copy.
+
 ## Why not a webview
 
 A task manager's whole job is telling you what is wasting your RAM and CPU. A webview
@@ -216,8 +236,14 @@ adds a Start Menu entry and an uninstaller, and can put `open-task` on the PATH 
 `open-task --headless` in a terminal. A newer installer upgrades in place, and
 open-task can run it for you (see [Updates](#updates)).
 
+The installer can also put open-task in Task Manager's place (**Use open-task
+instead of Task Manager**, off by default; see
+[Replace Task Manager](#using-it) above). Its checkbox shows whether Windows does that
+now, whatever was chosen last time, and updates leave it as it is.
+
 Silent install, from an elevated prompt:
-`open-task-vX.Y.Z-windows-setup.exe /VERYSILENT /NORESTART`. If you cannot elevate,
+`open-task-vX.Y.Z-windows-setup.exe /VERYSILENT /NORESTART`, with
+`/MERGETASKS="replacetaskmgr"` to replace Task Manager too. If you cannot elevate,
 `/CURRENTUSER` installs into your own profile instead, without the protection above.
 
 The installer and the binaries are not code-signed yet, so SmartScreen asks you to

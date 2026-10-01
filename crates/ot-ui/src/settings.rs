@@ -17,9 +17,18 @@
 //! same step a click on the rail's version takes. Its three switches build on each
 //! other (checking, then downloading, then installing), so turning one on turns on
 //! those it needs, and turning one off turns off those that need it.
+//!
+//! The Windows section holds the Task Manager card ([`TaskManager`]). It is not a
+//! setting: its switch shows what the system does, and flipping it asks the shell
+//! to change that ([`Effect::ReplaceTaskManager`]) rather than to store anything.
+//! Where there is nothing to replace, the section is not shown.
+//!
+//! Below the page's title the sections scroll with the wheel when the window is too
+//! short to show them all.
 
 use ot_paint::{DisplayList, HAlign, Point, Rect, VAlign};
 
+use crate::task_manager::TaskManager;
 use crate::theme::Theme;
 use crate::update::UpdateView;
 use crate::view::{Effect, MouseButton, Reaction, UiEvent};
@@ -68,6 +77,7 @@ pub(crate) struct Context<'a> {
     /// What a setting that still follows the system shows.
     pub system_animations: bool,
     pub update: &'a UpdateView,
+    pub task_manager: &'a TaskManager,
 }
 
 /// One switch on the page.
@@ -173,10 +183,46 @@ enum Card {
     Toggle(Toggle),
     /// The version and the update button.
     Update,
+    /// Whether the system opens open-task in its task manager's place.
+    TaskManager,
+}
+
+impl Card {
+    /// Whether the card is on the page at all.
+    fn shown(self, cx: Context<'_>) -> bool {
+        match self {
+            Self::TaskManager => cx.task_manager.available(),
+            Self::Toggle(_) | Self::Update => true,
+        }
+    }
+
+    /// The line of note under the card's detail, if it has one. `scratch` holds it
+    /// when it has to be written out.
+    fn note<'s>(
+        self,
+        settings: Settings,
+        cx: Context<'_>,
+        scratch: &'s mut String,
+    ) -> Option<&'s str> {
+        match self {
+            Self::Toggle(t) => t.note(settings, cx),
+            Self::Update => cx.update.note(),
+            Self::TaskManager => cx.task_manager.note(scratch).then_some(scratch.as_str()),
+        }
+    }
+
+    /// Whether a click does something now.
+    fn clickable(self, cx: Context<'_>) -> bool {
+        match self {
+            Self::Toggle(_) => true,
+            Self::Update => cx.update.action().is_some(),
+            Self::TaskManager => !cx.task_manager.pending,
+        }
+    }
 }
 
 /// The page, top to bottom: each section's heading and its cards.
-const SECTIONS: [(&str, &[Card]); 2] = [
+const SECTIONS: [(&str, &[Card]); 3] = [
     ("Process table", &[Card::Toggle(Toggle::AnimateRows)]),
     (
         "Updates",
@@ -187,8 +233,9 @@ const SECTIONS: [(&str, &[Card]); 2] = [
             Card::Toggle(Toggle::InstallUpdates),
         ],
     ),
+    ("Windows", &[Card::TaskManager]),
 ];
-const CARD_COUNT: usize = 5;
+const CARD_COUNT: usize = 6;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -198,9 +245,13 @@ fn card_kind(i: usize) -> Option<Card> {
         .nth(i)
 }
 
+const HEADING_H: f32 = 28.0;
 const CARD_H: f32 = 64.0;
 /// A card with a line of note under its detail.
 const CARD_H_NOTE: f32 = 80.0;
+const CARD_GAP: f32 = 4.0;
+/// How far a notch of the wheel scrolls the page.
+const WHEEL_STEP: f32 = 48.0;
 const TITLE_LINE_H: f32 = 20.0;
 const LINE_H: f32 = 17.0;
 const SWITCH_W: f32 = 40.0;
@@ -214,8 +265,17 @@ const BUTTON_H: f32 = 28.0;
 
 #[derive(Debug, Default)]
 pub(crate) struct SettingsPage {
+    /// Where each section's heading was placed, or `None` when none of its cards
+    /// is shown.
+    headings: [Option<Rect>; SECTIONS.len()],
+    /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
+    /// Where the sections scroll: the page below its title.
+    view: Rect,
+    /// How far the sections are scrolled, in DIPs, and how far they can be.
+    scroll: f32,
+    max_scroll: f32,
 }
 
 impl SettingsPage {
@@ -225,12 +285,16 @@ impl SettingsPage {
         self.cards[i]
     }
 
+    /// The card under `p`, if it is in view.
     fn card_at(&self, p: Point) -> Option<usize> {
+        if !self.view.contains(p) {
+            return None;
+        }
         self.cards.iter().position(|r| r.contains(p))
     }
 
-    /// Handle input on the page: flip a switch (changing `settings`) or press the
-    /// update button.
+    /// Handle input on the page: flip a switch (changing `settings`), press the
+    /// update button, ask for Task Manager to be replaced or restored, or scroll.
     pub fn handle(&mut self, ev: UiEvent, settings: &mut Settings, cx: Context<'_>) -> Reaction {
         match ev {
             UiEvent::MouseMove(p) => {
@@ -253,9 +317,72 @@ impl SettingsPage {
                     .update
                     .action()
                     .map_or(Reaction::NONE, |a| Reaction::effect(Effect::Update(a))),
-                None => Reaction::NONE,
+                Some(Card::TaskManager) if !cx.task_manager.pending => {
+                    Reaction::effect(Effect::ReplaceTaskManager(!cx.task_manager.on()))
+                }
+                Some(Card::TaskManager) | None => Reaction::NONE,
             },
+            UiEvent::Wheel {
+                at,
+                lines,
+                horizontal: false,
+            } if self.view.contains(at) => {
+                let scroll = (self.scroll + lines * WHEEL_STEP).clamp(0.0, self.max_scroll);
+                let moved = scroll - self.scroll;
+                if moved.abs() < f32::EPSILON {
+                    return Reaction::NONE;
+                }
+                self.scroll = scroll;
+                // Move what was placed, so the pointer finds the card now under it
+                // before the next paint places them again.
+                self.shift(-moved);
+                self.hover = self.card_at(at);
+                Reaction::REPAINT
+            }
             _ => Reaction::NONE,
+        }
+    }
+
+    /// Place the headings and cards top to bottom in `view`, scrolled, keeping the
+    /// scroll in range. `scratch` holds the notes that have to be written out.
+    fn lay_out(&mut self, view: Rect, settings: Settings, cx: Context<'_>, scratch: &mut String) {
+        self.view = view;
+        let mut y = 0.0;
+        let mut i = 0;
+        for (s, (_, cards)) in SECTIONS.iter().enumerate() {
+            self.headings[s] = cards.iter().any(|c| c.shown(cx)).then(|| {
+                let r = Rect::new(view.x, y, view.w, HEADING_H);
+                y += HEADING_H;
+                r
+            });
+            for &card in *cards {
+                self.cards[i] = if card.shown(cx) {
+                    let h = if card.note(settings, cx, scratch).is_some() {
+                        CARD_H_NOTE
+                    } else {
+                        CARD_H
+                    };
+                    let r = Rect::new(view.x, y, view.w, h);
+                    y += h + CARD_GAP;
+                    r
+                } else {
+                    Rect::ZERO
+                };
+                i += 1;
+            }
+        }
+        self.max_scroll = (y - view.h).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll);
+        self.shift(view.y - self.scroll);
+    }
+
+    /// Move every placed heading and card down by `dy`.
+    fn shift(&mut self, dy: f32) {
+        for r in self.headings.iter_mut().flatten() {
+            r.y += dy;
+        }
+        for r in self.cards.iter_mut().filter(|r| r.w > 0.0) {
+            r.y += dy;
         }
     }
 
@@ -268,7 +395,7 @@ impl SettingsPage {
         theme: &Theme,
         buf: &mut String,
     ) {
-        let (title, mut remaining) = rect.split_top(40.0);
+        let (title, view) = rect.split_top(40.0);
         dl.text(
             "Settings",
             title,
@@ -278,62 +405,51 @@ impl SettingsPage {
             VAlign::Middle,
             true,
         );
-        let mut i = 0;
-        for (heading, cards) in SECTIONS {
-            let (heading_rect, below) = remaining.split_top(28.0);
-            remaining = below;
-            dl.label(heading, heading_rect, theme.title, theme.text_dim);
-            for &card in cards {
-                let note = match card {
-                    Card::Toggle(t) => t.note(settings, cx),
-                    Card::Update => cx.update.note(),
-                };
-                let card_h = if note.is_some() { CARD_H_NOTE } else { CARD_H };
-                let (r, below) = remaining.split_top(card_h);
-                let (_, below) = below.split_top(4.0);
-                remaining = below;
-                self.cards[i] = r;
-                let clickable = match card {
-                    Card::Toggle(_) => true,
-                    Card::Update => cx.update.action().is_some(),
-                };
-                let fill = if clickable && self.hover == Some(i) {
-                    theme.button_hover
-                } else {
-                    theme.surface
-                };
-                dl.fill_round_rect(r, theme.card_radius, fill);
-                dl.stroke_rect(r, theme.surface_border, 1.0);
-                let inner = r.inset(theme.pad * 2.0, theme.pad);
-                let (text, control) = inner.split_left((inner.w - BUTTON_W).max(0.0));
-                match card {
-                    Card::Toggle(t) => {
-                        paint_text(dl, text, t.title(), t.detail(settings, cx), note, theme);
-                        let on = t.get(settings, cx);
-                        let (state, switch) = control.split_left(control.w - SWITCH_W - 10.0);
-                        dl.text(
-                            if on { "On" } else { "Off" },
-                            state,
-                            theme.cell,
-                            theme.text,
-                            HAlign::Right,
-                            VAlign::Middle,
-                            false,
-                        );
-                        paint_switch(dl, switch, on, theme);
-                    }
-                    Card::Update => {
-                        let mut title = String::new();
-                        cx.update.title(&mut title);
-                        cx.update.detail(buf);
-                        paint_text(dl, text, &title, buf, note, theme);
-                        let enabled = cx.update.button(buf);
-                        paint_button(dl, control, buf, enabled, theme);
-                    }
-                }
-                i += 1;
+        let mut note_buf = String::new();
+        self.lay_out(view, settings, cx, &mut note_buf);
+        dl.push_clip(view);
+        for ((heading, _), r) in SECTIONS.iter().zip(self.headings) {
+            if let Some(r) = r {
+                dl.label(heading, r, theme.title, theme.text_dim);
             }
         }
+        let cards = SECTIONS.iter().flat_map(|(_, cards)| cards.iter().copied());
+        for (i, card) in cards.enumerate() {
+            let r = self.cards[i];
+            if r.w <= 0.0 || r.bottom() <= view.y || r.y >= view.bottom() {
+                continue;
+            }
+            let note = card.note(settings, cx, &mut note_buf);
+            let fill = if card.clickable(cx) && self.hover == Some(i) {
+                theme.button_hover
+            } else {
+                theme.surface
+            };
+            dl.fill_round_rect(r, theme.card_radius, fill);
+            dl.stroke_rect(r, theme.surface_border, 1.0);
+            let inner = r.inset(theme.pad * 2.0, theme.pad);
+            let (text, control) = inner.split_left((inner.w - BUTTON_W).max(0.0));
+            match card {
+                Card::Toggle(t) => {
+                    paint_text(dl, text, t.title(), t.detail(settings, cx), note, theme);
+                    paint_state_and_switch(dl, control, t.get(settings, cx), theme);
+                }
+                Card::TaskManager => {
+                    let (title, detail) = (TaskManager::title(), TaskManager::detail());
+                    paint_text(dl, text, title, detail, note, theme);
+                    paint_state_and_switch(dl, control, cx.task_manager.on(), theme);
+                }
+                Card::Update => {
+                    let mut title = String::new();
+                    cx.update.title(&mut title);
+                    cx.update.detail(buf);
+                    paint_text(dl, text, &title, buf, note, theme);
+                    let enabled = cx.update.button(buf);
+                    paint_button(dl, control, buf, enabled, theme);
+                }
+            }
+        }
+        dl.pop_clip();
     }
 }
 
@@ -366,6 +482,21 @@ fn paint_text(
             theme.accent,
         );
     }
+}
+
+/// "On" or "Off" and the switch, at the right of `control`.
+fn paint_state_and_switch(dl: &mut DisplayList, control: Rect, on: bool, theme: &Theme) {
+    let (state, switch) = control.split_left(control.w - SWITCH_W - 10.0);
+    dl.text(
+        if on { "On" } else { "Off" },
+        state,
+        theme.cell,
+        theme.text,
+        HAlign::Right,
+        VAlign::Middle,
+        false,
+    );
+    paint_switch(dl, switch, on, theme);
 }
 
 /// A Windows 11 style button, at the right of `r` and vertically centered: filled
@@ -426,9 +557,10 @@ fn paint_switch(dl: &mut DisplayList, r: Rect, on: bool, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_manager::Replacement;
     use crate::update::UpdateAction;
     use ot_paint::DrawCmd;
-    use ot_update::{Status, Version};
+    use ot_update::{Scope, Status, Version};
 
     const PAGE: Rect = Rect::new(0.0, 0.0, 600.0, 700.0);
 
@@ -457,10 +589,28 @@ mod tests {
             .expect("the card has a switch")
     }
 
+    /// Nothing to replace, as on a platform without Task Manager.
+    static NO_TASK_MANAGER: TaskManager = TaskManager {
+        replacement: Replacement::Unavailable,
+        install: None,
+        pending: false,
+    };
+
     fn cx(system_animations: bool, update: &UpdateView) -> Context<'_> {
         Context {
             system_animations,
             update,
+            task_manager: &NO_TASK_MANAGER,
+        }
+    }
+
+    /// The Task Manager card's place among the cards.
+    const TASK_MANAGER: usize = 5;
+
+    fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
+        Context {
+            task_manager: tm,
+            ..cx(true, update)
         }
     }
 
@@ -646,5 +796,163 @@ mod tests {
         let at = page.cards[2].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
+    }
+
+    #[test]
+    fn nothing_to_replace_shows_no_windows_section() {
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        let dl = paint(&mut page, s, cx(true, &update));
+        let strings = texts(&dl);
+        assert!(!strings.iter().any(|t| t == "Windows"));
+        assert!(!strings.iter().any(|t| t == "Replace Task Manager"));
+        assert_eq!(page.cards[TASK_MANAGER], Rect::ZERO);
+        let r = click(&mut page, Point::new(0.0, 0.0), &mut s, cx(true, &update));
+        assert_eq!(r, Reaction::NONE);
+    }
+
+    #[test]
+    fn the_task_manager_switch_asks_the_shell_and_shows_what_windows_does() {
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        let mut tm = TaskManager {
+            replacement: Replacement::Off,
+            install: Some(Scope::Machine),
+            pending: false,
+        };
+        let dl = paint(&mut page, s, with_task_manager(&update, &tm));
+        let strings = texts(&dl);
+        for expected in ["Windows", "Replace Task Manager", TaskManager::detail()] {
+            assert!(strings.iter().any(|t| t == expected), "{expected}");
+        }
+        let card = page.cards[TASK_MANAGER];
+        assert_eq!(state_of(&dl, card), "Off");
+        assert!(
+            (card.h - CARD_H).abs() < f32::EPSILON,
+            "an install for everyone has nothing to add"
+        );
+
+        // A click asks; it changes no setting, and the switch waits for the answer.
+        let r = click(
+            &mut page,
+            card.center(),
+            &mut s,
+            with_task_manager(&update, &tm),
+        );
+        assert_eq!(r.effect, Some(Effect::ReplaceTaskManager(true)));
+        assert_eq!(s, Settings::default());
+
+        // Waiting for permission: said, and a second click does nothing.
+        tm.pending = true;
+        let dl = paint(&mut page, s, with_task_manager(&update, &tm));
+        assert!(texts(&dl)
+            .iter()
+            .any(|t| t == "Waiting for permission from Windows\u{2026}"));
+        let card = page.cards[TASK_MANAGER];
+        let r = click(
+            &mut page,
+            card.center(),
+            &mut s,
+            with_task_manager(&update, &tm),
+        );
+        assert_eq!(r, Reaction::NONE);
+
+        // Done: on, and a click turns it off.
+        tm.pending = false;
+        tm.replacement = Replacement::ThisCopy;
+        let dl = paint(&mut page, s, with_task_manager(&update, &tm));
+        let card = page.cards[TASK_MANAGER];
+        assert_eq!(state_of(&dl, card), "On");
+        let r = click(
+            &mut page,
+            card.center(),
+            &mut s,
+            with_task_manager(&update, &tm),
+        );
+        assert_eq!(r.effect, Some(Effect::ReplaceTaskManager(false)));
+    }
+
+    #[test]
+    fn another_replacement_shows_off_and_is_named() {
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        let tm = TaskManager {
+            replacement: Replacement::Other {
+                path: r"C:\Tools\procexp64.exe".into(),
+                exists: true,
+            },
+            install: Some(Scope::Machine),
+            pending: false,
+        };
+        let dl = paint(&mut page, s, with_task_manager(&update, &tm));
+        let card = page.cards[TASK_MANAGER];
+        assert_eq!(state_of(&dl, card), "Off");
+        assert!((card.h - CARD_H_NOTE).abs() < f32::EPSILON);
+        assert!(texts(&dl)
+            .iter()
+            .any(|t| t.ends_with(r"C:\Tools\procexp64.exe")));
+        // Turning it on takes over, as Process Explorer would.
+        let r = click(
+            &mut page,
+            card.center(),
+            &mut s,
+            with_task_manager(&update, &tm),
+        );
+        assert_eq!(r.effect, Some(Effect::ReplaceTaskManager(true)));
+    }
+
+    #[test]
+    fn a_short_window_scrolls_to_the_last_card() {
+        let update = UpdateView::new("0.2.1", true);
+        let tm = TaskManager {
+            replacement: Replacement::Off,
+            install: Some(Scope::Machine),
+            pending: false,
+        };
+        let cx = with_task_manager(&update, &tm);
+        let short = Rect::new(0.0, 0.0, 600.0, 300.0);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        let mut dl = DisplayList::new();
+        page.paint(&mut dl, short, s, cx, &Theme::dark(), &mut String::new());
+        let last = page.cards[TASK_MANAGER];
+        assert!(last.y >= short.bottom(), "starts below the window");
+        assert!(!texts(&dl).iter().any(|t| t == "Replace Task Manager"));
+        // Out of view, a click there does nothing.
+        let r = click(&mut page, Point::new(10.0, 299.0), &mut s, cx);
+        assert_eq!(r, Reaction::NONE);
+
+        let wheel = |page: &mut SettingsPage, s: &mut Settings, lines: f32| {
+            page.handle(
+                UiEvent::Wheel {
+                    at: Point::new(300.0, 200.0),
+                    lines,
+                    horizontal: false,
+                },
+                s,
+                cx,
+            )
+        };
+        // Far past the end: stops with the last card at the bottom.
+        assert_eq!(wheel(&mut page, &mut s, 50.0), Reaction::REPAINT);
+        let mut dl = DisplayList::new();
+        page.paint(&mut dl, short, s, cx, &Theme::dark(), &mut String::new());
+        let last = page.cards[TASK_MANAGER];
+        assert!(
+            (last.bottom() + CARD_GAP - short.bottom()).abs() < 0.01,
+            "{last:?}"
+        );
+        assert!(texts(&dl).iter().any(|t| t == "Replace Task Manager"));
+        let r = click(&mut page, last.center(), &mut s, cx);
+        assert_eq!(r.effect, Some(Effect::ReplaceTaskManager(true)));
+        // Already at the end: nothing moves.
+        assert_eq!(wheel(&mut page, &mut s, 1.0), Reaction::NONE);
+        // Back to the top.
+        assert_eq!(wheel(&mut page, &mut s, -50.0), Reaction::REPAINT);
+        assert!(page.cards[0].y > 0.0 && page.cards[0].y < 100.0);
+        assert_eq!(wheel(&mut page, &mut s, -1.0), Reaction::NONE);
     }
 }

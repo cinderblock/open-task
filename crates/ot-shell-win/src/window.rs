@@ -2,9 +2,9 @@
 //!
 //! Every input message becomes a [`UiEvent`] and goes through [`dispatch`], which
 //! hands it to the view and carries out whatever [`Effect`] comes back with native
-//! APIs: a popup menu, a confirmation box and the kill, a shell verb. Effects run
-//! with the window state unborrowed, because menus and message boxes pump messages
-//! and those messages re-enter the window procedure.
+//! APIs: a popup menu, a confirmation box and the kill, a shell verb, replacing Task
+//! Manager. Effects run with the window state unborrowed, because menus and message
+//! boxes pump messages and those messages re-enter the window procedure.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -19,10 +19,10 @@ use ot_paint::{DisplayList, Point, Size};
 use ot_probe::{ControlError, PlatformControl, ProcessControl, SystemProbe};
 use ot_probe::{CpuSampler, PlatformSampler};
 use ot_ui::{
-    App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Page, Theme, UiEvent,
-    UpdateAction, UpdateView, ViewMode,
+    App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Page, TaskManager,
+    Theme, UiEvent, UpdateAction, UpdateView, ViewMode,
 };
-use ot_update::Updater;
+use ot_update::{Installation, Updater};
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -47,23 +47,24 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadImageW,
-    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HICON,
-    HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_IBEAM, IDC_SIZEWE, IDYES, IMAGE_ICON,
-    LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, IsIconic, LoadCursorW,
+    LoadImageW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, HCURSOR, HICON, HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_IBEAM,
+    IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING,
+    MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SIZE_MINIMIZED, SM_CXICON,
+    SM_CXSMICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWDEFAULT, SW_SHOWNORMAL,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP,
+    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::gfx::Gfx;
-use crate::prefs;
+use crate::task_manager::{self, Elevated};
+use crate::{instance, prefs};
 use crate::{ShellError, ShellOptions, ThemePreference};
 
 /// Posted by the sampler thread after each publish.
@@ -72,6 +73,9 @@ const WM_APP_SNAPSHOT: u32 = WM_APP + 1;
 const WM_APP_SAMPLE: u32 = WM_APP + 2;
 /// The updater's status changed; read it with `Updater::status`.
 const WM_APP_UPDATE: u32 = WM_APP + 3;
+/// The elevated helper that replaces or restores Task Manager finished; `lparam` is
+/// a `Box<TaskManagerOutcome>`.
+const WM_APP_TASK_MANAGER: u32 = WM_APP + 4;
 
 /// The timer for scheduled update checks: first shortly after start, so it does
 /// not compete with the first frames, then hourly to see whether a day has passed.
@@ -88,7 +92,14 @@ struct SampleOutcome {
     result: Result<ot_model::attribution::Attribution, ot_probe::SampleError>,
 }
 
-const CLASS_NAME: PCWSTR = w!("OpenTaskMainWindow");
+/// What the Task Manager helper's thread hands back to the window.
+struct TaskManagerOutcome {
+    /// Replacing (`true`) or restoring.
+    on: bool,
+    result: Elevated,
+}
+
+pub(crate) const CLASS_NAME: PCWSTR = w!("OpenTaskMainWindow");
 /// The app icon's resource id, as `ot-app`'s build script writes it.
 const APP_ICON: u16 = 1;
 const TITLE: &str = "open-task";
@@ -132,6 +143,9 @@ struct State {
     /// repository never produces.
     updater: Option<Updater>,
     closing: Closing,
+    /// The registered message a Task Manager stand-in sends to bring this window
+    /// forward (`instance`).
+    raise_message: u32,
 }
 
 /// How far the app is along in closing.
@@ -165,6 +179,9 @@ enum Outcome {
     Notify(String),
     /// Hide the window, once the state is released (`ShowWindow` re-enters).
     Hide,
+    /// Restore the window if minimized and bring it to the front, for a Task
+    /// Manager stand-in, answering 1.
+    Raise,
 }
 
 fn win(context: &'static str) -> impl FnOnce(windows::core::Error) -> ShellError {
@@ -179,6 +196,9 @@ pub fn run(
     config: SamplerConfig,
     options: ShellOptions,
 ) -> Result<(), ShellError> {
+    // A Task Manager stand-in looks for this.
+    let _ = instance::mark();
+
     // SAFETY: plain process-wide setting; failure (already set) is harmless.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -223,6 +243,8 @@ pub fn run(
         )
         .map_err(win("CreateWindowExW"))?
     };
+    let raise_message = instance::raise_message();
+    instance::accept_raise(hwnd, raise_message);
 
     // Title bar follows the theme; Mica backdrop is best-effort (older builds refuse,
     // and we fall back to an opaque background).
@@ -253,7 +275,14 @@ pub fn run(
     app.set_view(options.view);
     app.set_page(options.page);
     let _ = app.handle(UiEvent::Resize(to_dips_size(size_px, dpi)));
-    let updater = start_updater(options.version, hwnd);
+    let installation = ot_update::installation();
+    tracing::info!(?installation, "installation");
+    app.set_task_manager(TaskManager {
+        replacement: task_manager::replacement(),
+        install: installation.as_ref().map(|i| i.scope),
+        pending: false,
+    });
+    let updater = start_updater(options.version, hwnd, installation);
     let can_install = updater.as_ref().is_some_and(Updater::can_install);
     app.set_update(UpdateView::new(options.version, can_install));
 
@@ -290,6 +319,7 @@ pub fn run(
         title: TITLE,
         updater,
         closing: Closing::No,
+        raise_message,
     }));
     let state_ptr = Box::into_raw(state);
     // SAFETY: hwnd is valid; the pointer stays alive until after the loop below.
@@ -328,8 +358,9 @@ pub fn run(
 }
 
 /// The updater, posting `WM_APP_UPDATE` to the window after every change. It
-/// installs updates only if the installer put this copy where it runs.
-fn start_updater(version: &str, hwnd: HWND) -> Option<Updater> {
+/// installs updates only if the installer put this copy where it runs
+/// (`installation`).
+fn start_updater(version: &str, hwnd: HWND, installation: Option<Installation>) -> Option<Updater> {
     let build = match ot_update::Build::parse(version) {
         Ok(b) => b,
         Err(e) => {
@@ -337,8 +368,6 @@ fn start_updater(version: &str, hwnd: HWND) -> Option<Updater> {
             return None;
         }
     };
-    let installation = ot_update::installation();
-    tracing::info!(?installation, "updates");
     let config = ot_update::Config {
         build,
         feed: ot_update::Feed::official(),
@@ -605,11 +634,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         Outcome::Notify(text) => {
-            let text = HSTRING::from(text);
-            // SAFETY: strings outlive the call; hwnd is valid.
-            unsafe {
-                MessageBoxW(Some(hwnd), &text, w!("open-task"), MB_OK | MB_ICONWARNING);
-            }
+            notify(hwnd, &text);
             LRESULT(0)
         }
         Outcome::Hide => {
@@ -619,12 +644,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        Outcome::Raise => {
+            // SAFETY: hwnd is valid. The stand-in that asked handed this process the
+            // right to take the foreground.
+            unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(hwnd);
+            }
+            LRESULT(1)
+        }
+    }
+}
+
+/// Tell the user something in a message box.
+fn notify(hwnd: HWND, text: &str) {
+    let text = HSTRING::from(text);
+    // SAFETY: strings outlive the call; hwnd is valid.
+    unsafe {
+        MessageBoxW(Some(hwnd), &text, w!("open-task"), MB_OK | MB_ICONWARNING);
     }
 }
 
 #[allow(clippy::too_many_lines)]
 fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Outcome {
     match msg {
+        // A Task Manager stand-in asks this window to come forward. Not while it
+        // is closing: then the stand-in opens its own.
+        m if m == st.raise_message => {
+            if st.closing == Closing::No {
+                Outcome::Raise
+            } else {
+                Outcome::Done(LRESULT(0))
+            }
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             // SAFETY: validates the update region; we do not draw with the HDC.
@@ -824,6 +878,33 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
         }
+        WM_APP_TASK_MANAGER => {
+            // SAFETY: the pointer was made by `Box::into_raw` in
+            // `replace_task_manager` and is delivered exactly once.
+            let outcome = unsafe { Box::from_raw(lparam.0 as *mut TaskManagerOutcome) };
+            set_task_manager_pending(st, false);
+            refresh_task_manager(st);
+            invalidate(hwnd);
+            match outcome.result {
+                Elevated::Done => Outcome::Done(LRESULT(0)),
+                Elevated::Cancelled => {
+                    tracing::info!("permission to change Task Manager was not given");
+                    Outcome::Done(LRESULT(0))
+                }
+                Elevated::Failed(e) => {
+                    tracing::warn!(error = %e, "the Task Manager helper failed");
+                    Outcome::Notify(task_manager_failure(outcome.on, &e))
+                }
+            }
+        }
+        // Coming back to the window: whatever changed Task Manager's replacement
+        // meanwhile (Process Explorer, the installer) shows on the Settings page.
+        WM_ACTIVATEAPP => {
+            if wparam.0 != 0 && refresh_task_manager(st) {
+                invalidate(hwnd);
+            }
+            Outcome::Default
+        }
         WM_APP_SNAPSHOT => {
             if let Some(s) = &st.sampler {
                 if st.app.set_snapshot(s.latest()) {
@@ -976,7 +1057,92 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
             update(cell, hwnd, action);
             None
         }
+        Effect::ReplaceTaskManager(on) => {
+            replace_task_manager(cell, hwnd, on);
+            None
+        }
     }
+}
+
+/// Replace Task Manager (`on`) or restore it: directly when this process may write
+/// the machine's registry, otherwise through a copy of this program started as
+/// administrator. That runs on a worker thread, so the window stays live while
+/// Windows asks for permission, and reports back with `WM_APP_TASK_MANAGER`. The
+/// card shows what the registry says afterwards, whatever happened.
+fn replace_task_manager(cell: &RefCell<State>, hwnd: HWND, on: bool) {
+    let failure = match task_manager::change(on) {
+        Ok(()) => None,
+        Err(e) if task_manager::denied(&e) => {
+            tracing::info!(
+                on,
+                "changing Task Manager needs administrator rights; asking"
+            );
+            if let Ok(mut st) = cell.try_borrow_mut() {
+                set_task_manager_pending(&mut st, true);
+            }
+            invalidate(hwnd);
+            let hwnd_bits = hwnd.0 as isize;
+            let spawned = std::thread::Builder::new()
+                .name("ot-task-manager".into())
+                .spawn(move || {
+                    let owner = HWND(hwnd_bits as *mut c_void);
+                    let result = task_manager::change_elevated(on, owner);
+                    let ptr = Box::into_raw(Box::new(TaskManagerOutcome { on, result }));
+                    // SAFETY: posting to a window handle is thread-safe. If the
+                    // window is gone the post fails and the box is reclaimed here.
+                    let posted = unsafe {
+                        PostMessageW(
+                            Some(owner),
+                            WM_APP_TASK_MANAGER,
+                            WPARAM(0),
+                            LPARAM(ptr as isize),
+                        )
+                    };
+                    if posted.is_err() {
+                        // SAFETY: the message was not delivered, so the box is ours.
+                        drop(unsafe { Box::from_raw(ptr) });
+                    }
+                });
+            match spawned {
+                Ok(_) => return,
+                Err(e) => {
+                    if let Ok(mut st) = cell.try_borrow_mut() {
+                        set_task_manager_pending(&mut st, false);
+                    }
+                    Some(e.to_string())
+                }
+            }
+        }
+        Err(e) => Some(e.message()),
+    };
+    if let Ok(mut st) = cell.try_borrow_mut() {
+        refresh_task_manager(&mut st);
+    }
+    invalidate(hwnd);
+    if let Some(reason) = failure {
+        tracing::warn!(on, %reason, "could not change Task Manager");
+        notify(hwnd, &task_manager_failure(on, &reason));
+    }
+}
+
+/// The message box text for a failed replace or restore.
+fn task_manager_failure(on: bool, reason: &dyn std::fmt::Display) -> String {
+    let verb = if on { "replace" } else { "restore" };
+    format!("Could not {verb} Task Manager.\n\n{reason}")
+}
+
+/// Read what Windows starts in Task Manager's place again. Returns whether the card
+/// changed.
+fn refresh_task_manager(st: &mut State) -> bool {
+    let mut tm = st.app.task_manager().clone();
+    tm.replacement = task_manager::replacement();
+    st.app.set_task_manager(tm)
+}
+
+fn set_task_manager_pending(st: &mut State, pending: bool) {
+    let mut tm = st.app.task_manager().clone();
+    tm.pending = pending;
+    let _ = st.app.set_task_manager(tm);
 }
 
 /// `WM_CLOSE`. With "Install updates automatically" on and a verified update

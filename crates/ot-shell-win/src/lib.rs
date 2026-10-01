@@ -17,15 +17,23 @@
 //! [`launcher`] is the console launcher (`open-task.com`), which lets a terminal
 //! wait for the command-line modes of this GUI program.
 //!
+//! [`task_manager`] makes Windows start open-task in Task Manager's place, as
+//! Process Explorer's "Replace Task Manager" does; `instance` makes such a launch
+//! bring an open window forward instead of opening another.
+//!
 //! On other platforms this crate compiles to a stub that returns
 //! [`ShellError::Unsupported`], so the workspace builds everywhere.
 
 #[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
+mod instance;
+#[cfg(windows)]
 pub mod launcher;
 #[cfg(windows)]
 mod prefs;
+#[cfg(windows)]
+pub mod task_manager;
 #[cfg(windows)]
 mod window;
 
@@ -110,6 +118,16 @@ pub fn error_box(message: &str) {
             MB_OK | MB_ICONERROR,
         );
     }
+}
+
+/// For a launch in Task Manager's place ([`task_manager::is_stand_in`]): bring
+/// forward an open-task window that is already open, as Task Manager does, waiting
+/// a moment for one that is still starting. Returns whether one came forward, in
+/// which case this process has nothing more to do. Call it before any slow setup.
+#[cfg(windows)]
+#[must_use]
+pub fn raise_open_window() -> bool {
+    instance::mark() && instance::raise_existing(window::CLASS_NAME)
 }
 
 /// Create the main window, start sampling, and run the message loop until the

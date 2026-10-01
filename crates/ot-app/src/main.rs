@@ -4,6 +4,11 @@
 //! platforms until their shells exist) runs the measuring core and prints live
 //! snapshots to the terminal instead. The headless path is permanent: it is the
 //! CI smoke test for the probe on every platform and the seed of a future CLI.
+//!
+//! `--replace-task-manager` and `--restore-task-manager` make Windows start this
+//! copy in Task Manager's place, or stop, as the Settings page's switch does (which
+//! runs them elevated when it needs to). When Windows does start it that way, Task
+//! Manager's own path and arguments come first on the command line and are ignored.
 
 #![forbid(unsafe_code)]
 // Release builds are GUI-subsystem so launching the app does not open a terminal.
@@ -49,9 +54,12 @@ fn main() {
     let version = args.iter().any(|a| a == "--version" || a == "-V");
     let check_update = args.iter().any(|a| a == "--check-update");
     let sample = arg_value(&args, "--sample").and_then(|s| s.parse::<u32>().ok());
+    let replace_task_manager = args.iter().any(|a| a == "--replace-task-manager");
+    let restore_task_manager = args.iter().any(|a| a == "--restore-task-manager");
+    let task_manager = replace_task_manager || restore_task_manager;
     let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
     // Everything but the window is a command-line mode, and prints.
-    let window = !(version || check_update || sample.is_some() || headless);
+    let window = !(version || check_update || task_manager || sample.is_some() || headless);
     #[cfg(windows)]
     {
         if window {
@@ -78,6 +86,21 @@ fn main() {
     tracing::info!(version = VERSION, "open-task");
     if check_update {
         std::process::exit(run_check_update());
+    }
+    if task_manager {
+        if replace_task_manager && restore_task_manager {
+            eprintln!("--replace-task-manager and --restore-task-manager: choose one");
+            std::process::exit(2);
+        }
+        std::process::exit(run_task_manager(replace_task_manager));
+    }
+    // Started in Task Manager's place with a window already open: bring that one
+    // forward, as Task Manager would, before any of the setup below.
+    #[cfg(windows)]
+    if window && ot_shell_win::task_manager::is_stand_in(&args) && ot_shell_win::raise_open_window()
+    {
+        tracing::info!("started in Task Manager's place; brought the open window forward");
+        return;
     }
 
     let theme = arg_value(&args, "--theme").unwrap_or("system");
@@ -110,6 +133,51 @@ fn main() {
     } else {
         run_gui(Box::new(probe), config, theme, view, page);
     }
+}
+
+/// `--replace-task-manager` (`replace`) or `--restore-task-manager`. Exits with 0,
+/// or the Win32 error code, which the Settings page reads back when it ran this
+/// elevated.
+#[cfg(windows)]
+fn run_task_manager(replace: bool) -> i32 {
+    use ot_shell_win::task_manager::{self, Restored};
+    let result = if replace {
+        task_manager::replace().map(|exe| {
+            format!(
+                "Windows now starts {} in Task Manager's place (Ctrl+Shift+Esc, the taskbar, \
+                 Ctrl+Alt+Del).",
+                exe.display()
+            )
+        })
+    } else {
+        task_manager::restore().map(|restored| match restored {
+            Restored::Restored => "Task Manager is back: Windows starts it again.".to_owned(),
+            Restored::NotReplaced => "Task Manager is not replaced; nothing to do.".to_owned(),
+            Restored::Other(program) => format!(
+                "Windows starts {program} in Task Manager's place, not this copy; left as it is."
+            ),
+        })
+    };
+    match result {
+        Ok(message) => {
+            out!("{message}");
+            0
+        }
+        Err(e) => {
+            let verb = if replace { "replace" } else { "restore" };
+            eprintln!("could not {verb} Task Manager: {}", e.message());
+            if task_manager::denied(&e) {
+                eprintln!("this needs administrator rights: run it from a terminal opened as administrator");
+            }
+            task_manager::exit_code(&e)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_task_manager(_replace: bool) -> i32 {
+    eprintln!("replacing Task Manager is a Windows feature");
+    2
 }
 
 /// `--check-update`: what the update button's check does, printed. Exit code 0
