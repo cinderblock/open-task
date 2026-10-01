@@ -131,7 +131,8 @@ processes run across the first row, each as wide as its share of the cycles used
 and what runs under each sits beneath it within its span; the gap a parent's children
 leave is its own cycles. Chains fold and color is heat, as in the Map. Pointing at a
 segment reads it out in place of the ancestry line, and a click selects that process
-in the table and scrolls to it.
+in the table and scrolls to it. A second click on it lets the selection go, as it
+does on a selected tile of the Map or band of the History.
 
 Switching keeps the selected process: pick the hottest thing in the list, press
 Ctrl+T, and the tree opens with that process revealed and centered, ancestors

@@ -1187,12 +1187,23 @@ impl App {
             return Reaction::REPAINT;
         }
         search.focused = false;
+        // In the Map, the strip and the History, a click on what is already
+        // selected lets it go; there is no empty row to click instead.
         if self.map_on() || self.map.key_at(at).is_some() {
+            let selected = self.table.selected;
+            if selected.is_some_and(|id| self.map.stands_for(at, id)) {
+                self.table.selected = None;
+                return Reaction::REPAINT;
+            }
             return Reaction::painted(self.select_at(at));
         }
         if self.history_on() {
             return match self.history.click(at) {
                 Some(ChartHit::Mode) => Reaction::REPAINT,
+                Some(ChartHit::Program(program)) if self.selected_program() == Some(program) => {
+                    self.table.selected = None;
+                    Reaction::REPAINT
+                }
                 Some(ChartHit::Program(program)) => Reaction::painted(self.select_program(program)),
                 None => Reaction::NONE,
             };
@@ -1232,6 +1243,12 @@ impl App {
             Some(id) => self.table.selected.replace(id) != Some(id),
             None => false,
         }
+    }
+
+    /// The program the selected process is charted under.
+    fn selected_program(&self) -> Option<ProgramId> {
+        let name = self.snap.processes.get(self.selected_process()?)?.name();
+        self.usage.program(name)
     }
 
     /// Select the row under `at`, if there is one. Returns whether anything changed.
@@ -2832,6 +2849,17 @@ mod tests {
         let crumb = "p4.exe \u{203a} p10.exe \u{203a} p11.exe";
         assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
 
+        // A second click on the tile lets the selection go, and a third takes it
+        // back.
+        for want in [None, Some(id(11))] {
+            painted_strings(&mut app);
+            app.handle(UiEvent::MouseDown {
+                at: tile.center(),
+                button: MouseButton::Left,
+            });
+            assert_eq!(app.table.selected, want);
+        }
+
         // Right-click gives the process menu, and so does the keyboard.
         let r = app.handle(UiEvent::ContextMenu {
             at: Some(tile.center()),
@@ -2913,6 +2941,19 @@ mod tests {
             at: seg.center(),
             button: MouseButton::Left,
         });
+        assert_eq!(app.table.selected, Some(id(20)));
+        // A second click on it lets the selection go; a right click does not.
+        painted_strings(&mut app);
+        let click = |app: &mut App, button| {
+            app.handle(UiEvent::MouseDown {
+                at: seg.center(),
+                button,
+            })
+        };
+        assert!(click(&mut app, MouseButton::Left).repaint);
+        assert_eq!(app.table.selected, None);
+        click(&mut app, MouseButton::Right);
+        click(&mut app, MouseButton::Right);
         assert_eq!(app.table.selected, Some(id(20)));
         app.handle(UiEvent::MouseLeave);
 
@@ -3060,6 +3101,17 @@ mod tests {
         assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
         let r = app.handle(UiEvent::ContextMenu { at: Some(at) });
         assert!(matches!(r.effect, Some(Effect::Menu { .. })), "{r:?}");
+
+        // A second click on the band lets the selection go, and a third takes it
+        // back.
+        for want in [None, Some(id(11))] {
+            painted_strings(&mut app);
+            app.handle(UiEvent::MouseDown {
+                at,
+                button: MouseButton::Left,
+            });
+            assert_eq!(app.table.selected, want);
+        }
 
         // Pointing at the chart marks the same moment in the summary charts.
         assert!(app.handle(UiEvent::MouseMove(at)).repaint);

@@ -524,6 +524,20 @@ impl UsageMap {
             })
     }
 
+    /// Whether the tile under `p` is the one drawn as selected when the process
+    /// with table id `id` is: its own, or that of a folded chain it begins or ends.
+    #[must_use]
+    pub fn stands_for(&self, p: Point, id: RowId) -> bool {
+        self.tiles
+            .iter()
+            .rev()
+            .find(|t| t.rect.contains(p))
+            .is_some_and(|t| {
+                row_id(self.nodes[t.node].statics.key) == id
+                    || row_id(self.nodes[t.top].statics.key) == id
+            })
+    }
+
     /// Where the process with table id `id` was drawn last, if it was.
     #[must_use]
     pub fn tile_rect(&self, id: RowId) -> Option<Rect> {
