@@ -519,9 +519,11 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
     let mut procs: Vec<_> = snap.processes.iter().collect();
     procs.sort_by(|a, b| b.cpu.get().total_cmp(&a.cpu.get()));
     out!(
-        "  {:>7}  {:>6}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  name",
+        "  {:>7}  {:>6}  {:>9}  {:>10}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  name",
         "pid",
         "cpu%",
+        "cpu s",
+        "cycles G",
         "ws",
         "private",
         "thr",
@@ -530,9 +532,11 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
     );
     for p in procs.iter().take(12) {
         out!(
-            "  {:>7}  {:>6.1}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  {}",
+            "  {:>7}  {:>6.1}  {:>9.1}  {:>10.1}  {:>10}  {:>10}  {:>5}  {:>6}  {:<16}  {}",
             p.key().pid,
             p.cpu.get(),
+            p.cpu_time.as_secs_f64(),
+            p.cycles as f64 / 1e9,
             human(p.working_set),
             human(p.private_bytes),
             p.threads,

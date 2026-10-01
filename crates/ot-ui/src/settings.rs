@@ -23,6 +23,10 @@
 //! to change that ([`Effect::ReplaceTaskManager`]) rather than to store anything.
 //! Where there is nothing to replace, the section is not shown.
 //!
+//! The fade card is the page's one number: how fast the cycle totals fade
+//! ([`ot_core::Usage`]), stepped through [`DECAY_STEPS`] with a minus and a plus
+//! button, the card saying how long a total takes to halve at that rate.
+//!
 //! Below the page's title the sections scroll with the wheel when the window is too
 //! short to show them all.
 
@@ -32,6 +36,12 @@ use crate::task_manager::TaskManager;
 use crate::theme::Theme;
 use crate::update::UpdateView;
 use crate::view::{Effect, MouseButton, Reaction, UiEvent};
+
+/// The rates the cycle totals can fade at, in percent a second: from halving in
+/// over a minute to halving in a second.
+pub const DECAY_STEPS: [u8; 10] = [1, 2, 3, 5, 7, 10, 15, 20, 30, 50];
+/// The rate unless changed.
+pub const DECAY_DEFAULT: u8 = 5;
 
 /// Everything the user can set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,11 +60,16 @@ pub struct Settings {
     /// is the new version. Off unless turned on; implies the two above. Never while
     /// it runs: restarting would lose the history it has gathered.
     pub install_updates: bool,
+    /// How fast the cycles a process has used fade from its total, in percent a
+    /// second: one of [`DECAY_STEPS`]. The Cycles column, the Map, the usage strip
+    /// and the History all show totals fading at this rate.
+    pub usage_decay_percent: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            usage_decay_percent: DECAY_DEFAULT,
             animate_rows: None,
             check_updates: true,
             download_updates: false,
@@ -68,6 +83,38 @@ impl Settings {
     #[must_use]
     pub fn animates_rows(self, system_animations: bool) -> bool {
         self.animate_rows.unwrap_or(system_animations)
+    }
+
+    /// These settings with the fade rate set to the step nearest `percent`, as
+    /// when reading a stored value.
+    #[must_use]
+    pub fn with_usage_decay(self, percent: u32) -> Self {
+        let nearest = DECAY_STEPS
+            .into_iter()
+            .min_by_key(|&s| u32::from(s).abs_diff(percent))
+            .unwrap_or(DECAY_DEFAULT);
+        Self {
+            usage_decay_percent: nearest,
+            ..self
+        }
+    }
+
+    /// The share of a cycle total lost each second, `0.05` for 5 %.
+    #[must_use]
+    pub fn usage_decay(self) -> f64 {
+        f64::from(self.usage_decay_percent) / 100.0
+    }
+
+    /// The fade rate one step slower (`-1`) or faster (`1`), or `None` at the end
+    /// of the steps.
+    fn decay_step(self, by: isize) -> Option<u8> {
+        let at = DECAY_STEPS
+            .iter()
+            .position(|&s| s >= self.usage_decay_percent)
+            .unwrap_or(DECAY_STEPS.len() - 1);
+        at.checked_add_signed(by)
+            .and_then(|i| DECAY_STEPS.get(i))
+            .copied()
     }
 }
 
@@ -185,6 +232,8 @@ enum Card {
     Update,
     /// Whether the system opens open-task in its task manager's place.
     TaskManager,
+    /// How fast the cycle totals fade: a number with a minus and a plus button.
+    Decay,
 }
 
 impl Card {
@@ -192,7 +241,7 @@ impl Card {
     fn shown(self, cx: Context<'_>) -> bool {
         match self {
             Self::TaskManager => cx.task_manager.available(),
-            Self::Toggle(_) | Self::Update => true,
+            Self::Toggle(_) | Self::Update | Self::Decay => true,
         }
     }
 
@@ -208,12 +257,15 @@ impl Card {
             Self::Toggle(t) => t.note(settings, cx),
             Self::Update => cx.update.note(),
             Self::TaskManager => cx.task_manager.note(scratch).then_some(scratch.as_str()),
+            Self::Decay => None,
         }
     }
 
-    /// Whether a click does something now.
+    /// Whether a click anywhere on the card does something now. The fade card
+    /// answers only on its two buttons.
     fn clickable(self, cx: Context<'_>) -> bool {
         match self {
+            Self::Decay => false,
             Self::Toggle(_) => true,
             Self::Update => cx.update.action().is_some(),
             Self::TaskManager => !cx.task_manager.pending,
@@ -223,7 +275,10 @@ impl Card {
 
 /// The page, top to bottom: each section's heading and its cards.
 const SECTIONS: [(&str, &[Card]); 3] = [
-    ("Process table", &[Card::Toggle(Toggle::AnimateRows)]),
+    (
+        "Process table",
+        &[Card::Toggle(Toggle::AnimateRows), Card::Decay],
+    ),
     (
         "Updates",
         &[
@@ -235,7 +290,9 @@ const SECTIONS: [(&str, &[Card]); 3] = [
     ),
     ("Windows", &[Card::TaskManager]),
 ];
-const CARD_COUNT: usize = 6;
+const CARD_COUNT: usize = 7;
+/// The fade card's place among the cards.
+const DECAY_CARD: usize = 1;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -262,6 +319,8 @@ const STATE_W: f32 = 36.0;
 /// The update card's button: as wide as a switch with its state.
 const BUTTON_W: f32 = SWITCH_W + STATE_W + 16.0;
 const BUTTON_H: f32 = 28.0;
+/// The fade card's minus and plus buttons.
+const STEP_W: f32 = 28.0;
 
 #[derive(Debug, Default)]
 pub(crate) struct SettingsPage {
@@ -271,6 +330,9 @@ pub(crate) struct SettingsPage {
     /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
+    /// The fade card's minus and plus buttons, and the one under the pointer.
+    steppers: [Rect; 2],
+    hover_step: Option<usize>,
     /// Where the sections scroll: the page below its title.
     view: Rect,
     /// How far the sections are scrolled, in DIPs, and how far they can be.
@@ -293,15 +355,29 @@ impl SettingsPage {
         self.cards.iter().position(|r| r.contains(p))
     }
 
+    /// The fade card's button under `p`: 0 for minus, 1 for plus.
+    fn step_at(&self, p: Point) -> Option<usize> {
+        if !self.view.contains(p) {
+            return None;
+        }
+        self.steppers.iter().position(|r| r.contains(p))
+    }
+
     /// Handle input on the page: flip a switch (changing `settings`), press the
     /// update button, ask for Task Manager to be replaced or restored, or scroll.
     pub fn handle(&mut self, ev: UiEvent, settings: &mut Settings, cx: Context<'_>) -> Reaction {
         match ev {
             UiEvent::MouseMove(p) => {
                 let hit = self.card_at(p);
-                Reaction::painted(std::mem::replace(&mut self.hover, hit) != hit)
+                let step = self.step_at(p);
+                let card = std::mem::replace(&mut self.hover, hit) != hit;
+                let button = std::mem::replace(&mut self.hover_step, step) != step;
+                Reaction::painted(card || button)
             }
-            UiEvent::MouseLeave => Reaction::painted(self.hover.take().is_some()),
+            UiEvent::MouseLeave => {
+                let step = self.hover_step.take().is_some();
+                Reaction::painted(self.hover.take().is_some() || step)
+            }
             UiEvent::MouseDown {
                 at,
                 button: MouseButton::Left,
@@ -320,6 +396,21 @@ impl SettingsPage {
                 Some(Card::TaskManager) if !cx.task_manager.pending => {
                     Reaction::effect(Effect::ReplaceTaskManager(!cx.task_manager.on()))
                 }
+                Some(Card::Decay) => {
+                    let by = match self.step_at(at) {
+                        Some(0) => -1,
+                        Some(_) => 1,
+                        None => return Reaction::NONE,
+                    };
+                    let Some(percent) = settings.decay_step(by) else {
+                        return Reaction::NONE;
+                    };
+                    settings.usage_decay_percent = percent;
+                    Reaction {
+                        repaint: true,
+                        effect: Some(Effect::SaveSettings(*settings)),
+                    }
+                }
                 Some(Card::TaskManager) | None => Reaction::NONE,
             },
             UiEvent::Wheel {
@@ -337,6 +428,7 @@ impl SettingsPage {
                 // before the next paint places them again.
                 self.shift(-moved);
                 self.hover = self.card_at(at);
+                self.hover_step = self.step_at(at);
                 Reaction::REPAINT
             }
             _ => Reaction::NONE,
@@ -371,6 +463,11 @@ impl SettingsPage {
                 i += 1;
             }
         }
+        // The fade card's buttons, either side of its number, at its right.
+        let card = self.cards[DECAY_CARD];
+        let right = card.right() - 16.0;
+        let button = |x: f32| Rect::new(x, card.center().y - BUTTON_H * 0.5, STEP_W, BUTTON_H);
+        self.steppers = [button(right - BUTTON_W), button(right - STEP_W)];
         self.max_scroll = (y - view.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
         self.shift(view.y - self.scroll);
@@ -382,6 +479,9 @@ impl SettingsPage {
             r.y += dy;
         }
         for r in self.cards.iter_mut().filter(|r| r.w > 0.0) {
+            r.y += dy;
+        }
+        for r in &mut self.steppers {
             r.y += dy;
         }
     }
@@ -438,6 +538,35 @@ impl SettingsPage {
                     let (title, detail) = (TaskManager::title(), TaskManager::detail());
                     paint_text(dl, text, title, detail, note, theme);
                     paint_state_and_switch(dl, control, cx.task_manager.on(), theme);
+                }
+                Card::Decay => {
+                    use std::fmt::Write as _;
+                    buf.clear();
+                    let _ = write!(
+                        buf,
+                        "Every second each total loses this share, so a total halves in \
+                         {:.0} s. Slower keeps past work in view longer.",
+                        ot_core::usage::half_life(settings.usage_decay())
+                    );
+                    paint_text(dl, text, "How fast cycles used fade", buf, note, theme);
+                    let [minus, plus] = self.steppers;
+                    for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
+                        let enabled = settings.decay_step(by).is_some();
+                        let hover = enabled && self.hover_step == Some(i);
+                        paint_stepper(dl, r, by > 0, enabled, hover, theme);
+                    }
+                    buf.clear();
+                    let _ = write!(buf, "{}%", settings.usage_decay_percent);
+                    let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
+                    dl.text(
+                        buf,
+                        value,
+                        theme.cell_num,
+                        theme.text,
+                        HAlign::Center,
+                        VAlign::Middle,
+                        false,
+                    );
                 }
                 Card::Update => {
                     let mut title = String::new();
@@ -525,6 +654,36 @@ fn paint_button(dl: &mut DisplayList, r: Rect, label: &str, enabled: bool, theme
     );
 }
 
+/// One of the fade card's buttons: a minus, or a plus, drawn as geometry so it
+/// needs no glyph; quiet at the end of the steps.
+fn paint_stepper(
+    dl: &mut DisplayList,
+    r: Rect,
+    plus: bool,
+    enabled: bool,
+    hover: bool,
+    theme: &Theme,
+) {
+    let fill = if hover {
+        theme.button_active
+    } else {
+        theme.input_bg
+    };
+    dl.fill_round_rect(r, theme.card_radius, fill);
+    dl.stroke_round_rect(r, theme.card_radius, theme.surface_border, 1.0);
+    let ink = if enabled {
+        theme.text
+    } else {
+        theme.text_dim.with_alpha(0.3)
+    };
+    let c = r.center();
+    let s = 5.0;
+    dl.fill_rect(Rect::new(c.x - s, c.y - 0.75, 2.0 * s, 1.5), ink);
+    if plus {
+        dl.fill_rect(Rect::new(c.x - 0.75, c.y - s, 1.5, 2.0 * s), ink);
+    }
+}
+
 /// A Windows 11 style toggle switch, vertically centered in `r`: a pill, filled in
 /// the accent color with a dark knob on the right when on, outlined with the knob
 /// on the left when off.
@@ -605,7 +764,7 @@ mod tests {
     }
 
     /// The Task Manager card's place among the cards.
-    const TASK_MANAGER: usize = 5;
+    const TASK_MANAGER: usize = 6;
 
     fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
         Context {
@@ -724,7 +883,7 @@ mod tests {
         ] {
             assert!(strings.iter().any(|t| t == expected), "{expected}");
         }
-        let card = page.cards[1].center();
+        let card = page.cards[2].center();
         let r = click(&mut page, card, &mut s, cx(true, &update));
         assert_eq!(r.effect, Some(Effect::Update(UpdateAction::Check)));
         assert_eq!(s, Settings::default(), "no setting changed");
@@ -750,18 +909,18 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[2]), "On");
-        assert_eq!(state_of(&dl, page.cards[3]), "Off");
+        assert_eq!(state_of(&dl, page.cards[3]), "On");
+        assert_eq!(state_of(&dl, page.cards[4]), "Off");
         // A copy that cannot install says so, once, on the update card.
         let note = update.note().unwrap();
         assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
 
-        let at = page.cards[2].center();
+        let at = page.cards[3].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[3].center();
+        let at = page.cards[4].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
         assert!(s.check_updates, "downloading needs checking");
@@ -773,29 +932,87 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[4]), "Off");
+        assert_eq!(state_of(&dl, page.cards[5]), "Off");
         assert!(texts(&dl)
             .iter()
             .any(|t| t == "Install updates automatically"));
 
         // On: downloading and checking come with it.
         s.check_updates = false;
-        let at = page.cards[4].center();
+        let at = page.cards[5].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.install_updates && s.download_updates && s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         // Downloading off: installing goes too, checking stays.
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[3].center();
+        let at = page.cards[4].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.download_updates && !s.install_updates && s.check_updates);
         // Checking off takes everything with it.
         s.download_updates = true;
         s.install_updates = true;
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[2].center();
+        let at = page.cards[3].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
+    }
+
+    #[test]
+    fn the_fade_card_steps_the_rate_and_asks_to_save_it() {
+        let update = UpdateView::new("0.2.1", true);
+        let cx = cx(true, &update);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        assert_eq!(s.usage_decay_percent, 5);
+        assert!((s.usage_decay() - 0.05).abs() < 1e-12);
+        let dl = paint(&mut page, s, cx);
+        let strings = texts(&dl);
+        assert!(strings.iter().any(|t| t == "How fast cycles used fade"));
+        assert!(strings.iter().any(|t| t == "5%"));
+        assert!(
+            strings.iter().any(|t| t.contains("a total halves in 14 s")),
+            "{strings:?}"
+        );
+
+        // The card itself does nothing; its buttons step the rate.
+        let card = page.cards[DECAY_CARD];
+        let r = click(
+            &mut page,
+            Point::new(card.x + 20.0, card.center().y),
+            &mut s,
+            cx,
+        );
+        assert_eq!(r, Reaction::NONE);
+        let [minus, plus] = page.steppers;
+        assert!(card.contains(minus.center()) && card.contains(plus.center()));
+        let r = click(&mut page, plus.center(), &mut s, cx);
+        assert_eq!(s.usage_decay_percent, 7);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let _ = click(&mut page, minus.center(), &mut s, cx);
+        let _ = click(&mut page, minus.center(), &mut s, cx);
+        assert_eq!(s.usage_decay_percent, 3);
+        assert!(texts(&paint(&mut page, s, cx)).iter().any(|t| t == "3%"));
+        assert!(
+            page.handle(UiEvent::MouseMove(minus.center()), &mut s, cx)
+                .repaint
+        );
+
+        // The steps end at both ends.
+        for _ in 0..DECAY_STEPS.len() {
+            let _ = click(&mut page, minus.center(), &mut s, cx);
+        }
+        assert_eq!(s.usage_decay_percent, 1);
+        assert_eq!(click(&mut page, minus.center(), &mut s, cx), Reaction::NONE);
+        for _ in 0..DECAY_STEPS.len() {
+            let _ = click(&mut page, plus.center(), &mut s, cx);
+        }
+        assert_eq!(s.usage_decay_percent, 50);
+        assert_eq!(click(&mut page, plus.center(), &mut s, cx), Reaction::NONE);
+
+        // A stored value that is not a step reads as the nearest one.
+        assert_eq!(s.with_usage_decay(6).usage_decay_percent, 5);
+        assert_eq!(s.with_usage_decay(0).usage_decay_percent, 1);
+        assert_eq!(s.with_usage_decay(4000).usage_decay_percent, 50);
     }
 
     #[test]

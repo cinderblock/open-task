@@ -35,13 +35,14 @@ pub(crate) mod col {
     pub const PID: usize = 1;
     pub const USER: usize = 2;
     pub const CPU: usize = 3;
-    pub const MEMORY: usize = 4;
-    pub const WORKING_SET: usize = 5;
-    pub const DISK_READ: usize = 6;
-    pub const DISK_WRITE: usize = 7;
-    pub const THREADS: usize = 8;
-    pub const HANDLES: usize = 9;
-    pub const COMMAND_LINE: usize = 10;
+    pub const CYCLES: usize = 4;
+    pub const MEMORY: usize = 5;
+    pub const WORKING_SET: usize = 6;
+    pub const DISK_READ: usize = 7;
+    pub const DISK_WRITE: usize = 8;
+    pub const THREADS: usize = 9;
+    pub const HANDLES: usize = 10;
+    pub const COMMAND_LINE: usize = 11;
 }
 
 pub(crate) fn columns() -> Vec<Column> {
@@ -50,6 +51,7 @@ pub(crate) fn columns() -> Vec<Column> {
         Column::number("PID", 70.0),
         Column::text("User", 110.0),
         Column::number("CPU %", 70.0),
+        Column::number("Cycles", 75.0),
         Column::number("Memory", 95.0),
         Column::number("Working set", 95.0),
         Column::number("Disk read", 95.0),
@@ -198,6 +200,9 @@ pub(crate) struct ProcessTree {
     /// Parent's index in the process list, or `NONE` for a root.
     parent: Vec<u32>,
     rollup: Vec<Rollup>,
+    /// Each process's fading cycle total with everything below it, see
+    /// [`ProcessTree::roll_cycles`].
+    cycles: Vec<f64>,
     index: HashMap<ProcessKey, u32>,
     depth: Vec<u32>,
     by_depth: Vec<u32>,
@@ -285,6 +290,26 @@ impl ProcessTree {
                 };
             }
         }
+    }
+
+    /// Fold the processes' fading cycle totals (`own`, parallel to the process list
+    /// of the last [`ProcessTree::rebuild`]) into their ancestors.
+    pub fn roll_cycles(&mut self, own: &[f64]) {
+        self.cycles.clear();
+        self.cycles.extend_from_slice(own);
+        self.cycles.resize(self.parent.len(), 0.0);
+        for &i in &self.by_depth {
+            let p = self.parent[i as usize];
+            if p != NONE {
+                self.cycles[p as usize] += self.cycles[i as usize];
+            }
+        }
+    }
+
+    /// Fading cycle total of a process and everything below it.
+    #[must_use]
+    pub fn cycles(&self, row: usize) -> f64 {
+        self.cycles.get(row).copied().unwrap_or(0.0)
     }
 
     #[must_use]
@@ -613,6 +638,12 @@ pub(crate) struct ProcessRows<'a> {
     pub attribution: Option<&'a Attribution>,
     pub interval_secs: f32,
     pub mem_total: f32,
+    /// Each process's fading cycle total ([`ot_core::Usage`]), parallel to `procs`;
+    /// empty when there is none to show.
+    pub cycles: &'a [f64],
+    /// The total a process settles at with one core busy throughout, which a full
+    /// heat tint in the Cycles column stands for. Zero when the clock is unknown.
+    pub cycles_core: f64,
     /// Search results, parallel to `procs`; empty when there is no search.
     pub matched: &'a [bool],
     /// Rows to list: the matches, plus their ancestors in tree mode. Empty means
@@ -633,6 +664,12 @@ pub(crate) fn band(column: usize) -> Option<Band> {
         col::CPU => Some(Band {
             abs: 1.0,
             rel: 0.15,
+        }),
+        // A fading total moves smoothly, so a narrow band is enough: 50 M cycles
+        // (a few hundredths of a second of one core) or 10 %.
+        col::CYCLES => Some(Band {
+            abs: 5.0e7,
+            rel: 0.10,
         }),
         // Bytes per interval; I/O is bursty, so a wide relative band.
         col::DISK_READ | col::DISK_WRITE => Some(Band {
@@ -667,6 +704,7 @@ impl ProcessRows<'_> {
                     let ru = self.tree.rollup(row);
                     match column {
                         col::CPU => f64::from(ru.cpu),
+                        col::CYCLES => self.tree.cycles(row),
                         col::MEMORY => ru.private_bytes as f64,
                         col::WORKING_SET => ru.working_set as f64,
                         col::DISK_READ => ru.disk_read as f64,
@@ -679,6 +717,7 @@ impl ProcessRows<'_> {
                     let p = &self.procs[r.proc as usize];
                     match column {
                         col::CPU => f64::from(p.cpu.get()),
+                        col::CYCLES => self.own_cycles(r.proc as usize),
                         col::MEMORY => p.private_bytes.get() as f64,
                         col::WORKING_SET => p.working_set.get() as f64,
                         col::DISK_READ => p.disk_read.get() as f64,
@@ -781,6 +820,16 @@ impl ProcessRows<'_> {
     #[must_use]
     pub fn listed(&self) -> usize {
         (0..self.procs.len()).filter(|&r| self.visible(r)).count()
+    }
+
+    /// A process's own fading cycle total.
+    fn own_cycles(&self, proc: usize) -> f64 {
+        self.cycles.get(proc).copied().unwrap_or(0.0)
+    }
+
+    /// Cycle heat is relative to one core busy throughout.
+    fn cycles_heat(&self, cycles: f64) -> Option<f32> {
+        (self.cycles_core > 0.0).then(|| (cycles / self.cycles_core).min(1.0) as f32)
     }
 
     fn memory_heat(&self, private_bytes: u64) -> Option<f32> {
@@ -933,6 +982,7 @@ impl RowSource for ProcessRows<'_> {
                 }
                 col::PID => format::count(out, p.key().pid),
                 col::CPU => format::percent(out, p.cpu.get()),
+                col::CYCLES => format::cycles_cell(out, self.own_cycles(r.proc as usize)),
                 col::MEMORY => format::bytes(out, p.private_bytes),
                 col::WORKING_SET => format::bytes(out, p.working_set),
                 col::DISK_READ => format::rate(out, p.disk_read, self.interval_secs),
@@ -1004,6 +1054,7 @@ impl RowSource for ProcessRows<'_> {
         let r = self.row(row);
         match (r.kind, col) {
             (RowKind::Process, col::CPU) => Some((r.value / 100.0).min(1.0)),
+            (RowKind::Process, col::CYCLES) => self.cycles_heat(self.own_cycles(r.proc as usize)),
             (RowKind::Process, col::MEMORY) => {
                 self.memory_heat(self.procs[r.proc as usize].private_bytes.get())
             }
@@ -1099,6 +1150,7 @@ impl RowSource for ProcessRows<'_> {
                         }
                     }
                     col::CPU => format::percent(out, ru.cpu),
+                    col::CYCLES => format::cycles_cell(out, self.tree.cycles(row)),
                     col::MEMORY => format::bytes(out, Bytes(ru.private_bytes)),
                     col::WORKING_SET => format::bytes(out, Bytes(ru.working_set)),
                     col::DISK_READ => format::rate(out, Bytes(ru.disk_read), self.interval_secs),
@@ -1129,6 +1181,7 @@ impl RowSource for ProcessRows<'_> {
         let r = self.tree.rollup(row);
         match col {
             col::CPU => Some((r.cpu / 100.0).min(1.0)),
+            col::CYCLES => self.cycles_heat(self.tree.cycles(row)),
             col::MEMORY => self.memory_heat(r.private_bytes),
             _ => None,
         }
@@ -1212,6 +1265,7 @@ pub(crate) mod tests {
             }),
             cpu: Percent(cpu),
             cpu_time: Duration::ZERO,
+            cycles: 0,
             working_set: Bytes(1),
             private_bytes: Bytes(1),
             disk_read: Bytes(0),
@@ -1300,6 +1354,8 @@ pub(crate) mod tests {
             attribution: a,
             interval_secs: 1.0,
             mem_total: 0.0,
+            cycles: &[],
+            cycles_core: 0.0,
             matched: &[],
             shown: &[],
             tree_mode,

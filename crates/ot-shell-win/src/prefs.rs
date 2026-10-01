@@ -2,8 +2,9 @@
 //! follows.
 //!
 //! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each
-//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`, `InstallUpdates`), per user
-//! like every other per-user preference on Windows. A missing key or value means the
+//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`, `InstallUpdates`, and
+//! `UsageDecayPercent`, a number), per user like every other per-user preference on
+//! Windows. A missing key or value means the
 //! default. Nothing here is fatal: a value that cannot be read or written is
 //! logged and the app carries on with what it has.
 
@@ -24,16 +25,22 @@ const ANIMATE_ROWS: PCWSTR = w!("AnimateRows");
 const CHECK_UPDATES: PCWSTR = w!("CheckForUpdates");
 const DOWNLOAD_UPDATES: PCWSTR = w!("DownloadUpdates");
 const INSTALL_UPDATES: PCWSTR = w!("InstallUpdates");
+const USAGE_DECAY: PCWSTR = w!("UsageDecayPercent");
 
 /// The settings as last saved, defaults for anything never saved.
 pub fn load() -> Settings {
     let defaults = Settings::default();
     let flag = |name, default| read_dword(name).map_or(default, |v| v != 0);
-    Settings {
+    let settings = Settings {
         animate_rows: read_dword(ANIMATE_ROWS).map(|v| v != 0),
         check_updates: flag(CHECK_UPDATES, defaults.check_updates),
         download_updates: flag(DOWNLOAD_UPDATES, defaults.download_updates),
         install_updates: flag(INSTALL_UPDATES, defaults.install_updates),
+        ..defaults
+    };
+    match read_dword(USAGE_DECAY) {
+        Some(percent) => settings.with_usage_decay(percent),
+        None => settings,
     }
 }
 
@@ -41,10 +48,11 @@ pub fn load() -> Settings {
 /// (never chosen) is not written.
 pub fn save(s: &Settings) {
     let values = [
-        (ANIMATE_ROWS, s.animate_rows),
-        (CHECK_UPDATES, Some(s.check_updates)),
-        (DOWNLOAD_UPDATES, Some(s.download_updates)),
-        (INSTALL_UPDATES, Some(s.install_updates)),
+        (ANIMATE_ROWS, s.animate_rows.map(u32::from)),
+        (CHECK_UPDATES, Some(u32::from(s.check_updates))),
+        (DOWNLOAD_UPDATES, Some(u32::from(s.download_updates))),
+        (INSTALL_UPDATES, Some(u32::from(s.install_updates))),
+        (USAGE_DECAY, Some(u32::from(s.usage_decay_percent))),
     ];
     let mut key = HKEY::default();
     // SAFETY: the out-pointer is a local; the strings are static.
@@ -69,7 +77,7 @@ pub fn save(s: &Settings) {
         let Some(value) = value else {
             continue;
         };
-        let data = u32::from(value).to_le_bytes();
+        let data = value.to_le_bytes();
         // SAFETY: `key` was just opened with KEY_SET_VALUE; the data outlives the call.
         let status = unsafe { RegSetValueExW(key, name, None, REG_DWORD, Some(&data)) };
         if status.is_err() {

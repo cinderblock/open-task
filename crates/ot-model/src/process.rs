@@ -70,6 +70,11 @@ pub struct ProcessSample {
     /// a process "has been using" over any stretch is the difference of two of
     /// these.
     pub cpu_time: Duration,
+    /// Processor clock cycles used since the process started, all threads, where
+    /// the platform counts them (Windows does); zero where it does not. A finer
+    /// measure of the same thing as `cpu_time`: that is charged a clock tick at a
+    /// time, this is counted exactly, so a short burst shows in it.
+    pub cycles: u64,
     /// Private working set: physical memory this process alone is holding.
     pub working_set: Bytes,
     /// Private committed bytes, the closest thing to "how much will I get back".

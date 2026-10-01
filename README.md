@@ -10,8 +10,8 @@ computer slow?" diagnostics, in a native app that stays out of the way of the ma
 it is measuring.
 
 **Status: early, but real.** On Windows it opens a native window with two pages: live
-CPU and memory graphs over a sortable process table (a flat list or a process tree),
-and a Performance page with a chart and the numbers for the CPU, memory, each disk
+CPU and memory graphs over a sortable process table (a flat list, a process tree, a
+map or a history of who has been using the CPU), and a Performance page with a chart and the numbers for the CPU, memory, each disk
 and each network connection. Everything
 is drawn with Direct2D over a Mica backdrop. Linux and macOS compile, run headless,
 and measure nothing yet.
@@ -63,36 +63,73 @@ line and keeps its width as the pointer moves: `2m 05s ago`, `25m ago`,
 come back only once the pointer is well short of those, so a readout resting near
 a boundary does not flicker between the two.
 
-The process table has three arrangements, switched with the **List / Tree / Map**
-control above it; **Ctrl+T** toggles List and Tree (Process Explorer's binding) and
-**Ctrl+M** opens the Map:
+**Cycles used.** CPU % says who is busy this second: power, in watts. open-task
+also keeps the other number, what each process has consumed: energy, in joules. It
+counts the processor clock cycles every process uses and adds them up, and so that
+the totals do not grow forever, they fade: every second each total loses 5 % (the
+rate is on the **Settings** page, from 1 % to 50 %). A process that was busy lately
+is at the top, one that has been steadily at work for a long time stays in view, and
+a short burst shows for a while and then sinks. At a steady rate a total settles at
+about twenty seconds' worth of cycles (at 5 %; a total halves in 14 s), so read it
+as "what was used recently". The **Cycles** column, the Map, the usage strip and the
+History all show these totals. The fading goes by the clock, not by the sample, so
+the numbers are the same however often the system is sampled; a process that exits
+stays in the Map and the strip until its total has faded away, and in the History
+for as long as the chart reaches back.
 
-- **List** is one flat list sorted by the column you click. It starts sorted by CPU.
+Cycles are what Windows counts for each process, exactly, where CPU time is charged
+a clock tick (15.6 ms) at a time, so a short burst that CPU % misses still shows.
+They are counted at the processor's fixed base clock (1.6 billion a second for each
+busy logical processor on a chip with a 1.6 GHz base speed), whatever speed the core
+is running at that moment: a cycle here is a slice of time, not a unit of work done.
+Two things are not seen: the cycles a process uses between its last sample and its
+exit, and a process that starts and ends between two samples.
+
+The process table has four arrangements, switched with the **List / Tree / Map /
+History** control above it; **Ctrl+T** toggles List and Tree (Process Explorer's
+binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
+
+- **List** is one flat list sorted by the column you click. It starts sorted by
+  Cycles: who has been using the CPU, rather than who is using it this second.
 - **Tree** nests children under their parents. Siblings are sorted by the same
   column, using subtree totals, so the branch that is busy rises to the top at every
   level even when its root is idle. Click a row's chevron, or press **Left** and
   **Right**, to collapse and expand; a collapsed row shows the totals of everything
   underneath it and how many processes that is. Left on a leaf moves to its parent;
   Right on an expanded row moves to its first child.
-- **Map** answers a different question: not who is busy this second, but who has
-  been using the CPU. Every process is a tile whose area is the CPU time it used in
-  the last minute (while open-task has been running less than a minute, what it has
-  seen), nested by the process tree: a process whose children used a real share of
-  its time is a frame around them, with one more tile for its own time. A chain of
+- **Map** shows the cycles used as areas. Every process is a tile whose area is its
+  total, nested by the process tree: a process whose children used a real share of
+  its cycles is a frame around them, with one more tile for its own. A chain of
   processes that only launched the next (a shell, a runtime, an app) folds into one
   frame, `pwsh.exe › node.exe › electron.exe`. Color is the table's heat: how busy the
-  process is right now. A process that exited in the last minute stays, dimmed and
-  marked, until the minute passes it. Pointing at a tile names it and gives its
-  average CPU and seconds used; a click selects it (the ancestry line and the other
-  arrangements keep the selection), right-click gives the process menu, and the
-  search dims what does not match. The line under the map says how much of the
-  machine was used over the minute.
+  process is right now. A process that has exited stays, dimmed and marked, until
+  its total has faded. Pointing at a tile names it and gives its cycles; a click
+  selects it (the ancestry line and the other arrangements keep the selection),
+  right-click gives the process menu, and the search dims what does not match. The
+  line under the map gives the cycles used by everything together.
+- **History** shows the cycles used over the last hour, as a chart: a stack of
+  bands, one per program, on the same time axis as the graphs above it. A program is
+  every process of one name, so twelve `chrome.exe`, or the two hundred `rustc.exe`
+  of a build, are one band. The switch above the chart picks what a band's thickness
+  is. **Fading total** is the number the Cycles column shows, over time: a band
+  swells while its program works and sags once it stops. **Rate** is the cycles the
+  program was using each second: the CPU graph cut up by program, of which the
+  fading total is a smoothed copy. The eight programs that take the most of the
+  chart get a band and a color each, and the rest are one grey band, "Everything
+  else". A program keeps its color for as long as it keeps a band, and a band
+  changes hands only when a newcomer is clearly bigger, so the chart does not
+  recolor itself as you watch. The legend beside it names the bands, top to bottom
+  as they are stacked, with each one's value now; point at the chart and it gives
+  the values at that moment instead, and the CPU and memory graphs mark the same
+  moment (and the other way round). Pointing at a band, or its legend row, sets it
+  off from the others; a click selects the program's busiest process, right-click
+  gives its menu, and the search dims the programs it does not match.
 
-In List and Tree, a thin **usage strip** between the graphs and the table keeps the
-Map's answer in view: the Map folded flat into two rows. The top-level processes run
-across the first row, each as wide as its share of the CPU used over the last minute,
+In List, Tree and History, a thin **usage strip** between the graphs and the table
+keeps the Map's answer in view: the Map folded flat into two rows. The top-level
+processes run across the first row, each as wide as its share of the cycles used,
 and what runs under each sits beneath it within its span; the gap a parent's children
-leave is its own time. Chains fold and color is heat, as in the Map. Pointing at a
+leave is its own cycles. Chains fold and color is heat, as in the Map. Pointing at a
 segment reads it out in place of the ancestry line, and a click selects that process
 in the table and scrolls to it.
 
@@ -132,8 +169,9 @@ arrow keys keep walking the table while you type. The filter matches name, PID,
 user, image path and command line, case-insensitively. In tree mode the ancestors of
 a match stay listed, dimmed, so the match keeps its place in the hierarchy.
 
-**Columns:** Name, PID, User, CPU %, Memory, Working set, Disk read, Disk write,
-Threads, Handles, Command line. Drag a header divider to resize; **Shift+wheel** (or
+**Columns:** Name, PID, User, CPU %, Cycles, Memory, Working set, Disk read, Disk
+write, Threads, Handles, Command line. In the tree, a collapsed row's Cycles are
+those of everything under it, like its other numbers, and siblings sort by them. Drag a header divider to resize; **Shift+wheel** (or
 a tilt wheel) scrolls sideways when the columns are wider than the window. The user,
 image path and command line come from a limited-rights handle to each process; a
 process that refuses even that (another user's, from an unelevated open-task) still
@@ -313,10 +351,11 @@ cargo run --release
 Opens the window on Windows. The theme and title bar follow the Windows app mode
 setting, including live changes; `--theme dark` or `--theme light` overrides it.
 `--view tree` starts with the process tree instead of the list (`--view map` with the
-Map), and `--page performance` on the Performance page.
+Map, `--view history` with the History), and `--page performance` on the Performance
+page.
 `--headless --passes 5` prints a few passes of live system state to the terminal
 instead and exits (the processor and its caches, the top processes by CPU with
-their owning user, the busiest
+their CPU time, cycles and owning user, the busiest
 service hosts with the services they run, and the hottest threads with the service
 each works for); that is the only mode on Linux and macOS for now, where it exits
 with code 3 ("no probe on this platform yet"). `--headless --sample <pid>

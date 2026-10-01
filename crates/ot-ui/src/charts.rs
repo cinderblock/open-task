@@ -41,7 +41,7 @@ impl Crosshair {
     /// The crosshair at `age_ms`, following on from `prev`. The units and the side
     /// change with hysteresis, so a readout keeps its shape and place while the
     /// pointer, or the chart moving under it, jitters around a boundary.
-    fn follow(prev: Option<Self>, age_ms: f32) -> Self {
+    pub fn follow(prev: Option<Self>, age_ms: f32) -> Self {
         Self {
             age_ms,
             fields: AgoFields::follow(prev.map(|c| c.fields), age_ms),
@@ -69,6 +69,9 @@ pub(crate) struct ChartGroup {
     pointer: Option<(usize, f32)>,
     /// What every chart marks while the pointer is over one of them.
     crosshair: Option<Crosshair>,
+    /// An age a chart outside the group asks this group to mark too, while the
+    /// pointer is over that chart rather than one of these.
+    outside: Option<f32>,
     scratch: Vec<Point>,
     ago: String,
     readout: String,
@@ -113,7 +116,26 @@ impl ChartGroup {
     /// forgets it, so the next hover starts fresh.
     fn resnap(&mut self) {
         let prev = self.crosshair;
-        self.crosshair = self.snapped().map(|age| Crosshair::follow(prev, age));
+        self.crosshair = self
+            .snapped()
+            .or(self.outside)
+            .map(|age| Crosshair::follow(prev, age));
+    }
+
+    /// Mark `age_ms` in every chart of the group on behalf of a chart outside it
+    /// that shares the time axis and has the pointer; `None` when it no longer
+    /// does. The group's own pointer wins. Returns whether the crosshair moved.
+    pub fn mark(&mut self, age_ms: Option<f32>) -> bool {
+        self.outside = age_ms;
+        let before = self.crosshair;
+        self.resnap();
+        self.crosshair != before
+    }
+
+    /// Whether the pointer is over one of the group's own charts.
+    #[must_use]
+    pub fn pointed(&self) -> bool {
+        self.pointer.is_some_and(|(i, _)| i < self.len)
     }
 
     /// Follow the pointer, `None` when it left. Returns whether the crosshair moved.

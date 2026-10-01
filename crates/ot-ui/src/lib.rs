@@ -19,6 +19,7 @@ mod task_manager;
 pub mod theme;
 pub mod treemap;
 mod update;
+mod usage_chart;
 mod usage_map;
 pub mod view;
 

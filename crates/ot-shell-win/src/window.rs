@@ -108,6 +108,7 @@ const INITIAL_SIZE: (i32, i32) = (1180, 760);
 
 /// Virtual-key codes for letters are their upper-case ASCII values.
 const VK_F: u16 = b'F' as u16;
+const VK_H: u16 = b'H' as u16;
 const VK_M: u16 = b'M' as u16;
 const VK_T: u16 = b'T' as u16;
 /// The digit keys above the letters, `1` to `9`.
@@ -820,6 +821,7 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 VK_T if ctrl => UiEvent::Command(Command::ToggleView),
                 // Ctrl+M: the Map, the process table's area as a treemap.
                 VK_M if ctrl => UiEvent::Command(Command::SetView(ViewMode::Map)),
+                VK_H if ctrl => UiEvent::Command(Command::SetView(ViewMode::History)),
                 VK_F if ctrl => UiEvent::Command(Command::Find),
                 // Ctrl+Tab and Ctrl+Shift+Tab walk the pages, as in classic Task
                 // Manager; Ctrl+1..9 jump to one.

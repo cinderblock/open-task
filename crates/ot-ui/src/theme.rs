@@ -80,6 +80,12 @@ pub struct Theme {
     pub memory_modified: Color,
     /// A headline number in a page's statistics.
     pub stat: TextStyle,
+    /// Colors that tell series apart where a chart has several, in a fixed order:
+    /// neighbours in it stay distinguishable with the common color-vision
+    /// deficiencies. A series past the last is not given a color of its own; it is
+    /// counted under `series_other`.
+    pub series: [Color; 8],
+    pub series_other: Color,
 }
 
 impl Theme {
@@ -129,6 +135,17 @@ impl Theme {
             network_send: Color::hex(0xF8_D4_A8),
             memory_modified: Color::hex(0xFF_B4_54),
             stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
+            series: [
+                Color::hex(0x39_87_E5),
+                Color::hex(0xD9_59_26),
+                Color::hex(0x19_9E_70),
+                Color::hex(0xC9_85_00),
+                Color::hex(0xD5_51_81),
+                Color::hex(0x00_83_00),
+                Color::hex(0x90_85_E9),
+                Color::hex(0xE6_67_67),
+            ],
+            series_other: Color::hex(0x6E_6D_68),
         }
     }
 
@@ -178,6 +195,17 @@ impl Theme {
             network_send: Color::hex(0xE8_A8_65),
             memory_modified: Color::hex(0xC2_5E_00),
             stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
+            series: [
+                Color::hex(0x2A_78_D6),
+                Color::hex(0xEB_68_34),
+                Color::hex(0x1B_AF_7A),
+                Color::hex(0xED_A1_00),
+                Color::hex(0xE8_7B_A4),
+                Color::hex(0x00_83_00),
+                Color::hex(0x4A_3A_A7),
+                Color::hex(0xE3_49_48),
+            ],
+            series_other: Color::hex(0xA9_A7_A0),
         }
     }
 }

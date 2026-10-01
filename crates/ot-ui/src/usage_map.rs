@@ -1,13 +1,13 @@
 //! The Map: the process table's area drawn as a treemap of who has been using the
 //! CPU, the third arrangement beside List and Tree.
 //!
-//! Each process is a tile whose area is the CPU time it used over the last minute
-//! ([`ot_core::Usage`]), so the map answers "who has been busy", which the table's
-//! one-second CPU column cannot. Tiles nest by the process tree: a process with
-//! children is a frame with its name on a header strip, its children inside, and one
-//! more tile for the time it used itself. Color says whether a tile is still at it:
-//! the table's heat orange, as strong as the process's CPU in the last interval. A
-//! process that exited inside the window stays, dimmed, until the window passes it.
+//! Each process is a tile whose area is the clock cycles it has used, as a total
+//! that fades ([`ot_core::Usage`]), so the map answers "who has been busy", which
+//! the table's one-second CPU column cannot. Tiles nest by the process tree: a
+//! process with children is a frame with its name on a header strip, its children
+//! inside, and one more tile for what it used itself. Color says whether a tile is
+//! still at it: the table's heat orange, as strong as the process's CPU in the last
+//! interval. A process that exited stays, dimmed, until its total has faded away.
 //!
 //! Layout is squarified ([`crate::treemap`]). Siblings are laid out largest first,
 //! but by sticky keys ([`Steady`]), so two siblings of about the same size do not
@@ -16,7 +16,7 @@
 //!
 //! The same accounting also draws the icicle strip above the table in List and
 //! Tree: two rows, the top-level processes across the first, what runs under each
-//! beneath it, every segment as wide as its share of the CPU used over the minute.
+//! beneath it, every segment as wide as its share of the cycles used.
 //! It is the Map folded flat, always in view; the strip and the Map are never shown
 //! together, so they share this one struct.
 
@@ -29,6 +29,7 @@ use ot_model::process::ProcessStatic;
 use ot_model::ProcessKey;
 use ot_paint::{DisplayList, HAlign, Point, Rect, VAlign};
 
+use crate::format;
 use crate::process_rows::{process_matches, row_id, statics_match};
 use crate::steady::{Band, Steady};
 use crate::table::RowId;
@@ -46,13 +47,13 @@ const FRAME_MIN: (f32, f32) = (64.0, 48.0);
 const FRAME_PAD: f32 = 3.0;
 /// Smallest tile drawn.
 const TILE_MIN: f32 = 2.0;
-/// A tile gets its name from this size, and a second line (its average CPU) from
-/// this height.
+/// A tile gets its name from this size, and a second line (its cycles) from this
+/// height.
 const LABEL_MIN: (f32, f32) = (34.0, 15.0);
 const TWO_LINES_H: f32 = 32.0;
-/// A frame's share of the header for its percentage, right-aligned.
-const HEADER_VALUE_W: f32 = 44.0;
-/// A process with one child and less than this share of its subtree's time to
+/// A frame's share of the header for its cycles, right-aligned.
+const HEADER_VALUE_W: f32 = 52.0;
+/// A process with one child and less than this share of its subtree's cycles to
 /// itself is folded into its child's frame: `a.exe \u{203a} b.exe`. Chains of
 /// launchers and wrappers (a shell, a runtime, an app) otherwise nest frame in frame.
 const CHAIN_OWN: f64 = 0.02;
@@ -62,9 +63,10 @@ const STRIP_ROWS: usize = 2;
 const STRIP_ROW_GAP: f32 = 1.0;
 /// A strip segment gets its name from this width.
 const STRIP_LABEL_W: f32 = 48.0;
-/// Siblings reorder only when one's time changes by more than this: 50 ms or 10 %.
+/// Siblings reorder only when one's cycles change by more than this: 50 M (a few
+/// hundredths of a second of one core) or 10 %.
 const ORDER_BAND: Band = Band {
-    abs: 0.05,
+    abs: 5.0e7,
     rel: 0.10,
 };
 
@@ -72,7 +74,7 @@ const ORDER_BAND: Band = Band {
 struct Node {
     statics: Arc<ProcessStatic>,
     parent: Option<usize>,
-    /// CPU seconds this process used itself, and with everything under it.
+    /// Cycles this process used itself, and with everything under it, faded.
     own: f64,
     total: f64,
     alive: bool,
@@ -88,7 +90,7 @@ enum TileKind {
     Leaf,
     /// A process with children: name strip, contents inside.
     Frame,
-    /// Inside a frame: the time the framed process used itself.
+    /// Inside a frame: what the framed process used itself.
     Own,
 }
 
@@ -102,7 +104,7 @@ struct Tile {
     kind: TileKind,
 }
 
-/// What a container lays out: a child process, or the parent's own time.
+/// What a container lays out: a child process, or the parent's own cycles.
 #[derive(Debug, Clone, Copy)]
 enum Item {
     Child(usize),
@@ -134,15 +136,14 @@ pub(crate) struct UsageMap {
     tiles: Vec<Tile>,
     order: Steady,
     hover: Option<ProcessKey>,
-    /// Seconds the window covers, and CPU seconds everything used in it.
-    span: f64,
+    /// Cycles everything used, faded, and the share the totals lose each second.
     used: f64,
-    logical_processors: usize,
+    decay: f64,
 }
 
 impl UsageMap {
-    /// Rebuild the process tree from the usage accounting: every process that used
-    /// CPU in the window, alive or exited.
+    /// Rebuild the process tree from the usage accounting: every process with a
+    /// total, alive or exited.
     fn build(&mut self, usage: &Usage, snap: &Snapshot, needle: &str, buf: &mut String) {
         self.nodes.clear();
         self.index.clear();
@@ -163,7 +164,7 @@ impl UsageMap {
             self.nodes.push(Node {
                 statics: Arc::clone(u.statics),
                 parent: None,
-                own: u.used.as_secs_f64(),
+                own: u.used,
                 total: 0.0,
                 alive: u.alive,
                 cpu_now: sample.map_or(0.0, |p| p.cpu.get()),
@@ -246,9 +247,8 @@ impl UsageMap {
             Some(ORDER_BAND),
             self.nodes.iter().map(|n| (row_id(n.statics.key), n.total)),
         );
-        self.span = usage.span().as_secs_f64();
         self.used = self.roots.iter().map(|&r| self.nodes[r].total).sum();
-        self.logical_processors = usage.logical_processors();
+        self.decay = usage.decay();
     }
 
     fn children(&self, i: usize) -> &[usize] {
@@ -273,7 +273,7 @@ impl UsageMap {
                 None => items.extend(self.roots.iter().map(|&r| Item::Child(r))),
                 Some(i) => items.extend(self.children(i).iter().map(|&c| Item::Child(c))),
             }
-            // Largest first, by sticky key; the parent's own time goes last so it
+            // Largest first, by sticky key; the parent's own cycles go last so it
             // keeps its corner of the frame.
             self.sort_items(&mut items);
             if let Some(i) = container {
@@ -320,8 +320,8 @@ impl UsageMap {
     }
 
     /// Lay the icicle out across `area`: the top-level processes (chains folded)
-    /// along the first row, as wide as their share of the CPU used; the busy
-    /// children of each beneath it, within its span. A parent's own time is the
+    /// along the first row, as wide as their share of the cycles used; the busy
+    /// children of each beneath it, within its span. A parent's own cycles are the
     /// part of its span its children leave empty.
     fn layout_strip(&mut self, area: Rect) {
         self.tiles.clear();
@@ -430,8 +430,8 @@ impl UsageMap {
         dl.pop_clip();
     }
 
-    /// What the pointer is over, for a status line: the process, its average CPU
-    /// and seconds used over the window. False, and `out` empty, when nothing is.
+    /// What the pointer is over, for a status line: the process and the cycles it
+    /// has used. False, and `out` empty, when nothing is.
     pub fn describe_hover(&self, out: &mut String) -> bool {
         out.clear();
         let Some(&i) = self.hover.and_then(|k| self.index.get(&k)) else {
@@ -443,10 +443,8 @@ impl UsageMap {
             "{} \u{b7} PID {} \u{b7} ",
             n.statics.name, n.statics.key.pid
         );
-        push_percent(out, self.average(n.total));
-        out.push_str("% of a core on average over ");
-        self.window(out);
-        let _ = write!(out, ", {:.1} s of CPU", n.total);
+        push_cycles(out, n.total);
+        out.push_str(" cycles");
         if !self.children(i).is_empty() {
             out.push_str(" with everything under it");
         }
@@ -457,7 +455,7 @@ impl UsageMap {
     }
 
     /// Follow a chain of single children down from `i` while each link has next to
-    /// no time of its own: the process whose frame (or tile) the chain folds into.
+    /// no cycles of its own: the process whose frame (or tile) the chain folds into.
     fn chain_end(&self, i: usize) -> usize {
         let mut at = i;
         loop {
@@ -470,9 +468,9 @@ impl UsageMap {
         }
     }
 
-    /// The children of `i` that took a real share of its subtree's time. Only these
-    /// make it a frame or a link in a chain: a parent whose children barely ran is
-    /// better drawn as one tile than as a frame around its own time.
+    /// The children of `i` that took a real share of its subtree's cycles. Only
+    /// these make it a frame or a link in a chain: a parent whose children barely
+    /// ran is better drawn as one tile than as a frame around its own cycles.
     fn busy_children(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
         let floor = CHAIN_OWN * self.nodes[i].total;
         self.children(i)
@@ -545,16 +543,6 @@ impl UsageMap {
         std::mem::replace(&mut self.hover, key) != key
     }
 
-    /// Average CPU over the window, as a share of one core (100 is one core busy
-    /// throughout), for `seconds` used.
-    fn average(&self, seconds: f64) -> f32 {
-        if self.span > 0.0 {
-            (seconds / self.span * 100.0) as f32
-        } else {
-            0.0
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
@@ -620,8 +608,7 @@ impl UsageMap {
                 self.chain_name(t.top, t.node, buf);
                 dl.label(buf, names, theme.small, ink);
                 buf.clear();
-                push_percent(buf, self.average(top.total));
-                buf.push('%');
+                push_cycles(buf, top.total);
                 dl.text(
                     buf,
                     value,
@@ -641,7 +628,7 @@ impl UsageMap {
                     dl.fill_rect(body, theme.button_hover);
                 }
                 if body.w >= LABEL_MIN.0 && body.h >= LABEL_MIN.1 {
-                    let seconds = if t.kind == TileKind::Own {
+                    let cycles = if t.kind == TileKind::Own {
                         n.own
                     } else {
                         n.total
@@ -651,8 +638,7 @@ impl UsageMap {
                     dl.label(buf, line1, theme.small, ink);
                     if body.h >= TWO_LINES_H {
                         buf.clear();
-                        push_percent(buf, self.average(seconds));
-                        buf.push('%');
+                        push_cycles(buf, cycles);
                         if !n.alive {
                             buf.push_str("  exited");
                         }
@@ -680,37 +666,22 @@ impl UsageMap {
         if self.describe_hover(out) {
             return;
         }
-        let lp = self.logical_processors.max(1);
-        out.push_str("CPU used over ");
-        self.window(out);
-        out.push_str(": ");
-        push_percent(out, self.average(self.used) / lp as f32);
+        out.push_str("Cycles used: ");
+        push_cycles(out, self.used);
         let _ = write!(
             out,
-            "% of the machine ({:.1} s over {lp} logical processors). \
-             Area is CPU time, color is CPU now.",
-            self.used
+            ", fading {:.0}% a second. Area is cycles used, color is CPU now.",
+            self.decay * 100.0
         );
-    }
-
-    /// "the last minute", or while the session is younger, "the last 23 s".
-    fn window(&self, out: &mut String) {
-        if self.span >= 59.5 {
-            out.push_str("the last minute");
-        } else {
-            let _ = write!(out, "the last {:.0} s", self.span);
-        }
     }
 }
 
-/// Append a percentage the way [`crate::format::percent`] writes one: a decimal
-/// below ten, none above.
-fn push_percent(out: &mut String, p: f32) {
-    let _ = if p < 10.0 {
-        write!(out, "{p:.1}")
-    } else {
-        write!(out, "{p:.0}")
-    };
+/// Append a cycle count the way [`format::cycles`] writes one.
+fn push_cycles(out: &mut String, cycles: f64) {
+    let at = out.len();
+    let mut tail = out.split_off(at);
+    format::cycles(&mut tail, cycles);
+    out.push_str(&tail);
 }
 
 #[cfg(test)]
@@ -721,17 +692,21 @@ mod tests {
     use ot_paint::DrawCmd;
     use std::time::{Duration, SystemTime};
 
-    /// Two snapshots a minute apart; `cpu` gives each pid's CPU seconds used in
-    /// between. 1 is the parent of 2 and 3; 4 stands alone.
+    /// A billion cycles.
+    const G: u64 = 1_000_000_000;
+
+    /// Two snapshots a second apart; `cpu` gives the G cycles each pid used in
+    /// between. 1 is the parent of 2 and 3; 4 stands alone. A second's fading
+    /// leaves 97.479 % of what arrived in it.
     fn usage_of(cpu: &[(u32, u64)]) -> (Usage, Snapshot) {
-        let mut u = Usage::new(Duration::from_secs(60));
+        let mut u = Usage::new(0.05);
         let tree = [(1, None), (2, Some(1)), (3, Some(1)), (4, None)];
         let snap_at = |secs: u64, used: bool| {
             let mut procs = Vec::new();
             for &(pid, parent) in &tree {
                 let mut p = proc(pid, parent, 5.0);
                 let s = cpu.iter().find(|c| c.0 == pid).map_or(0, |c| c.1);
-                p.cpu_time = Duration::from_secs(if used { 100 + s } else { 100 });
+                p.cycles = G * if used { 100 + s } else { 100 };
                 procs.push(p);
             }
             Snapshot {
@@ -743,7 +718,7 @@ mod tests {
             }
         };
         u.observe(&snap_at(1000, false));
-        let last = snap_at(1060, true);
+        let last = snap_at(1001, true);
         u.observe(&last);
         (u, last)
     }
@@ -795,7 +770,7 @@ mod tests {
         // p1 frames its children and its own 6 s; p4 is a leaf.
         let frame = tile(&m, 1, TileKind::Frame).expect("p1 is a frame");
         let four = tile(&m, 4, TileKind::Leaf).expect("p4 is a leaf");
-        // 48 s under p1 against 12 s for p4.
+        // 48 G under p1 against 12 G for p4.
         let ratio = area(frame) / area(four);
         assert!((ratio - 4.0).abs() < 0.05, "{frame:?} {four:?}");
         let two = tile(&m, 2, TileKind::Leaf).unwrap();
@@ -803,16 +778,16 @@ mod tests {
         assert!(frame.contains(two.center()) && frame.contains(own.center()));
         assert!(
             (area(two) / area(own) - 5.0).abs() < 0.1,
-            "30 s against 6 s"
+            "30 G against 6 G"
         );
         let strings = texts(&dl);
         assert!(strings.iter().any(|s| s == "p1.exe"), "{strings:?}");
-        assert!(strings.iter().any(|s| s == "80%"), "{strings:?}");
+        assert!(strings.iter().any(|s| s == "46.8 G"), "{strings:?}");
         assert!(strings.iter().any(|s| s == "p2.exe"));
         assert!(
             strings
                 .iter()
-                .any(|s| s.starts_with("CPU used over the last minute: ")),
+                .any(|s| s.starts_with("Cycles used: 58.5 G, fading 5% a second.")),
             "{strings:?}"
         );
     }
@@ -830,7 +805,7 @@ mod tests {
         assert!(
             texts(&dl)
                 .iter()
-                .any(|s| s.starts_with("p2.exe \u{b7} PID 2 \u{b7} 50% of a core on average")),
+                .any(|s| s == "p2.exe \u{b7} PID 2 \u{b7} 29.2 G cycles"),
             "{:?}",
             texts(&dl)
         );
@@ -851,7 +826,7 @@ mod tests {
     #[test]
     fn a_chain_of_single_children_folds_into_one_frame() {
         // 1 > 2 > 3, where 1 and 2 only launched the next; 3 has children 4 and 5.
-        let mut u = Usage::new(Duration::from_secs(60));
+        let mut u = Usage::new(0.05);
         let tree = [
             (1, None),
             (2, Some(1)),
@@ -866,7 +841,7 @@ mod tests {
                 .zip(used)
                 .map(|(&(pid, parent), s)| {
                     let mut p = proc(pid, parent, 1.0);
-                    p.cpu_time = Duration::from_secs(if busy { 100 + s } else { 100 });
+                    p.cycles = G * if busy { 100 + s } else { 100 };
                     p
                 })
                 .collect();
@@ -878,7 +853,7 @@ mod tests {
             }
         };
         u.observe(&snap_at(1000, false));
-        let last = snap_at(1060, true);
+        let last = snap_at(1001, true);
         u.observe(&last);
         let mut m = UsageMap::default();
         let dl = painted(&mut m, &u, &last, "");
@@ -900,7 +875,7 @@ mod tests {
     #[test]
     fn idle_children_do_not_make_a_frame_or_break_a_chain() {
         // 1 > 2 and 1 > 3; 2 did all the work, 3 did nothing; 2 > 4 did a trace.
-        let mut u = Usage::new(Duration::from_secs(60));
+        let mut u = Usage::new(0.05);
         let tree = [(1, None), (2, Some(1)), (3, Some(1)), (4, Some(2))];
         let used_ms = [0u64, 30_000, 0, 100];
         let snap_at = |secs: u64, busy: bool| {
@@ -909,7 +884,7 @@ mod tests {
                 .zip(used_ms)
                 .map(|(&(pid, parent), ms)| {
                     let mut p = proc(pid, parent, 1.0);
-                    p.cpu_time = Duration::from_millis(100_000 + if busy { ms } else { 0 });
+                    p.cycles = (G / 1000) * (100_000 + if busy { ms } else { 0 });
                     p
                 })
                 .collect();
@@ -921,7 +896,7 @@ mod tests {
             }
         };
         u.observe(&snap_at(1000, false));
-        let last = snap_at(1060, true);
+        let last = snap_at(1001, true);
         u.observe(&last);
         let mut m = UsageMap::default();
         let dl = painted(&mut m, &u, &last, "");
@@ -963,11 +938,11 @@ mod tests {
                 .unwrap()
         };
         let (one, four) = (seg(1), seg(4));
-        // Top row: 48 s under p1 and 12 s for p4, across the whole width.
+        // Top row: 48 G under p1 and 12 G for p4, across the whole width.
         assert!((one.y - four.y).abs() < 1e-3 && one.y.abs() < 1e-3);
         assert!((one.w - 480.0).abs() < 0.5 && (four.w - 120.0).abs() < 0.5);
         // Second row: p1's children within its span, in proportion to the whole
-        // it spans (30 s and 12 s of 48); its own 6 s is the gap left at the end.
+        // it spans (30 G and 12 G of 48); its own 6 G is the gap left at the end.
         let (two, three) = (seg(2), seg(3));
         assert!(two.y > one.y && (two.y - three.y).abs() < 1e-3);
         assert!(two.x >= one.x && three.right() <= one.right() + 1e-3);
@@ -978,10 +953,7 @@ mod tests {
         assert!(m.set_hover(Some(two.center())));
         let mut out = String::new();
         assert!(m.describe_hover(&mut out));
-        assert!(
-            out.starts_with("p2.exe \u{b7} PID 2 \u{b7} 50% of a core"),
-            "{out}"
-        );
+        assert_eq!(out, "p2.exe \u{b7} PID 2 \u{b7} 29.2 G cycles");
     }
 
     #[test]

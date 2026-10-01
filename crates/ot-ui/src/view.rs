@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ot_core::{Resolution, Retention, Snapshot, Timeline, Usage};
+use ot_core::{ProgramId, Resolution, Retention, Snapshot, Timeline, Usage};
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
 use ot_model::ProcessKey;
@@ -26,6 +26,7 @@ use crate::table::{Hit, RowSource, Table};
 use crate::task_manager::TaskManager;
 use crate::theme::Theme;
 use crate::update::{UpdateAction, UpdateView};
+use crate::usage_chart::{ChartHit, UsageChart};
 use crate::usage_map::{UsageMap, STRIP_H};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +65,10 @@ pub enum ViewMode {
     List,
     /// Parent-child hierarchy; siblings sorted by the active column.
     Tree,
-    /// The processes as a treemap of the CPU time they used over the last minute.
+    /// The processes as a treemap of the cycles they have used.
     Map,
+    /// The cycles each program has used over the last hour, as a chart.
+    History,
 }
 
 impl ViewMode {
@@ -75,17 +78,18 @@ impl ViewMode {
         match s.to_ascii_lowercase().as_str() {
             "tree" => Self::Tree,
             "map" => Self::Map,
+            "history" => Self::History,
             _ => Self::List,
         }
     }
 
-    /// The other table arrangement, for Ctrl+T. The Map has none of its own; the
-    /// view goes back to the table (see [`Command::ToggleView`]).
+    /// The other table arrangement, for Ctrl+T. The Map and the History have none
+    /// of their own; the view goes back to the table (see [`Command::ToggleView`]).
     #[must_use]
     pub fn other(self) -> Self {
         match self {
             Self::List => Self::Tree,
-            Self::Tree | Self::Map => Self::List,
+            Self::Tree | Self::Map | Self::History => Self::List,
         }
     }
 }
@@ -253,8 +257,6 @@ const HISTORY: Retention = Retention {
     }],
 };
 const CARD_H: f32 = 96.0;
-/// What the Map sizes processes by: CPU time over this much of the recent past.
-const USAGE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Build a [`ProcessRows`] from an [`App`]'s fields without borrowing the table,
 /// so the table can be mutated while the rows are in use. A macro rather than a
@@ -269,6 +271,8 @@ macro_rules! rows_of {
             attribution: $app.attribution.as_deref(),
             interval_secs: interval_secs(&$app.snap),
             mem_total: $app.snap.memory.total.get() as f32,
+            cycles: &$app.cycles,
+            cycles_core: $app.cycles_core,
             matched: &$app.matched,
             shown: &$app.shown,
             tree_mode: $tree_mode,
@@ -390,16 +394,17 @@ struct Toolbar {
     /// is over in the usage strip above.
     note: String,
     /// Segment rectangles from the last paint, in [`SEGMENTS`] order.
-    segments: [Rect; 3],
+    segments: [Rect; 4],
     hover: Option<usize>,
     chain: Vec<u32>,
     search: SearchBox,
 }
 
-const SEGMENTS: [(ViewMode, &str); 3] = [
+const SEGMENTS: [(ViewMode, &str); 4] = [
     (ViewMode::List, "List"),
     (ViewMode::Tree, "Tree"),
     (ViewMode::Map, "Map"),
+    (ViewMode::History, "History"),
 ];
 const SEGMENT_W: f32 = 60.0;
 const COUNT_W: f32 = 130.0;
@@ -521,10 +526,18 @@ struct Paused {
     /// History as of the pause, for the charts. The live timeline keeps
     /// recording, so resuming loses nothing.
     timeline: Timeline,
-    /// CPU use per process as of the pause, for the Map.
+    /// Cycles used as of the pause, for the Map, the strip and the History.
     usage: Usage,
     /// The newest snapshot that arrived during the pause, shown on resume.
     latest: Option<Arc<Snapshot>>,
+}
+
+/// What the area under the toolbar shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlace {
+    Table,
+    Map,
+    History,
 }
 
 /// The whole application view. One per window.
@@ -543,12 +556,18 @@ pub struct App {
     /// A sample in progress, shown as a marker row under its process.
     sampling: Option<ProcessKey>,
     timeline: Timeline,
-    /// CPU time per process over [`USAGE_WINDOW`], and the Map drawn from it.
+    /// Cycles used per process, as totals that fade, and the Map drawn from them.
     usage: Usage,
     map: UsageMap,
-    /// The Map is shown in the table's place. The table keeps its own List or Tree
-    /// mode, which Ctrl+T goes back to.
-    map_on: bool,
+    /// The History chart.
+    history: UsageChart,
+    /// What is shown where the table goes. The table keeps its own List or Tree
+    /// mode, which Ctrl+T goes back to from the Map and the History.
+    shown_in_place: InPlace,
+    /// Each process's fading cycle total, parallel to the snapshot's process list,
+    /// for the table's Cycles column; and the total one busy core settles at.
+    cycles: Vec<f64>,
+    cycles_core: f64,
     /// The summary charts above the process table.
     charts: ChartGroup,
     page: Page,
@@ -587,7 +606,7 @@ impl App {
             theme,
             backdrop: false,
             size: Size::new(800.0, 600.0),
-            table: Table::new(columns(), col::CPU),
+            table: Table::new(columns(), col::CYCLES),
             toolbar: Toolbar::default(),
             snap: Arc::new(Snapshot::default()),
             tree: ProcessTree::default(),
@@ -595,9 +614,12 @@ impl App {
             attribution: None,
             sampling: None,
             timeline: Timeline::new(HISTORY),
-            usage: Usage::new(USAGE_WINDOW),
+            usage: Usage::new(Settings::default().usage_decay()),
             map: UsageMap::default(),
-            map_on: false,
+            history: UsageChart::default(),
+            shown_in_place: InPlace::Table,
+            cycles: Vec::new(),
+            cycles_core: 0.0,
             charts: ChartGroup::default(),
             page: Page::default(),
             nav: NavRail::default(),
@@ -637,8 +659,10 @@ impl App {
 
     #[must_use]
     pub fn view(&self) -> ViewMode {
-        if self.map_on {
+        if self.map_on() {
             ViewMode::Map
+        } else if self.history_on() {
+            ViewMode::History
         } else if self.table.tree() {
             ViewMode::Tree
         } else {
@@ -646,10 +670,28 @@ impl App {
         }
     }
 
+    fn map_on(&self) -> bool {
+        self.shown_in_place == InPlace::Map
+    }
+
+    fn history_on(&self) -> bool {
+        self.shown_in_place == InPlace::History
+    }
+
+    /// Whether the Map or the History is shown where the table would be. The
+    /// table's rectangles are stale then, and nothing on it can be pointed at.
+    fn table_off(&self) -> bool {
+        self.shown_in_place != InPlace::Table
+    }
+
     /// Switch the process table's arrangement, keeping the selection in view.
     pub fn set_view(&mut self, mode: ViewMode) {
-        self.map_on = mode == ViewMode::Map;
-        if self.map_on {
+        self.shown_in_place = match mode {
+            ViewMode::Map => InPlace::Map,
+            ViewMode::History => InPlace::History,
+            ViewMode::List | ViewMode::Tree => InPlace::Table,
+        };
+        if self.table_off() {
             let _ = self.hold_order(false);
             self.table.hover = None;
             return;
@@ -742,7 +784,19 @@ impl App {
     /// Apply settings, as loaded at start or changed on the Settings page.
     pub fn set_settings(&mut self, settings: Settings) {
         self.settings = settings;
+        self.apply_settings();
+    }
+
+    /// Make the settings take effect: the row animation, and how fast the cycle
+    /// totals fade.
+    fn apply_settings(&mut self) {
         self.apply_animation();
+        let decay = self.settings.usage_decay();
+        self.usage.set_decay(decay);
+        if let Some(p) = &mut self.paused {
+            p.usage.set_decay(decay);
+        }
+        self.cycles_core = cycles_core(&self.snap, &self.usage);
     }
 
     /// The running build and whether it can install updates, for the update
@@ -846,7 +900,7 @@ impl App {
             return Cursor::Arrow;
         };
         let search = &self.toolbar.search;
-        if !self.map_on && self.table.divider_at(p).is_some() {
+        if !self.table_off() && self.table.divider_at(p).is_some() {
             Cursor::ResizeColumn
         } else if search.rect.contains(p) && !search.clear_rect.contains(p) {
             Cursor::Text
@@ -874,6 +928,14 @@ impl App {
     /// Make `snap` the one on screen. Its history is already in the timeline.
     fn show_snapshot(&mut self, snap: Arc<Snapshot>) {
         self.tree.rebuild(&snap.processes);
+        self.cycles.clear();
+        self.cycles.extend(
+            snap.processes
+                .iter()
+                .map(|p| self.usage.used(p.key()).unwrap_or(0.0)),
+        );
+        self.tree.roll_cycles(&self.cycles);
+        self.cycles_core = cycles_core(&snap, &self.usage);
         self.snap = snap;
         // A finished sample outlives its process only until the next snapshot.
         if let Some(a) = &self.attribution {
@@ -917,6 +979,8 @@ impl App {
     pub fn set_page(&mut self, page: Page) {
         if page != self.page {
             let _ = self.charts.hover(None);
+            let _ = self.charts.mark(None);
+            let _ = self.history.set_pointer(None);
             self.table.hover = None;
             let _ = self.hold_order(false);
             let _ = self.perf.handle(UiEvent::MouseLeave);
@@ -1001,7 +1065,7 @@ impl App {
                 };
                 let r = self.settings_page.handle(ev, &mut self.settings, cx);
                 if matches!(r.effect, Some(Effect::SaveSettings(_))) {
-                    self.apply_animation();
+                    self.apply_settings();
                 }
                 r
             }
@@ -1023,23 +1087,26 @@ impl App {
                 if self.table.resizing() {
                     return Reaction::painted(self.table.resize_to(p));
                 }
-                // The table's rectangles are stale while the Map is shown.
+                // The table's rectangles are stale while the Map or the History
+                // is shown.
                 let hover = match self.table.hit(p, &self.theme) {
-                    Hit::Row(i) | Hit::Expander(i) if !self.map_on => Some(i),
+                    Hit::Row(i) | Hit::Expander(i) if !self.table_off() => Some(i),
                     _ => None,
                 };
                 let segment = self.toolbar.segment_at(p);
                 let clear = self.toolbar.search.clear_rect.contains(p);
                 let crosshair = self.charts.hover(Some(p));
-                let held = self.hold_order(!self.map_on && self.table.rect().contains(p));
-                // The Map's tiles, or in List and Tree the usage strip's.
+                let held = self.hold_order(!self.table_off() && self.table.rect().contains(p));
+                // The Map's tiles, or in the other arrangements the usage strip's.
                 let tile = self.map.set_hover(Some(p));
+                let history = self.history_on() && self.history.set_pointer(Some(p));
                 let changed = hover != self.table.hover
                     || segment != self.toolbar.hover
                     || clear != self.toolbar.search.hover_clear
                     || crosshair
                     || held
-                    || tile;
+                    || tile
+                    || history;
                 self.table.hover = hover;
                 self.toolbar.hover = segment;
                 self.toolbar.search.hover_clear = clear;
@@ -1053,7 +1120,8 @@ impl App {
                 let crosshair = self.charts.hover(None);
                 let held = self.hold_order(false);
                 let tile = self.map.set_hover(None);
-                Reaction::painted(row || segment || clear || crosshair || held || tile)
+                let history = self.history.set_pointer(None);
+                Reaction::painted(row || segment || clear || crosshair || held || tile || history)
             }
             UiEvent::MouseDown {
                 at,
@@ -1079,7 +1147,7 @@ impl App {
                 Reaction::painted(self.select_at(at))
             }
             UiEvent::MouseUp { .. } => Reaction::NONE,
-            UiEvent::Wheel { .. } if self.map_on => Reaction::NONE,
+            UiEvent::Wheel { .. } if self.table_off() => Reaction::NONE,
             UiEvent::Wheel {
                 lines, horizontal, ..
             } => {
@@ -1119,8 +1187,15 @@ impl App {
             return Reaction::REPAINT;
         }
         search.focused = false;
-        if self.map_on || self.map.key_at(at).is_some() {
+        if self.map_on() || self.map.key_at(at).is_some() {
             return Reaction::painted(self.select_at(at));
+        }
+        if self.history_on() {
+            return match self.history.click(at) {
+                Some(ChartHit::Mode) => Reaction::REPAINT,
+                Some(ChartHit::Program(program)) => Reaction::painted(self.select_program(program)),
+                None => Reaction::NONE,
+            };
         }
         let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, theme) {
@@ -1141,6 +1216,24 @@ impl App {
         }
     }
 
+    /// Select the process of `program` that has used the most cycles, among those
+    /// still running. Returns whether the selection changed.
+    fn select_program(&mut self, program: ProgramId) -> bool {
+        let usage = match &self.paused {
+            Some(p) => &p.usage,
+            None => &self.usage,
+        };
+        let busiest = usage
+            .iter()
+            .filter(|(_, u)| u.program == program && u.alive)
+            .max_by(|a, b| a.1.used.total_cmp(&b.1.used))
+            .map(|(key, _)| process_rows::row_id(key));
+        match busiest {
+            Some(id) => self.table.selected.replace(id) != Some(id),
+            None => false,
+        }
+    }
+
     /// Select the row under `at`, if there is one. Returns whether anything changed.
     fn select_at(&mut self, at: Point) -> bool {
         // A tile of the Map, or a segment of the usage strip above the table.
@@ -1152,14 +1245,20 @@ impl App {
             }
             let id = Some(process_rows::row_id(key));
             let changed = std::mem::replace(&mut self.table.selected, id) != id;
-            if !self.map_on {
+            if !self.map_on() {
                 let rows = rows_of!(self, self.table.tree());
                 self.table.reveal_selected(&rows, &self.theme);
             }
             return changed;
         }
-        if self.map_on {
+        if self.map_on() {
             return false;
+        }
+        if self.history_on() {
+            return self
+                .history
+                .program_at(at)
+                .is_some_and(|program| self.select_program(program));
         }
         let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, &self.theme) {
@@ -1214,9 +1313,10 @@ impl App {
     fn command(&mut self, c: Command) -> Reaction {
         match c {
             Command::ToggleView => {
-                // From the Map, back to whichever table arrangement it replaced.
+                // From the Map or the History, back to whichever table
+                // arrangement it replaced.
                 let next = match self.view() {
-                    ViewMode::Map if self.table.tree() => ViewMode::Tree,
+                    ViewMode::Map | ViewMode::History if self.table.tree() => ViewMode::Tree,
                     v => v.other(),
                 };
                 self.set_view(next);
@@ -1250,7 +1350,8 @@ impl App {
         let anchor = if let Some(p) = at {
             self.select_at(p);
             let over_process = self.map.key_at(p).is_some_and(|(_, alive)| alive)
-                || (!self.map_on
+                || (self.history_on() && self.history.program_at(p).is_some())
+                || (!self.table_off()
                     && matches!(
                         self.table.hit(p, &self.theme),
                         Hit::Row(_) | Hit::Expander(_)
@@ -1259,12 +1360,15 @@ impl App {
                 return Reaction::NONE;
             }
             p
-        } else if self.map_on {
+        } else if self.map_on() {
             // From the keyboard: inside the selected process's tile.
             let Some(r) = self.table.selected.and_then(|id| self.map.tile_rect(id)) else {
                 return Reaction::NONE;
             };
             Point::new(r.x + self.theme.pad, r.y + self.theme.pad)
+        } else if self.history_on() {
+            // The History has no place of its own for one process.
+            return Reaction::NONE;
         } else {
             // From the keyboard: just under the selected row's name.
             let rows = self.rows();
@@ -1409,8 +1513,8 @@ impl App {
         }
         let (cards, rest) = full.split_top(CARD_H);
         let (_, rest) = rest.split_top(theme.gap);
-        // The usage strip, in List and Tree; the Map shows the same thing larger.
-        let (strip, rest) = if self.map_on {
+        // The usage strip, except over the Map, which shows the same thing larger.
+        let (strip, rest) = if self.map_on() {
             (None, rest)
         } else {
             let (strip, rest) = rest.split_top(STRIP_H);
@@ -1421,6 +1525,25 @@ impl App {
 
         let (cpu_card, mem_card) = cards.split_left((cards.w - theme.gap) * 0.5);
         let (_, mem_card) = mem_card.split_left(theme.gap);
+
+        // The History shares the summary charts' time axis, so a moment marked in
+        // one is marked in all of them. It is placed first: its own pointer decides
+        // what the summary charts mark.
+        if self.history_on() {
+            let usage = match &self.paused {
+                Some(p) => &p.usage,
+                None => &self.usage,
+            };
+            let outside = self
+                .charts
+                .crosshair()
+                .filter(|_| self.charts.pointed())
+                .map(|c| c.age_ms);
+            self.history.build(table_rect, usage, outside);
+            let _ = self.charts.mark(self.history.hover_age());
+        } else {
+            let _ = self.charts.mark(None);
+        }
 
         let snap = Arc::clone(&self.snap);
         let graphs = [
@@ -1466,6 +1589,8 @@ impl App {
             attribution: self.attribution.as_deref(),
             interval_secs: interval_secs(snap),
             mem_total: snap.memory.total.get() as f32,
+            cycles: &self.cycles,
+            cycles_core: self.cycles_core,
             matched: &self.matched,
             shown: &self.shown,
             tree_mode: self.table.tree(),
@@ -1488,12 +1613,26 @@ impl App {
             );
         }
         // What the pointer is over in the strip reads out where the ancestry goes.
-        if self.map_on || !self.map.describe_hover(&mut self.toolbar.note) {
+        if self.map_on() || !self.map.describe_hover(&mut self.toolbar.note) {
             self.toolbar.note.clear();
         }
         // The table first: the toolbar reads its state, and the order must be
-        // current before the ancestry lookup. In its place, the Map.
-        if self.map_on {
+        // current before the ancestry lookup. In its place, the Map or the History.
+        if self.history_on() {
+            let selected = self
+                .table
+                .selected
+                .and_then(|id| rows.row_of(id))
+                .and_then(|row| usage.program(snap.processes[rows.process_of(row)].name()));
+            self.history.paint(
+                dl,
+                usage,
+                &self.toolbar.search.needle,
+                selected,
+                theme,
+                &mut self.buf,
+            );
+        } else if self.map_on() {
             self.map.paint(
                 dl,
                 table_rect,
@@ -1508,8 +1647,10 @@ impl App {
             self.table
                 .paint(dl, table_rect, &rows, theme, &mut self.buf);
         }
-        self.toolbar.mode = if self.map_on {
+        self.toolbar.mode = if self.map_on() {
             ViewMode::Map
+        } else if self.history_on() {
+            ViewMode::History
         } else if self.table.tree() {
             ViewMode::Tree
         } else {
@@ -1628,6 +1769,15 @@ fn apply_view(table: &mut Table, mode: ViewMode, rows: &ProcessRows<'_>, theme: 
     }
 }
 
+/// The cycle total a process settles at with one core busy throughout: the rate
+/// cycles are counted at (the processor's base clock) times how long a total takes
+/// to fade. Zero when the clock is unknown.
+fn cycles_core(snap: &Snapshot, usage: &Usage) -> f64 {
+    snap.hardware
+        .base_frequency
+        .map_or(0.0, |f| f.0 as f64 * usage.time_constant())
+}
+
 fn interval_secs(snap: &Snapshot) -> f32 {
     let s = snap.interval.as_secs_f32();
     if s > 0.0 {
@@ -1668,6 +1818,17 @@ mod tests {
     fn id(pid: u32) -> crate::table::RowId {
         row_id(ProcessKey::new(pid, 1))
     }
+
+    /// An app whose table is sorted by the CPU column, which these snapshots give
+    /// values for; the default, Cycles, has tests of its own.
+    fn by_cpu() -> App {
+        let mut app = App::new(Theme::dark());
+        app.table.set_sort(col::CPU);
+        app
+    }
+
+    /// A billion cycles.
+    const G: u64 = 1_000_000_000;
 
     /// Idle(0) ─ 4 ─ 10 ─ 11
     ///              └─ 12 ─ 13
@@ -1753,7 +1914,7 @@ mod tests {
 
     #[test]
     fn paints_without_data_and_balances_clips() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         let mut dl = DisplayList::new();
         app.paint(&mut dl);
         assert!(!dl.is_empty());
@@ -1762,7 +1923,7 @@ mod tests {
 
     #[test]
     fn new_snapshot_requests_repaint_once() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         let s = snapshot(1, vec![proc(1, None, 10.0), proc(2, None, 90.0)]);
         assert!(app.set_snapshot(Arc::clone(&s)));
         assert!(!app.set_snapshot(s));
@@ -1771,7 +1932,7 @@ mod tests {
 
     #[test]
     fn keyboard_selects_top_cpu_process_first() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(snapshot(
             1,
             vec![
@@ -1797,7 +1958,7 @@ mod tests {
 
     #[test]
     fn list_mode_sorts_by_own_cpu_and_hides_idle() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         assert_eq!(app.view(), ViewMode::List);
@@ -1809,7 +1970,7 @@ mod tests {
 
     #[test]
     fn tree_mode_nests_children_and_orders_siblings_by_subtree_cpu() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         cmd(&mut app, Command::SetView(ViewMode::Tree));
@@ -1824,7 +1985,7 @@ mod tests {
 
     #[test]
     fn toggling_keeps_the_selection_and_reveals_it() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         // Pick the hottest process in the list.
@@ -1853,7 +2014,7 @@ mod tests {
 
     #[test]
     fn collapsed_row_paints_subtree_totals() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         cmd(&mut app, Command::SetView(ViewMode::Tree));
@@ -1867,7 +2028,7 @@ mod tests {
 
     #[test]
     fn toolbar_shows_ancestry_of_the_selection_in_both_modes() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         let strings = painted_strings(&mut app);
@@ -1886,7 +2047,7 @@ mod tests {
 
     #[test]
     fn clicking_the_segments_switches_modes() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         let tree_seg = app.toolbar.segments[1].center();
@@ -1928,7 +2089,7 @@ mod tests {
 
     #[test]
     fn clicking_an_expander_collapses_without_selecting() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         cmd(&mut app, Command::SetView(ViewMode::Tree));
@@ -1954,7 +2115,7 @@ mod tests {
 
     #[test]
     fn typing_filters_the_list_and_escape_clears() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         type_str(&mut app, "P1");
@@ -1997,7 +2158,7 @@ mod tests {
 
     #[test]
     fn a_filtered_tree_keeps_ancestors_muted_and_arrows_still_move() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         cmd(&mut app, Command::SetView(ViewMode::Tree));
@@ -2025,7 +2186,7 @@ mod tests {
 
     #[test]
     fn clicking_the_field_and_its_clear_button() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         let field = app.toolbar.search.rect;
@@ -2064,7 +2225,7 @@ mod tests {
 
     #[test]
     fn right_click_selects_and_the_menu_reflects_the_row() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         let theme = app.theme.clone();
@@ -2138,7 +2299,7 @@ mod tests {
 
     #[test]
     fn end_task_and_end_tree_name_their_targets_parent_first() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         assert_eq!(
@@ -2183,7 +2344,7 @@ mod tests {
             image_path: Some("C:\\x\\p7.exe".to_owned()),
             ..(*p.statics).clone()
         });
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(snapshot(1, vec![p]));
         ready(&mut app);
         app.table.selected = Some(id(7));
@@ -2208,7 +2369,7 @@ mod tests {
 
     #[test]
     fn dragging_a_header_divider_resizes_the_column() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         let theme = app.theme.clone();
@@ -2262,7 +2423,7 @@ mod tests {
 
     #[test]
     fn charts_label_their_log_axis_and_share_one_crosshair() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         with_history(&mut app);
         ready(&mut app);
         let strings = painted_strings(&mut app);
@@ -2313,7 +2474,7 @@ mod tests {
 
     #[test]
     fn a_horizontal_wheel_scrolls_the_columns() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         let total = app.table.total_width();
@@ -2350,7 +2511,7 @@ mod tests {
 
     #[test]
     fn the_rail_switches_pages_and_the_keys_cycle_them() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         with_history(&mut app);
         ready(&mut app);
         assert_eq!(app.page(), Page::Processes);
@@ -2385,7 +2546,7 @@ mod tests {
 
     #[test]
     fn typing_on_another_page_searches_the_process_table() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         app.set_page(Page::Performance);
@@ -2401,7 +2562,7 @@ mod tests {
 
     #[test]
     fn process_actions_do_nothing_off_the_processes_page() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         app.table.selected = Some(id(4));
@@ -2425,7 +2586,7 @@ mod tests {
 
     #[test]
     fn the_hamburger_shows_and_hides_labels() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         ready(&mut app);
         assert!(!painted_strings(&mut app).iter().any(|s| s == "Performance"));
         let theme = app.theme.clone();
@@ -2449,7 +2610,7 @@ mod tests {
 
     #[test]
     fn pointing_at_the_table_holds_its_order() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(two(1, 10.0, 50.0));
         ready(&mut app);
         assert_eq!(painted_names(&mut app), ["p2.exe", "p1.exe"]);
@@ -2476,7 +2637,7 @@ mod tests {
 
     #[test]
     fn noise_does_not_reorder_rows() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(two(1, 5.0, 5.5));
         ready(&mut app);
         assert_eq!(painted_names(&mut app), ["p2.exe", "p1.exe"]);
@@ -2490,7 +2651,7 @@ mod tests {
 
     #[test]
     fn space_pauses_the_display_and_resuming_catches_up() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         with_history(&mut app);
         ready(&mut app);
         assert!(app.handle(UiEvent::Char(' ')).repaint);
@@ -2523,7 +2684,7 @@ mod tests {
 
     #[test]
     fn space_in_the_search_field_is_a_space() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(family());
         ready(&mut app);
         type_str(&mut app, "p1 ");
@@ -2537,7 +2698,7 @@ mod tests {
 
     #[test]
     fn a_reorder_slides_unless_animation_is_off() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         app.set_snapshot(two(1, 10.0, 50.0));
         ready(&mut app);
         app.set_system_animations(true);
@@ -2619,10 +2780,10 @@ mod tests {
         );
     }
 
-    /// The family, twice a minute apart, having used this much CPU in between:
-    /// p11 30 s, p12 6 s, p20 12 s.
+    /// The family, twice a second apart, having used this many cycles in between:
+    /// p11 30 G, p12 6 G, p20 12 G. A second's fading leaves 97.479 % of them.
     fn busy_minute(app: &mut App) {
-        for (tick, busy) in [(1u64, false), (61, true)] {
+        for (tick, busy) in [(1u64, false), (2, true)] {
             let mut procs = family().processes.clone();
             for p in &mut procs {
                 let used = match p.key().pid {
@@ -2631,15 +2792,15 @@ mod tests {
                     20 => 12,
                     _ => 0,
                 };
-                p.cpu_time = Duration::from_secs(if busy { 100 + used } else { 100 });
+                p.cycles = G * if busy { 100 + used } else { 100 };
             }
             app.set_snapshot(snapshot(tick, procs));
         }
     }
 
     #[test]
-    fn the_map_shows_cpu_time_as_a_treemap_and_shares_the_selection() {
-        let mut app = App::default();
+    fn the_map_shows_cycles_used_as_a_treemap_and_shares_the_selection() {
+        let mut app = by_cpu();
         busy_minute(&mut app);
         ready(&mut app);
         assert_eq!(ViewMode::parse("MAP"), ViewMode::Map);
@@ -2653,7 +2814,7 @@ mod tests {
         assert!(
             strings
                 .iter()
-                .any(|s| s.starts_with("CPU used over the last minute: ")),
+                .any(|s| s.starts_with("Cycles used: 46.8 G, fading 5% a second.")),
             "{strings:?}"
         );
         assert!(!strings.iter().any(|s| s == "PID"), "no table: {strings:?}");
@@ -2694,7 +2855,7 @@ mod tests {
 
     #[test]
     fn a_paused_map_stays_as_it_was() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         busy_minute(&mut app);
         ready(&mut app);
         cmd(&mut app, Command::SetView(ViewMode::Map));
@@ -2711,9 +2872,9 @@ mod tests {
                 20 => 90,
                 _ => 0,
             };
-            p.cpu_time = Duration::from_secs(100 + used);
+            p.cycles = G * (100 + used);
         }
-        app.set_snapshot(snapshot(62, procs));
+        app.set_snapshot(snapshot(3, procs));
         painted_strings(&mut app);
         assert_eq!(app.map.tile_rect(id(11)), Some(before));
         app.handle(UiEvent::Char(' '));
@@ -2727,7 +2888,7 @@ mod tests {
 
     #[test]
     fn the_usage_strip_sits_above_the_table_and_selects_into_it() {
-        let mut app = App::default();
+        let mut app = by_cpu();
         busy_minute(&mut app);
         ready(&mut app);
         let strings = painted_strings(&mut app);
@@ -2743,7 +2904,7 @@ mod tests {
         assert!(
             strings
                 .iter()
-                .any(|s| s.starts_with("p20.exe \u{b7} PID 20 \u{b7} 20% of a core")),
+                .any(|s| s == "p20.exe \u{b7} PID 20 \u{b7} 11.7 G cycles"),
             "{strings:?}"
         );
 
@@ -2759,5 +2920,160 @@ mod tests {
         cmd(&mut app, Command::SetView(ViewMode::Map));
         painted_strings(&mut app);
         assert!(app.toolbar.segments[0].y < list_toolbar);
+    }
+
+    #[test]
+    fn the_table_starts_sorted_by_cycles_used() {
+        let mut app = App::default();
+        busy_minute(&mut app);
+        ready(&mut app);
+        assert_eq!(app.table.sort_col, col::CYCLES);
+        // By what each has used lately, not by the CPU column (p20 shows 10 %,
+        // p12 5 %): p11 30 G, p20 12 G, p12 6 G, then those that used nothing.
+        // (The usage strip's labels come first; the table's six rows are last.)
+        let rows = |app: &mut App| {
+            let names = painted_names(app);
+            names[names.len() - 6..].to_vec()
+        };
+        assert_eq!(rows(&mut app)[..3], ["p11.exe", "p20.exe", "p12.exe"]);
+        let strings = painted_strings(&mut app);
+        for want in ["Cycles", "29.2 G", "11.7 G", "5.85 G"] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
+        // In the tree a branch carries what is under it: p4 has all of p11's and
+        // p12's cycles, and p10 has p11's.
+        cmd(&mut app, Command::SetView(ViewMode::Tree));
+        assert_eq!(
+            rows(&mut app),
+            ["p4.exe", "p10.exe", "p11.exe", "p12.exe", "p13.exe", "p20.exe"]
+        );
+        // Idle from here on, the totals fade: 5 % a second.
+        let mut procs = family().processes.clone();
+        for p in &mut procs {
+            p.cycles = G * match p.key().pid {
+                11 => 130,
+                12 => 106,
+                20 => 112,
+                _ => 100,
+            };
+        }
+        app.set_snapshot(snapshot(3, procs));
+        assert!(painted_strings(&mut app).iter().any(|s| s == "27.8 G"));
+    }
+
+    #[test]
+    fn the_fade_rate_is_a_setting() {
+        let mut app = App::default();
+        busy_minute(&mut app);
+        ready(&mut app);
+        app.set_settings(Settings::default().with_usage_decay(50));
+        assert_eq!(app.settings().usage_decay_percent, 50);
+        let mut procs = family().processes.clone();
+        for p in &mut procs {
+            p.cycles = G * match p.key().pid {
+                11 => 130,
+                12 => 106,
+                20 => 112,
+                _ => 100,
+            };
+        }
+        // Half of p11's 29.2 G is gone a second later.
+        app.set_snapshot(snapshot(3, procs));
+        assert!(painted_strings(&mut app).iter().any(|s| s == "14.6 G"));
+    }
+
+    #[test]
+    fn the_history_charts_programs_and_shares_the_selection_and_the_hover() {
+        let mut app = App::default();
+        busy_minute(&mut app);
+        // A few more seconds, so there is a history to draw.
+        for tick in 3..=12u64 {
+            let mut procs = family().processes.clone();
+            for p in &mut procs {
+                let rate = match p.key().pid {
+                    11 => 30,
+                    12 => 6,
+                    20 => 12,
+                    _ => 0,
+                };
+                p.cycles = G * (100 + rate * (tick - 1));
+            }
+            app.set_snapshot(snapshot(tick, procs));
+        }
+        ready(&mut app);
+        assert_eq!(ViewMode::parse("History"), ViewMode::History);
+        let segment = app.toolbar.segments[3].center();
+        app.handle(UiEvent::MouseDown {
+            at: segment,
+            button: MouseButton::Left,
+        });
+        assert_eq!(app.view(), ViewMode::History);
+        let strings = painted_strings(&mut app);
+        assert!(!strings.iter().any(|s| s == "PID"), "no table: {strings:?}");
+        for want in [
+            "Fading total",
+            "Rate",
+            "p11.exe",
+            "p20.exe",
+            "p12.exe",
+            "now",
+        ] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
+
+        // The other reading: cycles a second.
+        let p11 = app.usage.program("p11.exe").unwrap();
+        app.handle(UiEvent::MouseDown {
+            at: Point::new(segment.x, 0.0),
+            button: MouseButton::Left,
+        });
+        let strings = painted_strings(&mut app);
+        assert!(strings.iter().any(|s| s == "now"));
+        let rate = strings
+            .iter()
+            .position(|s| s == "Rate")
+            .expect("the switch");
+        assert!(rate > 0);
+
+        // A click on a band selects the program's busiest process, and the
+        // ancestry line follows; the menu is that process's.
+        let mut at = None;
+        'find: for y in (0..700).step_by(4) {
+            for x in (150..500).step_by(4) {
+                let p = Point::new(x as f32, y as f32);
+                if app.history.program_at(p) == Some(p11) {
+                    at = Some(p);
+                    break 'find;
+                }
+            }
+        }
+        let at = at.expect("p11 has a band");
+        assert!(
+            app.handle(UiEvent::MouseDown {
+                at,
+                button: MouseButton::Left,
+            })
+            .repaint
+        );
+        assert_eq!(app.table.selected, Some(id(11)));
+        let crumb = "p4.exe \u{203a} p10.exe \u{203a} p11.exe";
+        assert!(painted_strings(&mut app).iter().any(|s| s == crumb));
+        let r = app.handle(UiEvent::ContextMenu { at: Some(at) });
+        assert!(matches!(r.effect, Some(Effect::Menu { .. })), "{r:?}");
+
+        // Pointing at the chart marks the same moment in the summary charts.
+        assert!(app.handle(UiEvent::MouseMove(at)).repaint);
+        painted_strings(&mut app);
+        let age = app.history.hover_age().expect("over the plot");
+        assert_eq!(app.charts.hover_age(), Some(age));
+        app.handle(UiEvent::MouseLeave);
+        painted_strings(&mut app);
+        assert_eq!(app.charts.hover_age(), None);
+
+        // Ctrl+T goes back to the table, selection kept.
+        cmd(&mut app, Command::ToggleView);
+        assert_eq!(app.view(), ViewMode::List);
+        assert_eq!(app.table.selected, Some(id(11)));
+        assert!(painted_strings(&mut app).iter().any(|s| s == "PID"));
     }
 }

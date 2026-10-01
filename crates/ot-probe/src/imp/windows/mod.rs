@@ -486,6 +486,7 @@ impl WindowsProbe {
                 cpu,
                 // Kernel plus user time, in 100 ns units.
                 cpu_time: Duration::from_nanos(now.cpu_100ns.saturating_mul(100)),
+                cycles: p.CycleTime,
                 working_set: Bytes(p.WorkingSetSize as u64),
                 private_bytes: Bytes(p.PrivatePageCount as u64),
                 disk_read,

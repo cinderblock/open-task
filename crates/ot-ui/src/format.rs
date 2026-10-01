@@ -53,6 +53,36 @@ pub fn percent(out: &mut String, p: f32) {
     };
 }
 
+/// A count of processor clock cycles: `850 k`, `12.3 M`, `1.20 G`, `68.2 G`,
+/// `1.40 T`. Three significant figures, decimal prefixes.
+pub fn cycles(out: &mut String, cycles: f64) {
+    const UNITS: [&str; 5] = ["", " k", " M", " G", " T"];
+    out.clear();
+    let mut v = cycles.max(0.0);
+    let mut u = 0;
+    while v >= 999.5 && u < UNITS.len() - 1 {
+        v /= 1000.0;
+        u += 1;
+    }
+    let _ = if u == 0 || v >= 99.95 {
+        write!(out, "{v:.0}{}", UNITS[u])
+    } else if v >= 9.995 {
+        write!(out, "{v:.1}{}", UNITS[u])
+    } else {
+        write!(out, "{v:.2}{}", UNITS[u])
+    };
+}
+
+/// [`cycles`] for a table cell: under a million (well under a millisecond of work)
+/// is left empty, so a column of idle processes reads as quiet.
+pub fn cycles_cell(out: &mut String, n: f64) {
+    if n < 1.0e6 {
+        out.clear();
+    } else {
+        cycles(out, n);
+    }
+}
+
 /// Plain integer.
 pub fn count(out: &mut String, n: u32) {
     out.clear();
@@ -286,6 +316,20 @@ mod tests {
         assert_eq!(s(|b| percent(b, 9.96)), "10.0");
         assert_eq!(s(|b| percent(b, 12.4)), "12");
         assert_eq!(s(|b| percent(b, 100.0)), "100");
+    }
+
+    #[test]
+    fn cycles_use_decimal_prefixes_and_three_figures() {
+        assert_eq!(s(|b| cycles(b, 0.0)), "0");
+        assert_eq!(s(|b| cycles(b, 850_000.0)), "850 k");
+        assert_eq!(s(|b| cycles(b, 12_340_000.0)), "12.3 M");
+        assert_eq!(s(|b| cycles(b, 1.2e9)), "1.20 G");
+        assert_eq!(s(|b| cycles(b, 68.2e9)), "68.2 G");
+        assert_eq!(s(|b| cycles(b, 999.7e9)), "1.00 T");
+        assert_eq!(s(|b| cycles(b, 1.4e12)), "1.40 T");
+        // A table cell stays empty until there is something to say.
+        assert_eq!(s(|b| cycles_cell(b, 400_000.0)), "");
+        assert_eq!(s(|b| cycles_cell(b, 2.5e6)), "2.50 M");
     }
 
     #[test]
