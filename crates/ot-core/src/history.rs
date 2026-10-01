@@ -54,7 +54,6 @@ impl<T> Ring<T> {
     }
 
     /// Oldest to newest.
-    #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator {
         self.buf.iter()
     }

@@ -1481,7 +1481,7 @@ pub(crate) mod tests {
         t.subtree(2, &mut out);
         assert_eq!(out, [2]);
         t.subtree(99, &mut out);
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]

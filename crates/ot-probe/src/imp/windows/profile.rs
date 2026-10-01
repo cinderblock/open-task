@@ -901,8 +901,8 @@ mod tests {
         assert_eq!(a.target, me);
         assert!(a.duration >= Duration::from_millis(600));
         assert!(a.samples > 0, "no samples attributed: {a:?}");
-        assert!(!a.modules.is_empty());
-        assert!(!a.threads.is_empty());
+        assert!(!a.modules.is_empty(), "no modules: {a:?}");
+        assert!(!a.threads.is_empty(), "no threads: {a:?}");
         let c = a.clients.expect("client report for a known service");
         assert_eq!(c.service, "BrokerInfrastructure");
     }

@@ -243,7 +243,7 @@ mod tests {
         let first = Arc::clone(&out[0].info);
         std::thread::sleep(Duration::from_millis(300));
         probe.sample(&mut out);
-        assert!(!out.is_empty());
+        assert!(!out.is_empty(), "the adapter is still listed");
         assert!(
             Arc::ptr_eq(&first, &out[0].info),
             "facts are shared, not rebuilt"

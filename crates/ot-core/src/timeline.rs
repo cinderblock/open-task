@@ -197,7 +197,6 @@ impl Series {
     }
 
     /// Raw samples, oldest to newest.
-    #[must_use]
     pub fn raw(&self) -> impl DoubleEndedIterator<Item = &Sample> + ExactSizeIterator {
         self.raw.iter()
     }

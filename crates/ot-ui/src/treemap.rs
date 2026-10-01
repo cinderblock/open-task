@@ -163,6 +163,6 @@ mod tests {
         squarify(&[0.0], Rect::new(0.0, 0.0, 10.0, 10.0), &mut out);
         assert!(out[0].is_empty());
         squarify(&[], Rect::new(0.0, 0.0, 10.0, 10.0), &mut out);
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 }
