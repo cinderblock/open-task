@@ -10,8 +10,8 @@ use ot_model::attribution::Attribution;
 use ot_model::ProcessKey;
 
 use crate::{
-    Capabilities, ControlError, CpuSampler, ProbeError, ProbeOutput, ProcessControl, SampleError,
-    SystemProbe,
+    Capabilities, ControlError, CpuSampler, Inventory, ProbeError, ProbeOutput, ProcessControl,
+    SampleError, ServiceControl, SessionControl, StartupControl, SystemProbe,
 };
 
 /// Probe that measures nothing.
@@ -42,6 +42,11 @@ impl ProcessControl for StubControl {
         Err(ControlError::Unsupported)
     }
 }
+
+impl ServiceControl for StubControl {}
+impl SessionControl for StubControl {}
+impl StartupControl for StubControl {}
+impl Inventory for StubControl {}
 
 impl StubProbe {
     /// Construct the stub. Never fails.

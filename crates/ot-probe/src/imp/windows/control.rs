@@ -39,6 +39,11 @@ fn os(context: &'static str, e: windows::core::Error) -> ControlError {
     }
 }
 
+impl crate::ServiceControl for WindowsControl {}
+impl crate::SessionControl for WindowsControl {}
+impl crate::StartupControl for WindowsControl {}
+impl crate::Inventory for WindowsControl {}
+
 impl ProcessControl for WindowsControl {
     fn terminate(&self, key: ProcessKey) -> Result<(), ControlError> {
         // SAFETY: plain call; the handle is owned by the guard.

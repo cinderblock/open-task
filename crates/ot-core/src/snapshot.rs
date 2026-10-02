@@ -4,11 +4,15 @@ use std::time::{Duration, SystemTime};
 
 use std::sync::Arc;
 
+use ot_model::battery::BatterySample;
 use ot_model::cpu::CpuSample;
-use ot_model::device::{AdapterSample, DiskSample};
+use ot_model::device::{AdapterSample, DiskSample, VolumeSample};
+use ot_model::gpu::GpuSample;
 use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
 use ot_model::process::ProcessSample;
+use ot_model::service::ServiceEntry;
+use ot_model::session::SessionInfo;
 use ot_model::thread::ThreadSample;
 use ot_model::{Capabilities, Tick};
 
@@ -16,7 +20,7 @@ use ot_model::{Capabilities, Tick};
 ///
 /// Snapshots are published behind an `Arc` and never mutated. A reader that holds one
 /// can take as long as it likes; the sampler simply publishes the next one alongside.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Which pass produced this snapshot.
     pub tick: Tick,
@@ -39,11 +43,47 @@ pub struct Snapshot {
     pub disks: Vec<DiskSample>,
     /// Connected network adapters, physical ones first.
     pub adapters: Vec<AdapterSample>,
+    /// Graphics adapters, in the system's order. Empty where the platform cannot
+    /// report them.
+    pub gpus: Vec<GpuSample>,
+    /// The battery, on a machine that has one.
+    pub battery: Option<BatterySample>,
+    /// Mounted volumes, `C:` first.
+    pub volumes: Vec<VolumeSample>,
+    /// Logon sessions, for the Users page.
+    pub sessions: Vec<SessionInfo>,
+    /// Every service of the machine, by name, shared by pointer between
+    /// snapshots while unchanged.
+    pub services: Arc<[ServiceEntry]>,
     /// What the probe behind this snapshot can measure, so the UI can explain a
     /// missing column or attribution rather than show a blank.
     pub capabilities: Capabilities,
     /// Static facts about the machine, shared by every snapshot of a session.
     pub hardware: Arc<Hardware>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            tick: Tick::default(),
+            taken_at: None,
+            interval: Duration::ZERO,
+            probe_cost: Duration::ZERO,
+            cpu: CpuSample::default(),
+            memory: MemorySample::default(),
+            processes: Vec::new(),
+            threads: Vec::new(),
+            disks: Vec::new(),
+            adapters: Vec::new(),
+            gpus: Vec::new(),
+            battery: None,
+            volumes: Vec::new(),
+            sessions: Vec::new(),
+            services: Vec::new().into(),
+            capabilities: Capabilities::default(),
+            hardware: Arc::new(Hardware::default()),
+        }
+    }
 }
 
 impl Snapshot {

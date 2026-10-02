@@ -52,3 +52,58 @@ pub struct ServiceInfo {
     /// measurement: the work can happen in other modules.
     pub dll: Option<Arc<str>>,
 }
+
+/// When a service starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum StartType {
+    /// Started by the boot loader (a driver).
+    Boot,
+    /// Started during kernel initialization (a driver).
+    System,
+    /// Started at boot by the service control manager.
+    Automatic,
+    /// Started shortly after boot, once the automatic services are up.
+    AutomaticDelayed,
+    /// Started on demand, by a program or a trigger.
+    Manual,
+    Disabled,
+    #[default]
+    Unknown,
+}
+
+impl StartType {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Boot => "Boot",
+            Self::System => "System",
+            Self::Automatic => "Automatic",
+            Self::AutomaticDelayed => "Automatic (delayed)",
+            Self::Manual => "Manual",
+            Self::Disabled => "Disabled",
+            Self::Unknown => "",
+        }
+    }
+}
+
+/// One service of the machine, running or not, for the Services page.
+///
+/// [`ServiceInfo`] is the running service seen from its host process; this is the
+/// service as the control manager lists it, whether or not anything hosts it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEntry {
+    /// Key name, e.g. `BrokerInfrastructure`.
+    pub name: Arc<str>,
+    /// Human name, e.g. `Background Tasks Infrastructure Service`.
+    pub display_name: Arc<str>,
+    pub description: Option<Arc<str>>,
+    pub state: ServiceState,
+    pub start: StartType,
+    /// The process hosting it, while it runs.
+    pub pid: Option<u32>,
+    /// The service group it shares a host with (`-k netsvcs`), when it does.
+    pub group: Option<Arc<str>>,
+    /// Whether the control manager will let this caller stop it: a service that
+    /// does not accept stop, or one the caller lacks rights over, cannot be.
+    pub can_stop: bool,
+}

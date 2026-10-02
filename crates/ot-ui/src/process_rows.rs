@@ -1262,6 +1262,7 @@ pub(crate) mod tests {
                 user: None,
                 integrity: Integrity::Unknown,
                 started_unix_ms: None,
+                ..ProcessStatic::default()
             }),
             cpu: Percent(cpu),
             cpu_time: Duration::ZERO,
@@ -1274,12 +1275,7 @@ pub(crate) mod tests {
             net_tx: Bytes(0),
             threads: 1,
             handles: 1,
-            power: None,
-            gpu: None,
-            suspended: false,
-            services: Vec::new().into(),
-            thread_first: 0,
-            thread_rows: 0,
+            ..ProcessSample::default()
         }
     }
 

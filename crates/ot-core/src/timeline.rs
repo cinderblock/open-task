@@ -458,6 +458,7 @@ mod tests {
             adapters: Vec::new(),
             capabilities: ot_model::Capabilities::default(),
             hardware: std::sync::Arc::default(),
+            ..Snapshot::default()
         }
     }
 

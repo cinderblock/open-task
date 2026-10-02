@@ -23,6 +23,8 @@ pub struct DiskInfo {
     pub capacity: Option<Bytes>,
     /// USB sticks, card readers, some external drives.
     pub removable: bool,
+    /// The bus it is on: `NVMe`, `SATA`, `USB`, `SD`.
+    pub bus: Option<String>,
 }
 
 /// A disk over one sampling interval.
@@ -63,6 +65,32 @@ pub struct AdapterInfo {
     pub kind: LinkKind,
     /// A physical adapter, as opposed to a virtual switch port or a VPN.
     pub hardware: bool,
+    /// The adapter's addresses, IPv4 first, in the order the system lists them.
+    pub addresses: Vec<std::net::IpAddr>,
+    /// The connection-specific DNS suffix, when there is one.
+    pub dns_suffix: Option<String>,
+    /// The hardware address, formatted `00-11-22-33-44-55`.
+    pub mac: Option<String>,
+}
+
+/// A mounted volume (a drive letter, or a mount point), for the disk panes and
+/// TMOG's Disk Space view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeSample {
+    /// `C:`, or a mount path.
+    pub mount: String,
+    /// The volume's label, when it has one.
+    pub label: Option<String>,
+    /// `NTFS`, `ReFS`, `exFAT`.
+    pub filesystem: Option<String>,
+    pub total: Bytes,
+    pub free: Bytes,
+    /// The physical disk it lives on, when known.
+    pub disk: Option<u32>,
+    /// Holds the running operating system.
+    pub system: bool,
+    /// Holds a page file.
+    pub page_file: bool,
 }
 
 /// A network adapter over one sampling interval.

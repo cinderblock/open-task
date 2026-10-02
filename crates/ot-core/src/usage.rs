@@ -438,6 +438,7 @@ mod tests {
                 user: None,
                 integrity: Integrity::Unknown,
                 started_unix_ms: started_ms,
+                ..ProcessStatic::default()
             }),
             cpu: Percent(0.0),
             cpu_time: Duration::ZERO,
@@ -450,12 +451,7 @@ mod tests {
             net_tx: Bytes(0),
             threads: 1,
             handles: 1,
-            power: None,
-            gpu: None,
-            suspended: false,
-            services: Vec::new().into(),
-            thread_first: 0,
-            thread_rows: 0,
+            ..ProcessSample::default()
         }
     }
 

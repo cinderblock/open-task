@@ -170,6 +170,11 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                 // Few entries; taking them is cheaper than keeping capacity around.
                 let disks = std::mem::take(&mut out.disks);
                 let adapters = std::mem::take(&mut out.adapters);
+                let gpus = std::mem::take(&mut out.gpus);
+                let battery = out.battery.take();
+                let volumes = std::mem::take(&mut out.volumes);
+                let sessions = std::mem::take(&mut out.sessions);
+                let services = Arc::clone(&out.services);
 
                 shared.current.store(Arc::new(Snapshot {
                     tick,
@@ -182,6 +187,11 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                     threads,
                     disks,
                     adapters,
+                    gpus,
+                    battery,
+                    volumes,
+                    sessions,
+                    services,
                     capabilities,
                     hardware: Arc::clone(&hardware),
                 }));

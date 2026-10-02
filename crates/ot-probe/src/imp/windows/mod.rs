@@ -32,7 +32,9 @@ use std::time::{Duration, Instant};
 
 use ot_model::cpu::{CoreKind, CpuSample, LogicalCore};
 use ot_model::memory::MemorySample;
-use ot_model::process::{Integrity, ProcessSample, ProcessStatic};
+use ot_model::process::{
+    Integrity, IoCounters, Priority, ProcessKind, ProcessSample, ProcessStatic,
+};
 use ot_model::service::ServiceInfo;
 use ot_model::thread::{ServiceTag, ThreadSample, ThreadState, WaitReason};
 use ot_model::{Bytes, Hertz, Percent, ProcessKey};
@@ -54,16 +56,27 @@ use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INF
 use crate::{Capabilities, ProbeError, ProbeOutput, SystemProbe};
 
 mod access;
+mod battery;
+mod connections;
 mod control;
 mod counters;
 mod details;
+mod gpu;
 mod hardware;
+mod installed;
 mod network;
 mod nt;
 mod profile;
 mod services;
+mod sessions;
+mod smbios;
+mod startup;
 mod storage;
+mod system;
 mod tags;
+mod verinfo;
+mod volumes;
+mod windows_list;
 
 pub use control::WindowsControl;
 use counters::{DiskRates, PerfCounters};
@@ -498,6 +511,24 @@ impl WindowsProbe {
                 power: None,
                 gpu: None,
                 suspended: false,
+                efficiency_mode: None,
+                window: None,
+                kind: ProcessKind::Background,
+                priority: Priority::from_base(p.BasePriority),
+                page_faults: p.PageFaultCount,
+                peak_working_set: Bytes(p.PeakWorkingSetSize as u64),
+                virtual_size: Bytes(p.VirtualSize as u64),
+                paged_pool: Bytes(p.QuotaPagedPoolUsage as u64),
+                nonpaged_pool: Bytes(p.QuotaNonPagedPoolUsage as u64),
+                io: IoCounters {
+                    reads: p.ReadOperationCount as u64,
+                    writes: p.WriteOperationCount as u64,
+                    other: p.OtherOperationCount as u64,
+                    read_bytes: Bytes(p.ReadTransferCount as u64),
+                    write_bytes: Bytes(p.WriteTransferCount as u64),
+                    other_bytes: Bytes(p.OtherTransferCount as u64),
+                },
+                gpu_engine: None,
                 services: Arc::clone(&entry.services),
                 thread_first,
                 thread_rows,
@@ -669,6 +700,10 @@ impl SystemProbe for WindowsProbe {
             services: self.services.available(),
             service_tags: self.tags.is_some(),
             cpu_sampling: self.can_sample,
+            gpu: false,
+            sessions: false,
+            service_list: false,
+            elevated: access::is_elevated(),
         }
     }
 
@@ -835,6 +870,10 @@ fn build_statics(p: &SystemProcessInformation, key: ProcessKey) -> ProcessStatic
         user: None,
         integrity: Integrity::Unknown,
         started_unix_ms,
+        session_id: p.SessionId,
+        architecture: ot_model::process::Architecture::Unknown,
+        description: None,
+        company: None,
     }
 }
 

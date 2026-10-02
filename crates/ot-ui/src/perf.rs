@@ -1284,6 +1284,7 @@ mod tests {
                 ssd: Some(true),
                 capacity: Some(Bytes(1000 * GB)),
                 removable: false,
+                bus: None,
             }),
             active: Percent(12.0),
             read_per_sec: Bytes(3 << 20),
@@ -1300,6 +1301,7 @@ mod tests {
                 adapter: "Test Ethernet Controller".to_owned(),
                 kind: LinkKind::Ethernet,
                 hardware: true,
+                ..AdapterInfo::default()
             }),
             rx_per_sec: Bytes(700_000),
             tx_per_sec: Bytes(12_500),

@@ -7,14 +7,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apps;
 pub mod attribution;
+pub mod battery;
+pub mod connection;
 pub mod cpu;
 pub mod device;
+pub mod gpu;
 pub mod hardware;
 pub mod identity;
 pub mod memory;
 pub mod process;
 pub mod service;
+pub mod session;
+pub mod startup;
+pub mod system;
 pub mod thread;
 pub mod units;
 
@@ -48,6 +55,16 @@ pub struct Capabilities {
     /// On-demand CPU sampling of one process by module. On Windows it needs
     /// `SeSystemProfilePrivilege` and trace-session rights: administrator, elevated.
     pub cpu_sampling: bool,
+    /// Graphics adapters and their load.
+    pub gpu: bool,
+    /// Logon sessions, for the Users page.
+    pub sessions: bool,
+    /// The full service list, for the Services page.
+    pub service_list: bool,
+    /// Whether this process runs with administrator rights, which the actions
+    /// that need them (starting and stopping services, signing out another user,
+    /// ending another user's process) check for.
+    pub elevated: bool,
 }
 
 /// Monotonic sample counter. Increments once per full sampling pass.

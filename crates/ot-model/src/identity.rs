@@ -25,7 +25,7 @@ pub struct ProcessKeyRaw(pub u64);
 /// This is the key for every per-process time series in the application. Two
 /// processes that share a PID but not a birth stamp are different processes and must
 /// never share history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ProcessKey {
     /// The OS process id. Display this; do not key on it alone.
     pub pid: u32,

@@ -27,7 +27,7 @@ pub enum Integrity {
 /// Held behind an `Arc` and cloned by pointer into every sample, so a 1000-process
 /// refresh does not re-allocate a thousand command line strings each pass. This is
 /// the single most important allocation decision in the sampling path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProcessStatic {
     pub key: ProcessKey,
     /// Parent's identity, absent for a root or when the parent had already exited
@@ -51,6 +51,152 @@ pub struct ProcessStatic {
     /// Wall-clock start time as a Unix timestamp in milliseconds, for display only.
     /// Identity uses [`ProcessKey`], never this.
     pub started_unix_ms: Option<i64>,
+    /// The logon session the process runs in (Windows: session id; 0 is the
+    /// services session). What the Users page groups by.
+    pub session_id: u32,
+    /// The instruction set the process runs, when it could be read.
+    pub architecture: Architecture,
+    /// The image's description from its version resource (`Google Chrome`), when
+    /// readable. What Task Manager shows as a process's friendly name.
+    pub description: Option<String>,
+    /// The image's company from its version resource (`Google LLC`).
+    pub company: Option<String>,
+}
+
+/// The instruction set a process runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Architecture {
+    X64,
+    X86,
+    Arm64,
+    Arm,
+    #[default]
+    Unknown,
+}
+
+impl Architecture {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::X64 => "x64",
+            Self::X86 => "x86",
+            Self::Arm64 => "ARM64",
+            Self::Arm => "ARM",
+            Self::Unknown => "",
+        }
+    }
+}
+
+/// A process's scheduling priority class, as Task Manager and Process Explorer
+/// name them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum Priority {
+    Idle,
+    BelowNormal,
+    #[default]
+    Normal,
+    AboveNormal,
+    High,
+    Realtime,
+}
+
+impl Priority {
+    /// Every class, lowest first, for a menu.
+    pub const ALL: [Self; 6] = [
+        Self::Realtime,
+        Self::High,
+        Self::AboveNormal,
+        Self::Normal,
+        Self::BelowNormal,
+        Self::Idle,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Low",
+            Self::BelowNormal => "Below normal",
+            Self::Normal => "Normal",
+            Self::AboveNormal => "Above normal",
+            Self::High => "High",
+            Self::Realtime => "Realtime",
+        }
+    }
+
+    /// The class a Windows base priority (4, 6, 8, 10, 13, 24) stands for. Values
+    /// in between are rounded down to the class below them.
+    #[must_use]
+    pub const fn from_base(base: i32) -> Self {
+        match base {
+            i32::MIN..=5 => Self::Idle,
+            6..=7 => Self::BelowNormal,
+            8..=9 => Self::Normal,
+            10..=12 => Self::AboveNormal,
+            13..=23 => Self::High,
+            _ => Self::Realtime,
+        }
+    }
+
+    /// The Windows base priority of this class.
+    #[must_use]
+    pub const fn base(self) -> i32 {
+        match self {
+            Self::Idle => 4,
+            Self::BelowNormal => 6,
+            Self::Normal => 8,
+            Self::AboveNormal => 10,
+            Self::High => 13,
+            Self::Realtime => 24,
+        }
+    }
+}
+
+/// What a process is to a person, as Task Manager groups them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ProcessKind {
+    /// Has a window of its own on the desktop.
+    App,
+    /// Everything else that runs as a user.
+    #[default]
+    Background,
+    /// Part of the operating system: a system image run by a system account.
+    Windows,
+}
+
+impl ProcessKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::App => "App",
+            Self::Background => "Background",
+            Self::Windows => "Windows",
+        }
+    }
+}
+
+/// A process's main window, when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    /// The platform's window handle, opaque to everything above the probe; the
+    /// shell hands it back to bring the window forward.
+    pub handle: u64,
+    /// The window's title.
+    pub title: String,
+    /// The window has stopped answering the system: what Task Manager shows as
+    /// "Not responding".
+    pub hung: bool,
+}
+
+/// Cumulative I/O counts and bytes since the process started, every kind of I/O
+/// (file, network, device). Task Manager's Details page shows these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IoCounters {
+    pub reads: u64,
+    pub writes: u64,
+    pub other: u64,
+    pub read_bytes: Bytes,
+    pub write_bytes: Bytes,
+    pub other_bytes: Bytes,
 }
 
 /// Per-process values for one sampling pass.
@@ -58,7 +204,7 @@ pub struct ProcessStatic {
 /// Everything here is a rate or a level measured over the interval that just ended.
 /// Raw monotonic counters stay in the probe layer; by the time a value reaches the UI
 /// it has already been differenced.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProcessSample {
     /// Immutable facts, shared by pointer across samples.
     pub statics: Arc<ProcessStatic>,
@@ -103,6 +249,29 @@ pub struct ProcessSample {
     /// A suspended process at 0% CPU is idle by design, not stuck, and the diagnostics
     /// engine must not flag it.
     pub suspended: bool,
+    /// Whether the system is throttling the process to save power (Windows'
+    /// efficiency mode, `EcoQoS`). `None` where it could not be read.
+    pub efficiency_mode: Option<bool>,
+    /// The process's main window, when it has one on the desktop. Shared by
+    /// pointer between passes while unchanged.
+    pub window: Option<Arc<WindowInfo>>,
+    /// App, background or part of Windows.
+    pub kind: ProcessKind,
+    /// Scheduling priority class.
+    pub priority: Priority,
+    /// Page faults since the process started.
+    pub page_faults: u32,
+    /// The most physical memory the process has held at once.
+    pub peak_working_set: Bytes,
+    /// Virtual address space reserved or committed.
+    pub virtual_size: Bytes,
+    /// Kernel pool memory charged to the process.
+    pub paged_pool: Bytes,
+    pub nonpaged_pool: Bytes,
+    /// I/O since the process started.
+    pub io: IoCounters,
+    /// The GPU engine the process is busiest on (`GPU 0 - 3D`), when it uses one.
+    pub gpu_engine: Option<Arc<str>>,
 
     /// Services hosted by this process, as the platform's service manager reports
     /// them. Empty for an ordinary program. Shared by pointer between passes while

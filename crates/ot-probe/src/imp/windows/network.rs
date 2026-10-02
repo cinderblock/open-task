@@ -159,6 +159,7 @@ impl NetProbe {
                         adapter,
                         kind,
                         hardware,
+                        ..AdapterInfo::default()
                     })
                 });
             self.listed.push(info);

@@ -117,6 +117,12 @@ pub(super) fn in_group(group: WELL_KNOWN_SID_TYPE) -> bool {
     unsafe { CheckTokenMembership(None, psid, &raw mut member) }.is_ok() && member.as_bool()
 }
 
+/// Whether this process runs with administrator rights: its token holds the
+/// Administrators group for real, which only an elevated token does.
+pub(super) fn is_elevated() -> bool {
+    in_group(windows::Win32::Security::WinBuiltinAdministratorsSid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
