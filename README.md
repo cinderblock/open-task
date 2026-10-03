@@ -61,14 +61,19 @@ going in or out, time left, and the battery's health (full against design
 capacity), cycle count and chemistry. Connections are the ones a person
 would call connections: physical adapters, Hyper-V `vEthernet` ports and VPNs such
 as Tailscale, not the WAN miniports and virtual-switch internals Windows keeps
-underneath. Rate charts scale themselves to the busiest moment of the last hour.
+underneath. Rate charts scale themselves to the busiest moment they show.
 The list scrolls when there are more devices than fit. Every graph on the page, the
 small ones in the list included, shares one hover line.
 
 **Charts:** the CPU and memory graphs share a log-scale time axis, labeled
-`1h 10m 1m 10s now` underneath. The newest sample is on the right edge; the last
-ten seconds take about a third of the width, the last minute half, and the rest
-of the hour is compressed into the left end. Recent history is drawn sample by
+`1h 10m 1m 10s now` underneath. The newest sample is on the right edge and the
+oldest one held is on the left, so a chart fills its width from a session's first
+seconds and the axis grows with the history until it reaches the length set on the
+Settings page: **How far charts reach back**, ten minutes to a day, an hour unless
+changed. Older samples are dropped; the card says how many points a chart keeps at
+that length and about how much memory that is for the charts on this machine. With
+an hour, the last ten seconds take about a third of the width, the last minute
+half, and the rest of the hour is compressed into the left end. Recent history is drawn sample by
 sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point
 at either graph and a hairline marks the same moment in both, with each graph's
@@ -281,7 +286,7 @@ the numbers in its tooltip; a click brings the window back, and its menu has
 **Always on top** and **Exit**. With **Hide when minimized** on, minimizing hides
 the window and the icon is the way back. **Update speed** (High, Normal, Slow,
 Low: every half second to every four) is beside the fade rate under **Process
-table**; **Space** still pauses.
+table**; **Space** still pauses. **How far charts reach back** is under **Charts**.
 
 **Users** lists the logon sessions: user, session id, state (active, disconnected,
 idle), station, and the CPU, memory and disk of each session's processes added up.

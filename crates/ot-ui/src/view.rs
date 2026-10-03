@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ot_core::{ProgramId, Resolution, Retention, Snapshot, Timeline, Usage};
+use ot_core::{ProgramId, Retention, Snapshot, Timeline, Usage};
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
 use ot_model::process::Priority;
@@ -30,7 +30,7 @@ use crate::pages::PageOutcome;
 use crate::perf::PerfPage;
 use crate::process_rows::{self, col, columns, process_matches, Layout, ProcessRows, ProcessTree};
 use crate::search::SearchBox;
-use crate::settings::{Context, Settings, SettingsPage};
+use crate::settings::{Context, HistoryCost, Settings, SettingsPage};
 use crate::steady::Steady;
 use crate::table::{ColumnLayout, Hit, RowSource, Table};
 use crate::task_manager::TaskManager;
@@ -532,16 +532,6 @@ pub enum Cursor {
     Text,
 }
 
-/// History kept for the summary charts: every sample for ten minutes (at the
-/// default 1 Hz), then 10 s buckets for two hours. Covers [`AXIS`] (one hour) with
-/// room to spare.
-const HISTORY: Retention = Retention {
-    raw: 600,
-    tiers: &[Resolution {
-        bucket_ms: 10_000,
-        capacity: 720,
-    }],
-};
 const CARD_H: f32 = 96.0;
 
 /// Build a [`ProcessRows`] from an [`App`]'s fields without borrowing the table,
@@ -887,7 +877,7 @@ impl App {
             layout: Layout::default(),
             attribution: None,
             sampling: None,
-            timeline: Timeline::new(HISTORY),
+            timeline: Timeline::new(Retention::covering(Settings::default().history_ms())),
             usage: Usage::new(Settings::default().usage_decay()),
             map: UsageMap::default(),
             history: UsageChart::default(),
@@ -1068,16 +1058,28 @@ impl App {
         self.apply_settings();
     }
 
-    /// Make the settings take effect: the row animation, and how fast the cycle
-    /// totals fade.
+    /// Make the settings take effect: the row animation, how fast the cycle totals
+    /// fade, and how far back the history reaches.
     fn apply_settings(&mut self) {
         self.apply_animation();
         let decay = self.settings.usage_decay();
+        let history_ms = self.settings.history_ms();
         self.usage.set_decay(decay);
+        self.usage.set_history_span(history_ms);
+        self.timeline.set_retention(Retention::covering(history_ms));
         if let Some(p) = &mut self.paused {
             p.usage.set_decay(decay);
+            p.usage.set_history_span(history_ms);
         }
         self.cycles_core = cycles_core(&self.snap, &self.usage);
+    }
+
+    /// What a history length costs here, for the Settings page to say.
+    fn history_cost(&self) -> HistoryCost {
+        HistoryCost {
+            series: self.timeline.series_count(),
+            usage_frame_bytes: self.usage.frame_bytes(),
+        }
     }
 
     /// The running build and whether it can install updates, for the update
@@ -1322,6 +1324,7 @@ impl App {
                 update: &self.update,
                 task_manager: &self.task_manager,
                 elevated: self.elevated,
+                history: self.history_cost(),
             };
             let _ = self
                 .settings_page
@@ -1442,6 +1445,7 @@ impl App {
                     update: &self.update,
                     task_manager: &self.task_manager,
                     elevated: self.elevated,
+                    history: self.history_cost(),
                 };
                 let r = self.settings_page.handle(ev, &mut self.settings, cx);
                 if matches!(r.effect, Some(Effect::SaveSettings(_))) {
@@ -2169,6 +2173,7 @@ impl App {
                     update: &self.update,
                     task_manager: &self.task_manager,
                     elevated: self.elevated,
+                    history: self.history_cost(),
                 };
                 self.settings_page
                     .paint(dl, full, self.settings, cx, theme, &mut self.buf);
@@ -2193,6 +2198,7 @@ impl App {
         // The History shares the summary charts' time axis, so a moment marked in
         // one is marked in all of them. It is placed first: its own pointer decides
         // what the summary charts mark.
+        let axis = charts::axis_of(timeline);
         if self.history_on() {
             let usage = match &self.paused {
                 Some(p) => &p.usage,
@@ -2203,7 +2209,7 @@ impl App {
                 .crosshair()
                 .filter(|_| self.charts.pointed())
                 .map(|c| c.age_ms);
-            self.history.build(table_rect, usage, outside);
+            self.history.build(table_rect, usage, outside, axis);
             let _ = self.charts.mark(self.history.hover_age());
         } else {
             let _ = self.charts.mark(None);
@@ -2219,7 +2225,7 @@ impl App {
         let max = [100.0, snap.memory.total.get() as f32];
         let colors = [theme.cpu, theme.memory];
         let values: [charts::ValueFmt; 2] = [charts::percent_value, charts::bytes_value];
-        self.charts.begin(2);
+        self.charts.begin(2, axis);
         for i in 0..2 {
             self.charts
                 .build(i, graphs[i], charts::AXIS_BAND_H, series[i], max[i]);
@@ -3370,19 +3376,47 @@ mod tests {
     }
 
     #[test]
+    fn the_axis_spans_the_history_held_and_its_reach_is_a_setting() {
+        let mut app = by_cpu();
+        with_history(&mut app);
+        ready(&mut app);
+        let _ = painted_strings(&mut app);
+        let tl = &app.timeline;
+        let held =
+            (tl.cpu_total.latest().unwrap().at_unix_ms - tl.cpu_total.oldest_ms().unwrap()) as f32;
+        assert!(held > crate::sparkline::TimeAxis::MIN_SPAN_MS, "{held}");
+        assert_eq!(app.charts.axis().span_ms, held, "the chart fills its width");
+        assert_eq!(app.timeline.retention(), &Retention::covering(3_600_000));
+
+        let mut s = app.settings();
+        s.history_minutes = 1440;
+        app.set_settings(s);
+        assert_eq!(
+            app.timeline.retention(),
+            &Retention::covering(24 * 3_600_000)
+        );
+        assert_eq!(app.usage.history_span(), 24 * 3_600_000);
+        assert_eq!(app.timeline.cpu_total.len(), 20, "nothing held was lost");
+    }
+
+    #[test]
     fn charts_label_their_log_axis_and_share_one_crosshair() {
         let mut app = by_cpu();
         with_history(&mut app);
         ready(&mut app);
         let strings = painted_strings(&mut app);
-        for label in ["now", "10s", "1m", "10m", "1h"] {
+        // Twenty seconds of history: the axis spans that, so the labels past it
+        // are not drawn.
+        for label in ["now", "10s"] {
             let n = strings.iter().filter(|s| *s == label).count();
             assert_eq!(n, 2, "{label} under both charts: {strings:?}");
         }
+        assert!(!strings.iter().any(|s| s == "1m"), "{strings:?}");
 
         // Point at the CPU chart, a little off the sample 3 s old: it snaps.
         let cpu = app.charts.plot(0).rect();
-        let at = Point::new(charts::AXIS.x(cpu, 3000.0) + 1.5, cpu.center().y);
+        let axis = app.charts.axis();
+        let at = Point::new(axis.x(cpu, 3000.0) + 1.5, cpu.center().y);
         assert!(app.handle(UiEvent::MouseMove(at)).repaint);
         assert_eq!(app.charts.hover_age(), Some(3000.0));
         let nudge = Point::new(at.x + 0.5, at.y);
@@ -3415,7 +3449,7 @@ mod tests {
         assert_eq!(app.charts.hover_age(), None);
         let n = painted_strings(&mut app)
             .iter()
-            .filter(|s| *s == "1m")
+            .filter(|s| *s == "10s")
             .count();
         assert_eq!(n, 2, "labels are back");
     }

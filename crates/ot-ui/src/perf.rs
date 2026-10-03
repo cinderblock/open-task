@@ -22,9 +22,9 @@ use ot_model::gpu::GpuSample;
 use ot_model::{Bytes, Hertz};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
-use crate::charts::{self, ChartGroup, ValueFmt, AXIS, AXIS_BAND_H};
+use crate::charts::{self, ChartGroup, ValueFmt, AXIS_BAND_H};
 use crate::format;
-use crate::sparkline::{self, PlotPoint};
+use crate::sparkline::{self, PlotPoint, TimeAxis};
 use crate::theme::Theme;
 use crate::view::{Key, MouseButton, Reaction, UiEvent};
 
@@ -220,8 +220,9 @@ fn cell(area: Rect, cols: usize, rows: usize, index: usize) -> Rect {
     )
 }
 
-/// The largest value `series` reaches within the time axis's span.
-fn peak(series: Option<&Series>) -> f32 {
+/// The largest value `series` reaches within the last `span_ms`, the time axis's
+/// span.
+fn peak(series: Option<&Series>, span_ms: f32) -> f32 {
     let Some(s) = series else {
         return 0.0;
     };
@@ -230,7 +231,7 @@ fn peak(series: Option<&Series>) -> f32 {
     };
     let mut top = 0.0f32;
     for b in s.history() {
-        if (newest.at_unix_ms - b.last_ms) as f32 > AXIS.span_ms {
+        if (newest.at_unix_ms - b.last_ms) as f32 > span_ms {
             break;
         }
         top = top.max(b.max);
@@ -310,6 +311,8 @@ pub(crate) struct PerfPage {
     toggle_hover: Option<usize>,
     /// Stands in for a device's series before the timeline has one.
     empty: Series,
+    /// The time axis of the frame being painted.
+    axis: TimeAxis,
 }
 
 impl Default for PerfPage {
@@ -318,6 +321,7 @@ impl Default for PerfPage {
             device: Device::default(),
             per_core: false,
             charts: ChartGroup::default(),
+            axis: TimeAxis::DEFAULT,
             slots: Vec::new(),
             devices: Vec::new(),
             items: Vec::new(),
@@ -465,7 +469,7 @@ impl PerfPage {
             }
             Device::Disk(n) => self.plan(Line::DiskActive(n), area, 0.0, 100.0),
             Device::Adapter(id) => {
-                let max = net_scale(tl, id);
+                let max = net_scale(tl, id, self.axis.span_ms);
                 self.plan(Line::Rx(id), area, 0.0, max);
                 self.plan(Line::Tx(id), area, 0.0, max);
             }
@@ -501,7 +505,8 @@ impl PerfPage {
                 self.plan(Line::DiskActive(n), upper, AXIS_BAND_H, 100.0);
                 let (band, plot) = lower.split_bottom(AXIS_BAND_H);
                 let d = tl.disk(n);
-                let top = peak(d.map(|d| &d.read)).max(peak(d.map(|d| &d.write)));
+                let span = self.axis.span_ms;
+                let top = peak(d.map(|d| &d.read), span).max(peak(d.map(|d| &d.write), span));
                 let max = nice_bytes(top, DISK_FLOOR);
                 self.plan(Line::DiskRead(n), plot, 0.0, max);
                 self.plan(Line::DiskWrite(n), plot, 0.0, max);
@@ -511,7 +516,7 @@ impl PerfPage {
             }
             Device::Adapter(id) => {
                 let (band, plot) = f.chart.split_bottom(AXIS_BAND_H);
-                let max = net_scale(tl, id);
+                let max = net_scale(tl, id, self.axis.span_ms);
                 self.plan(Line::Rx(id), plot, 0.0, max);
                 self.plan(Line::Tx(id), plot, 0.0, max);
                 detail.pair_band = band;
@@ -531,7 +536,10 @@ impl PerfPage {
                 let max = if total > 0.0 {
                     total
                 } else {
-                    nice_bytes(peak(tl.gpu(id).map(|g| &g.dedicated)), DISK_FLOOR)
+                    nice_bytes(
+                        peak(tl.gpu(id).map(|g| &g.dedicated), self.axis.span_ms),
+                        DISK_FLOOR,
+                    )
                 };
                 self.plan(Line::GpuMemory(id), lower, AXIS_BAND_H, max);
                 detail.second_caption = caption;
@@ -551,6 +559,7 @@ impl PerfPage {
         theme: &Theme,
         buf: &mut String,
     ) {
+        self.axis = charts::axis_of(tl);
         self.devices.clear();
         self.devices.extend([Device::Cpu, Device::Memory]);
         self.devices
@@ -594,7 +603,7 @@ impl PerfPage {
             self.minis.push((first, self.slots.len() - first));
         }
         self.plan_detail(&f, snap, tl, theme);
-        self.charts.begin(self.slots.len());
+        self.charts.begin(self.slots.len(), self.axis);
         for (i, s) in self.slots.iter().enumerate() {
             let series = series(tl, s.line).unwrap_or(&self.empty);
             self.charts.build(i, s.area, s.band_h, series, s.max);
@@ -899,18 +908,21 @@ impl PerfPage {
                 c.ago(buf);
                 let mut text = String::with_capacity(64);
                 charts::readout(&mut text, &values, buf, c.side);
-                let x = AXIS.x(plot, c.age_ms);
+                let x = self.axis.x(plot, c.age_ms);
                 sparkline::paint_readout(dl, band, x, c.side, &text, theme.small, theme.text);
             }
-            None => sparkline::paint_axis(dl, plot, band, &AXIS, theme.small, theme.text_dim),
+            None => {
+                sparkline::paint_axis(dl, plot, band, &self.axis, theme.small, theme.text_dim);
+            }
         }
     }
 }
 
-/// The full scale of an adapter's chart, in bytes per second.
-fn net_scale(tl: &Timeline, id: u64) -> f32 {
+/// The full scale of an adapter's chart, in bytes per second, from its busiest
+/// moment in the last `span_ms`.
+fn net_scale(tl: &Timeline, id: u64, span_ms: f32) -> f32 {
     let a = tl.adapter(id);
-    let top = peak(a.map(|a| &a.rx)).max(peak(a.map(|a| &a.tx)));
+    let top = peak(a.map(|a| &a.rx), span_ms).max(peak(a.map(|a| &a.tx), span_ms));
     nice_bits(top * 8.0, NET_FLOOR_BITS) / 8.0
 }
 
@@ -2011,7 +2023,7 @@ mod tests {
         let mut page = PerfPage::default();
         let _ = paint(&mut page, 2);
         let big = page.charts().plot(page.detail.first).rect();
-        let at = Point::new(AXIS.x(big, 3000.0), big.center().y);
+        let at = Point::new(page.charts().axis().x(big, 3000.0), big.center().y);
         assert!(page.handle(UiEvent::MouseMove(at)).repaint);
         assert_eq!(page.charts().hover_age(), Some(3000.0));
         let dl = paint(&mut page, 2);
@@ -2033,7 +2045,7 @@ mod tests {
         page.handle(UiEvent::Key(Key::End));
         let _ = paint_with(&mut page, &tl, &s);
         let rx = page.charts().plot(page.detail.first).rect();
-        let at = Point::new(AXIS.x(rx, 3000.0), rx.center().y);
+        let at = Point::new(page.charts().axis().x(rx, 3000.0), rx.center().y);
         assert!(page.handle(UiEvent::MouseMove(at)).repaint);
         let t = texts(&paint_with(&mut page, &tl, &s));
         assert!(

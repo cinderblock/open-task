@@ -22,7 +22,7 @@ use ot_core::usage::fade;
 use ot_core::{ProgramId, Usage};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
-use crate::charts::{self, Crosshair, AXIS, AXIS_BAND_H};
+use crate::charts::{self, Crosshair, AXIS_BAND_H};
 use crate::format;
 use crate::process_rows::contains_ci;
 use crate::sparkline::{self, TimeAxis};
@@ -126,6 +126,8 @@ pub(crate) struct UsageChart {
     area: Rect,
     plot: Rect,
     axis: Rect,
+    /// The time axis of the last build, shared with the summary charts.
+    time: TimeAxis,
     legend: Rect,
     switch: [Rect; 2],
     /// Each band's legend row; empty for a band that has none.
@@ -161,11 +163,12 @@ impl UsageChart {
         self.mode
     }
 
-    /// Lay the chart out in `rect` and place the history in it. `outside` is the
-    /// age another chart on the same time axis marks, which this one marks too
-    /// while the pointer is not over its own plot.
-    pub fn build(&mut self, rect: Rect, usage: &Usage, outside: Option<f32>) {
+    /// Lay the chart out in `rect` and place the history in it on `time`. `outside`
+    /// is the age another chart on the same time axis marks, which this one marks
+    /// too while the pointer is not over its own plot.
+    pub fn build(&mut self, rect: Rect, usage: &Usage, outside: Option<f32>, time: TimeAxis) {
         self.area = rect;
+        self.time = time;
         self.decay = usage.decay();
         let (head, body) = rect.split_top(HEAD_H);
         let (_, body) = body.split_top(4.0);
@@ -191,7 +194,9 @@ impl UsageChart {
         // The moment to mark: under the pointer, or what another chart marks.
         let own = self.pointed_age();
         let prev = self.crosshair;
-        self.crosshair = own.or(outside).map(|age| Crosshair::follow(prev, age));
+        self.crosshair = own
+            .or(outside)
+            .map(|age| Crosshair::follow(prev, age, time));
         self.hover_mode = self
             .pointer
             .and_then(|p| self.switch.iter().position(|r| r.contains(p)));
@@ -208,11 +213,11 @@ impl UsageChart {
         self.weight.resize(usage.programs(), 0.0);
         for f in usage.frames() {
             let age = (now - f.end_ms).max(0) as f32;
-            if age >= AXIS.span_ms || f.span_ms <= 0 {
+            if age >= self.time.span_ms || f.span_ms <= 0 {
                 break;
             }
             // A band's area here: its rate times the width the stretch gets.
-            let w = AXIS.x(plot, age) - AXIS.x(plot, age + f.span_ms as f32);
+            let w = self.time.x(plot, age) - self.time.x(plot, age + f.span_ms as f32);
             let per = w / f.span_ms as f32;
             for &(g, cycles) in f.cycles {
                 if let Some(slot) = self.weight.get_mut(g as usize) {
@@ -288,7 +293,7 @@ impl UsageChart {
                 v,
             });
             // The first stretch past the span carries the bands to the left edge.
-            if age_ms >= AXIS.span_ms {
+            if age_ms >= self.time.span_ms {
                 break;
             }
         }
@@ -322,7 +327,7 @@ impl UsageChart {
         let mut column = i64::MIN;
         let mut secs = 0.0;
         for r in &self.history {
-            let x = AXIS.x(self.plot, r.age_ms);
+            let x = self.time.x(self.plot, r.age_ms);
             let c = ((self.plot.right() - x) / COLUMN_W).floor() as i64;
             match self.points.last_mut() {
                 // Several stretches in one column: their average over time.
@@ -398,7 +403,7 @@ impl UsageChart {
     /// The column at an age, if the history reaches back that far.
     fn at_age(&self, age_ms: f32) -> Option<&Pt> {
         let oldest = self.points.last()?;
-        let x = AXIS.x(self.plot, age_ms);
+        let x = self.time.x(self.plot, age_ms);
         (x >= oldest.x - COLUMN_W)
             .then(|| self.nearest(x))
             .flatten()
@@ -521,8 +526,8 @@ impl UsageChart {
             dl.fill_rect(Rect::new(plot.x, y.floor(), plot.w, 1.0), theme.grid);
         }
         for (age, _) in TimeAxis::TICKS {
-            if age > 0.0 && age < AXIS.span_ms {
-                let x = AXIS.x(plot, age).floor();
+            if age > 0.0 && age < self.time.span_ms {
+                let x = self.time.x(plot, age).floor();
                 dl.fill_rect(Rect::new(x, plot.y, 1.0, plot.h), theme.grid);
             }
         }
@@ -600,10 +605,10 @@ impl UsageChart {
     fn paint_mark(&mut self, dl: &mut DisplayList, theme: &Theme, buf: &mut String) -> Option<Pt> {
         let plot = self.plot;
         let Some(c) = self.crosshair else {
-            sparkline::paint_axis(dl, plot, self.axis, &AXIS, theme.small, theme.text_dim);
+            sparkline::paint_axis(dl, plot, self.axis, &self.time, theme.small, theme.text_dim);
             return None;
         };
-        let x = AXIS.x(plot, c.age_ms);
+        let x = self.time.x(plot, c.age_ms);
         dl.fill_rect(Rect::new(x.floor(), plot.y, 1.0, plot.h), theme.crosshair);
         let marked = self.at_age(c.age_ms).copied();
         let mut ago = std::mem::take(&mut self.ago);
@@ -816,7 +821,7 @@ mod tests {
 
     fn painted(c: &mut UsageChart, u: &Usage, needle: &str) -> DisplayList {
         let mut dl = DisplayList::new();
-        c.build(RECT, u, None);
+        c.build(RECT, u, None, TimeAxis::DEFAULT);
         c.paint(&mut dl, u, needle, None, &Theme::dark(), &mut String::new());
         assert_eq!(dl.clip_depth(), 0);
         dl
@@ -944,7 +949,7 @@ mod tests {
         let _ = painted(&mut c, &u, "");
         let (a, b) = (band(&c, &u, "a.exe"), band(&c, &u, "b.exe"));
         // Ten seconds ago, a third of the way up a's band.
-        let x = AXIS.x(c.plot, 10_000.0);
+        let x = c.time.x(c.plot, 10_000.0);
         let at = c.at_age(10_000.0).copied().unwrap();
         let lower = if a < b { 0.0 } else { at.v[b] };
         let y = c.y(lower + at.v[a] / 3.0);
@@ -971,7 +976,7 @@ mod tests {
         // Off the chart: nothing marked, unless another chart marks a moment.
         assert!(c.set_pointer(None));
         assert!(!c.set_pointer(None));
-        c.build(RECT, &u, Some(30_000.0));
+        c.build(RECT, &u, Some(30_000.0), TimeAxis::DEFAULT);
         assert_eq!(c.hover_age(), None);
         assert_eq!(c.crosshair.map(|c| c.age_ms), Some(30_000.0));
     }

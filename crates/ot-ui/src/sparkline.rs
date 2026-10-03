@@ -1,9 +1,10 @@
 //! Compact time-series chart on a log-scale time axis.
 //!
 //! The newest sample sits on the right edge and age grows leftward on a log scale:
-//! the last seconds get a wide stretch at full resolution, the last hour is
-//! compressed into the left end. A young session draws from the right and grows
-//! leftward as it ages, the way Task Manager's graphs fill in.
+//! the last seconds get a wide stretch at full resolution, the oldest history is
+//! compressed into the left end. The axis spans whatever history is held
+//! ([`TimeAxis::spanning`]), so a chart fills its width from a session's first
+//! seconds and the span settles once the history is as long as it is kept.
 //!
 //! Drawing is split in two so several charts can share one hover. [`Plot::build`]
 //! places a series' history into columns one DIP wide, keeping each column's
@@ -46,13 +47,29 @@ impl TimeAxis {
         tau_ms: 1_000.0,
     };
 
+    /// The shortest span a chart shows. With one sample a log axis has no width to
+    /// give, and a session's first seconds would stretch across the whole chart.
+    pub const MIN_SPAN_MS: f32 = 10_000.0;
+
+    /// The axis for a history reaching back `oldest_age_ms`, so a chart fills its
+    /// width: at least [`Self::MIN_SPAN_MS`], with the default knee.
+    #[must_use]
+    pub fn spanning(oldest_age_ms: f32) -> Self {
+        Self {
+            span_ms: oldest_age_ms.max(Self::MIN_SPAN_MS),
+            tau_ms: Self::DEFAULT.tau_ms,
+        }
+    }
+
     /// Labeled ages, newest first. Those older than the span are skipped.
-    pub const TICKS: [(f32, &'static str); 5] = [
+    pub const TICKS: [(f32, &'static str); 7] = [
         (0.0, "now"),
         (10_000.0, "10s"),
         (60_000.0, "1m"),
         (600_000.0, "10m"),
         (3_600_000.0, "1h"),
+        (21_600_000.0, "6h"),
+        (86_400_000.0, "1d"),
     ];
 
     fn scale(self) -> f32 {
@@ -79,6 +96,12 @@ impl TimeAxis {
         }
         let f = ((rect.right() - x) / rect.w).clamp(0.0, 1.0);
         self.tau_ms * (f * self.scale()).exp_m1()
+    }
+}
+
+impl Default for TimeAxis {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -508,16 +531,16 @@ mod tests {
     fn a_column_never_holds_two_points_and_spikes_survive_in_the_envelope() {
         // Two hours at 1 Hz with one spike 40 minutes ago; raw holds 10 minutes,
         // 10 s buckets the rest.
-        const R: Retention = Retention {
+        let r = Retention {
             raw: 600,
-            tiers: &[Resolution {
+            tiers: vec![Resolution {
                 bucket_ms: 10_000,
                 capacity: 720,
             }],
         };
         let n = 7200;
         let spike = n - 1 - 2400;
-        let s = per_second(R, (0..n).map(|i| if i == spike { 100.0 } else { 10.0 }));
+        let s = per_second(r, (0..n).map(|i| if i == spike { 100.0 } else { 10.0 }));
         let rect = Rect::new(0.0, 0.0, 300.0, 60.0);
         let p = plot(&s, rect, 100.0);
         assert!(p.points().len() <= 301, "{}", p.points().len());

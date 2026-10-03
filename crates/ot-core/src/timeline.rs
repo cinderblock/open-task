@@ -75,14 +75,22 @@ pub struct Resolution {
 }
 
 /// How much history a series keeps, at which resolutions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Retention {
     /// Raw samples kept, each at its own timestamp.
     pub raw: usize,
     /// Coarser tiers, finest first. Each should cover more time than the one before
     /// it, or it adds nothing.
-    pub tiers: &'static [Resolution],
+    pub tiers: Vec<Resolution>,
 }
+
+/// Raw samples [`Retention::covering`] keeps: ten minutes at one a second.
+pub const RAW_SAMPLES: usize = 600;
+/// The finer coarse tier's bucket width and how much of the span it covers.
+const FINE_MS: i64 = 10_000;
+const FINE_SPAN_MS: i64 = 2 * 3_600_000;
+/// The coarser tier's bucket width, for spans past the finer tier's reach.
+const COARSE_MS: i64 = 60_000;
 
 impl Retention {
     /// Raw samples only.
@@ -90,8 +98,49 @@ impl Retention {
     pub const fn raw(capacity: usize) -> Self {
         Self {
             raw: capacity,
-            tiers: &[],
+            tiers: Vec::new(),
         }
+    }
+
+    /// Enough history to chart the last `span_ms`: [`RAW_SAMPLES`] raw samples,
+    /// then 10 s buckets for up to two hours, then 60 s buckets for the rest. The
+    /// charts' log time axis gives the old end a few pixels an hour, so the coarse
+    /// tiers lose nothing a chart could show.
+    #[must_use]
+    pub fn covering(span_ms: i64) -> Self {
+        let span_ms = span_ms.max(1);
+        // Buckets are aligned to the clock, so covering a span takes one more than
+        // its width divides into, plus the one being filled.
+        let buckets = |span: i64, width: i64| (span / width) as usize + 2;
+        let mut tiers = vec![Resolution {
+            bucket_ms: FINE_MS,
+            capacity: buckets(span_ms.min(FINE_SPAN_MS), FINE_MS),
+        }];
+        if span_ms > FINE_SPAN_MS {
+            tiers.push(Resolution {
+                bucket_ms: COARSE_MS,
+                capacity: buckets(span_ms, COARSE_MS),
+            });
+        }
+        Self {
+            raw: RAW_SAMPLES,
+            tiers,
+        }
+    }
+
+    /// Points a series holds when full: raw samples and buckets together.
+    #[must_use]
+    pub fn points(&self) -> usize {
+        self.raw + self.tiers.iter().map(|t| t.capacity + 1).sum::<usize>()
+    }
+
+    /// Memory one series commits to at this retention. The rings allocate their
+    /// capacity up front, so this is what a series costs from the start, not what
+    /// it grows to.
+    #[must_use]
+    pub fn bytes_per_series(&self) -> usize {
+        let buckets: usize = self.tiers.iter().map(|t| t.capacity + 1).sum();
+        self.raw * size_of::<Sample>() + buckets * size_of::<Bucket>()
     }
 }
 
@@ -164,6 +213,57 @@ impl Series {
         }
     }
 
+    /// Keep history to a new retention. Rings resize in place, so nothing already
+    /// held is lost but what no longer fits; a tier whose bucket width is kept
+    /// keeps its buckets, a new one starts empty and fills from here on.
+    pub fn set_retention(&mut self, retention: Retention) {
+        if self.retention == retention {
+            return;
+        }
+        self.raw.set_capacity(retention.raw);
+        let mut old: Vec<Option<Tier>> = std::mem::take(&mut self.tiers)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.tiers = retention
+            .tiers
+            .iter()
+            .map(|r| {
+                let bucket_ms = r.bucket_ms.max(1);
+                let kept = old
+                    .iter_mut()
+                    .find(|t| t.as_ref().is_some_and(|t| t.bucket_ms == bucket_ms))
+                    .and_then(Option::take);
+                match kept {
+                    Some(mut t) => {
+                        t.closed.set_capacity(r.capacity);
+                        t
+                    }
+                    None => Tier {
+                        bucket_ms,
+                        closed: Ring::new(r.capacity),
+                        open: None,
+                    },
+                }
+            })
+            .collect();
+        self.retention = retention;
+    }
+
+    /// Time of the oldest sample still held, raw or in a bucket.
+    #[must_use]
+    pub fn oldest_ms(&self) -> Option<i64> {
+        let raw = self.raw.oldest().map(|s| s.at_unix_ms);
+        let tiers = self.tiers.iter().flat_map(|t| {
+            t.closed
+                .oldest()
+                .map(|b| b.first_ms)
+                .into_iter()
+                .chain(t.open.map(|o| o.bucket.first_ms))
+        });
+        raw.into_iter().chain(tiers).min()
+    }
+
     /// Append a sample. Samples are expected in time order; one that is older than
     /// the newest is still kept raw, but a coarse tier folds it into whichever
     /// bucket is open.
@@ -176,8 +276,8 @@ impl Series {
     }
 
     #[must_use]
-    pub fn retention(&self) -> Retention {
-        self.retention
+    pub fn retention(&self) -> &Retention {
+        &self.retention
     }
 
     /// Raw samples held.
@@ -325,17 +425,73 @@ impl Timeline {
     #[must_use]
     pub fn new(retention: Retention) -> Self {
         Self {
-            cpu_total: Series::new(retention),
+            cpu_total: Series::new(retention.clone()),
             cores: Vec::new(),
-            mem_in_use: Series::new(retention),
+            mem_in_use: Series::new(retention.clone()),
             disks: Vec::new(),
             adapters: Vec::new(),
             gpus: Vec::new(),
-            battery_charge: Series::new(retention),
-            battery_rate: Series::new(retention),
+            battery_charge: Series::new(retention.clone()),
+            battery_rate: Series::new(retention.clone()),
             retention,
             last_tick: None,
         }
+    }
+
+    #[must_use]
+    pub fn retention(&self) -> &Retention {
+        &self.retention
+    }
+
+    /// Keep every series to a new retention, present and future ones alike. See
+    /// [`Series::set_retention`] for what is kept.
+    pub fn set_retention(&mut self, retention: Retention) {
+        if self.retention == retention {
+            return;
+        }
+        for s in self.series_mut() {
+            s.set_retention(retention.clone());
+        }
+        self.retention = retention;
+    }
+
+    /// Every series, for the ones that apply to all alike.
+    fn series_mut(&mut self) -> impl Iterator<Item = &mut Series> {
+        let disks = self
+            .disks
+            .iter_mut()
+            .flat_map(|d| [&mut d.active, &mut d.read, &mut d.write]);
+        let adapters = self
+            .adapters
+            .iter_mut()
+            .flat_map(|a| [&mut a.rx, &mut a.tx]);
+        let gpus = self
+            .gpus
+            .iter_mut()
+            .flat_map(|g| [&mut g.utilization, &mut g.dedicated]);
+        [&mut self.cpu_total, &mut self.mem_in_use]
+            .into_iter()
+            .chain(self.cores.iter_mut())
+            .chain(disks)
+            .chain(adapters)
+            .chain(gpus)
+            .chain([&mut self.battery_charge, &mut self.battery_rate])
+    }
+
+    /// Series held, each committed to [`Retention::bytes_per_series`].
+    #[must_use]
+    pub fn series_count(&self) -> usize {
+        4 + self.cores.len() + 3 * self.disks.len() + 2 * self.adapters.len() + 2 * self.gpus.len()
+    }
+
+    /// How far back the history reaches: the age of the oldest sample still held,
+    /// in milliseconds before the newest. `None` before the first sample. The charts
+    /// size their time axis to this, so a session fills its width from the start.
+    #[must_use]
+    pub fn span_ms(&self) -> Option<i64> {
+        let newest = self.cpu_total.latest()?.at_unix_ms;
+        let oldest = self.cpu_total.oldest_ms()?;
+        Some((newest - oldest).max(0))
     }
 
     /// Fold a snapshot in. Ignores empty snapshots and repeats of the last tick, so
@@ -363,14 +519,14 @@ impl Timeline {
 
         if self.cores.len() != snap.cpu.cores.len() {
             self.cores = (0..snap.cpu.cores.len())
-                .map(|_| Series::new(self.retention))
+                .map(|_| Series::new(self.retention.clone()))
                 .collect();
         }
         for (series, core) in self.cores.iter_mut().zip(&snap.cpu.cores) {
             series.push(at, core.usage.get());
         }
 
-        let retention = self.retention;
+        let retention = self.retention.clone();
         for d in &snap.disks {
             let n = d.info.number;
             let i = self
@@ -380,9 +536,9 @@ impl Timeline {
                 .unwrap_or_else(|| {
                     self.disks.push(DiskSeries {
                         number: n,
-                        active: Series::new(retention),
-                        read: Series::new(retention),
-                        write: Series::new(retention),
+                        active: Series::new(retention.clone()),
+                        read: Series::new(retention.clone()),
+                        write: Series::new(retention.clone()),
                     });
                     self.disks.len() - 1
                 });
@@ -400,8 +556,8 @@ impl Timeline {
                 .unwrap_or_else(|| {
                     self.adapters.push(AdapterSeries {
                         id,
-                        rx: Series::new(retention),
-                        tx: Series::new(retention),
+                        rx: Series::new(retention.clone()),
+                        tx: Series::new(retention.clone()),
                     });
                     self.adapters.len() - 1
                 });
@@ -418,8 +574,8 @@ impl Timeline {
                 .unwrap_or_else(|| {
                     self.gpus.push(GpuSeries {
                         id,
-                        utilization: Series::new(retention),
-                        dedicated: Series::new(retention),
+                        utilization: Series::new(retention.clone()),
+                        dedicated: Series::new(retention.clone()),
                     });
                     self.gpus.len() - 1
                 });
@@ -648,17 +804,19 @@ mod tests {
         assert_eq!(t.cpu_total.latest().map(|s| s.at_unix_ms), Some(7000));
     }
 
-    const TIERED: Retention = Retention {
-        raw: 30,
-        tiers: &[Resolution {
-            bucket_ms: 10_000,
-            capacity: 6,
-        }],
-    };
+    fn tiered() -> Retention {
+        Retention {
+            raw: 30,
+            tiers: vec![Resolution {
+                bucket_ms: 10_000,
+                capacity: 6,
+            }],
+        }
+    }
 
     /// One sample a second from t = 0 s, value = the second.
     fn seconds(n: i64) -> Series {
-        let mut s = Series::new(TIERED);
+        let mut s = Series::new(tiered());
         for i in 0..n {
             s.push(i * 1000, i as f32);
         }
@@ -734,5 +892,111 @@ mod tests {
         // Raw covers the last 30 s, which the filling bucket and the two newest
         // closed ones overlap; the other four closed buckets extend it.
         assert_eq!(s.history().count(), 34);
+    }
+
+    #[test]
+    fn the_oldest_sample_held_is_the_span_of_the_history() {
+        let s = seconds(25);
+        assert_eq!(s.oldest_ms(), Some(0), "all raw");
+        let s = seconds(10_000);
+        // Raw holds 9970..=9999 s; [9990, 10000) is filling, and the six closed 10 s
+        // buckets before it reach back to 9930 s.
+        assert_eq!(s.oldest_ms(), Some(9_930_000));
+        assert_eq!(Series::new(tiered()).oldest_ms(), None);
+    }
+
+    #[test]
+    fn covering_a_span_scales_the_tiers_with_it() {
+        let hour = Retention::covering(3_600_000);
+        assert_eq!(hour.raw, RAW_SAMPLES);
+        assert_eq!(hour.tiers.len(), 1);
+        assert_eq!(hour.tiers[0].bucket_ms, 10_000);
+        assert!(hour.tiers[0].capacity >= 360);
+
+        let day = Retention::covering(24 * 3_600_000);
+        assert_eq!(day.tiers.len(), 2);
+        assert_eq!(day.tiers[0].capacity, hour.tiers[0].capacity.max(722));
+        assert_eq!(day.tiers[1].bucket_ms, 60_000);
+        assert!(day.tiers[1].capacity >= 1440);
+        assert!(day.bytes_per_series() > hour.bytes_per_series());
+        assert!(
+            day.bytes_per_series() < 100_000,
+            "{}",
+            day.bytes_per_series()
+        );
+        assert_eq!(
+            day.points(),
+            day.raw + day.tiers[0].capacity + 1 + day.tiers[1].capacity + 1
+        );
+
+        // A day of samples fits and reaches back a day.
+        let mut s = Series::new(day);
+        for i in 0..(25 * 3600) {
+            s.push(i64::from(i) * 1000, 1.0);
+        }
+        let span = s.latest().unwrap().at_unix_ms - s.oldest_ms().unwrap();
+        assert!(span >= 24 * 3_600_000, "{span}");
+    }
+
+    #[test]
+    fn changing_the_retention_keeps_what_still_fits() {
+        let mut s = seconds(100);
+        // Shrink: raw drops to the newest 10, the tier to 3 closed buckets.
+        s.set_retention(Retention {
+            raw: 10,
+            tiers: vec![Resolution {
+                bucket_ms: 10_000,
+                capacity: 3,
+            }],
+        });
+        assert_eq!(s.len(), 10);
+        assert_eq!(s.raw().next().unwrap().at_unix_ms, 90_000);
+        assert_eq!(s.tiers[0].closed.len(), 3);
+        assert_eq!(s.oldest_ms(), Some(60_000));
+        // Grow, with a coarser tier added: the 10 s tier keeps its buckets, the new
+        // one starts empty and fills from the next sample.
+        s.set_retention(Retention {
+            raw: 50,
+            tiers: vec![
+                Resolution {
+                    bucket_ms: 10_000,
+                    capacity: 8,
+                },
+                Resolution {
+                    bucket_ms: 60_000,
+                    capacity: 4,
+                },
+            ],
+        });
+        assert_eq!(s.tiers[0].closed.len(), 3, "kept");
+        assert_eq!(s.tiers.len(), 2);
+        assert!(s.tiers[1].open.is_none());
+        for i in 100..250 {
+            s.push(i * 1000, i as f32);
+        }
+        assert_eq!(s.len(), 50);
+        assert_eq!(s.tiers[0].closed.len(), 8);
+        assert_eq!(
+            s.tiers[1].closed.len(),
+            3,
+            "[60, 120) from 100 s on, then [120, 180) and [180, 240)"
+        );
+        assert!(s.history().count() > 50);
+    }
+
+    #[test]
+    fn the_timeline_resizes_every_series_and_reports_its_span() {
+        let mut t = Timeline::new(Retention::raw(10));
+        assert_eq!(t.span_ms(), None);
+        for tick in 1..=20 {
+            t.observe(&snap(tick, 50.0, 2));
+        }
+        assert_eq!(t.span_ms(), Some(9000), "ten samples, 11 s to 20 s");
+        assert_eq!(t.series_count(), 6);
+        t.set_retention(Retention::raw(3));
+        assert_eq!(t.span_ms(), Some(2000));
+        assert_eq!(t.cores[1].len(), 3);
+        assert_eq!(t.mem_in_use.len(), 3);
+        assert_eq!(t.retention().raw, 3);
     }
 }

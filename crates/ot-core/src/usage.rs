@@ -26,9 +26,11 @@
 //! [`Usage`] also keeps the history behind the usage chart: for every interval, the
 //! cycles each *program* used, a program being every process of one name
 //! (twelve `chrome.exe`, or the two hundred `rustc.exe` of a build, are one line of
-//! the chart). An hour is kept, the last ten minutes sample by sample and the rest
-//! in ten-second steps, with only the programs that ran in each step, so the cost is
-//! set by how many programs are busy, not by how many processes exist.
+//! the chart). As much is kept as the charts reach back ([`Usage::set_history_span`],
+//! an hour unless set otherwise): the last ten minutes sample by sample, the rest in
+//! steps of ten seconds, or wider when the reach is long, so a day is at most 720
+//! steps. Each step lists only the programs that ran in it, so the cost is set by how
+//! many programs are busy, not by how many processes exist.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -45,9 +47,30 @@ const GHOST_FLOOR: f64 = 1.0e6;
 const GHOST_SHARE: f64 = 1.0e-4;
 /// History kept sample by sample.
 const RAW_FRAMES: usize = 600;
-/// Width of the steps older history is kept in, and how many of them.
-const COARSE_MS: i64 = 10_000;
-const COARSE_FRAMES: usize = 360;
+/// The narrowest step older history is kept in, and the most steps a history has,
+/// which sets the step width of a long one.
+const STEP_MIN_MS: i64 = 10_000;
+const STEPS: i64 = 720;
+/// How far back the history reaches unless set otherwise: an hour.
+pub const DEFAULT_HISTORY_MS: i64 = 3_600_000;
+
+/// Width of the steps a history reaching back `history_ms` folds old frames into:
+/// ten seconds, or wider so that there are at most [`STEPS`] of them.
+#[must_use]
+pub fn step_ms(history_ms: i64) -> i64 {
+    (history_ms / STEPS).max(STEP_MIN_MS)
+}
+
+/// About how many bytes a history reaching back `span_ms` takes, at `frame_bytes`
+/// a frame ([`Usage::frame_bytes`] for a running session). An estimate for the
+/// Settings page; the raw frames count whole since their reach depends on the
+/// sampling interval.
+#[must_use]
+pub fn history_bytes(span_ms: i64, frame_bytes: usize) -> usize {
+    let span_ms = span_ms.max(STEP_MIN_MS);
+    let steps = (span_ms / step_ms(span_ms)) as usize + 1;
+    (RAW_FRAMES + steps) * frame_bytes
+}
 
 /// A program in the usage history: every process of one name. An index into
 /// [`Usage::program_name`], stable for the session.
@@ -134,6 +157,8 @@ pub struct Usage {
     open: Option<Open>,
     /// Scratch: this interval's cycles per program.
     interval: Vec<(ProgramId, f32)>,
+    /// How far back the history reaches, in milliseconds.
+    history_ms: i64,
 }
 
 /// One step of a fading total: the share of it left after `secs`, and the share
@@ -168,6 +193,7 @@ impl Usage {
             coarse: VecDeque::new(),
             open: None,
             interval: Vec::new(),
+            history_ms: DEFAULT_HISTORY_MS,
         }
     }
 
@@ -175,6 +201,47 @@ impl Usage {
     /// new rate from here on.
     pub fn set_decay(&mut self, decay: f64) {
         self.decay = clamp_decay(decay);
+    }
+
+    /// Keep history reaching back `ms` milliseconds (at least ten seconds). What is
+    /// older goes as the next snapshot arrives; steps already made keep their width,
+    /// new ones take the width the new reach calls for ([`step_ms`]).
+    pub fn set_history_span(&mut self, ms: i64) {
+        self.history_ms = ms.max(STEP_MIN_MS);
+    }
+
+    /// How far back the history reaches, in milliseconds.
+    #[must_use]
+    pub fn history_span(&self) -> i64 {
+        self.history_ms
+    }
+
+    /// Bytes the history holds now.
+    #[must_use]
+    pub fn history_bytes(&self) -> usize {
+        let entry = size_of::<(ProgramId, f32)>();
+        let stored = |s: &Stored| size_of::<Stored>() + s.cycles.len() * entry;
+        let open = self
+            .open
+            .as_ref()
+            .map_or(0, |o| size_of::<Open>() + o.cycles.capacity() * entry);
+        self.raw
+            .iter()
+            .chain(&self.coarse)
+            .map(stored)
+            .sum::<usize>()
+            + open
+    }
+
+    /// Bytes a frame of this history takes on average, for projecting the cost of
+    /// another reach with [`history_bytes`]. A guess of sixteen programs a frame
+    /// until there are frames to go by.
+    #[must_use]
+    pub fn frame_bytes(&self) -> usize {
+        let frames = self.raw.len() + self.coarse.len();
+        self.history_bytes()
+            .checked_div(frames)
+            .unwrap_or(size_of::<Stored>() + 16 * size_of::<(ProgramId, f32)>())
     }
 
     /// Share of every total lost each second.
@@ -273,14 +340,19 @@ impl Usage {
     }
 
     /// Append a frame to the history, moving what leaves the raw part into the
-    /// coarse steps.
+    /// coarse steps and dropping what has passed the reach.
     fn push_frame(&mut self, frame: Stored) {
+        let now = frame.end_ms;
+        let reach = self.history_ms;
+        let step = step_ms(reach);
         self.raw.push_back(frame);
-        while self.raw.len() > RAW_FRAMES {
+        while self.raw.len() > RAW_FRAMES
+            || self.raw.front().is_some_and(|f| now - f.end_ms > reach)
+        {
             let Some(old) = self.raw.pop_front() else {
                 break;
             };
-            let index = old.end_ms.div_euclid(COARSE_MS);
+            let index = old.end_ms.div_euclid(step);
             if self.open.as_ref().is_some_and(|o| o.index != index) {
                 self.close_open();
             }
@@ -297,13 +369,17 @@ impl Usage {
                 }
             }
         }
+        // Steps that have passed the reach go, the one being filled included.
+        if self.open.as_ref().is_some_and(|o| now - o.end_ms > reach) {
+            self.open = None;
+        }
+        while self.coarse.front().is_some_and(|f| now - f.end_ms > reach) {
+            self.coarse.pop_front();
+        }
     }
 
     fn close_open(&mut self) {
         if let Some(o) = self.open.take() {
-            if self.coarse.len() == COARSE_FRAMES {
-                self.coarse.pop_front();
-            }
             self.coarse.push_back(Stored {
                 end_ms: o.end_ms,
                 span_ms: o.span_ms,
@@ -366,8 +442,8 @@ impl Usage {
         self.programs.len()
     }
 
-    /// The history, newest first: every sample of the last ten minutes, then
-    /// ten-second steps for the rest of the hour. No stretch is covered twice.
+    /// The history, newest first: every sample of the last ten minutes, then steps
+    /// for the rest of the reach. No stretch is covered twice.
     pub fn frames(&self) -> impl Iterator<Item = Frame<'_>> + '_ {
         let open = self.open.as_ref().map(|o| Frame {
             end_ms: o.end_ms,
@@ -691,15 +767,16 @@ mod tests {
     }
 
     #[test]
-    fn old_history_is_kept_in_ten_second_steps_and_bounded() {
+    fn old_history_is_kept_in_ten_second_steps_and_dropped_past_the_reach() {
         let mut u = Usage::new(0.05);
+        assert_eq!(u.history_span(), DEFAULT_HISTORY_MS);
         // Three hours at one sample a second, 1 G a second.
         let n = 3 * 3600u64;
         for s in 0..=n {
             u.observe(&snap(100_000 + s, vec![proc(1, Some(0), s * G)]));
         }
         let frames: Vec<Frame<'_>> = u.frames().collect();
-        assert!(frames.len() <= RAW_FRAMES + 1 + COARSE_FRAMES);
+        assert!(frames.len() <= RAW_FRAMES + 1 + 362, "{}", frames.len());
         // The raw samples, and perhaps a step that has only its first one yet.
         let raw = frames.iter().filter(|f| f.span_ms == 1000).count();
         assert!((RAW_FRAMES..=RAW_FRAMES + 1).contains(&raw), "{raw}");
@@ -710,10 +787,47 @@ mod tests {
             .all(|w| w[0].end_ms - w[0].span_ms == w[1].end_ms));
         // A full step holds ten seconds' cycles.
         let step = frames.last().unwrap();
-        assert_eq!(step.span_ms, COARSE_MS);
+        assert_eq!(step.span_ms, STEP_MIN_MS);
         assert!((f64::from(step.cycles[0].1) / (10.0 * G as f64) - 1.0).abs() < 1e-6);
-        // An hour and ten minutes, give or take the step being filled.
+        // An hour, give or take the step that straddles its edge.
         let covered: i64 = frames.iter().map(|f| f.span_ms).sum();
-        assert!((4_190_000..=4_210_000).contains(&covered), "{covered}");
+        assert!((3_600_000..=3_620_000).contains(&covered), "{covered}");
+        assert!(u.history_bytes() > 0);
+        assert!(u.frame_bytes() >= size_of::<Stored>());
+    }
+
+    #[test]
+    fn a_longer_reach_takes_wider_steps_and_a_shorter_one_drops_the_old() {
+        assert_eq!(step_ms(3_600_000), 10_000);
+        assert_eq!(step_ms(2 * 3_600_000), 10_000);
+        assert_eq!(step_ms(6 * 3_600_000), 30_000);
+        assert_eq!(step_ms(24 * 3_600_000), 120_000);
+        assert!(history_bytes(24 * 3_600_000, 100) > history_bytes(3_600_000, 100));
+        assert!(history_bytes(24 * 3_600_000, 100) <= (RAW_FRAMES + 721) * 100);
+
+        let mut u = Usage::new(0.05);
+        u.set_history_span(24 * 3_600_000);
+        // Two hours at one sample a second: nothing is old enough to go, and the
+        // steps are two minutes wide.
+        let n = 2 * 3600u64;
+        for s in 0..=n {
+            u.observe(&snap(100_000 + s, vec![proc(1, Some(0), s * G)]));
+        }
+        let frames: Vec<Frame<'_>> = u.frames().collect();
+        let covered: i64 = frames.iter().map(|f| f.span_ms).sum();
+        assert_eq!(covered, i64::try_from(n).unwrap() * 1000);
+        // The oldest step is the partial one the session began in; the next is full.
+        assert_eq!(frames[frames.len() - 2].span_ms, 120_000);
+
+        // Ten minutes: the next snapshot drops everything older, but the step that
+        // straddles the edge.
+        u.set_history_span(600_000);
+        u.observe(&snap(100_000 + n + 1, vec![proc(1, Some(0), (n + 1) * G)]));
+        let frames: Vec<Frame<'_>> = u.frames().collect();
+        let covered: i64 = frames.iter().map(|f| f.span_ms).sum();
+        assert!((600_000..=721_000).contains(&covered), "{covered}");
+        assert!(frames
+            .windows(2)
+            .all(|w| w[0].end_ms - w[0].span_ms == w[1].end_ms));
     }
 }

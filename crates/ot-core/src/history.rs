@@ -37,6 +37,27 @@ impl<T> Ring<T> {
         self.cap
     }
 
+    /// Change the capacity, keeping the newest elements that still fit. `cap` of
+    /// zero is clamped to one.
+    pub fn set_capacity(&mut self, cap: usize) {
+        let cap = cap.max(1);
+        while self.buf.len() > cap {
+            self.buf.pop_front();
+        }
+        if cap > self.cap {
+            self.buf.reserve_exact(cap - self.buf.len());
+        } else {
+            self.buf.shrink_to(cap);
+        }
+        self.cap = cap;
+    }
+
+    /// Oldest element still held.
+    #[must_use]
+    pub fn oldest(&self) -> Option<&T> {
+        self.buf.front()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.buf.len()
@@ -86,6 +107,23 @@ mod tests {
         assert_eq!(r.len(), 3);
         assert_eq!(r.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4]);
         assert_eq!(r.latest(), Some(&4));
+    }
+
+    #[test]
+    fn resizing_keeps_the_newest() {
+        let mut r = Ring::new(5);
+        for i in 0..5 {
+            r.push(i);
+        }
+        r.set_capacity(2);
+        assert_eq!(r.iter().copied().collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(r.oldest(), Some(&3));
+        r.set_capacity(4);
+        r.push(5);
+        r.push(6);
+        r.push(7);
+        assert_eq!(r.iter().copied().collect::<Vec<_>>(), vec![4, 5, 6, 7]);
+        assert_eq!(r.capacity(), 4);
     }
 
     #[test]

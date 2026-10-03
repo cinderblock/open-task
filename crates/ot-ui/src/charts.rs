@@ -1,7 +1,8 @@
 //! A group of charts that share one hover.
 //!
-//! Every chart on a page sits on the same log time axis, so an age means the same
-//! moment in all of them. When the pointer is over any chart of a group, the group
+//! Every chart on a page sits on the same log time axis, set for the frame by
+//! [`ChartGroup::begin`], so an age means the same moment in all of them. When the
+//! pointer is over any chart of a group, the group
 //! snaps it to that chart's nearest plotted point and every chart marks that age
 //! with a hairline and a dot; charts with a label band read out their value there.
 //!
@@ -10,7 +11,7 @@
 //! [`ChartGroup::paint`] for each. Building every chart before painting any is what
 //! lets the chart under the pointer decide the age the others mark.
 
-use ot_core::Series;
+use ot_core::{Series, Timeline};
 use ot_model::Bytes;
 use ot_paint::{Color, DisplayList, Point, Rect};
 
@@ -18,8 +19,12 @@ use crate::format::{self, AgoFields};
 use crate::sparkline::{self, Plot, PlotPoint, Side, SparkStyle, TimeAxis};
 use crate::theme::Theme;
 
-/// The time axis every chart shares, so one hover lines up across all of them.
-pub(crate) const AXIS: TimeAxis = TimeAxis::DEFAULT;
+/// The time axis for a frame: the charts fill their width with whatever history
+/// `timeline` holds, which the history setting bounds.
+pub(crate) fn axis_of(timeline: &Timeline) -> TimeAxis {
+    TimeAxis::spanning(timeline.span_ms().unwrap_or(0) as f32)
+}
+
 /// Height of the time labels (or the hover readout) under a chart that has them.
 pub(crate) const AXIS_BAND_H: f32 = 14.0;
 
@@ -38,14 +43,14 @@ pub(crate) struct Crosshair {
 }
 
 impl Crosshair {
-    /// The crosshair at `age_ms`, following on from `prev`. The units and the side
-    /// change with hysteresis, so a readout keeps its shape and place while the
-    /// pointer, or the chart moving under it, jitters around a boundary.
-    pub fn follow(prev: Option<Self>, age_ms: f32) -> Self {
+    /// The crosshair at `age_ms` on `axis`, following on from `prev`. The units and
+    /// the side change with hysteresis, so a readout keeps its shape and place while
+    /// the pointer, or the chart moving under it, jitters around a boundary.
+    pub fn follow(prev: Option<Self>, age_ms: f32, axis: TimeAxis) -> Self {
         Self {
             age_ms,
             fields: AgoFields::follow(prev.map(|c| c.fields), age_ms),
-            side: Side::follow(prev.map(|c| c.side), AXIS.fraction(age_ms)),
+            side: Side::follow(prev.map(|c| c.side), axis.fraction(age_ms)),
         }
     }
 
@@ -57,6 +62,8 @@ impl Crosshair {
 
 #[derive(Debug, Default)]
 pub(crate) struct ChartGroup {
+    /// The time axis of the current frame, the same for every chart in the group.
+    axis: TimeAxis,
     plots: Vec<Plot>,
     /// Each chart's whole area, plot and band, for hit-testing.
     areas: Vec<Rect>,
@@ -82,6 +89,13 @@ impl ChartGroup {
     #[must_use]
     pub fn plot(&self, i: usize) -> &Plot {
         &self.plots[i]
+    }
+
+    /// The time axis of the current frame.
+    #[cfg(test)]
+    #[must_use]
+    pub fn axis(&self) -> TimeAxis {
+        self.axis
     }
 
     /// Charts in the current frame.
@@ -116,10 +130,11 @@ impl ChartGroup {
     /// forgets it, so the next hover starts fresh.
     fn resnap(&mut self) {
         let prev = self.crosshair;
+        let axis = self.axis;
         self.crosshair = self
             .snapped()
             .or(self.outside)
-            .map(|age| Crosshair::follow(prev, age));
+            .map(|age| Crosshair::follow(prev, age, axis));
     }
 
     /// Mark `age_ms` in every chart of the group on behalf of a chart outside it
@@ -147,8 +162,9 @@ impl ChartGroup {
         self.crosshair != before
     }
 
-    /// Start a frame of `n` charts.
-    pub fn begin(&mut self, n: usize) {
+    /// Start a frame of `n` charts on `axis`.
+    pub fn begin(&mut self, n: usize, axis: TimeAxis) {
+        self.axis = axis;
         self.len = n;
         if self.plots.len() < n {
             self.plots.resize_with(n, Plot::default);
@@ -167,7 +183,7 @@ impl ChartGroup {
             (Rect::ZERO, area)
         };
         self.bands[i] = band;
-        self.plots[i].build(series, plot, max, &AXIS);
+        self.plots[i].build(series, plot, max, &self.axis);
     }
 
     /// After every chart is built: new samples slide under a pointer that stays
@@ -189,14 +205,21 @@ impl ChartGroup {
     ) -> Option<PlotPoint> {
         let plot = &self.plots[i];
         let band = self.bands[i];
-        plot.paint(dl, style, &AXIS, &mut self.scratch);
+        plot.paint(dl, style, &self.axis, &mut self.scratch);
         let Some(c) = self.crosshair else {
             if !band.is_empty() {
-                sparkline::paint_axis(dl, plot.rect(), band, &AXIS, theme.small, theme.text_dim);
+                sparkline::paint_axis(
+                    dl,
+                    plot.rect(),
+                    band,
+                    &self.axis,
+                    theme.small,
+                    theme.text_dim,
+                );
             }
             return None;
         };
-        let point = plot.paint_crosshair(dl, c.age_ms, style, &AXIS);
+        let point = plot.paint_crosshair(dl, c.age_ms, style, &self.axis);
         if !band.is_empty() {
             buf.clear();
             if let Some(p) = &point {
@@ -204,7 +227,7 @@ impl ChartGroup {
             }
             c.ago(&mut self.ago);
             readout(&mut self.readout, buf, &self.ago, c.side);
-            let x = AXIS.x(plot.rect(), c.age_ms);
+            let x = self.axis.x(plot.rect(), c.age_ms);
             sparkline::paint_readout(dl, band, x, c.side, &self.readout, theme.small, theme.text);
         }
         point
@@ -293,13 +316,13 @@ mod tests {
             Rect::new(0.0, 100.0, 300.0, 60.0),
             Rect::new(0.0, 200.0, 150.0, 30.0),
         ];
-        g.begin(3);
+        g.begin(3, TimeAxis::DEFAULT);
         for (i, a) in areas.iter().enumerate() {
             g.build(i, *a, if i == 0 { AXIS_BAND_H } else { 0.0 }, &s, 100.0);
         }
         g.snap();
         // Over the second chart, near the sample 4 s old.
-        let x = AXIS.x(areas[1], 4000.0) + 1.0;
+        let x = TimeAxis::DEFAULT.x(areas[1], 4000.0) + 1.0;
         assert!(g.hover(Some(Point::new(x, 130.0))));
         assert_eq!(g.hover_age(), Some(4000.0));
         let theme = Theme::dark();
@@ -317,7 +340,7 @@ mod tests {
         );
 
         // Fewer charts next frame: a pointer on a chart that is gone marks nothing.
-        g.begin(1);
+        g.begin(1, TimeAxis::DEFAULT);
         g.build(0, areas[0], AXIS_BAND_H, &s, 100.0);
         g.snap();
         assert_eq!(g.hover_age(), None);
@@ -341,25 +364,25 @@ mod tests {
     fn a_summarized_point_reads_out_one_value() {
         // Forty minutes at 1 Hz with a spike 25 minutes ago, where a column
         // summarizes several 10 s buckets.
-        const R: Retention = Retention {
+        let r = Retention {
             raw: 600,
-            tiers: &[Resolution {
+            tiers: vec![Resolution {
                 bucket_ms: 10_000,
                 capacity: 720,
             }],
         };
         let seconds = 2400;
-        let mut series = Series::new(R);
+        let mut series = Series::new(r);
         for t in 0..seconds {
             let v = if t == seconds - 1 - 1500 { 100.0 } else { 10.0 };
             series.push(t * 1000, v);
         }
         let area = Rect::new(0.0, 0.0, 300.0, 60.0);
         let mut group = ChartGroup::default();
-        group.begin(1);
+        group.begin(1, TimeAxis::DEFAULT);
         group.build(0, area, AXIS_BAND_H, &series, 100.0);
         group.snap();
-        let at = Point::new(AXIS.x(area, 1_500_000.0), 20.0);
+        let at = Point::new(TimeAxis::DEFAULT.x(area, 1_500_000.0), 20.0);
         assert!(group.hover(Some(at)));
         let crosshair = group.crosshair().expect("over the chart");
         assert_eq!(

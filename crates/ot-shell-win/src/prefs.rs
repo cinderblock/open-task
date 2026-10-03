@@ -2,8 +2,8 @@
 //! follows.
 //!
 //! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each
-//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`, `InstallUpdates`, and
-//! `UsageDecayPercent`, a number) plus `Layout`, a `REG_SZ` with the page,
+//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`, `InstallUpdates`, and the
+//! numbers `UsageDecayPercent` and `HistoryMinutes`) plus `Layout`, a `REG_SZ` with the page,
 //! arrangement, sort and columns the last session ended on, per user like every
 //! other per-user preference on Windows. A missing key or value means the
 //! default. Nothing here is fatal: a value that cannot be read or written is
@@ -27,6 +27,7 @@ const CHECK_UPDATES: PCWSTR = w!("CheckForUpdates");
 const DOWNLOAD_UPDATES: PCWSTR = w!("DownloadUpdates");
 const INSTALL_UPDATES: PCWSTR = w!("InstallUpdates");
 const USAGE_DECAY: PCWSTR = w!("UsageDecayPercent");
+const HISTORY_MINUTES: PCWSTR = w!("HistoryMinutes");
 const LAYOUT: PCWSTR = w!("Layout");
 
 /// The settings as last saved, defaults for anything never saved.
@@ -40,8 +41,12 @@ pub fn load() -> Settings {
         install_updates: flag(INSTALL_UPDATES, defaults.install_updates),
         ..defaults
     };
-    match read_dword(USAGE_DECAY) {
+    let settings = match read_dword(USAGE_DECAY) {
         Some(percent) => settings.with_usage_decay(percent),
+        None => settings,
+    };
+    match read_dword(HISTORY_MINUTES) {
+        Some(minutes) => settings.with_history_minutes(minutes),
         None => settings,
     }
 }
@@ -55,6 +60,7 @@ pub fn save(s: &Settings) {
         (DOWNLOAD_UPDATES, Some(u32::from(s.download_updates))),
         (INSTALL_UPDATES, Some(u32::from(s.install_updates))),
         (USAGE_DECAY, Some(u32::from(s.usage_decay_percent))),
+        (HISTORY_MINUTES, Some(s.history_minutes)),
     ];
     let Some(key) = open_for_writing() else {
         return;

@@ -23,15 +23,22 @@
 //! to change that ([`Effect::ReplaceTaskManager`]) rather than to store anything.
 //! Where there is nothing to replace, the section is not shown.
 //!
-//! The fade card is the page's one number: how fast the cycle totals fade
-//! ([`ot_core::Usage`]), stepped through [`DECAY_STEPS`] with a minus and a plus
-//! button, the card saying how long a total takes to halve at that rate.
+//! The fade card is a number: how fast the cycle totals fade ([`ot_core::Usage`]),
+//! stepped through [`DECAY_STEPS`] with a minus and a plus button, the card saying
+//! how long a total takes to halve at that rate. The speed and history cards step
+//! the same way: how often the system is sampled, and how far back the charts
+//! reach ([`HISTORY_STEPS`]), the history card saying what that commits to in
+//! memory on this machine ([`HistoryCost`]).
 //!
 //! Below the page's title the sections scroll with the wheel when the window is too
 //! short to show them all.
 
+use std::fmt::Write as _;
+
+use ot_model::Bytes;
 use ot_paint::{DisplayList, HAlign, Point, Rect, VAlign};
 
+use crate::format;
 use crate::task_manager::TaskManager;
 use crate::theme::Theme;
 use crate::update::UpdateView;
@@ -42,6 +49,11 @@ use crate::view::{Effect, MouseButton, Reaction, UiEvent};
 pub const DECAY_STEPS: [u8; 10] = [1, 2, 3, 5, 7, 10, 15, 20, 30, 50];
 /// The rate unless changed.
 pub const DECAY_DEFAULT: u8 = 5;
+
+/// How far back the charts can reach, in minutes: ten minutes to a day.
+pub const HISTORY_STEPS: [u32; 8] = [10, 30, 60, 120, 180, 360, 720, 1440];
+/// The reach unless changed: an hour.
+pub const HISTORY_DEFAULT: u32 = 60;
 
 /// Everything the user can set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +86,9 @@ pub struct Settings {
     /// How often the system is sampled, in milliseconds: one of [`SPEED_STEPS`].
     /// Task Manager's update speed: Low, Normal, High.
     pub update_interval_ms: u32,
+    /// How far back the charts reach, in minutes: one of [`HISTORY_STEPS`]. Older
+    /// samples are dropped, and the time axis spans what is held.
+    pub history_minutes: u32,
 }
 
 /// The sampling intervals, slowest first, in milliseconds.
@@ -91,6 +106,7 @@ impl Default for Settings {
             always_on_top: false,
             hide_when_minimized: false,
             update_interval_ms: SPEED_DEFAULT,
+            history_minutes: HISTORY_DEFAULT,
         }
     }
 }
@@ -146,6 +162,48 @@ impl Settings {
             .copied()
     }
 
+    /// These settings with the history reach set to the step nearest `minutes`.
+    #[must_use]
+    pub fn with_history_minutes(self, minutes: u32) -> Self {
+        let nearest = HISTORY_STEPS
+            .into_iter()
+            .min_by_key(|&s| s.abs_diff(minutes))
+            .unwrap_or(HISTORY_DEFAULT);
+        Self {
+            history_minutes: nearest,
+            ..self
+        }
+    }
+
+    /// How far back the charts reach, in milliseconds.
+    #[must_use]
+    pub fn history_ms(self) -> i64 {
+        i64::from(self.history_minutes) * 60_000
+    }
+
+    /// The reach one step shorter (`-1`) or longer (`1`), or `None` at the end of
+    /// the steps.
+    fn history_step(self, by: isize) -> Option<u32> {
+        let at = HISTORY_STEPS
+            .iter()
+            .position(|&s| s >= self.history_minutes)
+            .unwrap_or(HISTORY_STEPS.len() - 1);
+        at.checked_add_signed(by)
+            .and_then(|i| HISTORY_STEPS.get(i))
+            .copied()
+    }
+
+    /// The reach as its card shows it: `10 min`, `1 h`, `24 h`.
+    fn history_label(self, out: &mut String) {
+        out.clear();
+        let m = self.history_minutes;
+        let _ = if m < 60 {
+            write!(out, "{m} min")
+        } else {
+            write!(out, "{} h", m / 60)
+        };
+    }
+
     /// Task Manager's name for the interval.
     #[must_use]
     pub fn speed_label(self) -> &'static str {
@@ -170,6 +228,27 @@ impl Settings {
     }
 }
 
+/// What the charts' history costs on this machine, for the history card to say:
+/// how many series the timeline holds, and what a frame of the usage history
+/// takes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryCost {
+    /// Series in the timeline, each committed to [`ot_core::Retention::bytes_per_series`].
+    pub series: usize,
+    /// Bytes a frame of the usage history takes, [`ot_core::Usage::frame_bytes`].
+    pub usage_frame_bytes: usize,
+}
+
+impl HistoryCost {
+    /// Bytes a history reaching back `ms` commits to: every series' rings and the
+    /// usage history.
+    #[must_use]
+    pub fn bytes(self, ms: i64) -> usize {
+        ot_core::Retention::covering(ms).bytes_per_series() * self.series
+            + ot_core::usage::history_bytes(ms, self.usage_frame_bytes)
+    }
+}
+
 /// What the page shows besides the settings themselves.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Context<'a> {
@@ -180,6 +259,8 @@ pub(crate) struct Context<'a> {
     /// Whether this copy runs as administrator; the card offering to is shown
     /// only when it does not.
     pub elevated: bool,
+    /// What a history length costs here.
+    pub history: HistoryCost,
 }
 
 /// One switch on the page.
@@ -307,6 +388,8 @@ enum Card {
     Decay,
     /// How often the system is sampled: Task Manager's update speed, stepped.
     Speed,
+    /// How far back the charts reach: a length with a minus and a plus button.
+    History,
     /// Start a copy as administrator; shown while this one is not.
     RunAsAdministrator,
 }
@@ -317,7 +400,7 @@ impl Card {
         match self {
             Self::TaskManager => cx.task_manager.available(),
             Self::RunAsAdministrator => !cx.elevated,
-            Self::Toggle(_) | Self::Update | Self::Decay | Self::Speed => true,
+            Self::Toggle(_) | Self::Update | Self::Decay | Self::Speed | Self::History => true,
         }
     }
 
@@ -333,7 +416,7 @@ impl Card {
             Self::Toggle(t) => t.note(settings, cx),
             Self::Update => cx.update.note(),
             Self::TaskManager => cx.task_manager.note(scratch).then_some(scratch.as_str()),
-            Self::Decay | Self::Speed | Self::RunAsAdministrator => None,
+            Self::Decay | Self::Speed | Self::History | Self::RunAsAdministrator => None,
         }
     }
 
@@ -341,7 +424,7 @@ impl Card {
     /// cards answer only on their two buttons.
     fn clickable(self, cx: Context<'_>) -> bool {
         match self {
-            Self::Decay | Self::Speed => false,
+            Self::Decay | Self::Speed | Self::History => false,
             Self::Toggle(_) | Self::RunAsAdministrator => true,
             Self::Update => cx.update.action().is_some(),
             Self::TaskManager => !cx.task_manager.pending,
@@ -350,11 +433,12 @@ impl Card {
 }
 
 /// The page, top to bottom: each section's heading and its cards.
-const SECTIONS: [(&str, &[Card]); 4] = [
+const SECTIONS: [(&str, &[Card]); 5] = [
     (
         "Process table",
         &[Card::Toggle(Toggle::AnimateRows), Card::Decay, Card::Speed],
     ),
+    ("Charts", &[Card::History]),
     (
         "Window",
         &[
@@ -373,10 +457,11 @@ const SECTIONS: [(&str, &[Card]); 4] = [
     ),
     ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
 ];
-const CARD_COUNT: usize = 11;
-/// The fade card's place among the cards, and the speed card's.
+const CARD_COUNT: usize = 12;
+/// The fade card's place among the cards, the speed card's and the history card's.
 const DECAY_CARD: usize = 1;
 const SPEED_CARD: usize = 2;
+const HISTORY_CARD: usize = 3;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -414,9 +499,9 @@ pub(crate) struct SettingsPage {
     /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
-    /// The fade card's minus and plus buttons, then the speed card's, and the
-    /// one under the pointer.
-    steppers: [Rect; 4],
+    /// The fade card's minus and plus buttons, then the speed card's, then the
+    /// history card's, and the one under the pointer.
+    steppers: [Rect; 6],
     hover_step: Option<usize>,
     /// Where the sections scroll: the page below its title.
     view: Rect,
@@ -441,7 +526,7 @@ impl SettingsPage {
     }
 
     /// The stepper button under `p`: 0 and 1 for the fade card's minus and plus,
-    /// 2 and 3 for the speed card's.
+    /// 2 and 3 for the speed card's, 4 and 5 for the history card's.
     fn step_at(&self, p: Point) -> Option<usize> {
         if !self.view.contains(p) {
             return None;
@@ -512,6 +597,21 @@ impl SettingsPage {
                         effect: Some(Effect::SaveSettings(*settings)),
                     }
                 }
+                Some(Card::History) => {
+                    let by = match self.step_at(at) {
+                        Some(4) => -1,
+                        Some(5) => 1,
+                        _ => return Reaction::NONE,
+                    };
+                    let Some(minutes) = settings.history_step(by) else {
+                        return Reaction::NONE;
+                    };
+                    settings.history_minutes = minutes;
+                    Reaction {
+                        repaint: true,
+                        effect: Some(Effect::SaveSettings(*settings)),
+                    }
+                }
                 Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
                 Some(Card::TaskManager) | None => Reaction::NONE,
             },
@@ -573,7 +673,8 @@ impl SettingsPage {
         };
         let [d0, d1] = pair(self.cards[DECAY_CARD]);
         let [s0, s1] = pair(self.cards[SPEED_CARD]);
-        self.steppers = [d0, d1, s0, s1];
+        let [h0, h1] = pair(self.cards[HISTORY_CARD]);
+        self.steppers = [d0, d1, s0, s1, h0, h1];
         self.max_scroll = (y - view.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
         self.shift(view.y - self.scroll);
@@ -656,7 +757,7 @@ impl SettingsPage {
                         ot_core::usage::half_life(settings.usage_decay())
                     );
                     paint_text(dl, text, "How fast cycles used fade", buf, note, theme);
-                    let [minus, plus, _, _] = self.steppers;
+                    let [minus, plus, ..] = self.steppers;
                     for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
                         let enabled = settings.decay_step(by).is_some();
                         let hover = enabled && self.hover_step == Some(i);
@@ -686,7 +787,7 @@ impl SettingsPage {
                         settings.speed_label().to_ascii_lowercase()
                     );
                     paint_text(dl, text, "Update speed", buf, note, theme);
-                    let [_, _, minus, plus] = self.steppers;
+                    let [_, _, minus, plus, _, _] = self.steppers;
                     for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
                         let enabled = settings.speed_step(by).is_some();
                         let hover = enabled && self.hover_step == Some(i + 2);
@@ -695,6 +796,36 @@ impl SettingsPage {
                     let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
                     dl.text(
                         settings.speed_label(),
+                        value,
+                        theme.cell_num,
+                        theme.text,
+                        HAlign::Center,
+                        VAlign::Middle,
+                        false,
+                    );
+                }
+                Card::History => {
+                    let ms = settings.history_ms();
+                    let points = ot_core::Retention::covering(ms).points();
+                    let mut size = String::new();
+                    format::bytes(&mut size, Bytes(cx.history.bytes(ms) as u64));
+                    buf.clear();
+                    let _ = write!(
+                        buf,
+                        "Charts span this much and drop what is older: {points} points a \
+                         chart, about {size} for the charts on this machine."
+                    );
+                    paint_text(dl, text, "How far charts reach back", buf, note, theme);
+                    let [_, _, _, _, minus, plus] = self.steppers;
+                    for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
+                        let enabled = settings.history_step(by).is_some();
+                        let hover = enabled && self.hover_step == Some(i + 4);
+                        paint_stepper(dl, r, by > 0, enabled, hover, theme);
+                    }
+                    settings.history_label(buf);
+                    let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
+                    dl.text(
+                        buf,
                         value,
                         theme.cell_num,
                         theme.text,
@@ -910,11 +1041,12 @@ mod tests {
             update,
             task_manager: &NO_TASK_MANAGER,
             elevated: true,
+            history: HistoryCost::default(),
         }
     }
 
     /// The Task Manager card's place among the cards.
-    const TASK_MANAGER: usize = 9;
+    const TASK_MANAGER: usize = 10;
 
     fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
         Context {
@@ -1033,7 +1165,7 @@ mod tests {
         ] {
             assert!(strings.iter().any(|t| t == expected), "{expected}");
         }
-        let card = page.cards[5].center();
+        let card = page.cards[6].center();
         let r = click(&mut page, card, &mut s, cx(true, &update));
         assert_eq!(r.effect, Some(Effect::Update(UpdateAction::Check)));
         assert_eq!(s, Settings::default(), "no setting changed");
@@ -1059,18 +1191,18 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[6]), "On");
-        assert_eq!(state_of(&dl, page.cards[7]), "Off");
+        assert_eq!(state_of(&dl, page.cards[7]), "On");
+        assert_eq!(state_of(&dl, page.cards[8]), "Off");
         // A copy that cannot install says so, once, on the update card.
         let note = update.note().unwrap();
         assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
 
-        let at = page.cards[6].center();
+        let at = page.cards[7].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[7].center();
+        let at = page.cards[8].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
         assert!(s.check_updates, "downloading needs checking");
@@ -1082,27 +1214,27 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[8]), "Off");
+        assert_eq!(state_of(&dl, page.cards[9]), "Off");
         assert!(texts(&dl)
             .iter()
             .any(|t| t == "Install updates automatically"));
 
         // On: downloading and checking come with it.
         s.check_updates = false;
-        let at = page.cards[8].center();
+        let at = page.cards[9].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.install_updates && s.download_updates && s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         // Downloading off: installing goes too, checking stays.
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[7].center();
+        let at = page.cards[8].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.download_updates && !s.install_updates && s.check_updates);
         // Checking off takes everything with it.
         s.download_updates = true;
         s.install_updates = true;
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[6].center();
+        let at = page.cards[7].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
     }
@@ -1133,7 +1265,7 @@ mod tests {
             cx,
         );
         assert_eq!(r, Reaction::NONE);
-        let [minus, plus, _, _] = page.steppers;
+        let [minus, plus, ..] = page.steppers;
         assert!(card.contains(minus.center()) && card.contains(plus.center()));
         let r = click(&mut page, plus.center(), &mut s, cx);
         assert_eq!(s.usage_decay_percent, 7);
@@ -1163,6 +1295,68 @@ mod tests {
         assert_eq!(s.with_usage_decay(6).usage_decay_percent, 5);
         assert_eq!(s.with_usage_decay(0).usage_decay_percent, 1);
         assert_eq!(s.with_usage_decay(4000).usage_decay_percent, 50);
+    }
+
+    #[test]
+    fn the_history_card_steps_the_reach_and_says_what_it_costs() {
+        let update = UpdateView::new("0.2.1", true);
+        let cx = Context {
+            history: HistoryCost {
+                series: 50,
+                usage_frame_bytes: 200,
+            },
+            ..cx(true, &update)
+        };
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        assert_eq!(s.history_minutes, 60);
+        assert_eq!(s.history_ms(), 3_600_000);
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(strings.iter().any(|t| t == "How far charts reach back"));
+        assert!(strings.iter().any(|t| t == "1 h"), "{strings:?}");
+        let detail = strings
+            .iter()
+            .find(|t| t.contains("points a chart"))
+            .expect("the cost");
+        assert!(detail.contains("963 points"), "{detail}");
+        assert!(detail.contains("MB"), "{detail}");
+
+        // The card itself does nothing; its buttons step the reach.
+        let card = page.cards[HISTORY_CARD];
+        let r = click(
+            &mut page,
+            Point::new(card.x + 20.0, card.center().y),
+            &mut s,
+            cx,
+        );
+        assert_eq!(r, Reaction::NONE);
+        let [_, _, _, _, minus, plus] = page.steppers;
+        assert!(card.contains(minus.center()) && card.contains(plus.center()));
+        let r = click(&mut page, plus.center(), &mut s, cx);
+        assert_eq!(s.history_minutes, 120);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        for _ in 0..HISTORY_STEPS.len() {
+            let _ = click(&mut page, plus.center(), &mut s, cx);
+        }
+        assert_eq!(s.history_minutes, 1440);
+        assert_eq!(click(&mut page, plus.center(), &mut s, cx), Reaction::NONE);
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(strings.iter().any(|t| t == "24 h"), "{strings:?}");
+        for _ in 0..HISTORY_STEPS.len() {
+            let _ = click(&mut page, minus.center(), &mut s, cx);
+        }
+        assert_eq!(s.history_minutes, 10);
+        assert_eq!(click(&mut page, minus.center(), &mut s, cx), Reaction::NONE);
+        assert!(texts(&paint(&mut page, s, cx))
+            .iter()
+            .any(|t| t == "10 min"));
+
+        // A stored value that is not a step reads as the nearest one; a longer
+        // reach costs more.
+        assert_eq!(s.with_history_minutes(100).history_minutes, 120);
+        assert_eq!(s.with_history_minutes(0).history_minutes, 10);
+        assert_eq!(s.with_history_minutes(100_000).history_minutes, 1440);
+        assert!(cx.history.bytes(24 * 3_600_000) > cx.history.bytes(3_600_000));
     }
 
     #[test]
