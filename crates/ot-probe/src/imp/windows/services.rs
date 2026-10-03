@@ -691,15 +691,20 @@ pub(super) fn stop(name: &str) -> Result<(), ControlError> {
 mod tests {
     use super::*;
 
+    /// Passes the tests allow for every configuration to be read. Each pass reads
+    /// what [`CONFIG_BUDGET`] allows, so this is a time bound of a few seconds; a
+    /// slow CI machine needs well over the ~25 passes this machine takes.
+    const DRAIN_PASSES: usize = 400;
+
     /// Refresh until every queued configuration has been read, bounded.
     fn drain(p: &mut ServiceProbe) {
-        for _ in 0..50 {
+        for _ in 0..DRAIN_PASSES {
             p.refresh();
             if p.queue.is_empty() {
                 return;
             }
         }
-        panic!("configuration queue not drained in 50 passes");
+        panic!("configuration queue not drained in {DRAIN_PASSES} passes");
     }
 
     #[test]
@@ -764,7 +769,7 @@ mod tests {
     #[test]
     fn the_endpoint_mapper_is_automatic_with_a_description_once_read() {
         let mut p = ServiceProbe::new();
-        let entry = (0..50)
+        let entry = (0..DRAIN_PASSES)
             .map(|_| {
                 p.refresh();
                 p.list()
@@ -774,7 +779,7 @@ mod tests {
                     .expect("RpcEptMapper is listed")
             })
             .find(|e| e.start != StartType::Unknown)
-            .expect("RpcEptMapper's configuration read within 50 passes");
+            .expect("RpcEptMapper's configuration read within DRAIN_PASSES passes");
         assert_eq!(entry.start, StartType::Automatic);
         assert!(entry.description.as_deref().is_some_and(|d| !d.is_empty()));
         assert_eq!(entry.state, ServiceState::Running);

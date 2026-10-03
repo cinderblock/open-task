@@ -235,6 +235,8 @@ mod tests {
         let boot = hw.boot_unix_ms.expect("boot time");
         assert!(boot > 1_500_000_000_000, "{boot}");
         assert!(hw.virtualization.is_some(), "{hw:?}");
+        // Only x86 has CPUID to ask; elsewhere the answer is honestly unknown.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert!(hw.hypervisor.is_some(), "{hw:?}");
     }
 
@@ -259,7 +261,9 @@ mod tests {
                 .is_some_and(|n| n >= 1 && Some(n) <= hw.memory_slots),
             "{hw:?}"
         );
-        assert!(hw.memory_speed_mts.is_some_and(|s| s > 0), "{hw:?}");
+        // A virtual machine's firmware (GitHub's Azure runners) lists its modules
+        // without a speed; a real board has one.
+        assert!(hw.memory_speed_mts.is_none_or(|s| s > 0), "{hw:?}");
     }
 
     #[test]
