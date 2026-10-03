@@ -1350,7 +1350,20 @@ mod tests {
         std::thread::sleep(Duration::from_millis(250));
         WindowsControl.suspend(key).expect("suspend");
         std::thread::sleep(Duration::from_millis(50));
-        probe.sample(&mut out).expect("pass");
+        // Kinds need each process's account and image path, which the details
+        // budget spreads over passes; on a slow machine (a CI runner) the first
+        // pass reaches few of them. Sample until the kernel has been classified.
+        for pass in 1.. {
+            probe.sample(&mut out).expect("pass");
+            let kernel_known = out
+                .processes
+                .iter()
+                .any(|p| p.key().pid == 4 && p.kind == ProcessKind::Windows);
+            if kernel_known || pass >= 40 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let me = out
             .processes
             .iter()
