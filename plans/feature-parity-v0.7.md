@@ -1,6 +1,6 @@
 # Feature parity with Task Manager, TMOG and Process Explorer: v0.7.0
 
-> **Status:** implemented, releasing · **Started:** 2026-10-02 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** shipped in v0.7.0 · **Started:** 2026-10-02 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 
 ## Goal
 
@@ -135,8 +135,8 @@ Package name [later] and Platform / Operating system context [later].
    layout).
 5. [x] Shell: tray icon, topmost, run dialog, elevation, properties, clipboard,
    crosshair, dump, restart.
-6. [ ] **[current]** README (done), verify list (done), version bump, release
-   v0.7.0, check the published assets.
+6. [x] README, verify list, version bump, release v0.7.0 pushed.
+7. [x] Published assets checked; CI's Windows test failures fixed; plan note.
 
 ## Findings / gotchas
 
@@ -223,7 +223,13 @@ Package name [later] and Platform / Operating system context [later].
       page.
 - [x] README: status, pages, columns, menu, the six new pages, window/tray
       settings, "Not yet" list.
-- [ ] Release v0.7.0: bump, `cargo update -w`, commit, tag, push; check the assets.
+- [x] Release v0.7.0: `cbe4b80` (the work), `4073167` (the bump), tag `v0.7.0`,
+      pushed 2026-10-02; Release run 37085967683 and CI run 37085966412 started.
+- [x] Release run 37085967683 succeeded: nine assets published (x64 and ARM64
+      Windows zips and the setup.exe, Linux and macOS tarballs, SHA256SUMS and
+      its minisig). CI run 37085966412 failed on the two Windows runners on
+      probe tests that assumed real hardware (memory speed, hypervisor on Arm)
+      and a 50-pass drain; the tests were loosened in a follow-up commit.
 
 ## Open questions for the user
 
