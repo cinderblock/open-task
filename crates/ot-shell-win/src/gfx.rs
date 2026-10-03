@@ -642,6 +642,7 @@ fn create_d3d_device() -> Result<ID3D11Device> {
 fn glyph(icon: Icon) -> char {
     match icon {
         Icon::Menu => '\u{E700}',        // GlobalNavigationButton
+        Icon::Summary => '\u{F246}',     // ViewDashboard, tiles of a dashboard
         Icon::Processes => '\u{E71D}',   // AllApps, drawn as a checklist
         Icon::Performance => '\u{E9D9}', // Diagnostic, a pulse in a box
         Icon::Settings => '\u{E713}',    // Setting, a gear

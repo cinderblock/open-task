@@ -10,6 +10,8 @@
 pub enum Icon {
     /// Three horizontal lines: show or hide navigation labels.
     Menu,
+    /// A dashboard of tiles: the Summary page.
+    Summary,
     /// A list of items: the process table.
     Processes,
     /// A pulse line: live performance graphs.
@@ -34,8 +36,9 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon, for backends that want to check their mapping is complete.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Menu,
+        Self::Summary,
         Self::Processes,
         Self::Performance,
         Self::Settings,

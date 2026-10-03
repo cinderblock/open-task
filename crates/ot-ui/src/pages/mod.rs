@@ -1,7 +1,8 @@
-//! The pages beyond Processes and Performance: lists of users, services, startup
-//! entries, connections and installed programs, and the System facts page. Each
-//! is built on [`crate::list_page::ListPage`] (or, for System, on a plain scroll
-//! of facts) and answers input with a [`PageOutcome`].
+//! The pages beyond Processes and Performance: the Summary of every other page's
+//! headline numbers, lists of users, services, startup entries, connections and
+//! installed programs, and the System facts page. The lists are built on
+//! [`crate::list_page::ListPage`] (System on a plain scroll of facts, Summary on a
+//! grid of cards) and every page answers input with a [`PageOutcome`].
 
 use crate::view::Reaction;
 
@@ -9,6 +10,7 @@ pub(crate) mod apps;
 pub(crate) mod connections;
 pub(crate) mod services;
 pub(crate) mod startup;
+pub(crate) mod summary;
 pub(crate) mod system;
 pub(crate) mod users;
 
