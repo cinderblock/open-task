@@ -104,6 +104,8 @@ The user's request on 2026-10-02:
 - [x] 2026-10-02: UI axis rewiring, settings card, prefs, README; workspace
   clippy clean, all tests pass (ot-core 30, ot-ui 161).
 - [x] 2026-10-02: visual check in the debug build; committed.
+- [x] 2026-10-02: released as v0.8.0 (`e12c334`, tag pushed; the release
+  workflow builds and publishes it).
 - Seen in passing, not mine: the Update speed card's value ("Normal") is clipped
   to "Norma" between its buttons at this window width.
 
