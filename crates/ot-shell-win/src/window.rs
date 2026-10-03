@@ -19,8 +19,9 @@ use ot_paint::{DisplayList, Point, Size};
 use ot_probe::{ControlError, PlatformControl, ProcessControl, SystemProbe};
 use ot_probe::{CpuSampler, PlatformSampler};
 use ot_ui::{
-    App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Page, TaskManager,
-    Theme, UiEvent, UpdateAction, UpdateView, ViewMode,
+    App, Command, Cursor, Effect, Inventory, Key, MenuAction, MenuEntry, MouseButton, Page,
+    ProcessAction, Query, ServiceAction, SessionAction, Settings, TaskManager, Theme, UiEvent,
+    UpdateAction, UpdateView, ViewMode,
 };
 use ot_update::{Installation, Updater};
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
@@ -47,24 +48,28 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, IsIconic, LoadCursorW,
-    LoadImageW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TrackPopupMenuEx, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, HCURSOR, HICON, HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_IBEAM,
-    IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING,
-    MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SIZE_MINIMIZED, SM_CXICON,
-    SM_CXSMICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWDEFAULT, SW_SHOWNORMAL,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP,
-    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, IsIconic,
+    IsWindowVisible, KillTimer, LoadCursorW, LoadImageW, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HICON,
+    HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_CROSS, IDC_IBEAM,
+    IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG,
+    SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP, WM_APP, WM_CHAR, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
     WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
+use crate::actions::{self, ActionOutcome};
 use crate::gfx::Gfx;
 use crate::task_manager::{self, Elevated};
-use crate::{instance, prefs};
+use crate::tray::Tray;
+use crate::{instance, prefs, run_dialog};
 use crate::{ShellError, ShellOptions, ThemePreference};
 
 /// Posted by the sampler thread after each publish.
@@ -76,10 +81,19 @@ const WM_APP_UPDATE: u32 = WM_APP + 3;
 /// The elevated helper that replaces or restores Task Manager finished; `lparam` is
 /// a `Box<TaskManagerOutcome>`.
 const WM_APP_TASK_MANAGER: u32 = WM_APP + 4;
+/// A list a page asked for was read; `lparam` is a `Box<Inventory>`.
+const WM_APP_INVENTORY: u32 = WM_APP + 5;
+/// An action on a worker thread finished; `lparam` is a `Box<ActionOutcome>`.
+const WM_APP_ACTION: u32 = WM_APP + 6;
+/// The tray icon was clicked; `lparam` is the mouse message.
+const WM_APP_TRAY: u32 = WM_APP + 7;
 
 /// The timer for scheduled update checks: first shortly after start, so it does
 /// not compete with the first frames, then hourly to see whether a day has passed.
 const TIMER_UPDATE: usize = 1;
+/// Re-reads the Connections page's list while it is showing.
+const TIMER_REFRESH: usize = 2;
+const REFRESH_MS: u32 = 2_000;
 const FIRST_CHECK_MS: u32 = 10_000;
 const CHECK_TICK_MS: u32 = 3_600_000;
 /// How often a scheduled check runs.
@@ -102,14 +116,26 @@ struct TaskManagerOutcome {
 pub(crate) const CLASS_NAME: PCWSTR = w!("OpenTaskMainWindow");
 /// The app icon's resource id, as `ot-app`'s build script writes it.
 const APP_ICON: u16 = 1;
-const TITLE: &str = "open-task";
-const TITLE_PAUSED: &str = "open-task (paused)";
 const INITIAL_SIZE: (i32, i32) = (1180, 760);
+
+/// The window title: the name, whether this copy runs as administrator (Task
+/// Manager says so the same way), and whether the display is paused.
+fn window_title(elevated: bool, paused: bool) -> String {
+    let mut t = String::from("open-task");
+    if elevated {
+        t.push_str(" (Administrator)");
+    }
+    if paused {
+        t.push_str(" (paused)");
+    }
+    t
+}
 
 /// Virtual-key codes for letters are their upper-case ASCII values.
 const VK_F: u16 = b'F' as u16;
 const VK_H: u16 = b'H' as u16;
 const VK_M: u16 = b'M' as u16;
+const VK_N: u16 = b'N' as u16;
 const VK_T: u16 = b'T' as u16;
 /// The digit keys above the letters, `1` to `9`.
 const VK_1: u16 = b'1' as u16;
@@ -120,8 +146,12 @@ struct Cursors {
     arrow: HCURSOR,
     size_we: HCURSOR,
     ibeam: HCURSOR,
+    cross: HCURSOR,
 }
 
+// The flags are independent facts about the window's moment; an enum would
+// only obscure them.
+#[allow(clippy::struct_excessive_bools)]
 struct State {
     hwnd: HWND,
     gfx: Option<Gfx>,
@@ -139,7 +169,15 @@ struct State {
     high_surrogate: Option<u16>,
     cursors: Cursors,
     /// The window title as last set; it says when the display is paused.
-    title: &'static str,
+    title: String,
+    /// Whether this process runs as administrator; in the title.
+    elevated: bool,
+    /// The notification-area icon with its CPU meter.
+    tray: Option<Tray>,
+    /// The crosshair is out: the mouse is captured until the button comes up.
+    picking: bool,
+    /// What the Run dialog showed last, shown again next time.
+    last_run: String,
     /// `None` if this build's version does not parse, which a build from this
     /// repository never produces.
     updater: Option<Updater>,
@@ -159,6 +197,8 @@ enum Closing {
     InstallingUpdate,
     /// Logoff, shutdown or Restart Manager is closing the app: never install then.
     SessionEnding,
+    /// A copy started as administrator takes over: close without installing.
+    Relaunching,
 }
 
 /// What a message handler decided. The borrow on [`State`] ends before anything
@@ -183,6 +223,13 @@ enum Outcome {
     /// Restore the window if minimized and bring it to the front, for a Task
     /// Manager stand-in, answering 1.
     Raise,
+    /// Show the window (restoring it, or unhiding it from the tray) and bring it
+    /// to the front, answering 0.
+    Show,
+    /// The tray icon's menu, at the pointer.
+    TrayMenu,
+    /// A worker thread finished something worth telling about.
+    Worker(Box<ActionOutcome>),
 }
 
 fn win(context: &'static str) -> impl FnOnce(windows::core::Error) -> ShellError {
@@ -211,6 +258,7 @@ pub fn run(
             arrow: LoadCursorW(None, IDC_ARROW).map_err(win("LoadCursorW"))?,
             size_we: LoadCursorW(None, IDC_SIZEWE).map_err(win("LoadCursorW"))?,
             ibeam: LoadCursorW(None, IDC_IBEAM).map_err(win("LoadCursorW"))?,
+            cross: LoadCursorW(None, IDC_CROSS).map_err(win("LoadCursorW"))?,
         }
     };
 
@@ -269,12 +317,22 @@ pub fn run(
     let size_px = client_size(hwnd);
     let gfx = Gfx::new(hwnd, size_px, dpi).map_err(win("Gfx::new"))?;
 
+    let elevated = ot_probe::is_elevated();
     let mut app = App::new(theme_for(dark));
     app.set_backdrop(backdrop);
     app.set_settings(prefs::load());
     app.set_system_animations(prefs::system_animations());
-    app.set_view(options.view);
-    app.set_page(options.page);
+    app.set_elevated(elevated);
+    // Where the last session left off, unless the command line says otherwise.
+    if let Some(layout) = prefs::load_layout() {
+        app.apply_view_layout(&layout);
+    }
+    if options.view_given {
+        app.set_view(options.view);
+    }
+    if options.page_given {
+        app.set_page(options.page);
+    }
     let _ = app.handle(UiEvent::Resize(to_dips_size(size_px, dpi)));
     let installation = ot_update::installation();
     tracing::info!(?installation, "installation");
@@ -303,6 +361,8 @@ pub fn run(
         };
     });
 
+    let settings = app.settings();
+    let first_query = app.page_query();
     let state = Box::new(RefCell::new(State {
         hwnd,
         gfx: Some(gfx),
@@ -317,7 +377,11 @@ pub fn run(
         dark,
         high_surrogate: None,
         cursors,
-        title: TITLE,
+        title: window_title(elevated, false),
+        elevated,
+        tray: Some(Tray::new(hwnd, WM_APP_TRAY)),
+        picking: false,
+        last_run: String::new(),
         updater,
         closing: Closing::No,
         raise_message,
@@ -326,8 +390,16 @@ pub fn run(
     // SAFETY: hwnd is valid; the pointer stays alive until after the loop below.
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+        let _ = SetWindowTextW(hwnd, &HSTRING::from(window_title(elevated, false)));
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
         SetTimer(Some(hwnd), TIMER_UPDATE, FIRST_CHECK_MS, None);
+    }
+    // SAFETY: the state was just stored; the window is up.
+    if let Some(cell) = unsafe { state_ptr.as_ref() } {
+        apply_settings(cell, hwnd, &settings);
+        if let Some(q) = first_query {
+            actions::spawn_query(hwnd, WM_APP_INVENTORY, q);
+        }
     }
 
     tracing::info!(backdrop, dark, dpi, ?size_px, "window up");
@@ -646,15 +718,136 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         Outcome::Raise => {
-            // SAFETY: hwnd is valid. The stand-in that asked handed this process the
-            // right to take the foreground.
-            unsafe {
-                if IsIconic(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
-                }
-                let _ = SetForegroundWindow(hwnd);
-            }
+            show_window(hwnd);
             LRESULT(1)
+        }
+        Outcome::Show => {
+            show_window(hwnd);
+            LRESULT(0)
+        }
+        Outcome::TrayMenu => {
+            tray_menu(cell, hwnd);
+            LRESULT(0)
+        }
+        Outcome::Worker(outcome) => {
+            report_outcome(hwnd, &outcome);
+            LRESULT(0)
+        }
+    }
+}
+
+/// Show the window, restoring it if minimized or unhiding it from the tray, and
+/// bring it to the front.
+fn show_window(hwnd: HWND) {
+    // SAFETY: hwnd is valid.
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Tell the user how a worker thread's action went: a failure, or a result
+/// worth seeing (the path of a dump).
+fn report_outcome(hwnd: HWND, outcome: &ActionOutcome) {
+    match &outcome.result {
+        Ok(None) => {}
+        Ok(Some(message)) => {
+            let text = HSTRING::from(message.as_str());
+            // SAFETY: strings outlive the call; hwnd is valid.
+            unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    &text,
+                    w!("open-task"),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+        }
+        Err(e) => notify(hwnd, &format!("Could not {}.\n\n{e}", outcome.what)),
+    }
+}
+
+/// The tray icon's menu: show the window, always on top, exit.
+fn tray_menu(cell: &RefCell<State>, hwnd: HWND) {
+    let topmost = cell
+        .try_borrow()
+        .is_ok_and(|st| st.app.settings().always_on_top);
+    let p = Tray::cursor();
+    // SAFETY: the menu is destroyed before returning; labels are static. The
+    // window is brought to the foreground first, as a tray menu must be, so it
+    // closes when the pointer leaves it.
+    let chosen = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let _ = AppendMenuW(menu, MF_STRING, 1, w!("Open open-task"));
+        let flags = if topmost {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(menu, flags, 2, w!("Always on top"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, 3, w!("Exit"));
+        let _ = SetForegroundWindow(hwnd);
+        let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN;
+        let chosen = TrackPopupMenuEx(menu, flags.0, p.x, p.y, hwnd, None);
+        let _ = DestroyMenu(menu);
+        chosen.0
+    };
+    match chosen {
+        1 => show_window(hwnd),
+        2 => {
+            let settings = cell.try_borrow().map(|st| st.app.settings());
+            if let Ok(mut settings) = settings {
+                settings.always_on_top = !settings.always_on_top;
+                if let Ok(mut st) = cell.try_borrow_mut() {
+                    st.app.set_settings(settings);
+                }
+                prefs::save(&settings);
+                apply_settings(cell, hwnd, &settings);
+                invalidate(hwnd);
+            }
+        }
+        3 => {
+            // SAFETY: posting to our own window.
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Make the settings that live in the shell take effect: the window's always-on-top
+/// state and the sampling cadence.
+fn apply_settings(cell: &RefCell<State>, hwnd: HWND, settings: &Settings) {
+    // SAFETY: hwnd is valid; the flags leave position and size alone.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(if settings.always_on_top {
+                HWND_TOPMOST
+            } else {
+                HWND_NOTOPMOST
+            }),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+    if let Ok(st) = cell.try_borrow() {
+        if let Some(s) = &st.sampler {
+            s.set_interval(Duration::from_millis(u64::from(
+                settings.update_interval_ms,
+            )));
         }
     }
 }
@@ -693,7 +886,12 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => Outcome::Done(LRESULT(1)),
         WM_SIZE => {
             if wparam.0 as u32 == SIZE_MINIMIZED {
-                return Outcome::Done(LRESULT(0));
+                // With "Hide when minimized" on, the tray icon is the way back.
+                return if st.app.settings().hide_when_minimized && st.closing == Closing::No {
+                    Outcome::Hide
+                } else {
+                    Outcome::Done(LRESULT(0))
+                };
             }
             let (w, h) = lparam_xy(lparam);
             let px = (w.max(0) as u32, h.max(0) as u32);
@@ -718,16 +916,48 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if (lparam.0 & 0xFFFF) as u32 != HTCLIENT {
                 return Outcome::Default;
             }
-            let c = match st.app.cursor() {
-                Cursor::Arrow => st.cursors.arrow,
-                Cursor::ResizeColumn => st.cursors.size_we,
-                Cursor::Text => st.cursors.ibeam,
+            let c = if st.picking {
+                st.cursors.cross
+            } else {
+                match st.app.cursor() {
+                    Cursor::Arrow => st.cursors.arrow,
+                    Cursor::ResizeColumn => st.cursors.size_we,
+                    Cursor::Text => st.cursors.ibeam,
+                }
             };
             // SAFETY: a cursor loaded in `run`.
             unsafe {
                 SetCursor(Some(c));
             }
             Outcome::Done(LRESULT(1))
+        }
+        WM_MOUSEMOVE if st.picking => {
+            // SAFETY: a cursor loaded in `run`.
+            unsafe {
+                SetCursor(Some(st.cursors.cross));
+            }
+            Outcome::Done(LRESULT(0))
+        }
+        WM_LBUTTONUP if st.picking => {
+            // The crosshair lands: the process of the window under the pointer.
+            st.picking = false;
+            let mut p = POINT::default();
+            // SAFETY: capture is ours to release; the out-struct is valid.
+            unsafe {
+                let _ = ReleaseCapture();
+                let _ = GetCursorPos(&raw mut p);
+                SetCursor(Some(st.cursors.arrow));
+            }
+            if let Some(pid) = actions::pid_at(p) {
+                if st.app.select_pid(pid) {
+                    invalidate(hwnd);
+                } else {
+                    return Outcome::Notify(format!(
+                        "The window belongs to PID {pid}, which is not in the table yet."
+                    ));
+                }
+            }
+            Outcome::Done(LRESULT(0))
         }
         WM_MOUSEMOVE => {
             if !st.tracking_leave {
@@ -809,6 +1039,16 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 v if v == VK_RIGHT.0 => UiEvent::Key(Key::Right),
                 v if v == VK_BACK.0 && ctrl => UiEvent::Key(Key::WordBackspace),
                 v if v == VK_BACK.0 => UiEvent::Key(Key::Backspace),
+                // Escape with the crosshair out puts it away.
+                v if v == VK_ESCAPE.0 && st.picking => {
+                    st.picking = false;
+                    // SAFETY: capture is ours to release.
+                    unsafe {
+                        let _ = ReleaseCapture();
+                        SetCursor(Some(st.cursors.arrow));
+                    }
+                    return Outcome::Done(LRESULT(0));
+                }
                 v if v == VK_ESCAPE.0 => UiEvent::Key(Key::Escape),
                 v if v == VK_RETURN.0 => UiEvent::Key(Key::Enter),
                 // Delete ends the selected process; Shift+Delete its whole tree.
@@ -823,6 +1063,8 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 VK_M if ctrl => UiEvent::Command(Command::SetView(ViewMode::Map)),
                 VK_H if ctrl => UiEvent::Command(Command::SetView(ViewMode::History)),
                 VK_F if ctrl => UiEvent::Command(Command::Find),
+                // Ctrl+N: the Run dialog, "Run new task".
+                VK_N if ctrl => UiEvent::Command(Command::RunTask),
                 // Ctrl+Tab and Ctrl+Shift+Tab walk the pages, as in classic Task
                 // Manager; Ctrl+1..9 jump to one.
                 v if v == VK_TAB.0 && ctrl => {
@@ -880,6 +1122,46 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
         }
+        WM_APP_INVENTORY => {
+            // SAFETY: the pointer was made by `Box::into_raw` in `spawn_query` and
+            // is delivered exactly once.
+            let inventory = unsafe { Box::from_raw(lparam.0 as *mut Inventory) };
+            let connections = matches!(*inventory, Inventory::Connections(_));
+            if st.app.set_inventory(*inventory) {
+                invalidate(hwnd);
+            }
+            // The Connections page follows the system: read it again shortly,
+            // while it is showing.
+            if connections && st.app.page() == Page::Connections {
+                // SAFETY: hwnd is valid; re-arming replaces the timer.
+                unsafe {
+                    SetTimer(Some(hwnd), TIMER_REFRESH, REFRESH_MS, None);
+                }
+            }
+            Outcome::Done(LRESULT(0))
+        }
+        WM_APP_ACTION => {
+            // SAFETY: the pointer was made by `Box::into_raw` in `spawn_action`
+            // and is delivered exactly once.
+            let outcome = unsafe { Box::from_raw(lparam.0 as *mut ActionOutcome) };
+            invalidate(hwnd);
+            Outcome::Worker(outcome)
+        }
+        WM_APP_TRAY => match (lparam.0 & 0xFFFF) as u32 {
+            WM_LBUTTONUP | WM_LBUTTONDBLCLK => Outcome::Show,
+            WM_RBUTTONUP => Outcome::TrayMenu,
+            _ => Outcome::Done(LRESULT(0)),
+        },
+        WM_TIMER if wparam.0 == TIMER_REFRESH => {
+            // SAFETY: hwnd is valid; the timer is ours.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_REFRESH);
+            }
+            if st.app.page() == Page::Connections && st.closing == Closing::No {
+                actions::spawn_query(hwnd, WM_APP_INVENTORY, Query::Connections);
+            }
+            Outcome::Done(LRESULT(0))
+        }
         WM_APP_TASK_MANAGER => {
             // SAFETY: the pointer was made by `Box::into_raw` in
             // `replace_task_manager` and is delivered exactly once.
@@ -909,7 +1191,14 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_SNAPSHOT => {
             if let Some(s) = &st.sampler {
-                if st.app.set_snapshot(s.latest()) {
+                let snap = s.latest();
+                if let Some(tray) = &mut st.tray {
+                    let mem = (snap.memory.total.get() > 0).then(|| {
+                        snap.memory.in_use().get() as f32 / snap.memory.total.get() as f32 * 100.0
+                    });
+                    tray.update(snap.cpu.total.get(), mem);
+                }
+                if st.app.set_snapshot(snap) {
                     invalidate(hwnd);
                 }
             }
@@ -1008,8 +1297,11 @@ fn dispatch(cell: &RefCell<State>, hwnd: HWND, ev: UiEvent) {
             if reaction.repaint {
                 invalidate(hwnd);
             }
-            let title = if st.app.paused() { TITLE_PAUSED } else { TITLE };
-            let changed = std::mem::replace(&mut st.title, title) != title;
+            let title = window_title(st.elevated, st.app.paused());
+            let changed = st.title != title;
+            if changed {
+                st.title.clone_from(&title);
+            }
             (reaction.effect, changed.then_some(title))
         };
         // Setting the title sends WM_SETTEXT, so only with the state released.
@@ -1025,6 +1317,7 @@ fn dispatch(cell: &RefCell<State>, hwnd: HWND, ev: UiEvent) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent> {
     match effect {
         Effect::Menu { at, entries } => {
@@ -1042,8 +1335,146 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
             sample_cpu(cell, hwnd, target, seconds);
             None
         }
+        Effect::Process {
+            target,
+            name,
+            action,
+        } => {
+            process_action(cell, hwnd, target, &name, action);
+            None
+        }
+        Effect::SwitchTo(handle) => {
+            actions::switch_to(handle);
+            None
+        }
+        Effect::OpenUrl(url) => {
+            actions::open(hwnd, &url);
+            None
+        }
+        Effect::Properties(path) => {
+            actions::properties(hwnd, &path);
+            None
+        }
+        Effect::CopyText(text) => {
+            if let Err(e) = actions::copy_text(hwnd, &text) {
+                notify(hwnd, &format!("Could not copy to the clipboard.\n\n{e}"));
+            }
+            None
+        }
+        Effect::RunTask => {
+            run_task(cell, hwnd);
+            None
+        }
+        Effect::RunAsAdministrator => {
+            match actions::relaunch_elevated(hwnd) {
+                Ok(true) => {
+                    tracing::info!("an elevated copy is starting; closing this one");
+                    if let Ok(mut st) = cell.try_borrow_mut() {
+                        st.closing = Closing::Relaunching;
+                    }
+                    // SAFETY: posting to our own window.
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+                Ok(false) => tracing::info!("permission to run as administrator was not given"),
+                Err(e) => notify(hwnd, &format!("Could not start as administrator.\n\n{e}")),
+            }
+            None
+        }
+        Effect::PickWindow => {
+            if let Ok(mut st) = cell.try_borrow_mut() {
+                st.picking = true;
+                // SAFETY: hwnd is valid; the cursor was loaded in `run`.
+                unsafe {
+                    SetCapture(hwnd);
+                    SetCursor(Some(st.cursors.cross));
+                }
+            }
+            None
+        }
+        Effect::Service {
+            name,
+            display_name,
+            action,
+        } => {
+            let what = match action {
+                ServiceAction::Start => format!("start {display_name}"),
+                ServiceAction::Stop => format!("stop {display_name}"),
+                ServiceAction::Restart => format!("restart {display_name}"),
+            };
+            actions::spawn_action(hwnd, WM_APP_ACTION, what, move || {
+                actions::service_action(&name, action)
+                    .map(|()| None)
+                    .map_err(|e| e.to_string())
+            });
+            None
+        }
+        Effect::OpenServices => {
+            actions::open(hwnd, "services.msc");
+            None
+        }
+        Effect::Session { id, user, action } => {
+            let (question, what) = match action {
+                SessionAction::Disconnect => (
+                    format!("Disconnect {user}?\n\nTheir programs keep running."),
+                    format!("disconnect {user}"),
+                ),
+                SessionAction::SignOut => (
+                    format!("Sign out {user}?\n\nAny unsaved data in their programs will be lost."),
+                    format!("sign out {user}"),
+                ),
+            };
+            if confirm(hwnd, &question) {
+                actions::spawn_action(hwnd, WM_APP_ACTION, what, move || {
+                    actions::session_action(id, action)
+                        .map(|()| None)
+                        .map_err(|e| e.to_string())
+                });
+            }
+            None
+        }
+        Effect::Startup { entry, on } => {
+            if let Err(e) = actions::startup_action(&entry, on) {
+                let verb = if on { "enable" } else { "disable" };
+                notify(hwnd, &format!("Could not {verb} {}.\n\n{e}", entry.name));
+            } else {
+                // Show the change: the list is read again.
+                actions::spawn_query(hwnd, WM_APP_INVENTORY, Query::Startup);
+            }
+            None
+        }
+        Effect::OpenInstallLocation {
+            location,
+            uninstall,
+        } => {
+            match actions::install_folder(location.as_deref(), uninstall.as_deref()) {
+                Some(folder) => actions::open(hwnd, &folder.to_string_lossy()),
+                None => notify(hwnd, "The program's folder could not be worked out."),
+            }
+            None
+        }
+        Effect::Uninstall { name, command } => {
+            if confirm(
+                hwnd,
+                &format!("Uninstall {name}?\n\nIts uninstaller will start."),
+            ) {
+                if let Err(e) = actions::launch(&command, None) {
+                    notify(
+                        hwnd,
+                        &format!("Could not start the uninstaller for {name}.\n\n{e}"),
+                    );
+                }
+            }
+            None
+        }
+        Effect::Query(query) => {
+            actions::spawn_query(hwnd, WM_APP_INVENTORY, query);
+            None
+        }
         Effect::SaveSettings(settings) => {
             prefs::save(&settings);
+            apply_settings(cell, hwnd, &settings);
             // Downloading was just turned on with a release waiting: start now.
             let updater = cell.try_borrow().ok().and_then(|st| st.updater.clone());
             if let Some(u) = updater {
@@ -1063,6 +1494,110 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
             replace_task_manager(cell, hwnd, on);
             None
         }
+    }
+}
+
+/// A yes/no question with No as the default.
+fn confirm(hwnd: HWND, question: &str) -> bool {
+    let text = HSTRING::from(question);
+    // SAFETY: strings outlive the call; hwnd is valid.
+    let answer = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            &text,
+            w!("open-task"),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+    answer == IDYES
+}
+
+/// One action on a process. The quick ones run here and report a failure at
+/// once; a dump runs on a worker thread; a restart asks first, ends the process
+/// and starts its command line again.
+fn process_action(
+    cell: &RefCell<State>,
+    hwnd: HWND,
+    target: ProcessKey,
+    name: &str,
+    action: ProcessAction,
+) {
+    let what = actions::describe(&action, name);
+    match action {
+        ProcessAction::WriteDump => {
+            actions::spawn_action(hwnd, WM_APP_ACTION, what, move || {
+                actions::write_dump(target).map(|p| p.map(|p| format!("Dump written to\n{p}")))
+            });
+        }
+        ProcessAction::Restart {
+            command_line,
+            directory,
+        } => {
+            if !confirm(
+                hwnd,
+                &format!("Restart {name}?\n\nAny unsaved data in it will be lost."),
+            ) {
+                return;
+            }
+            let ended = cell
+                .try_borrow()
+                .map_or(Err(ControlError::Unsupported), |st| {
+                    st.control.terminate(target)
+                });
+            match ended {
+                Ok(()) | Err(ControlError::Gone) => {
+                    if let Err(e) = actions::launch(&command_line, directory.as_deref()) {
+                        notify(
+                            hwnd,
+                            &format!("{name} was ended but could not be started again.\n\n{e}"),
+                        );
+                    }
+                }
+                Err(e) => notify(hwnd, &format!("Could not {what}.\n\n{e}")),
+            }
+        }
+        _ => {
+            let r = cell
+                .try_borrow()
+                .map_or(Err(ControlError::Unsupported), |st| {
+                    actions::process_action(st.control, target, &action)
+                });
+            match r {
+                Ok(()) => tracing::info!(pid = target.pid, %what, "done"),
+                Err(ControlError::Gone) => {}
+                Err(e) => notify(hwnd, &format!("Could not {what}.\n\n{e}")),
+            }
+            invalidate(hwnd);
+        }
+    }
+}
+
+/// The Run dialog, then the program it names: through the shell as administrator
+/// when asked, else as a plain process, with the shell as the fallback for a
+/// document or a URL.
+fn run_task(cell: &RefCell<State>, hwnd: HWND) {
+    let initial = cell
+        .try_borrow()
+        .map(|st| st.last_run.clone())
+        .unwrap_or_default();
+    let Some(request) = run_dialog::ask(hwnd, &initial) else {
+        return;
+    };
+    if let Ok(mut st) = cell.try_borrow_mut() {
+        st.last_run.clone_from(&request.command);
+    }
+    let (file, params) = actions::split_command(&request.command);
+    let result = if request.elevated {
+        actions::shell_start(hwnd, &file, &params, None, true)
+    } else {
+        actions::launch(&request.command, None)
+            .or_else(|_| actions::shell_start(hwnd, &file, &params, None, false))
+    };
+    if let Err(e) = result {
+        notify(
+            hwnd,
+            &format!("Could not start {}.\n\n{e}", request.command),
+        );
     }
 }
 
@@ -1153,6 +1688,9 @@ fn set_task_manager_pending(st: &mut State, pending: bool) {
 /// it, which keeps the installer locked through Setup's elevation, as a click does.
 /// Anything else closes as usual.
 fn close(st: &mut State) -> Outcome {
+    // Where things stand, for the next start.
+    prefs::save_layout(&st.app.view_layout());
+    st.tray = None;
     if st.closing != Closing::No {
         return Outcome::Default;
     }
@@ -1278,42 +1816,15 @@ fn show_menu(
     at: Point,
     entries: &[MenuEntry],
 ) -> Option<MenuAction> {
-    let dpi = cell.try_borrow().map_or(96.0, |st| st.dpi);
+    let (dpi, control) = cell
+        .try_borrow()
+        .map_or((96.0, PlatformControl), |st| (st.dpi, st.control));
     let mut p = to_px_point(at, dpi);
     // SAFETY: hwnd is valid; POINT is a plain in-out struct.
     unsafe {
         let _ = ClientToScreen(hwnd, &raw mut p);
     }
-    // Item ids are 1-based positions in `entries`; 0 means dismissed.
-    // SAFETY: the menu is destroyed before returning; AppendMenuW copies its label.
-    let chosen = unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        for (i, e) in entries.iter().enumerate() {
-            let r = match e {
-                MenuEntry::Item { label, enabled, .. } => {
-                    let flags = if *enabled {
-                        MF_STRING
-                    } else {
-                        MF_STRING | MF_GRAYED
-                    };
-                    AppendMenuW(menu, flags, i + 1, &HSTRING::from(*label))
-                }
-                MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
-            };
-            if let Err(e) = r {
-                tracing::warn!(error = %e, "AppendMenuW");
-            }
-        }
-        let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN;
-        let chosen = TrackPopupMenuEx(menu, flags.0, p.x, p.y, hwnd, None);
-        let _ = DestroyMenu(menu);
-        chosen.0
-    };
-    let index = usize::try_from(chosen).ok()?.checked_sub(1)?;
-    match entries.get(index)? {
-        MenuEntry::Item { action, .. } => Some(*action),
-        MenuEntry::Separator => None,
-    }
+    actions::show_menu(hwnd, p, entries, control)
 }
 
 /// Confirm, then end every target. Processes that are already gone are not

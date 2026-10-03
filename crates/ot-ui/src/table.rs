@@ -98,7 +98,7 @@ pub trait RowSource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub title: &'static str,
     pub width: f32,
@@ -106,6 +106,9 @@ pub struct Column {
     pub numeric: bool,
     /// First click sorts descending (natural for "most CPU first").
     pub default_desc: bool,
+    /// Shown, as opposed to turned off in the column chooser. The width and the
+    /// sort state of a hidden column are kept for when it comes back.
+    pub visible: bool,
 }
 
 impl Column {
@@ -116,6 +119,7 @@ impl Column {
             width,
             numeric: false,
             default_desc: false,
+            visible: true,
         }
     }
 
@@ -126,8 +130,27 @@ impl Column {
             width,
             numeric: true,
             default_desc: true,
+            visible: true,
         }
     }
+
+    /// The same column, off until chosen.
+    #[must_use]
+    pub const fn hidden(self) -> Self {
+        Self {
+            visible: false,
+            ..self
+        }
+    }
+}
+
+/// One column's place in a saved layout: what the shell persists, by title so a
+/// layout survives columns being added between versions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnLayout {
+    pub title: String,
+    pub width: f32,
+    pub visible: bool,
 }
 
 /// What is under a point.
@@ -155,6 +178,19 @@ struct Resize {
     /// Pointer x when the drag started, and the column's width then.
     start_x: f32,
     start_w: f32,
+}
+
+/// Pointer movement before a header press becomes a drag rather than a click.
+const DRAG_START: f32 = 6.0;
+
+/// The mouse is down on a column header: a click to sort until the pointer has
+/// moved [`DRAG_START`], a drag to reorder after that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HeaderPress {
+    col: usize,
+    start: Point,
+    /// Where the pointer is now, once dragging.
+    at: Option<Point>,
 }
 
 /// Per-position tree facts, parallel to the display order. Empty in list mode.
@@ -220,8 +256,12 @@ fn ease(t: f32) -> f32 {
 #[derive(Debug)]
 pub struct Table {
     pub columns: Vec<Column>,
+    /// Indices into `columns` of the visible columns, left to right.
+    display: Vec<usize>,
     pub sort_col: usize,
     pub sort_desc: bool,
+    /// A press on a header, see [`HeaderPress`].
+    header_press: Option<HeaderPress>,
     /// Scroll offset in rows; fractional for smooth wheel scrolling.
     scroll: f32,
     /// Horizontal scroll offset in DIPs, when the columns are wider than the table.
@@ -267,10 +307,18 @@ impl Table {
     #[must_use]
     pub fn new(columns: Vec<Column>, sort_col: usize) -> Self {
         let sort_desc = columns.get(sort_col).is_some_and(|c| c.default_desc);
+        let display = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.visible)
+            .map(|(i, _)| i)
+            .collect();
         Self {
             columns,
+            display,
             sort_col,
             sort_desc,
+            header_press: None,
             scroll: 0.0,
             scroll_x: 0.0,
             resize: None,
@@ -302,6 +350,166 @@ impl Table {
         self.order_dirty = true;
     }
 
+    /// The visible columns, left to right, with their indices into `columns`.
+    pub fn shown(&self) -> impl Iterator<Item = (usize, &Column)> + '_ {
+        self.display.iter().map(move |&i| (i, &self.columns[i]))
+    }
+
+    /// Show or hide column `col`. A column that comes back goes to the right end.
+    /// The last visible column cannot be hidden. Returns whether anything changed.
+    pub fn set_visible(&mut self, col: usize, on: bool) -> bool {
+        if col >= self.columns.len() || self.columns[col].visible == on {
+            return false;
+        }
+        if !on && self.display.len() <= 1 {
+            return false;
+        }
+        self.columns[col].visible = on;
+        if on {
+            self.display.push(col);
+        } else {
+            self.display.retain(|&i| i != col);
+        }
+        true
+    }
+
+    /// Put every column back as it was made: `defaults` in their order, with their
+    /// widths and visibility, keeping the sort if its column still exists.
+    pub fn reset_columns(&mut self, defaults: Vec<Column>) {
+        let sort_title = self.columns.get(self.sort_col).map(|c| c.title);
+        self.sort_col = defaults
+            .iter()
+            .position(|c| Some(c.title) == sort_title)
+            .unwrap_or(0);
+        self.columns = defaults;
+        self.display = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.visible)
+            .map(|(i, _)| i)
+            .collect();
+        self.scroll_x = 0.0;
+    }
+
+    /// The columns as they are, for saving: the visible ones in display order,
+    /// then the hidden ones.
+    #[must_use]
+    pub fn layout(&self) -> Vec<ColumnLayout> {
+        let entry = |c: &Column| ColumnLayout {
+            title: c.title.to_owned(),
+            width: c.width,
+            visible: c.visible,
+        };
+        self.shown()
+            .map(|(_, c)| entry(c))
+            .chain(self.columns.iter().filter(|c| !c.visible).map(entry))
+            .collect()
+    }
+
+    /// Restore a saved layout. Columns it names get its width, visibility and
+    /// order; columns it does not name keep their defaults and go after the named
+    /// ones; names that no longer exist are ignored. A layout that would hide
+    /// every column is ignored.
+    pub fn apply_layout(&mut self, layout: &[ColumnLayout]) {
+        let mut display = Vec::with_capacity(self.columns.len());
+        let mut seen = vec![false; self.columns.len()];
+        for l in layout {
+            let Some(i) = self.columns.iter().position(|c| c.title == l.title) else {
+                continue;
+            };
+            if seen[i] {
+                continue;
+            }
+            seen[i] = true;
+            let c = &mut self.columns[i];
+            c.width = l.width.max(MIN_COLUMN_W);
+            c.visible = l.visible;
+            if l.visible {
+                display.push(i);
+            }
+        }
+        for (i, c) in self.columns.iter().enumerate() {
+            if !seen[i] && c.visible {
+                display.push(i);
+            }
+        }
+        if display.is_empty() {
+            for c in &mut self.columns {
+                c.visible = true;
+            }
+            display = (0..self.columns.len()).collect();
+        }
+        self.display = display;
+    }
+
+    /// The column at display position `pos`, by its index into `columns`.
+    #[must_use]
+    pub fn column_at(&self, pos: usize) -> Option<usize> {
+        self.display.get(pos).copied()
+    }
+
+    /// The mouse went down on column `col`'s header at `p`: a sort if it comes
+    /// back up there, a reorder if it moves first.
+    pub fn begin_header_press(&mut self, col: usize, p: Point) {
+        if col < self.columns.len() {
+            self.header_press = Some(HeaderPress {
+                col,
+                start: p,
+                at: None,
+            });
+        }
+    }
+
+    /// The pointer moved with a header pressed. Returns whether a repaint is due
+    /// (the drag started or moved).
+    pub fn header_drag_to(&mut self, p: Point) -> bool {
+        let Some(h) = self.header_press.as_mut() else {
+            return false;
+        };
+        if h.at.is_none() && (p.x - h.start.x).abs() < DRAG_START {
+            return false;
+        }
+        h.at = Some(p);
+        true
+    }
+
+    /// The mouse came up. A press that never became a drag is a click on the
+    /// column, returned for the caller to sort by; a drag drops the column where
+    /// the pointer is and returns `None`.
+    pub fn end_header_press(&mut self, p: Point) -> Option<usize> {
+        let h = self.header_press.take()?;
+        if h.at.is_none() {
+            return Some(h.col);
+        }
+        let from = self.display.iter().position(|&i| i == h.col)?;
+        let to = self.drop_slot(p.x).min(self.display.len());
+        // Removing the dragged column shifts the slots after it left by one.
+        let to = if to > from { to - 1 } else { to };
+        let col = self.display.remove(from);
+        self.display.insert(to, col);
+        None
+    }
+
+    /// Whether a header is being dragged to a new place.
+    #[must_use]
+    pub fn header_dragging(&self) -> bool {
+        self.header_press.is_some_and(|h| h.at.is_some())
+    }
+
+    /// The display slot a column dropped at `x` would take: before the first
+    /// column whose middle is right of `x`.
+    fn drop_slot(&self, x: f32) -> usize {
+        let mut left = self.header.x - self.scroll_x;
+        for (slot, (_, c)) in self.shown().enumerate() {
+            if x < left + c.width * 0.5 {
+                return slot;
+            }
+            left += c.width;
+        }
+        self.display.len()
+    }
+
     /// The data changed (a new sample): re-sort, keeping the selected row where it
     /// is on screen if it is on screen, and sliding rows to their new places if
     /// animation is on.
@@ -328,6 +536,12 @@ impl Table {
     #[must_use]
     pub fn animating(&self) -> bool {
         !self.slide.is_empty()
+    }
+
+    /// Where the header was painted last.
+    #[must_use]
+    pub fn header_rect(&self) -> Rect {
+        self.header
     }
 
     /// Where the header and body were painted last.
@@ -507,7 +721,7 @@ impl Table {
                 return Hit::Divider(i);
             }
             let mut x = self.header.x - self.scroll_x;
-            for (i, c) in self.columns.iter().enumerate() {
+            for (i, c) in self.shown() {
                 if p.x < x + c.width {
                     return Hit::Header(i);
                 }
@@ -545,7 +759,7 @@ impl Table {
             return None;
         }
         let mut edge = self.header.x - self.scroll_x;
-        for (i, c) in self.columns.iter().enumerate() {
+        for (i, c) in self.shown() {
             edge += c.width;
             if (p.x - edge).abs() <= DIVIDER_GRAB {
                 return Some(i);
@@ -590,10 +804,10 @@ impl Table {
         self.resize.is_some()
     }
 
-    /// Sum of the column widths.
+    /// Sum of the visible columns' widths.
     #[must_use]
     pub fn total_width(&self) -> f32 {
-        self.columns.iter().map(|c| c.width).sum()
+        self.shown().map(|(_, c)| c.width).sum()
     }
 
     /// Positive scrolls the columns to the left. Clamped on next paint.
@@ -987,7 +1201,7 @@ impl Table {
         };
 
         let mut x = body.x + ox;
-        for (ci, col) in self.columns.iter().enumerate() {
+        for (slot, (ci, col)) in self.shown().enumerate() {
             let cr = Rect::new(x, y, col.width, row_h);
             let heat = if collapsed {
                 src.heat_collapsed(row, ci)
@@ -1003,7 +1217,7 @@ impl Table {
                 src.cell(row, ci, buf);
             }
             let mut text_rect = cr.inset(theme.pad, 0.0);
-            if self.tree && ci == 0 {
+            if self.tree && slot == 0 {
                 let x0 = cr.x + theme.pad;
                 for level in 0..meta.depth {
                     let gx = x0 + f32::from(level) * theme.indent + theme.expander_w * 0.5;
@@ -1070,19 +1284,25 @@ impl Table {
         // Header.
         dl.fill_rect(header, theme.surface);
         dl.push_clip(header);
+        let drag = self.header_press.and_then(|h| h.at.map(|at| (h.col, at)));
         let mut x = header.x + ox;
-        for (ci, col) in self.columns.iter().enumerate() {
+        for (ci, col) in self.shown() {
             let cr = Rect::new(x, header.y, col.width, header.h);
             let align = if col.numeric {
                 HAlign::Right
             } else {
                 HAlign::Left
             };
+            let color = if drag.is_some_and(|(c, _)| c == ci) {
+                theme.text_dim.with_alpha(0.4)
+            } else {
+                theme.text_dim
+            };
             dl.text(
                 col.title,
                 cr.inset(theme.pad, 0.0),
                 theme.header,
-                theme.text_dim,
+                color,
                 align,
                 VAlign::Middle,
                 true,
@@ -1101,6 +1321,32 @@ impl Table {
                 theme.grid,
             );
             x += col.width;
+        }
+        // A column being dragged: its title follows the pointer, and a bar marks
+        // where it would land.
+        if let Some((ci, at)) = drag {
+            let col = &self.columns[ci];
+            let slot = self.drop_slot(at.x);
+            let mark_x = header.x + ox + self.shown().take(slot).map(|(_, c)| c.width).sum::<f32>();
+            dl.fill_rect(
+                Rect::new(mark_x - 1.0, header.y + 4.0, 2.0, header.h - 8.0),
+                theme.accent,
+            );
+            let ghost = Rect::new(at.x - col.width * 0.5, header.y, col.width, header.h);
+            dl.fill_round_rect(
+                ghost.inset(0.0, 3.0),
+                theme.card_radius,
+                theme.button_active,
+            );
+            dl.text(
+                col.title,
+                ghost.inset(theme.pad, 0.0),
+                theme.header,
+                theme.text,
+                HAlign::Center,
+                VAlign::Middle,
+                true,
+            );
         }
         dl.pop_clip();
         dl.fill_rect(
@@ -1357,6 +1603,108 @@ mod tests {
         assert_eq!(t.hit(Point::new(5.0, 5.0), &theme), Hit::Header(1));
         // Column 1's right edge now sits at the table's right edge (exclusive).
         assert_eq!(t.divider_at(Point::new(149.0, 5.0)), Some(1));
+    }
+
+    #[test]
+    fn columns_hide_reorder_and_round_trip_through_a_layout() {
+        let src = Nums((0..5).collect());
+        let mut t = Table::new(
+            vec![
+                Column::number("a", 100.0),
+                Column::number("b", 100.0).hidden(),
+                Column::text("c", 100.0),
+            ],
+            0,
+        );
+        let theme = Theme::dark();
+        let mut dl = DisplayList::new();
+        let mut buf = String::new();
+        let rect = Rect::new(0.0, 0.0, 400.0, 300.0);
+        t.paint(&mut dl, rect, &src, &theme, &mut buf);
+        // b is hidden: a then c, 200 wide, and the header hit skips b.
+        assert_eq!(t.shown().map(|(i, _)| i).collect::<Vec<_>>(), [0, 2]);
+        assert!((t.total_width() - 200.0).abs() < f32::EPSILON);
+        assert_eq!(t.hit(Point::new(150.0, 5.0), &theme), Hit::Header(2));
+
+        // Show b: it goes to the right end. Hide the last visible one: refused.
+        assert!(t.set_visible(1, true));
+        assert!(!t.set_visible(1, true), "already shown");
+        assert_eq!(t.shown().map(|(i, _)| i).collect::<Vec<_>>(), [0, 2, 1]);
+        assert!(t.set_visible(0, false));
+        assert!(t.set_visible(2, false));
+        assert!(!t.set_visible(1, false), "the last column stays");
+        assert!(t.set_visible(0, true));
+        assert!(t.set_visible(2, true));
+        assert_eq!(t.shown().map(|(i, _)| i).collect::<Vec<_>>(), [1, 0, 2]);
+
+        // Drag a (second slot, x 100..200) to the far left: a click would have
+        // sorted; a drag reorders and reports no click.
+        t.paint(&mut dl, rect, &src, &theme, &mut buf);
+        t.begin_header_press(0, Point::new(150.0, 5.0));
+        assert!(!t.header_drag_to(Point::new(152.0, 5.0)), "within the slop");
+        assert!(!t.header_dragging());
+        assert!(t.header_drag_to(Point::new(20.0, 5.0)));
+        assert!(t.header_dragging());
+        t.paint(&mut dl, rect, &src, &theme, &mut buf);
+        assert_eq!(t.end_header_press(Point::new(20.0, 5.0)), None);
+        assert_eq!(t.shown().map(|(i, _)| i).collect::<Vec<_>>(), [0, 1, 2]);
+        // Drag a to the far right.
+        t.begin_header_press(0, Point::new(50.0, 5.0));
+        t.header_drag_to(Point::new(390.0, 5.0));
+        assert_eq!(t.end_header_press(Point::new(390.0, 5.0)), None);
+        assert_eq!(t.shown().map(|(i, _)| i).collect::<Vec<_>>(), [1, 2, 0]);
+        // A press released in place is a click.
+        t.begin_header_press(2, Point::new(150.0, 5.0));
+        assert_eq!(t.end_header_press(Point::new(151.0, 5.0)), Some(2));
+
+        // The layout lists visible columns in order, then hidden ones, and a
+        // fresh table restored from it matches; an unknown title is ignored and
+        // a column it does not name keeps its default place after the named ones.
+        t.columns[2].width = 123.0;
+        t.set_visible(1, false);
+        let layout = t.layout();
+        assert_eq!(
+            layout
+                .iter()
+                .map(|l| (l.title.as_str(), l.visible))
+                .collect::<Vec<_>>(),
+            [("c", true), ("a", true), ("b", false)]
+        );
+        let mut fresh = Table::new(
+            vec![
+                Column::number("a", 100.0),
+                Column::number("b", 100.0),
+                Column::text("c", 100.0),
+                Column::text("d", 100.0),
+            ],
+            0,
+        );
+        let mut saved = layout.clone();
+        saved.push(ColumnLayout {
+            title: "gone".to_owned(),
+            width: 1.0,
+            visible: true,
+        });
+        fresh.apply_layout(&saved);
+        assert_eq!(fresh.shown().map(|(i, _)| i).collect::<Vec<_>>(), [2, 0, 3]);
+        assert!((fresh.columns[2].width - 123.0).abs() < f32::EPSILON);
+        assert!(!fresh.columns[1].visible);
+        // A layout hiding everything is ignored.
+        let all_hidden: Vec<ColumnLayout> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|t| ColumnLayout {
+                title: (*t).to_owned(),
+                width: 50.0,
+                visible: false,
+            })
+            .collect();
+        fresh.apply_layout(&all_hidden);
+        assert_eq!(fresh.shown().count(), 4);
+        // Reset puts the defaults back and keeps the sort by title.
+        fresh.sort_col = 2;
+        fresh.reset_columns(vec![Column::text("c", 10.0), Column::number("a", 20.0)]);
+        assert_eq!(fresh.sort_col, 0);
+        assert_eq!(fresh.shown().count(), 2);
     }
 
     #[test]

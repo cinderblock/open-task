@@ -8,9 +8,12 @@
 
 mod charts;
 pub mod format;
+mod list_page;
 mod nav;
+mod pages;
 mod perf;
 mod process_rows;
+mod search;
 mod settings;
 pub mod sparkline;
 mod steady;
@@ -29,6 +32,6 @@ pub use task_manager::{Replacement, TaskManager};
 pub use theme::Theme;
 pub use update::{UpdateAction, UpdateView};
 pub use view::{
-    App, Command, Cursor, Effect, Key, MenuAction, MenuEntry, MouseButton, Reaction, UiEvent,
-    ViewMode,
+    App, Command, Cursor, Effect, Inventory, Key, MenuAction, MenuEntry, MouseButton,
+    ProcessAction, Query, Reaction, ServiceAction, SessionAction, UiEvent, ViewLayout, ViewMode,
 };

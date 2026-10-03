@@ -78,6 +78,11 @@ pub struct Theme {
     pub network_send: Color,
     /// Modified memory: written, waiting to reach disk before it can be reused.
     pub memory_modified: Color,
+    /// GPU load; its memory uses the lighter `gpu_memory`.
+    pub gpu: Color,
+    pub gpu_memory: Color,
+    /// Battery charge.
+    pub battery: Color,
     /// A headline number in a page's statistics.
     pub stat: TextStyle,
     /// Colors that tell series apart where a chart has several, in a fixed order:
@@ -134,6 +139,9 @@ impl Theme {
             network: Color::hex(0xF0_A0_4B),
             network_send: Color::hex(0xF8_D4_A8),
             memory_modified: Color::hex(0xFF_B4_54),
+            gpu: Color::hex(0xA7_8B_FA),
+            gpu_memory: Color::hex(0xD0_C4_FC),
+            battery: Color::hex(0xE8_D4_5A),
             stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
             series: [
                 Color::hex(0x39_87_E5),
@@ -194,6 +202,9 @@ impl Theme {
             network: Color::hex(0xC2_5E_00),
             network_send: Color::hex(0xE8_A8_65),
             memory_modified: Color::hex(0xC2_5E_00),
+            gpu: Color::hex(0x6B_3F_C9),
+            gpu_memory: Color::hex(0xA8_8C_E0),
+            battery: Color::hex(0x9A_7B_00),
             stat: TextStyle::ui(17.0).weight(FontWeight::SemiBold).tabular(),
             series: [
                 Color::hex(0x2A_78_D6),

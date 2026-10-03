@@ -286,6 +286,17 @@ pub struct AdapterSeries {
     pub tx: Series,
 }
 
+/// History for one graphics adapter.
+#[derive(Debug, Clone)]
+pub struct GpuSeries {
+    /// As in [`ot_model::gpu::GpuInfo::id`].
+    pub id: u64,
+    /// The busiest engine's share of the interval, percent `0..=100`.
+    pub utilization: Series,
+    /// Dedicated memory in use, bytes.
+    pub dedicated: Series,
+}
+
 /// All system-wide series the UI graphs.
 #[derive(Debug, Clone)]
 pub struct Timeline {
@@ -300,6 +311,12 @@ pub struct Timeline {
     pub disks: Vec<DiskSeries>,
     /// One entry per adapter the latest snapshot listed, in its order.
     pub adapters: Vec<AdapterSeries>,
+    /// One entry per graphics adapter the latest snapshot listed, in its order.
+    pub gpus: Vec<GpuSeries>,
+    /// Battery charge, percent `0..=100`; empty on a machine without a battery.
+    pub battery_charge: Series,
+    /// Power into or out of the battery, watts.
+    pub battery_rate: Series,
     retention: Retention,
     last_tick: Option<Tick>,
 }
@@ -313,6 +330,9 @@ impl Timeline {
             mem_in_use: Series::new(retention),
             disks: Vec::new(),
             adapters: Vec::new(),
+            gpus: Vec::new(),
+            battery_charge: Series::new(retention),
+            battery_rate: Series::new(retention),
             retention,
             last_tick: None,
         }
@@ -389,6 +409,32 @@ impl Timeline {
             s.rx.push(at, a.rx_per_sec.get() as f32);
             s.tx.push(at, a.tx_per_sec.get() as f32);
         }
+        for g in &snap.gpus {
+            let id = g.info.id;
+            let i = self
+                .gpus
+                .iter()
+                .position(|s| s.id == id)
+                .unwrap_or_else(|| {
+                    self.gpus.push(GpuSeries {
+                        id,
+                        utilization: Series::new(retention),
+                        dedicated: Series::new(retention),
+                    });
+                    self.gpus.len() - 1
+                });
+            let s = &mut self.gpus[i];
+            s.utilization.push(at, g.utilization.get());
+            s.dedicated.push(at, g.dedicated_used.get() as f32);
+        }
+        if let Some(b) = &snap.battery {
+            if let Some(charge) = b.charge {
+                self.battery_charge.push(at, charge);
+            }
+            if let Some(rate) = b.rate {
+                self.battery_rate.push(at, rate.0);
+            }
+        }
         // A device that is gone takes its history with it. An empty list is more
         // likely a failed read than every disk (or every adapter) vanishing at once,
         // so it prunes nothing.
@@ -400,6 +446,10 @@ impl Timeline {
             self.adapters
                 .retain(|s| snap.adapters.iter().any(|a| a.info.id == s.id));
         }
+        if !snap.gpus.is_empty() {
+            self.gpus
+                .retain(|s| snap.gpus.iter().any(|g| g.info.id == s.id));
+        }
     }
 
     #[must_use]
@@ -410,6 +460,11 @@ impl Timeline {
     #[must_use]
     pub fn adapter(&self, id: u64) -> Option<&AdapterSeries> {
         self.adapters.iter().find(|s| s.id == id)
+    }
+
+    #[must_use]
+    pub fn gpu(&self, id: u64) -> Option<&GpuSeries> {
+        self.gpus.iter().find(|s| s.id == id)
     }
 
     /// The tick most recently folded in, if any.
@@ -531,6 +586,51 @@ mod tests {
         assert!(t.disk(1).is_none());
         assert_eq!(t.disk(0).map(|d| d.active.len()), Some(2));
         assert!(t.adapter(7).is_some(), "an empty list prunes nothing");
+    }
+
+    #[test]
+    fn gpus_and_the_battery_get_series_too() {
+        use ot_model::battery::BatterySample;
+        use ot_model::gpu::{GpuInfo, GpuSample};
+        use ot_model::Watts;
+        use std::sync::Arc;
+        let gpu = |id: u64, load: f32| GpuSample {
+            info: Arc::new(GpuInfo {
+                id,
+                ..GpuInfo::default()
+            }),
+            utilization: Percent(load),
+            engines: Vec::new(),
+            dedicated_used: Bytes(1 << 30),
+            shared_used: Bytes(0),
+        };
+        let mut t = Timeline::new(Retention::raw(10));
+        let mut s = snap(1, 1.0, 1);
+        s.gpus = vec![gpu(3, 40.0), gpu(4, 5.0)];
+        s.battery = Some(BatterySample {
+            charge: Some(80.0),
+            rate: Some(Watts(12.0)),
+            ..BatterySample::default()
+        });
+        t.observe(&s);
+        assert_eq!(
+            t.gpu(3).map(|g| g.utilization.latest().unwrap().value),
+            Some(40.0)
+        );
+        assert_eq!(
+            t.gpu(4).map(|g| g.dedicated.latest().unwrap().value),
+            Some(1_073_741_824.0)
+        );
+        assert_eq!(t.battery_charge.latest().map(|s| s.value), Some(80.0));
+        assert_eq!(t.battery_rate.latest().map(|s| s.value), Some(12.0));
+
+        // GPU 4 is gone; the battery sample is missing this pass.
+        let mut s = snap(2, 1.0, 1);
+        s.gpus = vec![gpu(3, 50.0)];
+        t.observe(&s);
+        assert!(t.gpu(4).is_none());
+        assert_eq!(t.gpu(3).map(|g| g.utilization.len()), Some(2));
+        assert_eq!(t.battery_charge.len(), 1, "nothing to push, nothing lost");
     }
 
     #[test]

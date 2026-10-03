@@ -36,7 +36,7 @@ use ot_model::ProcessKey;
 
 mod imp;
 
-pub use imp::{PlatformControl, PlatformProbe, PlatformSampler};
+pub use imp::{is_elevated, PlatformControl, PlatformProbe, PlatformSampler};
 
 /// Why a sampling pass could not produce data.
 #[derive(Debug, thiserror::Error)]

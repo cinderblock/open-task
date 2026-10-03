@@ -45,6 +45,9 @@ pub const DECAY_DEFAULT: u8 = 5;
 
 /// Everything the user can set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Each is an independent switch the user flips; an enum or bit set would only
+// obscure them.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Settings {
     /// Rows slide to their new places when the process table re-sorts, rather than
     /// jumping. `None` until the user chooses: then it follows the platform's
@@ -64,7 +67,18 @@ pub struct Settings {
     /// second: one of [`DECAY_STEPS`]. The Cycles column, the Map, the usage strip
     /// and the History all show totals fading at this rate.
     pub usage_decay_percent: u8,
+    /// Keep the window above every other, as Task Manager's option does.
+    pub always_on_top: bool,
+    /// Minimizing hides the window; the tray icon brings it back.
+    pub hide_when_minimized: bool,
+    /// How often the system is sampled, in milliseconds: one of [`SPEED_STEPS`].
+    /// Task Manager's update speed: Low, Normal, High.
+    pub update_interval_ms: u32,
 }
+
+/// The sampling intervals, slowest first, in milliseconds.
+pub const SPEED_STEPS: [u32; 4] = [4000, 2000, 1000, 500];
+pub const SPEED_DEFAULT: u32 = 1000;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -74,6 +88,9 @@ impl Default for Settings {
             check_updates: true,
             download_updates: false,
             install_updates: false,
+            always_on_top: false,
+            hide_when_minimized: false,
+            update_interval_ms: SPEED_DEFAULT,
         }
     }
 }
@@ -105,6 +122,41 @@ impl Settings {
         f64::from(self.usage_decay_percent) / 100.0
     }
 
+    /// These settings with the sampling interval set to the step nearest `ms`.
+    #[must_use]
+    pub fn with_interval(self, ms: u32) -> Self {
+        let nearest = SPEED_STEPS
+            .into_iter()
+            .min_by_key(|&s| s.abs_diff(ms))
+            .unwrap_or(SPEED_DEFAULT);
+        Self {
+            update_interval_ms: nearest,
+            ..self
+        }
+    }
+
+    /// The interval one step slower (`-1`) or faster (`1`).
+    fn speed_step(self, by: isize) -> Option<u32> {
+        let at = SPEED_STEPS
+            .iter()
+            .position(|&s| s <= self.update_interval_ms)
+            .unwrap_or(SPEED_STEPS.len() - 1);
+        at.checked_add_signed(by)
+            .and_then(|i| SPEED_STEPS.get(i))
+            .copied()
+    }
+
+    /// Task Manager's name for the interval.
+    #[must_use]
+    pub fn speed_label(self) -> &'static str {
+        match self.update_interval_ms {
+            0..=500 => "High",
+            501..=1000 => "Normal",
+            1001..=2000 => "Slow",
+            _ => "Low",
+        }
+    }
+
     /// The fade rate one step slower (`-1`) or faster (`1`), or `None` at the end
     /// of the steps.
     fn decay_step(self, by: isize) -> Option<u8> {
@@ -125,12 +177,17 @@ pub(crate) struct Context<'a> {
     pub system_animations: bool,
     pub update: &'a UpdateView,
     pub task_manager: &'a TaskManager,
+    /// Whether this copy runs as administrator; the card offering to is shown
+    /// only when it does not.
+    pub elevated: bool,
 }
 
 /// One switch on the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Toggle {
     AnimateRows,
+    AlwaysOnTop,
+    HideWhenMinimized,
     CheckUpdates,
     DownloadUpdates,
     InstallUpdates,
@@ -140,6 +197,8 @@ impl Toggle {
     fn title(self) -> &'static str {
         match self {
             Self::AnimateRows => "Animate rows as the order changes",
+            Self::AlwaysOnTop => "Always on top",
+            Self::HideWhenMinimized => "Hide when minimized",
             Self::CheckUpdates => "Check for updates automatically",
             Self::DownloadUpdates => "Download updates automatically",
             Self::InstallUpdates => "Install updates automatically",
@@ -157,6 +216,14 @@ impl Toggle {
             (Self::AnimateRows, _, _) => {
                 "Rows slide to their new place when the table re-sorts, instead of \
                  jumping there."
+            }
+            (Self::AlwaysOnTop, _, _) => {
+                "Keeps the window above every other, so it stays in view while you \
+                 work in the program you are watching."
+            }
+            (Self::HideWhenMinimized, _, _) => {
+                "Minimizing takes the window off the taskbar; the icon in the \
+                 notification area, with its CPU meter, brings it back."
             }
             (Self::CheckUpdates, _, _) => {
                 "Looks on GitHub for a new release when open-task starts and once a day."
@@ -192,6 +259,8 @@ impl Toggle {
     fn get(self, s: Settings, cx: Context<'_>) -> bool {
         match self {
             Self::AnimateRows => s.animates_rows(cx.system_animations),
+            Self::AlwaysOnTop => s.always_on_top,
+            Self::HideWhenMinimized => s.hide_when_minimized,
             Self::CheckUpdates => s.check_updates,
             Self::DownloadUpdates => s.download_updates,
             Self::InstallUpdates => s.install_updates,
@@ -205,6 +274,8 @@ impl Toggle {
         let on = !self.get(*s, cx);
         match self {
             Self::AnimateRows => s.animate_rows = Some(on),
+            Self::AlwaysOnTop => s.always_on_top = on,
+            Self::HideWhenMinimized => s.hide_when_minimized = on,
             Self::CheckUpdates => {
                 s.check_updates = on;
                 s.download_updates &= on;
@@ -234,6 +305,10 @@ enum Card {
     TaskManager,
     /// How fast the cycle totals fade: a number with a minus and a plus button.
     Decay,
+    /// How often the system is sampled: Task Manager's update speed, stepped.
+    Speed,
+    /// Start a copy as administrator; shown while this one is not.
+    RunAsAdministrator,
 }
 
 impl Card {
@@ -241,7 +316,8 @@ impl Card {
     fn shown(self, cx: Context<'_>) -> bool {
         match self {
             Self::TaskManager => cx.task_manager.available(),
-            Self::Toggle(_) | Self::Update | Self::Decay => true,
+            Self::RunAsAdministrator => !cx.elevated,
+            Self::Toggle(_) | Self::Update | Self::Decay | Self::Speed => true,
         }
     }
 
@@ -257,16 +333,16 @@ impl Card {
             Self::Toggle(t) => t.note(settings, cx),
             Self::Update => cx.update.note(),
             Self::TaskManager => cx.task_manager.note(scratch).then_some(scratch.as_str()),
-            Self::Decay => None,
+            Self::Decay | Self::Speed | Self::RunAsAdministrator => None,
         }
     }
 
-    /// Whether a click anywhere on the card does something now. The fade card
-    /// answers only on its two buttons.
+    /// Whether a click anywhere on the card does something now. The stepper
+    /// cards answer only on their two buttons.
     fn clickable(self, cx: Context<'_>) -> bool {
         match self {
-            Self::Decay => false,
-            Self::Toggle(_) => true,
+            Self::Decay | Self::Speed => false,
+            Self::Toggle(_) | Self::RunAsAdministrator => true,
             Self::Update => cx.update.action().is_some(),
             Self::TaskManager => !cx.task_manager.pending,
         }
@@ -274,10 +350,17 @@ impl Card {
 }
 
 /// The page, top to bottom: each section's heading and its cards.
-const SECTIONS: [(&str, &[Card]); 3] = [
+const SECTIONS: [(&str, &[Card]); 4] = [
     (
         "Process table",
-        &[Card::Toggle(Toggle::AnimateRows), Card::Decay],
+        &[Card::Toggle(Toggle::AnimateRows), Card::Decay, Card::Speed],
+    ),
+    (
+        "Window",
+        &[
+            Card::Toggle(Toggle::AlwaysOnTop),
+            Card::Toggle(Toggle::HideWhenMinimized),
+        ],
     ),
     (
         "Updates",
@@ -288,11 +371,12 @@ const SECTIONS: [(&str, &[Card]); 3] = [
             Card::Toggle(Toggle::InstallUpdates),
         ],
     ),
-    ("Windows", &[Card::TaskManager]),
+    ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
 ];
-const CARD_COUNT: usize = 7;
-/// The fade card's place among the cards.
+const CARD_COUNT: usize = 11;
+/// The fade card's place among the cards, and the speed card's.
 const DECAY_CARD: usize = 1;
+const SPEED_CARD: usize = 2;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -330,8 +414,9 @@ pub(crate) struct SettingsPage {
     /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
-    /// The fade card's minus and plus buttons, and the one under the pointer.
-    steppers: [Rect; 2],
+    /// The fade card's minus and plus buttons, then the speed card's, and the
+    /// one under the pointer.
+    steppers: [Rect; 4],
     hover_step: Option<usize>,
     /// Where the sections scroll: the page below its title.
     view: Rect,
@@ -355,7 +440,8 @@ impl SettingsPage {
         self.cards.iter().position(|r| r.contains(p))
     }
 
-    /// The fade card's button under `p`: 0 for minus, 1 for plus.
+    /// The stepper button under `p`: 0 and 1 for the fade card's minus and plus,
+    /// 2 and 3 for the speed card's.
     fn step_at(&self, p: Point) -> Option<usize> {
         if !self.view.contains(p) {
             return None;
@@ -399,8 +485,8 @@ impl SettingsPage {
                 Some(Card::Decay) => {
                     let by = match self.step_at(at) {
                         Some(0) => -1,
-                        Some(_) => 1,
-                        None => return Reaction::NONE,
+                        Some(1) => 1,
+                        _ => return Reaction::NONE,
                     };
                     let Some(percent) = settings.decay_step(by) else {
                         return Reaction::NONE;
@@ -411,6 +497,22 @@ impl SettingsPage {
                         effect: Some(Effect::SaveSettings(*settings)),
                     }
                 }
+                Some(Card::Speed) => {
+                    let by = match self.step_at(at) {
+                        Some(2) => -1,
+                        Some(3) => 1,
+                        _ => return Reaction::NONE,
+                    };
+                    let Some(ms) = settings.speed_step(by) else {
+                        return Reaction::NONE;
+                    };
+                    settings.update_interval_ms = ms;
+                    Reaction {
+                        repaint: true,
+                        effect: Some(Effect::SaveSettings(*settings)),
+                    }
+                }
+                Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
                 Some(Card::TaskManager) | None => Reaction::NONE,
             },
             UiEvent::Wheel {
@@ -463,11 +565,15 @@ impl SettingsPage {
                 i += 1;
             }
         }
-        // The fade card's buttons, either side of its number, at its right.
-        let card = self.cards[DECAY_CARD];
-        let right = card.right() - 16.0;
-        let button = |x: f32| Rect::new(x, card.center().y - BUTTON_H * 0.5, STEP_W, BUTTON_H);
-        self.steppers = [button(right - BUTTON_W), button(right - STEP_W)];
+        // The stepper cards' buttons, either side of their value, at the right.
+        let pair = |card: Rect| {
+            let right = card.right() - 16.0;
+            let button = |x: f32| Rect::new(x, card.center().y - BUTTON_H * 0.5, STEP_W, BUTTON_H);
+            [button(right - BUTTON_W), button(right - STEP_W)]
+        };
+        let [d0, d1] = pair(self.cards[DECAY_CARD]);
+        let [s0, s1] = pair(self.cards[SPEED_CARD]);
+        self.steppers = [d0, d1, s0, s1];
         self.max_scroll = (y - view.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
         self.shift(view.y - self.scroll);
@@ -486,6 +592,7 @@ impl SettingsPage {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn paint(
         &mut self,
         dl: &mut DisplayList,
@@ -549,7 +656,7 @@ impl SettingsPage {
                         ot_core::usage::half_life(settings.usage_decay())
                     );
                     paint_text(dl, text, "How fast cycles used fade", buf, note, theme);
-                    let [minus, plus] = self.steppers;
+                    let [minus, plus, _, _] = self.steppers;
                     for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
                         let enabled = settings.decay_step(by).is_some();
                         let hover = enabled && self.hover_step == Some(i);
@@ -567,6 +674,46 @@ impl SettingsPage {
                         VAlign::Middle,
                         false,
                     );
+                }
+                Card::Speed => {
+                    use std::fmt::Write as _;
+                    buf.clear();
+                    let _ = write!(
+                        buf,
+                        "The system is sampled every {} s. Task Manager calls this {}. \
+                         Space pauses the display.",
+                        f64::from(settings.update_interval_ms) / 1000.0,
+                        settings.speed_label().to_ascii_lowercase()
+                    );
+                    paint_text(dl, text, "Update speed", buf, note, theme);
+                    let [_, _, minus, plus] = self.steppers;
+                    for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
+                        let enabled = settings.speed_step(by).is_some();
+                        let hover = enabled && self.hover_step == Some(i + 2);
+                        paint_stepper(dl, r, by > 0, enabled, hover, theme);
+                    }
+                    let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
+                    dl.text(
+                        settings.speed_label(),
+                        value,
+                        theme.cell_num,
+                        theme.text,
+                        HAlign::Center,
+                        VAlign::Middle,
+                        false,
+                    );
+                }
+                Card::RunAsAdministrator => {
+                    paint_text(
+                        dl,
+                        text,
+                        "Run as administrator",
+                        "Starts a copy with administrator rights, which can read every \
+                         process, sample CPU, and start and stop services; this one closes.",
+                        note,
+                        theme,
+                    );
+                    paint_button(dl, control, "Restart", true, theme);
                 }
                 Card::Update => {
                     let mut title = String::new();
@@ -721,7 +868,8 @@ mod tests {
     use ot_paint::DrawCmd;
     use ot_update::{Scope, Status, Version};
 
-    const PAGE: Rect = Rect::new(0.0, 0.0, 600.0, 700.0);
+    /// Tall enough for every card at once; the scrolling test shortens it.
+    const PAGE: Rect = Rect::new(0.0, 0.0, 600.0, 1100.0);
 
     fn texts(dl: &DisplayList) -> Vec<String> {
         dl.cmds()
@@ -756,15 +904,17 @@ mod tests {
     };
 
     fn cx(system_animations: bool, update: &UpdateView) -> Context<'_> {
+        // Elevated: the Run as administrator card is out of the way.
         Context {
             system_animations,
             update,
             task_manager: &NO_TASK_MANAGER,
+            elevated: true,
         }
     }
 
     /// The Task Manager card's place among the cards.
-    const TASK_MANAGER: usize = 6;
+    const TASK_MANAGER: usize = 9;
 
     fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
         Context {
@@ -883,7 +1033,7 @@ mod tests {
         ] {
             assert!(strings.iter().any(|t| t == expected), "{expected}");
         }
-        let card = page.cards[2].center();
+        let card = page.cards[5].center();
         let r = click(&mut page, card, &mut s, cx(true, &update));
         assert_eq!(r.effect, Some(Effect::Update(UpdateAction::Check)));
         assert_eq!(s, Settings::default(), "no setting changed");
@@ -909,18 +1059,18 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[3]), "On");
-        assert_eq!(state_of(&dl, page.cards[4]), "Off");
+        assert_eq!(state_of(&dl, page.cards[6]), "On");
+        assert_eq!(state_of(&dl, page.cards[7]), "Off");
         // A copy that cannot install says so, once, on the update card.
         let note = update.note().unwrap();
         assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
 
-        let at = page.cards[3].center();
+        let at = page.cards[6].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[4].center();
+        let at = page.cards[7].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
         assert!(s.check_updates, "downloading needs checking");
@@ -932,27 +1082,27 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[5]), "Off");
+        assert_eq!(state_of(&dl, page.cards[8]), "Off");
         assert!(texts(&dl)
             .iter()
             .any(|t| t == "Install updates automatically"));
 
         // On: downloading and checking come with it.
         s.check_updates = false;
-        let at = page.cards[5].center();
+        let at = page.cards[8].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.install_updates && s.download_updates && s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         // Downloading off: installing goes too, checking stays.
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[4].center();
+        let at = page.cards[7].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.download_updates && !s.install_updates && s.check_updates);
         // Checking off takes everything with it.
         s.download_updates = true;
         s.install_updates = true;
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[3].center();
+        let at = page.cards[6].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
     }
@@ -983,7 +1133,7 @@ mod tests {
             cx,
         );
         assert_eq!(r, Reaction::NONE);
-        let [minus, plus] = page.steppers;
+        let [minus, plus, _, _] = page.steppers;
         assert!(card.contains(minus.center()) && card.contains(plus.center()));
         let r = click(&mut page, plus.center(), &mut s, cx);
         assert_eq!(s.usage_decay_percent, 7);

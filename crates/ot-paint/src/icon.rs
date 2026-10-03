@@ -18,15 +18,33 @@ pub enum Icon {
     Settings,
     /// Two arrows in a circle: updates, as Windows draws Windows Update.
     Update,
+    /// Two people: the Users page.
+    Users,
+    /// A wrench or gears: the Services page.
+    Services,
+    /// A power symbol: the Startup page.
+    Startup,
+    /// A globe or network: the Connections page.
+    Connections,
+    /// A box: the Installed apps page.
+    Apps,
+    /// A monitor: the System page.
+    System,
 }
 
 impl Icon {
     /// Every icon, for backends that want to check their mapping is complete.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 11] = [
         Self::Menu,
         Self::Processes,
         Self::Performance,
         Self::Settings,
         Self::Update,
+        Self::Users,
+        Self::Services,
+        Self::Startup,
+        Self::Connections,
+        Self::Apps,
+        Self::System,
     ];
 }

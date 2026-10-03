@@ -19,6 +19,15 @@
 //! time budget allows and from a queue over the following passes otherwise, so a
 //! first pass over hundreds of processes stays quick.
 //!
+//! What a process is to a person (app, background, part of Windows) and whether it
+//! is responding come from the desktop's window list ([`windows_list`]), walked
+//! once per pass. Whether it is suspended comes from its threads' wait reasons,
+//! which the same system query already carries. Efficiency mode is the one fact
+//! that needs a handle and changes while a process runs: it is re-read on a
+//! round-robin of [`ECO_PER_PASS`] processes per pass, so every process is current
+//! within a quarter minute on a busy machine, and at once for a process whose base
+//! priority just changed, since turning efficiency mode on sets idle priority.
+//!
 //! # Known gaps (tracked in the plan)
 //! - Only the first processor group (up to 64 logical processors) is sampled.
 //! - Per-core frequency is not reported. `CallNtPowerInformation` is known to be
@@ -48,8 +57,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, GetSystemInfo, GlobalMemoryStatusEx, RelationProcessorCore,
-    MEMORYSTATUSEX, SYSTEM_INFO, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    GetLogicalProcessorInformationEx, GetSystemInfo, GetWindowsDirectoryW, GlobalMemoryStatusEx,
+    RelationProcessorCore, MEMORYSTATUSEX, SYSTEM_INFO, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
 
@@ -79,13 +88,24 @@ mod volumes;
 mod windows_list;
 
 pub use control::WindowsControl;
+
+/// Whether this process runs with administrator rights (an elevated token).
+#[must_use]
+pub fn is_elevated() -> bool {
+    access::is_elevated()
+}
+use battery::BatteryProbe;
 use counters::{DiskRates, PerfCounters};
 use details::DetailProbe;
+use gpu::GpuProbe;
 use network::NetProbe;
 use nt::{SystemProcessInformation, SystemThreadInformation};
 pub use profile::WindowsSampler;
 use services::ServiceProbe;
+use sessions::SessionProbe;
 use tags::{OwnedHandle, TagProbe};
+use volumes::VolumeProbe;
+use windows_list::WindowList;
 
 /// Difference between the Windows FILETIME epoch (1601-01-01) and the Unix epoch, in
 /// 100 ns units.
@@ -100,6 +120,28 @@ const DETAIL_BUDGET: Duration = Duration::from_millis(20);
 /// Hard cap on thread rows per pass, so a runaway process cannot make the snapshot
 /// arbitrarily large. Processes past the cap report no thread rows that pass.
 const MAX_THREAD_ROWS: usize = 65_536;
+
+/// Processes whose efficiency mode is re-read each pass, as a window that moves
+/// through the list: 600 processes are all current again within 15 passes. A read
+/// is one `OpenProcess` and one `GetProcessInformation`, a few tens of
+/// microseconds.
+const ECO_PER_PASS: usize = 40;
+/// Hard cap on efficiency-mode reads per pass, window plus the processes read out
+/// of turn (new ones, and ones whose base priority changed), so the handle count
+/// per pass is bounded whatever the machine is doing.
+const ECO_MAX_PER_PASS: usize = 2 * ECO_PER_PASS;
+/// Time per pass spent in efficiency-mode reads themselves, counted separately
+/// from `DETAIL_BUDGET` so neither starves the other: a first pass spends its
+/// whole detail budget in the same loop, and a deadline would have passed before
+/// the first read.
+const ECO_BUDGET: Duration = Duration::from_millis(5);
+
+/// `KWAIT_REASON` values for a thread suspended by `SuspendThread` or
+/// `NtSuspendProcess`: `Suspended` and `WrSuspended`.
+const WAIT_REASON_SUSPENDED: u32 = 5;
+const WAIT_REASON_WR_SUSPENDED: u32 = 12;
+/// `KTHREAD_STATE` for a waiting thread.
+const THREAD_STATE_WAITING: u32 = 5;
 
 /// Raw monotonic counters from the previous pass, per process.
 #[derive(Debug, Clone, Copy, Default)]
@@ -146,6 +188,12 @@ struct Tracked {
     /// are available. `tag_tried` stops a refused open from being retried.
     tag_handle: Option<OwnedHandle>,
     tag_tried: bool,
+    /// Efficiency mode as last read; `None` until read, or when it cannot be.
+    eco: Option<bool>,
+    /// Read out of turn next pass: never read yet, or the base priority changed.
+    eco_dirty: bool,
+    /// `BasePriority` last pass, to notice a change.
+    base_priority: i32,
 }
 
 /// Per-core raw times from the previous pass.
@@ -220,6 +268,19 @@ pub struct WindowsProbe {
     /// Facts per disk number, read once per disk.
     disk_infos: HashMap<u32, Arc<ot_model::device::DiskInfo>>,
     net: NetProbe,
+    /// The graphics adapters' counters, when this machine has them.
+    gpu: Option<GpuProbe>,
+    battery: BatteryProbe,
+    volumes: VolumeProbe,
+    sessions: SessionProbe,
+    /// The desktop's app windows, refreshed once per pass.
+    windows: WindowList,
+    /// `C:\Windows`, without a trailing separator, for telling a Windows process
+    /// from a background one.
+    windows_dir: String,
+    /// Where the efficiency-mode window starts next pass, as an index into the
+    /// pass's process list.
+    eco_cursor: usize,
     last_pass: Option<Instant>,
     pass: u64,
 }
@@ -259,6 +320,13 @@ impl WindowsProbe {
             disk_rates: Vec::new(),
             disk_infos: HashMap::new(),
             net: NetProbe::default(),
+            gpu: GpuProbe::new(),
+            battery: BatteryProbe::new(),
+            volumes: VolumeProbe::new(),
+            sessions: SessionProbe::new(),
+            windows: WindowList::new(),
+            windows_dir: windows_directory(),
+            eco_cursor: 0,
             last_pass: None,
             pass: 0,
         })
@@ -378,11 +446,15 @@ impl WindowsProbe {
         let max_cpu = self.logical_count as f32 * 100.0;
         let first_pass = self.last_pass.is_none();
         let deadline = Instant::now() + DETAIL_BUDGET;
+        let mut eco_spent = Duration::ZERO;
+        let eco_window = self.eco_cursor..self.eco_cursor + ECO_PER_PASS;
+        let mut eco_reads = 0usize;
 
         out.clear();
         threads_out.clear();
         self.new_this_pass.clear();
         self.services.refresh();
+        self.windows.refresh();
 
         let base = self.proc_buf.as_ptr();
         let mut offset = 0usize;
@@ -422,6 +494,9 @@ impl WindowsProbe {
                     threads: HashMap::new(),
                     tag_handle: None,
                     tag_tried: false,
+                    eco: None,
+                    eco_dirty: true,
+                    base_priority: p.BasePriority,
                 }
             });
 
@@ -434,9 +509,28 @@ impl WindowsProbe {
                 _ => {}
             }
 
+            // Efficiency mode: in turn when the window reaches this index, at once
+            // for a process never read or whose base priority just moved (turning
+            // efficiency mode on sets idle priority), within the per-pass cap.
+            if entry.base_priority != p.BasePriority {
+                entry.base_priority = p.BasePriority;
+                entry.eco_dirty = true;
+            }
+            if (entry.eco_dirty || eco_window.contains(&out.len()))
+                && eco_reads < ECO_MAX_PER_PASS
+                && eco_spent < ECO_BUDGET
+            {
+                let started = Instant::now();
+                entry.eco = details::efficiency_mode_of(pid);
+                entry.eco_dirty = false;
+                eco_reads += 1;
+                eco_spent += started.elapsed();
+            }
+
             // Thread rows follow the process entry in the same buffer.
             let thread_first = threads_out.len() as u32;
             let n_threads = p.NumberOfThreads as usize;
+            let mut suspended_threads = 0usize;
             let t_off = offset + size_of::<SystemProcessInformation>();
             let t_bytes = n_threads * size_of::<SystemThreadInformation>();
             let fits_entry = p.NextEntryOffset == 0
@@ -457,7 +551,7 @@ impl WindowsProbe {
                         n_threads,
                     )
                 };
-                sample_threads(
+                suspended_threads = sample_threads(
                     entry,
                     pid,
                     ts,
@@ -472,6 +566,9 @@ impl WindowsProbe {
                     threads_out,
                 );
             }
+            // Suspended means every thread is: a process with one suspended thread
+            // and others running is working.
+            let suspended = n_threads > 0 && suspended_threads == n_threads;
             let thread_rows = threads_out.len() as u32 - thread_first;
             // A freshly inserted entry already carries this pass number.
             let seen_before = entry.last_seen != pass;
@@ -494,6 +591,7 @@ impl WindowsProbe {
                 )
             };
 
+            let gpu = self.gpu.as_ref().and_then(|g| g.process_gpu(pid));
             out.push(ProcessSample {
                 statics: Arc::clone(&entry.statics),
                 cpu,
@@ -509,10 +607,11 @@ impl WindowsProbe {
                 threads: p.NumberOfThreads,
                 handles: p.HandleCount,
                 power: None,
-                gpu: None,
-                suspended: false,
-                efficiency_mode: None,
-                window: None,
+                gpu: gpu.as_ref().map(|(share, _)| *share),
+                suspended,
+                efficiency_mode: entry.eco,
+                window: self.windows.window_of(pid),
+                // Decided after the pass, once late details have been applied.
                 kind: ProcessKind::Background,
                 priority: Priority::from_base(p.BasePriority),
                 page_faults: p.PageFaultCount,
@@ -528,7 +627,7 @@ impl WindowsProbe {
                     write_bytes: Bytes(p.WriteTransferCount as u64),
                     other_bytes: Bytes(p.OtherTransferCount as u64),
                 },
-                gpu_engine: None,
+                gpu_engine: gpu.map(|(_, label)| label),
                 services: Arc::clone(&entry.services),
                 thread_first,
                 thread_rows,
@@ -542,6 +641,15 @@ impl WindowsProbe {
 
         self.resolve_parents(out);
         self.collect_pending_details(out, deadline);
+        for s in out.iter_mut() {
+            s.kind = kind_of(&s.statics, s.window.is_some(), &self.windows_dir);
+        }
+        // Move the efficiency-mode window on, wrapping at the end of the list.
+        self.eco_cursor = if eco_window.end >= out.len() {
+            0
+        } else {
+            eco_window.end
+        };
 
         // Reap processes that were not in this pass. Their statics Arcs may still be
         // held by history buffers upstream; that is fine and intended.
@@ -689,7 +797,7 @@ impl SystemProbe for WindowsProbe {
             per_process_cpu: true,
             per_process_disk: true,
             per_process_network: false,
-            per_process_gpu: false,
+            per_process_gpu: self.gpu.is_some(),
             per_process_power: false,
             core_frequency: self.hardware.base_frequency.is_some()
                 && self.counters.as_ref().is_some_and(PerfCounters::has_clock),
@@ -700,9 +808,9 @@ impl SystemProbe for WindowsProbe {
             services: self.services.available(),
             service_tags: self.tags.is_some(),
             cpu_sampling: self.can_sample,
-            gpu: false,
-            sessions: false,
-            service_list: false,
+            gpu: self.gpu.is_some(),
+            sessions: true,
+            service_list: self.services.available(),
             elevated: access::is_elevated(),
         }
     }
@@ -722,6 +830,10 @@ impl SystemProbe for WindowsProbe {
             }
         }
 
+        // The GPU counters go before the processes, which take their share from them.
+        if let Some(g) = self.gpu.as_mut() {
+            g.sample(&mut out.gpus);
+        }
         self.sample_cores(&mut out.cpu)?;
         self.sample_processes(&mut out.processes, &mut out.threads, wall_100ns)?;
         out.memory = sample_memory()?;
@@ -734,6 +846,10 @@ impl SystemProbe for WindowsProbe {
             self.sample_disks(&mut out.disks);
         }
         self.net.sample(&mut out.adapters);
+        out.battery = self.battery.sample();
+        self.volumes.sample(&mut out.volumes);
+        self.sessions.sample(&mut out.sessions);
+        out.services = self.services.list();
 
         self.last_pass = Some(now);
         Ok(())
@@ -753,7 +869,8 @@ struct ThreadPass {
 }
 
 /// Difference each thread's CPU time against the previous pass, read service tags
-/// for a service host when possible, and append the rows.
+/// for a service host when possible, and append the rows. Returns how many of the
+/// threads are suspended, for the process's suspended flag.
 ///
 /// Thread identity is `(tid, CreateTime)`: a TID recycled within the same process
 /// starts over rather than inheriting the old thread's counters or tag.
@@ -764,15 +881,21 @@ fn sample_threads(
     pp: ThreadPass,
     mut tags: Option<&mut TagProbe>,
     out: &mut Vec<ThreadSample>,
-) {
+) -> usize {
     // Tags are only meaningful in a service host, and only readable when elevated.
     let want_tags = !entry.services.is_empty() && tags.is_some();
     if want_tags && entry.tag_handle.is_none() && !entry.tag_tried {
         entry.tag_tried = true;
         entry.tag_handle = TagProbe::open(pid);
     }
+    let mut suspended = 0usize;
 
     for t in ts {
+        if t.ThreadState == THREAD_STATE_WAITING
+            && (t.WaitReason == WAIT_REASON_SUSPENDED || t.WaitReason == WAIT_REASON_WR_SUSPENDED)
+        {
+            suspended += 1;
+        }
         let tid = t.ClientId.UniqueThread.0 as usize as u32;
         let birth = t.CreateTime as u64;
         let cpu_now = (t.KernelTime as u64).wrapping_add(t.UserTime as u64);
@@ -839,6 +962,55 @@ fn sample_threads(
         });
     }
     entry.threads.retain(|_, t| t.last_seen == pp.pass);
+    suspended
+}
+
+/// What a process is to a person, by Task Manager's rule: an app has a window; a
+/// Windows process is a system image (under the Windows directory, or with no
+/// readable path at all: the idle process, the kernel) run by a system account
+/// (`SYSTEM`, `LOCAL SERVICE`, `NETWORK SERVICE`, or System integrity); everything
+/// else is background. A process that refused even a limited handle, so its
+/// account is unknown, counts as Windows when its image is a system one: only
+/// another account's or a protected process refuses, and a protected process is
+/// Windows.
+fn kind_of(s: &ProcessStatic, has_window: bool, windows_dir: &str) -> ProcessKind {
+    if has_window {
+        return ProcessKind::App;
+    }
+    let system_account = s.integrity == Integrity::System
+        || s.user.as_deref().is_some_and(|u| {
+            u.eq_ignore_ascii_case("SYSTEM")
+                || u.eq_ignore_ascii_case("LOCAL SERVICE")
+                || u.eq_ignore_ascii_case("NETWORK SERVICE")
+        });
+    let system_image = s.image_path.as_deref().map(|p| is_under(p, windows_dir));
+    let unknown_account = s.user.is_none() && s.integrity == Integrity::Unknown;
+    match (system_account, system_image) {
+        (true, None | Some(true)) => ProcessKind::Windows,
+        (false, Some(true)) if unknown_account => ProcessKind::Windows,
+        _ => ProcessKind::Background,
+    }
+}
+
+/// Whether `path` is inside directory `dir` (no trailing separator), comparing
+/// ASCII case-insensitively as the file system does.
+fn is_under(path: &str, dir: &str) -> bool {
+    path.get(..dir.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(dir))
+        && path[dir.len()..].starts_with('\\')
+}
+
+/// `C:\Windows`, without a trailing separator; empty if it cannot be read, in
+/// which case nothing is under it.
+fn windows_directory() -> String {
+    let mut buf = [0u16; 512];
+    // SAFETY: the buffer is passed with its length.
+    let n = unsafe { GetWindowsDirectoryW(Some(&mut buf)) } as usize;
+    if n == 0 || n >= buf.len() {
+        return String::new();
+    }
+    let dir = String::from_utf16_lossy(&buf[..n]);
+    dir.trim_end_matches('\\').to_owned()
 }
 
 /// Build the immutable half of a process record from its first observation.
@@ -1037,6 +1209,175 @@ pub(super) fn unicode_to_string(u: &UNICODE_STRING) -> String {
     String::from_utf16_lossy(units)
 }
 
+/// The PID of a running process by image name (case-insensitive), from one
+/// `SystemProcessInformation` read; the first match. For tests that need a known
+/// process (Explorer, in a desktop session).
+#[cfg(test)]
+pub(super) fn find_pid_by_name(name: &str) -> Option<u32> {
+    let mut buf = AlignedBuf::default();
+    let len = query_growing(
+        SystemProcessInformation,
+        &mut buf,
+        "SystemProcessInformation",
+    )
+    .ok()?;
+    let base = buf.as_ptr();
+    let mut offset = 0usize;
+    while offset + size_of::<SystemProcessInformation>() <= len {
+        // SAFETY: within the bytes the kernel wrote, at an 8-byte-aligned offset.
+        let p = unsafe { &*base.byte_add(offset).cast::<SystemProcessInformation>() };
+        if unicode_to_string(&p.ImageName).eq_ignore_ascii_case(name) {
+            return Some(p.UniqueProcessId.0 as usize as u32);
+        }
+        if p.NextEntryOffset == 0 {
+            break;
+        }
+        offset += p.NextEntryOffset as usize;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn statics(user: Option<&str>, integrity: Integrity, path: Option<&str>) -> ProcessStatic {
+        ProcessStatic {
+            user: user.map(str::to_owned),
+            integrity,
+            image_path: path.map(str::to_owned),
+            ..ProcessStatic::default()
+        }
+    }
+
+    #[test]
+    fn kinds_follow_task_manager() {
+        let win = "C:\\Windows";
+        let svchost = Some("c:\\windows\\system32\\svchost.exe");
+        let chrome = Some("C:\\Program Files\\Google\\Chrome\\chrome.exe");
+        // A window makes an app whoever runs it.
+        assert_eq!(
+            kind_of(
+                &statics(Some("SYSTEM"), Integrity::System, svchost),
+                true,
+                win
+            ),
+            ProcessKind::App
+        );
+        // System accounts running system images are Windows.
+        for user in ["SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"] {
+            assert_eq!(
+                kind_of(&statics(Some(user), Integrity::System, svchost), false, win),
+                ProcessKind::Windows
+            );
+        }
+        // The idle process and the kernel: SYSTEM with no path.
+        assert_eq!(
+            kind_of(
+                &statics(Some("SYSTEM"), Integrity::System, None),
+                false,
+                win
+            ),
+            ProcessKind::Windows
+        );
+        // A system account running something from elsewhere is background.
+        assert_eq!(
+            kind_of(
+                &statics(Some("SYSTEM"), Integrity::System, chrome),
+                false,
+                win
+            ),
+            ProcessKind::Background
+        );
+        // A user running a system image (cmd.exe) is background.
+        assert_eq!(
+            kind_of(
+                &statics(
+                    Some("cameron"),
+                    Integrity::Medium,
+                    Some("C:\\Windows\\System32\\cmd.exe")
+                ),
+                false,
+                win
+            ),
+            ProcessKind::Background
+        );
+        // Details not collected yet: background until known.
+        assert_eq!(
+            kind_of(&statics(None, Integrity::Unknown, None), false, win),
+            ProcessKind::Background
+        );
+        // Refused a handle, but a system image: Windows.
+        assert_eq!(
+            kind_of(&statics(None, Integrity::Unknown, svchost), false, win),
+            ProcessKind::Windows
+        );
+        // `C:\Windows.old\...` is not under `C:\Windows`.
+        assert_eq!(
+            kind_of(
+                &statics(
+                    Some("SYSTEM"),
+                    Integrity::System,
+                    Some("C:\\Windows.old\\x.exe")
+                ),
+                false,
+                win
+            ),
+            ProcessKind::Background
+        );
+    }
+
+    #[test]
+    fn the_windows_directory_is_known() {
+        let dir = windows_directory();
+        assert!(dir.to_ascii_lowercase().ends_with("\\windows"), "{dir}");
+        assert!(!dir.ends_with('\\'));
+    }
+
+    /// A full pass on this machine: our own process is not an app (a test binary
+    /// has no window), something is a Windows process, and a suspended child shows
+    /// as suspended.
+    #[test]
+    fn a_pass_fills_in_kinds_and_suspension() {
+        use crate::ProcessControl;
+        let mut probe = WindowsProbe::new().expect("probe");
+        let mut out = ProbeOutput::default();
+        let child = control::tests::quiet_child();
+        let key = control::tests::key_of(child.pid());
+        // A process a few milliseconds old still has threads starting up, not yet
+        // in any wait; let it settle, and give the suspension a moment to land on
+        // every thread.
+        std::thread::sleep(Duration::from_millis(250));
+        WindowsControl.suspend(key).expect("suspend");
+        std::thread::sleep(Duration::from_millis(50));
+        probe.sample(&mut out).expect("pass");
+        let me = out
+            .processes
+            .iter()
+            .find(|p| p.key().pid == std::process::id())
+            .expect("own process in the list");
+        assert_eq!(me.kind, ProcessKind::Background);
+        assert!(me.window.is_none());
+        assert!(!me.suspended);
+        assert!(out.processes.iter().any(|p| p.kind == ProcessKind::Windows));
+        let kernel = out
+            .processes
+            .iter()
+            .find(|p| p.key().pid == 4)
+            .expect("the kernel");
+        assert_eq!(kernel.kind, ProcessKind::Windows);
+        let suspended = out
+            .processes
+            .iter()
+            .find(|p| p.key() == key)
+            .expect("the child in the list");
+        assert!(suspended.suspended, "{suspended:?}");
+        WindowsControl.resume(key).expect("resume");
+        // The first pass reads efficiency mode for the first processes in the list.
+        assert!(out.processes.iter().any(|p| p.efficiency_mode.is_some()));
+    }
+}
+
 #[cfg(test)]
 mod cost {
     //! What a sampling pass costs, piece by piece. Ignored by default because it
@@ -1070,19 +1411,63 @@ mod cost {
         time("performance counters", 30, || {
             c.collect();
         });
+        let mut windows = WindowList::new();
+        time("window list", 30, || windows.refresh());
+        let pids: Vec<u32> = {
+            let mut buf = AlignedBuf::default();
+            let len = query_growing(
+                SystemProcessInformation,
+                &mut buf,
+                "SystemProcessInformation",
+            )
+            .expect("process list");
+            let mut pids = Vec::new();
+            let mut offset = 0usize;
+            while offset + size_of::<SystemProcessInformation>() <= len {
+                // SAFETY: within the bytes the kernel wrote, 8-byte aligned.
+                let p = unsafe {
+                    &*buf
+                        .as_ptr()
+                        .byte_add(offset)
+                        .cast::<SystemProcessInformation>()
+                };
+                pids.push(p.UniqueProcessId.0 as usize as u32);
+                if p.NextEntryOffset == 0 {
+                    break;
+                }
+                offset += p.NextEntryOffset as usize;
+            }
+            pids
+        };
+        let batch: Vec<u32> = pids.iter().copied().take(ECO_PER_PASS).collect();
+        time("efficiency mode, one window", 30, || {
+            for &pid in &batch {
+                let _ = details::efficiency_mode_of(pid);
+            }
+        });
         let mut probe = WindowsProbe::new().expect("probe");
         let mut out = ProbeOutput::default();
         probe.sample(&mut out).expect("first pass");
+        // Details (and now version resources) take a few passes to collect for
+        // every process; the steady state starts once the queue is empty.
+        let mut warm = 1;
+        while !probe.pending_details.is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+            probe.sample(&mut out).expect("warm-up pass");
+            warm += 1;
+        }
+        println!("({warm} passes to collect every process's details)");
         std::thread::sleep(Duration::from_millis(300));
         time("whole pass", 20, || {
             probe.sample(&mut out).expect("pass");
         });
         println!(
-            "({} processes, {} threads, {} disks, {} adapters)",
+            "({} processes, {} threads, {} disks, {} adapters, {} with a window)",
             out.processes.len(),
             out.threads.len(),
             out.disks.len(),
-            out.adapters.len()
+            out.adapters.len(),
+            out.processes.iter().filter(|p| p.window.is_some()).count()
         );
     }
 }

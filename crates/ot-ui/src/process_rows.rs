@@ -29,26 +29,54 @@ use crate::format;
 use crate::steady::{Band, Steady};
 use crate::table::{Column, RowId, RowSource};
 
-/// Process table columns, in display order.
+/// Process table columns, by index into [`columns`]. The first dozen are shown
+/// unless turned off; the rest wait in the column chooser, as on Task Manager's
+/// Details page.
 pub(crate) mod col {
     pub const NAME: usize = 0;
     pub const PID: usize = 1;
-    pub const USER: usize = 2;
-    pub const CPU: usize = 3;
-    pub const CYCLES: usize = 4;
-    pub const MEMORY: usize = 5;
-    pub const WORKING_SET: usize = 6;
-    pub const DISK_READ: usize = 7;
-    pub const DISK_WRITE: usize = 8;
-    pub const THREADS: usize = 9;
-    pub const HANDLES: usize = 10;
-    pub const COMMAND_LINE: usize = 11;
+    pub const STATUS: usize = 2;
+    pub const USER: usize = 3;
+    pub const CPU: usize = 4;
+    pub const CYCLES: usize = 5;
+    pub const MEMORY: usize = 6;
+    pub const WORKING_SET: usize = 7;
+    pub const DISK_READ: usize = 8;
+    pub const DISK_WRITE: usize = 9;
+    pub const GPU: usize = 10;
+    pub const THREADS: usize = 11;
+    pub const HANDLES: usize = 12;
+    pub const DESCRIPTION: usize = 13;
+    pub const COMMAND_LINE: usize = 14;
+    pub const GPU_ENGINE: usize = 15;
+    pub const KIND: usize = 16;
+    pub const COMPANY: usize = 17;
+    pub const PRIORITY: usize = 18;
+    pub const ARCHITECTURE: usize = 19;
+    pub const SESSION: usize = 20;
+    pub const ELEVATED: usize = 21;
+    pub const CPU_TIME: usize = 22;
+    pub const STARTED: usize = 23;
+    pub const PAGE_FAULTS: usize = 24;
+    pub const PEAK_WORKING_SET: usize = 25;
+    pub const VIRTUAL_SIZE: usize = 26;
+    pub const PAGED_POOL: usize = 27;
+    pub const NONPAGED_POOL: usize = 28;
+    pub const IO_READS: usize = 29;
+    pub const IO_WRITES: usize = 30;
+    pub const IO_OTHER: usize = 31;
+    pub const IO_READ_BYTES: usize = 32;
+    pub const IO_WRITE_BYTES: usize = 33;
+    pub const IO_OTHER_BYTES: usize = 34;
+    pub const IMAGE_PATH: usize = 35;
+    pub const WINDOW: usize = 36;
 }
 
 pub(crate) fn columns() -> Vec<Column> {
     vec![
         Column::text("Name", 300.0),
         Column::number("PID", 70.0),
+        Column::text("Status", 100.0),
         Column::text("User", 110.0),
         Column::number("CPU %", 70.0),
         Column::number("Cycles", 75.0),
@@ -56,10 +84,80 @@ pub(crate) fn columns() -> Vec<Column> {
         Column::number("Working set", 95.0),
         Column::number("Disk read", 95.0),
         Column::number("Disk write", 95.0),
+        Column::number("GPU %", 70.0),
         Column::number("Threads", 70.0),
         Column::number("Handles", 75.0),
+        Column::text("Description", 200.0),
         Column::text("Command line", 480.0),
+        Column::text("GPU engine", 110.0).hidden(),
+        Column::text("Type", 90.0).hidden(),
+        Column::text("Company", 160.0).hidden(),
+        Column::text("Priority", 100.0).hidden(),
+        Column::text("Architecture", 90.0).hidden(),
+        Column::number("Session", 70.0).hidden(),
+        Column::text("Elevated", 70.0).hidden(),
+        Column::number("CPU time", 95.0).hidden(),
+        Column::number("Started", 110.0).hidden(),
+        Column::number("Page faults", 95.0).hidden(),
+        Column::number("Peak working set", 115.0).hidden(),
+        Column::number("Virtual size", 95.0).hidden(),
+        Column::number("Paged pool", 90.0).hidden(),
+        Column::number("NP pool", 90.0).hidden(),
+        Column::number("I/O reads", 90.0).hidden(),
+        Column::number("I/O writes", 90.0).hidden(),
+        Column::number("I/O other", 90.0).hidden(),
+        Column::number("I/O read bytes", 110.0).hidden(),
+        Column::number("I/O write bytes", 110.0).hidden(),
+        Column::number("I/O other bytes", 110.0).hidden(),
+        Column::text("Image path", 320.0).hidden(),
+        Column::text("Window title", 220.0).hidden(),
     ]
+}
+
+/// The Status cell: what is wrong, or special, about a process right now.
+pub(crate) fn status_label(p: &ProcessSample) -> &'static str {
+    if p.window.as_ref().is_some_and(|w| w.hung) {
+        "Not responding"
+    } else if p.suspended {
+        "Suspended"
+    } else if p.efficiency_mode == Some(true) {
+        "Efficiency mode"
+    } else {
+        ""
+    }
+}
+
+/// `Yes` for a process running with administrator or system rights.
+fn elevated_label(p: &ProcessSample) -> &'static str {
+    match p.statics.integrity {
+        ot_model::process::Integrity::High | ot_model::process::Integrity::System => "Yes",
+        ot_model::process::Integrity::Low | ot_model::process::Integrity::Medium => "No",
+        ot_model::process::Integrity::Unknown => "",
+    }
+}
+
+/// A process's own figure in a numeric column that is not rolled up through the
+/// tree: the cumulative counters, sizes and times from the Details page. `None`
+/// for the columns handled elsewhere and for the text columns.
+fn own_figure(p: &ProcessSample, column: usize) -> Option<f64> {
+    Some(match column {
+        col::GPU => f64::from(p.gpu?.get()),
+        col::SESSION => f64::from(p.statics.session_id),
+        col::CPU_TIME => p.cpu_time.as_secs_f64(),
+        col::STARTED => p.statics.started_unix_ms? as f64,
+        col::PAGE_FAULTS => f64::from(p.page_faults),
+        col::PEAK_WORKING_SET => p.peak_working_set.get() as f64,
+        col::VIRTUAL_SIZE => p.virtual_size.get() as f64,
+        col::PAGED_POOL => p.paged_pool.get() as f64,
+        col::NONPAGED_POOL => p.nonpaged_pool.get() as f64,
+        col::IO_READS => p.io.reads as f64,
+        col::IO_WRITES => p.io.writes as f64,
+        col::IO_OTHER => p.io.other as f64,
+        col::IO_READ_BYTES => p.io.read_bytes.get() as f64,
+        col::IO_WRITE_BYTES => p.io.write_bytes.get() as f64,
+        col::IO_OTHER_BYTES => p.io.other_bytes.get() as f64,
+        _ => return None,
+    })
 }
 
 /// ASCII case-insensitive substring test. `needle` must already be lower-case.
@@ -622,7 +720,7 @@ impl Layout {
     }
 }
 
-fn hash_str(s: &str) -> u64 {
+pub(crate) fn hash_str(s: &str) -> u64 {
     // FNV-1a; short strings, stability across runs is all that matters.
     s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -653,6 +751,8 @@ pub(crate) struct ProcessRows<'a> {
     pub tree_mode: bool,
     /// Sticky sort keys; `None` sorts by the exact values.
     pub steady: Option<&'a Steady>,
+    /// When the snapshot was taken, for the Started column's "ago".
+    pub now_unix_ms: i64,
 }
 
 /// The dead band a numeric column's sort keys get, so noise does not reorder rows
@@ -661,7 +761,7 @@ pub(crate) struct ProcessRows<'a> {
 pub(crate) fn band(column: usize) -> Option<Band> {
     const MIB: f64 = 1024.0 * 1024.0;
     match column {
-        col::CPU => Some(Band {
+        col::CPU | col::GPU => Some(Band {
             abs: 1.0,
             rel: 0.15,
         }),
@@ -684,6 +784,28 @@ pub(crate) fn band(column: usize) -> Option<Band> {
             abs: 2.0,
             rel: 0.02,
         }),
+        // Sizes that drift: the same band as memory.
+        col::PEAK_WORKING_SET | col::VIRTUAL_SIZE | col::PAGED_POOL | col::NONPAGED_POOL => {
+            Some(Band {
+                abs: MIB,
+                rel: 0.02,
+            })
+        }
+        // Cumulative counters only grow; a small relative band keeps a busy
+        // process from leapfrogging every second.
+        col::PAGE_FAULTS
+        | col::IO_READS
+        | col::IO_WRITES
+        | col::IO_OTHER
+        | col::IO_READ_BYTES
+        | col::IO_WRITE_BYTES
+        | col::IO_OTHER_BYTES
+        | col::CPU_TIME => Some(Band {
+            abs: 0.0,
+            rel: 0.05,
+        }),
+        // Exact: a session id or a start time does not move.
+        col::SESSION | col::STARTED => Some(Band { abs: 0.0, rel: 0.0 }),
         _ => None,
     }
 }
@@ -711,7 +833,7 @@ impl ProcessRows<'_> {
                         col::DISK_WRITE => ru.disk_write as f64,
                         col::THREADS => f64::from(ru.threads),
                         col::HANDLES => f64::from(ru.handles),
-                        _ => return None,
+                        _ => return own_figure(&self.procs[r.proc as usize], column),
                     }
                 } else {
                     let p = &self.procs[r.proc as usize];
@@ -724,7 +846,7 @@ impl ProcessRows<'_> {
                         col::DISK_WRITE => p.disk_write.get() as f64,
                         col::THREADS => f64::from(p.threads),
                         col::HANDLES => f64::from(p.handles),
-                        _ => return None,
+                        _ => return own_figure(p, column),
                     }
                 };
                 Some(v)
@@ -966,6 +1088,7 @@ impl RowSource for ProcessRows<'_> {
         self.layout.rows[row].id
     }
 
+    #[allow(clippy::too_many_lines)]
     fn cell(&self, row: usize, col: usize, out: &mut String) {
         let r = self.row(row);
         let p = &self.procs[r.proc as usize];
@@ -981,14 +1104,80 @@ impl RowSource for ProcessRows<'_> {
                     out.push_str(p.statics.command_line.as_deref().unwrap_or(""));
                 }
                 col::PID => format::count(out, p.key().pid),
+                col::STATUS => {
+                    out.clear();
+                    out.push_str(status_label(p));
+                }
                 col::CPU => format::percent(out, p.cpu.get()),
                 col::CYCLES => format::cycles_cell(out, self.own_cycles(r.proc as usize)),
                 col::MEMORY => format::bytes(out, p.private_bytes),
                 col::WORKING_SET => format::bytes(out, p.working_set),
                 col::DISK_READ => format::rate(out, p.disk_read, self.interval_secs),
                 col::DISK_WRITE => format::rate(out, p.disk_write, self.interval_secs),
+                col::GPU => {
+                    out.clear();
+                    if let Some(g) = p.gpu.filter(|g| g.get() > 0.0) {
+                        format::percent(out, g.get());
+                    }
+                }
+                col::GPU_ENGINE => {
+                    out.clear();
+                    out.push_str(p.gpu_engine.as_deref().unwrap_or(""));
+                }
                 col::THREADS => format::count(out, p.threads),
                 col::HANDLES => format::count(out, p.handles),
+                col::DESCRIPTION => {
+                    out.clear();
+                    out.push_str(p.statics.description.as_deref().unwrap_or(""));
+                }
+                col::COMPANY => {
+                    out.clear();
+                    out.push_str(p.statics.company.as_deref().unwrap_or(""));
+                }
+                col::KIND => {
+                    out.clear();
+                    out.push_str(p.kind.label());
+                }
+                col::PRIORITY => {
+                    out.clear();
+                    out.push_str(p.priority.label());
+                }
+                col::ARCHITECTURE => {
+                    out.clear();
+                    out.push_str(p.statics.architecture.label());
+                }
+                col::SESSION => format::count(out, p.statics.session_id),
+                col::ELEVATED => {
+                    out.clear();
+                    out.push_str(elevated_label(p));
+                }
+                col::CPU_TIME => format::hms(out, p.cpu_time.as_secs()),
+                col::STARTED => {
+                    out.clear();
+                    if let Some(started) = p.statics.started_unix_ms {
+                        let ms = (self.now_unix_ms - started).max(0) as f32;
+                        format::ago(out, ms, format::AgoFields::of(ms));
+                    }
+                }
+                col::PAGE_FAULTS => format::count(out, p.page_faults),
+                col::PEAK_WORKING_SET => format::bytes(out, p.peak_working_set),
+                col::VIRTUAL_SIZE => format::bytes(out, p.virtual_size),
+                col::PAGED_POOL => format::bytes(out, p.paged_pool),
+                col::NONPAGED_POOL => format::bytes(out, p.nonpaged_pool),
+                col::IO_READS => format::count64(out, p.io.reads),
+                col::IO_WRITES => format::count64(out, p.io.writes),
+                col::IO_OTHER => format::count64(out, p.io.other),
+                col::IO_READ_BYTES => format::bytes(out, p.io.read_bytes),
+                col::IO_WRITE_BYTES => format::bytes(out, p.io.write_bytes),
+                col::IO_OTHER_BYTES => format::bytes(out, p.io.other_bytes),
+                col::IMAGE_PATH => {
+                    out.clear();
+                    out.push_str(p.statics.image_path.as_deref().unwrap_or(""));
+                }
+                col::WINDOW => {
+                    out.clear();
+                    out.push_str(p.window.as_ref().map_or("", |w| w.title.as_str()));
+                }
                 _ => out.clear(),
             },
             RowKind::Service(k) => {
@@ -1058,6 +1247,10 @@ impl RowSource for ProcessRows<'_> {
             (RowKind::Process, col::MEMORY) => {
                 self.memory_heat(self.procs[r.proc as usize].private_bytes.get())
             }
+            (RowKind::Process, col::GPU) => self.procs[r.proc as usize]
+                .gpu
+                .filter(|g| g.get() > 0.0)
+                .map(|g| (g.get() / 100.0).min(1.0)),
             (RowKind::Process | RowKind::Sampling | RowKind::Sample | RowKind::Clients, _) => None,
             (RowKind::Service(_), col::CPU) => {
                 let known = self
@@ -1107,6 +1300,28 @@ impl RowSource for ProcessRows<'_> {
                     b.statics.command_line.as_deref(),
                 ),
                 col::PID => a.key().pid.cmp(&b.key().pid),
+                col::STATUS => cmp_ci(status_label(a), status_label(b)),
+                col::GPU_ENGINE => cmp_opt(a.gpu_engine.as_deref(), b.gpu_engine.as_deref()),
+                col::DESCRIPTION => cmp_opt(
+                    a.statics.description.as_deref(),
+                    b.statics.description.as_deref(),
+                ),
+                col::COMPANY => cmp_opt(a.statics.company.as_deref(), b.statics.company.as_deref()),
+                col::KIND => a.kind.label().cmp(b.kind.label()),
+                col::PRIORITY => a.priority.cmp(&b.priority),
+                col::ARCHITECTURE => cmp_ci(
+                    a.statics.architecture.label(),
+                    b.statics.architecture.label(),
+                ),
+                col::ELEVATED => cmp_ci(elevated_label(a), elevated_label(b)),
+                col::IMAGE_PATH => cmp_opt(
+                    a.statics.image_path.as_deref(),
+                    b.statics.image_path.as_deref(),
+                ),
+                col::WINDOW => cmp_opt(
+                    a.window.as_ref().map(|w| w.title.as_str()),
+                    b.window.as_ref().map(|w| w.title.as_str()),
+                ),
                 _ => Ordering::Equal,
             };
         }
@@ -1356,6 +1571,7 @@ pub(crate) mod tests {
             shown: &[],
             tree_mode,
             steady: None,
+            now_unix_ms: 0,
         }
     }
 

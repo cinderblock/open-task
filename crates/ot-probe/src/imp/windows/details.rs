@@ -10,15 +10,24 @@
 //! mapped from its NT device path to a drive letter. The user and command line stay
 //! unknown in that case rather than guessed.
 //!
+//! The architecture comes from `IsWow64Process2` on the same handle, and the
+//! description and company from the image's version resource ([`verinfo`]), read
+//! from the path, so they are known for a process that refused a handle too.
+//!
 //! Everything here runs once per process lifetime, under the per-pass time budget the
 //! probe enforces. Account names are cached by SID: a machine has a handful of
-//! distinct users, and `LookupAccountSidW` can go to a domain controller.
+//! distinct users, and `LookupAccountSidW` can go to a domain controller. Version
+//! strings are cached by path, since a dozen processes often share one image.
+//!
+//! Efficiency mode is the one fact here that changes while a process runs, so it
+//! has its own reader, [`efficiency_mode_of`], which the probe calls on a slow
+//! round-robin rather than once.
 
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
-use ot_model::process::{Integrity, ProcessStatic};
+use ot_model::process::{Architecture, Integrity, ProcessStatic};
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Wdk::System::SystemInformation::NtQuerySystemInformation;
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
@@ -33,13 +42,20 @@ use windows::Win32::Security::{
     SID_AND_ATTRIBUTES, SID_NAME_USE, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
-use windows::Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW};
+use windows::Win32::System::SystemInformation::{
+    ComputerNameNetBIOS, GetComputerNameExW, IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_I386,
+    IMAGE_FILE_MACHINE_UNKNOWN,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    GetProcessInformation, IsWow64Process2, OpenProcess, OpenProcessToken, ProcessPowerThrottling,
+    QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use super::nt::{SystemProcessIdInformation, SYSTEM_PROCESS_ID_INFORMATION};
+use super::verinfo::VerInfoCache;
 use super::{unicode_to_string, AlignedBuf};
 
 /// What one query learned. `None` means "could not be read"; the UI shows it blank
@@ -50,6 +66,9 @@ pub(super) struct Details {
     pub command_line: Option<String>,
     pub user: Option<String>,
     pub integrity: Integrity,
+    pub architecture: Architecture,
+    pub description: Option<String>,
+    pub company: Option<String>,
 }
 
 impl Details {
@@ -58,6 +77,84 @@ impl Details {
         s.command_line = self.command_line;
         s.user = self.user;
         s.integrity = self.integrity;
+        s.architecture = self.architecture;
+        s.description = self.description;
+        s.company = self.company;
+    }
+}
+
+/// Whether the process is under execution-speed power throttling (efficiency
+/// mode), read from a handle with `PROCESS_QUERY_LIMITED_INFORMATION`, which is
+/// enough: the `own_process_reads_its_efficiency_mode` test opens with exactly
+/// that right. `None` when the call fails (a process from before the API, or a
+/// protected one).
+///
+/// The state has two masks: `ControlMask` says which policies are set explicitly
+/// and `StateMask` which of those are on. Both set means on; the control bit
+/// alone means explicitly off; neither means the system default, which is off.
+pub(super) fn efficiency_mode(h: HANDLE) -> Option<bool> {
+    let mut state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: 0,
+        StateMask: 0,
+    };
+    // SAFETY: `state` is a valid out-struct of the size passed.
+    unsafe {
+        GetProcessInformation(
+            h,
+            ProcessPowerThrottling,
+            (&raw mut state).cast(),
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    }
+    .ok()?;
+    let on = state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED != 0
+        && state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED != 0;
+    Some(on)
+}
+
+/// [`efficiency_mode`] by PID: one `OpenProcess` with the limited right. `None`
+/// when the process cannot be opened.
+pub(super) fn efficiency_mode_of(pid: u32) -> Option<bool> {
+    if pid == 0 || pid == 4 {
+        return None;
+    }
+    // SAFETY: plain call; the handle is closed below.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let eco = efficiency_mode(h);
+    // SAFETY: `h` came from OpenProcess and is closed exactly once.
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    eco
+}
+
+/// The instruction set a process runs, from `IsWow64Process2`: the process
+/// machine is `UNKNOWN` for a native process, in which case the native machine is
+/// the answer; otherwise it is the emulated one (`I386` under WOW64, `ARMNT` or
+/// `AMD64` on ARM64 hardware).
+fn architecture(h: HANDLE) -> Architecture {
+    let mut process = IMAGE_FILE_MACHINE_UNKNOWN;
+    let mut native = IMAGE_FILE_MACHINE_UNKNOWN;
+    // SAFETY: two valid out-pointers.
+    if unsafe { IsWow64Process2(h, &raw mut process, Some(&raw mut native)) }.is_err() {
+        return Architecture::Unknown;
+    }
+    let machine = if process == IMAGE_FILE_MACHINE_UNKNOWN {
+        native
+    } else {
+        process
+    };
+    architecture_of(machine)
+}
+
+fn architecture_of(machine: IMAGE_FILE_MACHINE) -> Architecture {
+    match machine {
+        IMAGE_FILE_MACHINE_AMD64 => Architecture::X64,
+        IMAGE_FILE_MACHINE_I386 => Architecture::X86,
+        IMAGE_FILE_MACHINE_ARM64 => Architecture::Arm64,
+        IMAGE_FILE_MACHINE_ARMNT => Architecture::Arm,
+        _ => Architecture::Unknown,
     }
 }
 
@@ -106,6 +203,8 @@ pub(super) struct DetailProbe {
     /// NT device prefixes and their drive letters: `\Device\HarddiskVolume3` is `C`.
     drives: Vec<(String, char)>,
     drives_at: Instant,
+    /// Version strings by image path.
+    verinfo: VerInfoCache,
 }
 
 impl DetailProbe {
@@ -117,6 +216,7 @@ impl DetailProbe {
             nt: AlignedBuf::default(),
             drives: Vec::new(),
             drives_at: Instant::now(),
+            verinfo: VerInfoCache::new(),
         };
         p.refresh_drives();
         p
@@ -137,6 +237,7 @@ impl DetailProbe {
             Ok(h) => {
                 d.image_path = self.image_path(h);
                 d.command_line = self.command_line(h);
+                d.architecture = architecture(h);
                 self.token_details(h, &mut d);
                 // SAFETY: `h` came from OpenProcess and is closed exactly once.
                 unsafe {
@@ -144,6 +245,11 @@ impl DetailProbe {
                 }
             }
             Err(_) => d.image_path = self.image_path_by_pid(pid),
+        }
+        if let Some(path) = &d.image_path {
+            let v = self.verinfo.get(path);
+            d.description.clone_from(&v.description);
+            d.company.clone_from(&v.company);
         }
         d
     }
@@ -558,7 +664,56 @@ mod tests {
         assert!(d.command_line.is_some());
         assert!(d.user.is_some());
         assert_ne!(d.integrity, Integrity::Unknown);
+        assert_ne!(d.architecture, Architecture::Unknown);
         // Second query of the same user hits the cache.
         assert_eq!(p.names.len(), 1);
+    }
+
+    #[test]
+    fn machines_map_to_architectures() {
+        assert_eq!(architecture_of(IMAGE_FILE_MACHINE_AMD64), Architecture::X64);
+        assert_eq!(architecture_of(IMAGE_FILE_MACHINE_I386), Architecture::X86);
+        assert_eq!(
+            architecture_of(IMAGE_FILE_MACHINE_ARM64),
+            Architecture::Arm64
+        );
+        assert_eq!(architecture_of(IMAGE_FILE_MACHINE_ARMNT), Architecture::Arm);
+        assert_eq!(
+            architecture_of(IMAGE_FILE_MACHINE_UNKNOWN),
+            Architecture::Unknown
+        );
+    }
+
+    /// A test binary has no version resource, so the check runs on Explorer,
+    /// found by name in the kernel's process list. A session with no Explorer
+    /// (a service account) is skipped.
+    #[test]
+    fn a_known_image_gets_its_description_and_company() {
+        let Some(pid) = super::super::find_pid_by_name("explorer.exe") else {
+            eprintln!("no explorer.exe running; skipping");
+            return;
+        };
+        let mut p = DetailProbe::new();
+        let d = p.query(pid);
+        assert_eq!(d.description.as_deref(), Some("Windows Explorer"), "{d:?}");
+        assert!(
+            d.company
+                .as_deref()
+                .is_some_and(|c| c.contains("Microsoft")),
+            "{d:?}"
+        );
+        // The same image again is served from the cache.
+        assert_eq!(p.verinfo.len(), 1);
+        p.query(pid);
+        assert_eq!(p.verinfo.len(), 1);
+    }
+
+    #[test]
+    fn own_process_reads_its_efficiency_mode() {
+        // Nothing has put the test runner in efficiency mode.
+        assert_eq!(efficiency_mode_of(std::process::id()), Some(false));
+        // The idle process and the kernel are never asked.
+        assert_eq!(efficiency_mode_of(0), None);
+        assert_eq!(efficiency_mode_of(4), None);
     }
 }

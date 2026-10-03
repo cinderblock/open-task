@@ -9,22 +9,28 @@ paywalls, with the depth of Sysinternals Process Explorer and TMOG's "why is my
 computer slow?" diagnostics, in a native app that stays out of the way of the machine
 it is measuring.
 
-**Status: early, but real.** On Windows it opens a native window with two pages: live
-CPU and memory graphs over a sortable process table (a flat list, a process tree, a
-map or a history of who has been using the CPU), and a Performance page with a chart and the numbers for the CPU, memory, each disk
-and each network connection. Everything
-is drawn with Direct2D over a Mica backdrop. Linux and macOS compile, run headless,
-and measure nothing yet.
+**Status: real, and at Task Manager's feature set.** On Windows it opens a native
+window with eight pages: live CPU and memory graphs over a sortable process table
+(a flat list, a process tree, a map or a history of who has been using the CPU),
+Performance (CPU, memory, each disk, each network connection, each GPU and the
+battery), Users, Services, Startup apps, Connections, Installed apps and System.
+Everything is drawn with Direct2D over a Mica backdrop. Linux and macOS compile, run
+headless, and measure nothing yet. What is still missing is listed under
+[Not yet](#not-yet).
 
 ## Using it
 
-**Pages:** the rail down the left edge switches between **Processes** and
-**Performance**, with **Settings** at its bottom and the version above it, which is
-also the update button (see [Updates](#updates)). It shows labels when the window is
-wide and icons alone when it is narrow; the button at its top flips that.
-**Ctrl+Tab** and **Ctrl+Shift+Tab** step through the pages, and **Ctrl+1**,
-**Ctrl+2** jump to one. Typing (or **Ctrl+F**) on any page goes to the process
-search. Settings are kept per user, in `HKCU\Software\open-task`.
+**Pages:** the rail down the left edge switches between **Processes**,
+**Performance**, **Users**, **Services**, **Startup apps**, **Connections**,
+**Installed apps** and **System**, with **Settings** at its bottom and the version
+above it, which is also the update button (see [Updates](#updates)). It shows labels
+when the window is wide and icons alone when it is narrow; the button at its top
+flips that. **Ctrl+Tab** and **Ctrl+Shift+Tab** step through the pages, and
+**Ctrl+1** to **Ctrl+8** jump to one. Typing (or **Ctrl+F**) on any page goes to
+that page's search. **Ctrl+N** opens **Run new task**. The page, arrangement, sort
+and columns you leave open come back at the next start (`--page` and `--view` on
+the command line override that). Settings are kept per user, in
+`HKCU\Software\open-task`.
 
 **Performance** lists the devices down its left side, each with a small live graph
 and its headline number; Up and Down, or a click, pick one. The CPU pane shows its
@@ -32,17 +38,27 @@ utilization, either as one graph or as one small graph per logical processor (th
 **Overall / Logical processors** switch; on a processor with performance and
 efficiency cores the two kinds get different colors), then utilization, the current
 clock speed, processes, threads, handles and up time, next to the processor's name,
-base speed, sockets, cores, logical processors and cache sizes. The current speed is
+base speed, sockets, cores, logical processors, whether virtualization is enabled
+and a hypervisor running, and cache sizes. The current speed is
 the base clock scaled by each processor's performance counter, the way Task Manager
 computes it, so a boosting chip reads well above its base. The Memory pane shows
 memory in use over time; how physical memory divides into in use, modified (written,
 waiting to reach disk), standby (cached, reclaimable) and free; and in use,
 available, committed against the commit limit, cached, and the paged and non-paged
-kernel pools. "In use" counts modified pages, since they are not available; the bar
-shows them separately. Each **disk** gets its active time (the share of time it
-had work outstanding) and its read and write rates on one chart, with average
-response time, capacity, and whether it is an SSD; each **network connection** gets
-what it received and sent, with its link speed. Connections are the ones a person
+kernel pools, with the memory's speed, slots used, form factor and what the
+hardware reserves, from the firmware. "In use" counts modified pages, since they
+are not available; the bar shows them separately. Each **disk** gets its active
+time (the share of time it had work outstanding) and its read and write rates on
+one chart, with average response time, capacity, whether it is an SSD, its bus,
+and the volumes on it with their free space, file system and whether they hold
+Windows or a page file; each **network connection** gets what it received and sent,
+with its link speed, IP addresses, DNS suffix and MAC address. Each **GPU** gets
+its utilization (the busiest engine's share, as Task Manager counts it) and its
+dedicated memory over time, the busiest engines by name, shared memory, and the
+driver's version and date; the counters are the same `GPU Engine` ones Task
+Manager reads. A machine with a **battery** gets its charge over time, the power
+going in or out, time left, and the battery's health (full against design
+capacity), cycle count and chemistry. Connections are the ones a person
 would call connections: physical adapters, Hyper-V `vEthernet` ports and VPNs such
 as Tailscale, not the WAN miniports and virtual-switch internals Windows keeps
 underneath. Rate charts scale themselves to the busiest moment of the last hour.
@@ -170,21 +186,40 @@ arrow keys keep walking the table while you type. The filter matches name, PID,
 user, image path and command line, case-insensitively. In tree mode the ancestors of
 a match stay listed, dimmed, so the match keeps its place in the hierarchy.
 
-**Columns:** Name, PID, User, CPU %, Cycles, Memory, Working set, Disk read, Disk
-write, Threads, Handles, Command line. In the tree, a collapsed row's Cycles are
-those of everything under it, like its other numbers, and siblings sort by them. Drag a header divider to resize; **Shift+wheel** (or
-a tilt wheel) scrolls sideways when the columns are wider than the window. The user,
-image path and command line come from a limited-rights handle to each process; a
-process that refuses even that (another user's, from an unelevated open-task) still
-shows its image path, but its user and command line stay blank.
+**Columns:** twelve show by default: Name, PID, Status, User, CPU %, Cycles,
+Memory, Working set, Disk read, Disk write, Threads, Handles. Right-click the header
+for the rest, every column Task Manager's Details page has: Description, Command
+line, GPU %, GPU engine, Type (App, Background or Windows process), Company,
+Priority, Architecture, Session, Elevated, CPU time, Started, Page faults, Peak
+working set, Virtual size, Paged pool, NP pool, I/O reads, writes and other (counts
+and bytes), Image path and Window title, plus **Reset columns**. Status says when a
+process is suspended, in efficiency mode or not responding. Drag a header to move
+the column, drag its divider to resize; **Shift+wheel** (or a tilt wheel) scrolls
+sideways when the columns are wider than the window. In the tree, a collapsed row's
+Cycles are those of everything under it, like its other numbers, and siblings sort
+by them. The user, image path, command line, description and company come from a
+limited-rights handle to each process; a process that refuses even that (another
+user's, from an unelevated open-task) still shows its image path, but those stay
+blank.
 
 **Right-click a process** for **End task**, **End process tree** (the process and
-everything under it, parents first) and **Open file location**. **Delete** and
-**Shift+Delete** are the keyboard shortcuts for the first two; the menu key or
-**Shift+F10** opens the menu for the selected row. Ending a process asks first, with
-No as the default. Every kill checks the process's creation time against the one in
-the table before it acts, so a PID that has been recycled since the last sample is
-never killed by mistake.
+everything under it, parents first), **Restart** (end it, then start its command
+line again in its directory), **Suspend** / **Resume**, **Efficiency mode** (EcoQoS
+and idle priority, as Task Manager's), **Set priority**, **Set affinity** (a check
+per logical processor), **Switch to** (bring its window forward), **Open file
+location**, **Search online**, **Properties** (Explorer's sheet), **Copy** (the row,
+tab-separated), **Create dump file** (a full minidump in `%TEMP%`, then revealed)
+and **Sample CPU for 5 s** (below). **Delete** and **Shift+Delete** are the keyboard
+shortcuts for the first two; the menu key or **Shift+F10** opens the menu for the
+selected row. Ending a process asks first, with No as the default. Every kill checks
+the process's creation time against the one in the table before it acts, so a PID
+that has been recycled since the last sample is never killed by mistake. Actions
+that need rights this copy does not have are shown disabled with the reason.
+
+**Run new task** (the button above the table, or **Ctrl+N**) is Task Manager's:
+a command line, Browse, and **Create this task with administrator privileges**.
+The crosshair button beside it is Process Explorer's **Find window's process**:
+drag it onto any window and that window's process is selected in the table.
 
 **Inside a process.** In tree mode every process can be opened one level further.
 Under it sit the **services** it hosts (from the service control manager, so a
@@ -236,6 +271,76 @@ open-task run as administrator. From an elevated terminal, `open-task
 --replace-task-manager` and `open-task --restore-task-manager` do the same as the
 switch. Uninstalling always puts Task Manager back if it was starting that copy.
 
+**Run as administrator** (the Settings page, under **Windows**) starts a copy with
+administrator rights and closes this one. That copy reads every process's command
+line and user, samples CPU, starts and stops services, and reads service tags.
+
+**Window:** **Always on top** and **Hide when minimized** are on the Settings page.
+A notification-area icon shows the CPU as a live bar, as Task Manager's does, with
+the numbers in its tooltip; a click brings the window back, and its menu has
+**Always on top** and **Exit**. With **Hide when minimized** on, minimizing hides
+the window and the icon is the way back. **Update speed** (High, Normal, Slow,
+Low: every half second to every four) is beside the fade rate under **Process
+table**; **Space** still pauses.
+
+**Users** lists the logon sessions: user, session id, state (active, disconnected,
+idle), station, and the CPU, memory and disk of each session's processes added up.
+A session opens to its processes; right-click for **Disconnect** (their programs
+keep running) and **Sign out**, both asking first, or on a process, **Go to
+process** and **End task**.
+
+**Services** lists every service with its PID, description, status, start type and
+group, with **Start**, **Stop** and **Restart** (as administrator; a stop waits
+for the service to stop), **Go to process** (the host, on the Processes page) and
+**Open Services** (the console). The list is read incrementally, so the page costs
+a couple of milliseconds a second once it has settled.
+
+**Startup apps** lists what runs at sign-in, from the Run keys and the Startup
+folders of this user and the machine: name, publisher, whether Windows has it
+enabled, command, and where the entry lives. **Enable** and **Disable** flip the
+same `StartupApproved` value Task Manager uses, so the two agree. Startup impact is
+not shown (Windows derives it from boot traces).
+
+**Connections** is TMOG's view: every TCP and UDP endpoint with its protocol, local
+and remote address and port, state, and the process that owns it, read from the
+same tables `netstat -ano` uses, so no elevation is needed. **Go to process** and
+**End process** are on the menu.
+
+**Installed apps** lists the programs in Apps & features with publisher, version,
+install date, size, scope (this user or everyone) and location; **Uninstall** runs
+the program's own uninstaller after asking, and **Open install location** opens its
+folder.
+
+**System** is one page of facts with **Copy all**: the Windows edition, version,
+build, install date, computer name and up time; the computer's maker and model,
+motherboard, BIOS and its date, firmware kind and Secure Boot; the processor's name,
+topology, base speed, caches, virtualization and hypervisor; installed memory, what
+the hardware reserves, each memory module's size, speed, form factor and slot; and
+the volumes and page files.
+
+## Not yet
+
+What the reference tools have that this release does not, and why, so nobody
+thinks it was forgotten:
+
+- **Power usage columns.** Windows computes them from its energy estimation engine,
+  which has no public API; TMOG estimates them. A guess is not worth a column.
+- **Package watts and temperatures.** RAPL and the on-die sensors need a kernel
+  driver on Windows (TMOG ships one). The battery's rate is shown where there is a
+  battery.
+- **App history.** Cumulative per-app use over 30 days needs usage persisted across
+  runs; the fading totals and the History chart answer the live question.
+- **Startup impact.** Windows derives it from boot traces.
+- **Process icons in the Name column.** The paint layer has no bitmap support yet.
+- **Expand/collapse groups, UAC virtualization, Analyze wait chain, Debug** on the
+  process menu; **Package name** and **Platform** columns.
+- **Signature verification** (Process Explorer's Verified Signer), the DLL and
+  handle lower pane, thread stacks, VirusTotal.
+- TMOG's **Summary** page, **Benchmarks**, and the **Flight Recorder**: `ot-record`
+  is a stub and the snapshot stream is designed for it; a release of its own.
+- **Minimize on use**, **Start with Windows** (an installer task), and showing
+  resource values as percentages.
+
 ## Why not a webview
 
 A task manager's whole job is telling you what is wasting your RAM and CPU. A webview
@@ -253,7 +358,7 @@ class: tens of megabytes, not hundreds.
 | `ot-probe` | Platform sampling. Windows is real; Linux and macOS are stubs. |
 | `ot-core` | Sampling thread, multi-resolution history, lock-free snapshot publication. |
 | `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
-| `ot-ui` | UI-agnostic view models: theme, pages, navigation rail, virtualized table, charts. |
+| `ot-ui` | UI-agnostic view models: theme, the pages, navigation rail, virtualized table with a column chooser, charts. |
 | `ot-record` | Flight Recorder: record and replay a session (planned). |
 | `ot-update` | Self-updater: finds signed releases, downloads, verifies and installs them. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |

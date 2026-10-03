@@ -1,6 +1,6 @@
 # Feature parity with Task Manager, TMOG and Process Explorer: v0.7.0
 
-> **Status:** active · **Started:** 2026-10-02 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** implemented, releasing · **Started:** 2026-10-02 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 
 ## Goal
 
@@ -125,25 +125,105 @@ Package name [later] and Platform / Operating system context [later].
 ## Plan / steps
 
 1. [x] Audit (above).
-2. [ ] **[current]** Model types for everything new (`ot-model`), so the probe and
-   the UI can be built in parallel.
-3. [ ] Probe: process facts, control actions, GPU, services list, sessions, startup
+2. [x] Model types for everything new (`ot-model`), so the probe and the UI could
+   be built in parallel.
+3. [x] Probe: process facts, control actions, GPU, services list, sessions, startup
    entries, installed apps, connections, system info, volumes, addresses, battery,
    SMBIOS memory.
-4. [ ] UI: columns and column chooser; context menu additions; new pages; Performance
+4. [x] UI: columns and column chooser; context menu additions; new pages; Performance
    additions; settings (always on top, update speed, hide when minimized, remember
    layout).
-5. [ ] Shell: tray icon, topmost, run dialog, elevation, properties, clipboard,
+5. [x] Shell: tray icon, topmost, run dialog, elevation, properties, clipboard,
    crosshair, dump, restart.
-6. [ ] README, verify list, version bump, release v0.7.0, check the published assets.
+6. [ ] **[current]** README (done), verify list (done), version bump, release
+   v0.7.0, check the published assets.
 
 ## Findings / gotchas
 
-- (none yet)
+- **Agent worktrees were created at `2c5f6c6`, one commit behind the scaffold
+  commit `d9af87f` they were told to branch from** (the Agent tool branches from
+  the checkout's state at the time the tool was called, or so it seems; the
+  scaffold commit had just been made). Every agent noticed and fast-forwarded its
+  branch. Next time: commit, then wait a moment, or tell agents to check `git log`.
+- **Sharing one `target/` between worktrees makes cargo mix up their builds.** A
+  workspace member's unit hash depends on its workspace-relative path, which is the
+  same in every worktree, so all of them write the same
+  `target/debug/deps/ot_probe-<hash>.exe`; whichever built last is "fresh" for all
+  of them and `cargo test` may run a peer's binary ("0 tests", or a surprising
+  count). Workarounds the agents found: bump the file's mtime before each cargo
+  command and confirm the `Compiling ot-probe (<my path>)` line, or give the crate
+  its own hash with `--config 'profile.dev.package.ot-probe.debug=1'`. The final
+  verification is done in the main tree anyway.
+- Agent results (probe modules, costs on this machine): startup entries 32-76 ms
+  (`entries()`, on demand only); connections ~2 ms per `list` (keep one probe behind
+  a mutex); sessions 5-9 ms per enumeration (cached 5 s); service list ~1.7 ms per
+  pass steady, ~20 s at 1 Hz until every start type is read (15 ms budget per pass);
+  GPU counters 2.4-3.2 ms per pass (two adapters, ~580 engine instances).
+- **New files from agents and patch scripts came in LF.** The tree is CRLF
+  (`.gitattributes`), and a Python patch anchored on `\r\n` text silently matches
+  nothing in an LF file. `sed -i` on Git Bash also rewrote a CRLF file as LF once.
+  Check with `file` (not `grep -c $'\r'`, which lies on Git Bash) and normalize with
+  Python before patching.
+- **`windows` 0.62 moved `IsDlgButtonChecked` and `EM_SETSEL` to
+  `Win32::UI::Controls`**, not `WindowsAndMessaging`. `CreateProcessW`'s current
+  directory is a plain `PCWSTR` (`PCWSTR::null()` for none), not an `Option`.
+- **`ot-shell-win` must gate every module on `#[cfg(windows)]`**, or the Linux and
+  macOS clippy passes fail on the `windows` crate imports; the agents' new modules
+  (`actions`, `gfx`, `run_dialog`, `tray`) had lost their gates in the merge.
+- **`Page::parse` by label prefix made `--page apps` ambiguous** (Startup apps,
+  Installed apps). Pages now have a one-word `name()` that wins an exact match.
+- **The Performance page's facts column** was first laid out line by line, which
+  either overflowed the pane (nine CPU facts in seven rows) or, when split into two
+  columns up front, left the value column too narrow for a volume line. It now
+  collects the lines and lays them out once it knows how many there are: one column
+  when they fit, two when the pane is wide enough, and the rest left out. The stats
+  area grew from 140 to 180 px to hold Task Manager's nine CPU facts.
+- **The network probe listed addresses nowhere**: `GetUnicastIpAddressTable` only
+  said which interfaces had one. `GetAdaptersAddresses` (one call every 5 s, into a
+  kept aligned buffer) now gives each adapter its addresses, DNS suffix and MAC, and
+  replaces that table. A physical NIC bound to an external Hyper-V switch has no
+  address or MAC of its own; the switch's `vEthernet` port carries them.
+- **Screenshot runs steal focus on the user's desktop.** Two shots came back with
+  the user's typing in the search field (`nalog`, `break?`). Not a bug of ours; take
+  shots when the user is not typing, or warn them.
+- `scripts/screenshot.ps1` gained `-Keys "End;Up"` (posted `WM_KEYDOWN`/`WM_KEYUP`)
+  so a shot can reach list items below the fold (the GPU pane).
 
 ## Progress log
 
 - [x] 2026-10-02 audit written.
+- [x] Scaffold commit `d9af87f`: model types, probe traits, snapshot fields.
+- [x] Eight probe agents launched in worktrees (gpu, sessions, services, startup,
+      installed, connections, system+smbios+volumes+battery+hardware, process
+      facts+control). Done and copied into the main tree: startup, connections,
+      sessions, services. Waiting: gpu, installed, system group, process facts.
+- [x] UI: table columns can hide, reorder by drag and round-trip a layout; the
+      process table has 37 columns (12 shown by default); the context menu has
+      every Task Manager / Process Explorer action; header right-click is the
+      column chooser; Run new task and crosshair buttons; `select_pid`,
+      `view_layout`.
+- [x] Shell: menu model (submenus, checks, affinity), the new effects, tray,
+      topmost, run dialog, elevation, crosshair, inventory worker, layout saved
+      to `HKCU\Software\open-task\Layout` (`REG_SZ`).
+- [x] Pages: Users, Services, Startup, Connections, Apps, System. All eight render
+      with real data (screenshots in `target/shot-*.png`).
+- [x] Performance: GPU and battery devices with timeline series, charts and stats;
+      memory speed / slots / form factor / hardware reserved / compressed; volumes
+      and bus on the disk pane; addresses, DNS suffix and MAC on the adapter pane;
+      virtualization and hypervisor on the CPU pane.
+- [x] Settings and prefs: always on top, update speed, hide when minimized,
+      run as administrator, layout persistence.
+- [x] Wired the agents' probe modules into `WindowsProbe` (GPU, battery, volumes,
+      sessions, service list, per-process GPU) and `WindowsControl` (services,
+      sessions, startup, inventory). Capabilities report `gpu`, `sessions`,
+      `service_list`, `per_process_gpu` true on this machine.
+- [x] 2026-10-02 verify list: `rustup update stable` (1.99.0 unchanged), fmt,
+      clippy `-D warnings` on Windows, Linux and macOS targets, 321 tests pass
+      (159 ot-ui, 91 ot-probe, 24 ot-core, …), headless run, screenshots of every
+      page.
+- [x] README: status, pages, columns, menu, the six new pages, window/tray
+      settings, "Not yet" list.
+- [ ] Release v0.7.0: bump, `cargo update -w`, commit, tag, push; check the assets.
 
 ## Open questions for the user
 

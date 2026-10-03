@@ -1,4 +1,4 @@
-//! A physical disk's facts: model, solid state or not, capacity.
+//! A physical disk's facts: model, bus, solid state or not, capacity.
 //!
 //! The disk is opened with no access rights at all (`\\.\PhysicalDriveN`, desired
 //! access 0), which Windows allows without elevation for exactly this: storage
@@ -12,7 +12,10 @@ use ot_model::Bytes;
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    BusType1394, BusTypeAta, BusTypeAtapi, BusTypeFibre, BusTypeFileBackedVirtual, BusTypeMmc,
+    BusTypeNvme, BusTypeRAID, BusTypeSCM, BusTypeSas, BusTypeSata, BusTypeScsi, BusTypeSd,
+    BusTypeSpaces, BusTypeSsa, BusTypeUfs, BusTypeUsb, BusTypeVirtual, BusTypeiScsi, CreateFileW,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, STORAGE_BUS_TYPE,
 };
 use windows::Win32::System::Ioctl::{
     PropertyStandardQuery, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
@@ -70,6 +73,7 @@ pub(super) fn disk_info(number: u32, letters: &str) -> DiskInfo {
         let vendor = c_string(bytes, d.VendorIdOffset);
         let product = c_string(bytes, d.ProductIdOffset);
         info.model = model(vendor.as_deref(), product.as_deref());
+        info.bus = bus(d.BusType).map(str::to_owned);
     }
     if query(&dev, StorageDeviceSeekPenaltyProperty, &mut buf).is_some() {
         // SAFETY: the query succeeded and wrote the descriptor.
@@ -156,6 +160,32 @@ fn c_string(bytes: &[u8], offset: u32) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// The bus's usual name. Unknown and reserved values are left empty.
+fn bus(kind: STORAGE_BUS_TYPE) -> Option<&'static str> {
+    Some(match kind {
+        k if k == BusTypeNvme => "NVMe",
+        k if k == BusTypeSata => "SATA",
+        k if k == BusTypeAta => "ATA",
+        k if k == BusTypeAtapi => "ATAPI",
+        k if k == BusTypeUsb => "USB",
+        k if k == BusTypeSd => "SD",
+        k if k == BusTypeMmc => "MMC",
+        k if k == BusTypeScsi => "SCSI",
+        k if k == BusTypeSas => "SAS",
+        k if k == BusTypeiScsi => "iSCSI",
+        k if k == BusTypeRAID => "RAID",
+        k if k == BusTypeFibre => "Fibre Channel",
+        k if k == BusType1394 => "FireWire",
+        k if k == BusTypeSsa => "SSA",
+        k if k == BusTypeVirtual => "Virtual",
+        k if k == BusTypeFileBackedVirtual => "Virtual disk file",
+        k if k == BusTypeSpaces => "Storage Spaces",
+        k if k == BusTypeSCM => "SCM",
+        k if k == BusTypeUfs => "UFS",
+        _ => return None,
+    })
+}
+
 /// Vendor and product as one model name. `NVMe` drives often report the vendor as
 /// `NVMe` and put the real maker in the product string; SATA drives often leave the
 /// vendor empty. Drop the vendor when it is empty, generic, or already in the
@@ -214,10 +244,19 @@ mod tests {
     }
 
     #[test]
+    fn buses_are_named() {
+        assert_eq!(bus(BusTypeNvme), Some("NVMe"));
+        assert_eq!(bus(BusTypeUsb), Some("USB"));
+        assert_eq!(bus(STORAGE_BUS_TYPE(0)), None);
+        assert_eq!(bus(STORAGE_BUS_TYPE(0x7F)), None);
+    }
+
+    #[test]
     fn the_first_disk_describes_itself() {
         let d = disk_info(0, "C:");
         assert_eq!(d.name, "Disk 0 (C:)");
         assert!(d.model.is_some(), "{d:?}");
         assert!(d.capacity.is_some_and(|c| c.get() > 1 << 30), "{d:?}");
+        assert!(d.bus.is_some(), "a real disk is on a known bus: {d:?}");
     }
 }

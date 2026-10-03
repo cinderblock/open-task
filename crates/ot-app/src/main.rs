@@ -104,8 +104,9 @@ fn main() {
     }
 
     let theme = arg_value(&args, "--theme").unwrap_or("system");
-    let view = arg_value(&args, "--view").unwrap_or("list");
-    let page = arg_value(&args, "--page").unwrap_or("processes");
+    // `None` means not given: the GUI then restores the last session's choice.
+    let view = arg_value(&args, "--view");
+    let page = arg_value(&args, "--page");
     let passes: usize = args
         .iter()
         .position(|a| a == "--passes")
@@ -242,13 +243,15 @@ fn run_gui(
     probe: Box<dyn SystemProbe>,
     config: SamplerConfig,
     theme: &str,
-    view: &str,
-    page: &str,
+    view: Option<&str>,
+    page: Option<&str>,
 ) {
     let options = ot_shell_win::ShellOptions {
         theme: ot_shell_win::ThemePreference::parse(theme),
-        view: ot_shell_win::ViewMode::parse(view),
-        page: ot_shell_win::Page::parse(page).unwrap_or_default(),
+        view: ot_shell_win::ViewMode::parse(view.unwrap_or("list")),
+        page: page.and_then(ot_shell_win::Page::parse).unwrap_or_default(),
+        view_given: view.is_some(),
+        page_given: page.is_some(),
         version: VERSION,
     };
     if let Err(e) = ot_shell_win::run(probe, config, options) {
@@ -274,8 +277,8 @@ fn run_gui(
     probe: Box<dyn SystemProbe>,
     config: SamplerConfig,
     theme: &str,
-    view: &str,
-    page: &str,
+    view: Option<&str>,
+    page: Option<&str>,
 ) {
     let _ = (probe, config, theme, view, page);
     eprintln!("no GUI shell on this platform yet; use --headless");

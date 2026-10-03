@@ -646,6 +646,12 @@ fn glyph(icon: Icon) -> char {
         Icon::Performance => '\u{E9D9}', // Diagnostic, a pulse in a box
         Icon::Settings => '\u{E713}',    // Setting, a gear
         Icon::Update => '\u{E895}',      // Sync, Windows Update's own
+        Icon::Users => '\u{E716}',       // People
+        Icon::Services => '\u{E9F5}',    // Processing, two gears
+        Icon::Startup => '\u{E7E8}',     // PowerButton
+        Icon::Connections => '\u{E774}', // Globe
+        Icon::Apps => '\u{E7B8}',        // Package
+        Icon::System => '\u{E7F4}',      // Devices, a monitor
     }
 }
 

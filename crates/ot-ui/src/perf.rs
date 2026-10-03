@@ -15,8 +15,10 @@ use std::fmt::Write as _;
 use std::time::UNIX_EPOCH;
 
 use ot_core::{Retention, Series, Snapshot, Timeline};
+use ot_model::battery::{BatterySample, BatteryState};
 use ot_model::cpu::CoreKind;
 use ot_model::device::{AdapterSample, DiskSample, LinkKind};
+use ot_model::gpu::GpuSample;
 use ot_model::{Bytes, Hertz};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
@@ -36,6 +38,9 @@ pub(crate) enum Device {
     Disk(u32),
     /// By adapter id.
     Adapter(u64),
+    /// By the graphics adapter's id.
+    Gpu(u64),
+    Battery,
 }
 
 /// A plotted line: which of the timeline's series it draws.
@@ -49,6 +54,9 @@ enum Line {
     DiskWrite(u32),
     Rx(u64),
     Tx(u64),
+    GpuUtil(u64),
+    GpuMemory(u64),
+    BatteryCharge,
 }
 
 impl Line {
@@ -60,13 +68,20 @@ impl Line {
             Self::DiskWrite(_) => theme.disk_write,
             Self::Rx(_) => theme.network,
             Self::Tx(_) => theme.network_send,
+            Self::GpuUtil(_) => theme.gpu,
+            Self::GpuMemory(_) => theme.gpu_memory,
+            Self::BatteryCharge => theme.battery,
         }
     }
 
     fn value_fmt(self) -> ValueFmt {
         match self {
-            Self::CpuTotal | Self::Core(_) | Self::DiskActive(_) => charts::percent_value,
-            Self::Memory => charts::bytes_value,
+            Self::CpuTotal
+            | Self::Core(_)
+            | Self::DiskActive(_)
+            | Self::GpuUtil(_)
+            | Self::BatteryCharge => charts::percent_value,
+            Self::Memory | Self::GpuMemory(_) => charts::bytes_value,
             Self::DiskRead(_) | Self::DiskWrite(_) => charts::byte_rate_value,
             Self::Rx(_) | Self::Tx(_) => charts::bit_rate_value,
         }
@@ -83,6 +98,9 @@ fn series(tl: &Timeline, line: Line) -> Option<&Series> {
         Line::DiskWrite(n) => tl.disk(n).map(|d| &d.write),
         Line::Rx(id) => tl.adapter(id).map(|a| &a.rx),
         Line::Tx(id) => tl.adapter(id).map(|a| &a.tx),
+        Line::GpuUtil(id) => tl.gpu(id).map(|g| &g.utilization),
+        Line::GpuMemory(id) => tl.gpu(id).map(|g| &g.dedicated),
+        Line::BatteryCharge => Some(&tl.battery_charge),
     }
 }
 
@@ -101,7 +119,9 @@ const ITEM_GAP: f32 = 4.0;
 const MINI_W: f32 = 64.0;
 const HEADER_H: f32 = 36.0;
 const CAPTION_H: f32 = 22.0;
-const STATS_H: f32 = 140.0;
+/// Room for the headline grid and nine fact lines beside it, which is what the
+/// CPU pane lists.
+const STATS_H: f32 = 180.0;
 const COMPOSITION_H: f32 = 60.0;
 const STAT_W: f32 = 132.0;
 const STAT_H: f32 = 44.0;
@@ -449,6 +469,8 @@ impl PerfPage {
                 self.plan(Line::Rx(id), area, 0.0, max);
                 self.plan(Line::Tx(id), area, 0.0, max);
             }
+            Device::Gpu(id) => self.plan(Line::GpuUtil(id), area, 0.0, 100.0),
+            Device::Battery => self.plan(Line::BatteryCharge, area, 0.0, 100.0),
         }
     }
 
@@ -495,10 +517,31 @@ impl PerfPage {
                 detail.pair_band = band;
                 detail.pair_max = max;
             }
+            Device::Gpu(id) => {
+                let (upper, caption, lower) = split_pair(f.chart, theme);
+                self.plan(Line::GpuUtil(id), upper, AXIS_BAND_H, 100.0);
+                // The memory chart's full scale is the adapter's memory, so a half
+                // full chart means half the memory; without a known size, the peak.
+                let total = snap
+                    .gpus
+                    .iter()
+                    .find(|g| g.info.id == id)
+                    .and_then(|g| g.info.dedicated_total)
+                    .map_or(0.0, |b| b.get() as f32);
+                let max = if total > 0.0 {
+                    total
+                } else {
+                    nice_bytes(peak(tl.gpu(id).map(|g| &g.dedicated)), DISK_FLOOR)
+                };
+                self.plan(Line::GpuMemory(id), lower, AXIS_BAND_H, max);
+                detail.second_caption = caption;
+            }
+            Device::Battery => self.plan(Line::BatteryCharge, f.chart, AXIS_BAND_H, 100.0),
         }
         self.detail = detail;
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn paint(
         &mut self,
         dl: &mut DisplayList,
@@ -514,6 +557,16 @@ impl PerfPage {
             .extend(snap.disks.iter().map(|d| Device::Disk(d.info.number)));
         self.devices
             .extend(snap.adapters.iter().map(|a| Device::Adapter(a.info.id)));
+        // Software adapters (the basic render driver) are not GPUs anyone watches.
+        self.devices.extend(
+            snap.gpus
+                .iter()
+                .filter(|g| !g.info.software)
+                .map(|g| Device::Gpu(g.info.id)),
+        );
+        if snap.battery.is_some() {
+            self.devices.push(Device::Battery);
+        }
         if !self.devices.contains(&self.device) {
             self.device = Device::Cpu;
         }
@@ -577,7 +630,7 @@ impl PerfPage {
                 self.paint_slot(first, dl, theme, buf);
                 let caption = self.detail.second_caption;
                 self.paint_pair(dl, first + 1, caption, ["Read", "Write"], theme, buf);
-                paint_disk_stats(dl, f.stats, d, theme, buf);
+                paint_disk_stats(dl, f.stats, d, snap, theme, buf);
             }
             Device::Adapter(id) => {
                 let Some(a) = snap.adapters.iter().find(|a| a.info.id == id) else {
@@ -586,6 +639,27 @@ impl PerfPage {
                 head(dl, &f, &a.info.name, Some(&a.info.adapter), theme);
                 self.paint_pair(dl, first, f.caption, ["Receive", "Send"], theme, buf);
                 paint_adapter_stats(dl, f.stats, a, theme, buf);
+            }
+            Device::Gpu(id) => {
+                let Some(g) = snap.gpus.iter().find(|g| g.info.id == id) else {
+                    return;
+                };
+                head(dl, &f, &g.info.name, Some(&g.info.adapter), theme);
+                dl.label("Utilization", f.caption, theme.small, theme.text_dim);
+                self.paint_slot(first, dl, theme, buf);
+                let caption = self.detail.second_caption;
+                dl.label("Dedicated GPU memory", caption, theme.small, theme.text_dim);
+                self.paint_slot(first + 1, dl, theme, buf);
+                paint_gpu_stats(dl, f.stats, g, theme, buf);
+            }
+            Device::Battery => {
+                let Some(b) = &snap.battery else {
+                    return;
+                };
+                head(dl, &f, "Battery", b.manufacturer.as_deref(), theme);
+                dl.label("Charge", f.caption, theme.small, theme.text_dim);
+                self.paint_slot(first, dl, theme, buf);
+                paint_battery_stats(dl, f.stats, b, theme, buf);
             }
         }
     }
@@ -871,6 +945,12 @@ fn title_of(d: Device, snap: &Snapshot) -> &str {
             .iter()
             .find(|a| a.info.id == id)
             .map_or("Network", |a| a.info.name.as_str()),
+        Device::Gpu(id) => snap
+            .gpus
+            .iter()
+            .find(|g| g.info.id == id)
+            .map_or("GPU", |g| g.info.name.as_str()),
+        Device::Battery => "Battery",
     }
 }
 
@@ -917,6 +997,30 @@ fn summary(d: Device, snap: &Snapshot, buf: &mut String) {
                 let _ = write!(buf, "\u{2191} {tmp}");
             }
         }
+        Device::Gpu(id) => {
+            if let Some(g) = snap.gpus.iter().find(|x| x.info.id == id) {
+                format::percent(buf, g.utilization.get());
+                buf.push('%');
+                if let Some(total) = g.info.dedicated_total.filter(|t| t.get() > 0) {
+                    format::bytes_of(&mut tmp, g.dedicated_used, total);
+                    let _ = write!(buf, "  {tmp}");
+                }
+            }
+        }
+        Device::Battery => {
+            if let Some(b) = &snap.battery {
+                if let Some(c) = b.charge {
+                    let _ = write!(buf, "{c:.0}%");
+                }
+                let state = b.state.label();
+                if !state.is_empty() {
+                    if !buf.is_empty() {
+                        buf.push_str("  ");
+                    }
+                    buf.push_str(state);
+                }
+            }
+        }
     }
 }
 
@@ -949,41 +1053,66 @@ fn slot(stats: Rect, col: usize, row: usize) -> Rect {
 }
 
 /// Label-and-value lines to the right of the headline grid, where there is room.
-/// The value is written into `text` before each [`Facts::line`].
+/// The value is written into `text` before each [`Facts::line`]; the lines are
+/// laid out by [`Facts::paint`] once they are all known, in one column when they
+/// fit, in two when they do not and the pane is wide enough, and the rest are left
+/// out.
 struct Facts {
     rect: Rect,
-    row: f32,
+    /// The value being written, for the next line.
     text: String,
+    /// Every line's label and value, as ranges into `store`.
+    lines: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    store: String,
 }
+
+/// The least a facts column needs: its label and a short value.
+const FACT_COL_MIN_W: f32 = FACT_LABEL_W + 60.0;
 
 impl Facts {
     /// Right of `cols` headline columns; `None` if the pane is too narrow for them.
     fn beside(stats: Rect, cols: usize, theme: &Theme) -> Option<Self> {
         let (_, rect) = stats.split_left(cols as f32 * STAT_W + theme.gap);
-        (rect.w >= FACT_LABEL_W + 60.0).then(|| Self {
+        (rect.w >= FACT_COL_MIN_W).then(|| Self {
             rect,
-            row: 0.0,
             text: String::with_capacity(32),
+            lines: Vec::with_capacity(12),
+            store: String::with_capacity(256),
         })
     }
 
-    fn line(&mut self, dl: &mut DisplayList, label: &str, theme: &Theme) {
-        let r = Rect::new(
-            self.rect.x,
-            self.rect.y + self.row * FACT_H,
-            self.rect.w,
-            FACT_H,
-        );
-        let (l, v) = r.split_left(FACT_LABEL_W.min(r.w));
-        dl.label(label, l, theme.small, theme.text_dim);
-        dl.label(&self.text, v, theme.small, theme.text);
-        self.row += 1.0;
+    /// Add a line: `label`, then what `text` holds.
+    fn line(&mut self, label: &str) {
+        let l = self.store.len()..self.store.len() + label.len();
+        self.store.push_str(label);
+        let v = self.store.len()..self.store.len() + self.text.len();
+        self.store.push_str(&self.text);
+        self.lines.push((l, v));
     }
 
-    fn word(&mut self, dl: &mut DisplayList, label: &str, value: &str, theme: &Theme) {
+    fn word(&mut self, label: &str, value: &str) {
         self.text.clear();
         self.text.push_str(value);
-        self.line(dl, label, theme);
+        self.line(label);
+    }
+
+    fn paint(self, dl: &mut DisplayList, theme: &Theme) {
+        let rows = ((self.rect.h / FACT_H).floor().max(1.0)) as usize;
+        let two = self.lines.len() > rows && self.rect.w >= 2.0 * FACT_COL_MIN_W;
+        let col_w = if two { self.rect.w * 0.5 } else { self.rect.w };
+        let shown = if two { rows * 2 } else { rows };
+        for (i, (l, v)) in self.lines.iter().take(shown).enumerate() {
+            let (col, row) = (i / rows, i % rows);
+            let r = Rect::new(
+                self.rect.x + col as f32 * col_w,
+                self.rect.y + row as f32 * FACT_H,
+                col_w,
+                FACT_H,
+            );
+            let (lr, vr) = r.split_left(FACT_LABEL_W.min(r.w));
+            dl.label(&self.store[l.clone()], lr, theme.small, theme.text_dim);
+            dl.label(&self.store[v.clone()], vr, theme.small, theme.text);
+        }
     }
 }
 
@@ -1031,11 +1160,11 @@ fn paint_cpu_stats(
     };
     if let Some(hz) = hw.base_frequency {
         format::clock(&mut facts.text, hz);
-        facts.line(dl, "Base speed", theme);
+        facts.line("Base speed");
     }
     if hw.sockets > 0 {
         format::count(&mut facts.text, hw.sockets);
-        facts.line(dl, "Sockets", theme);
+        facts.line("Sockets");
     }
     if hw.physical_cores > 0 {
         format::count(&mut facts.text, hw.physical_cores);
@@ -1051,7 +1180,7 @@ fn paint_cpu_stats(
         if p > 0 && e > 0 {
             let _ = write!(facts.text, " ({p} P + {e} E threads)");
         }
-        facts.line(dl, "Cores", theme);
+        facts.line("Cores");
     }
     let logical = if hw.logical_processors > 0 {
         hw.logical_processors
@@ -1059,7 +1188,15 @@ fn paint_cpu_stats(
         snap.cpu.cores.len() as u32
     };
     format::count(&mut facts.text, logical);
-    facts.line(dl, "Logical processors", theme);
+    facts.line("Logical processors");
+    if let Some(on) = hw.virtualization {
+        let value = if on { "Enabled" } else { "Disabled" };
+        facts.word("Virtualization", value);
+    }
+    if let Some(running) = hw.hypervisor {
+        let value = if running { "Running" } else { "No" };
+        facts.word("Hypervisor", value);
+    }
     for (name, size) in [
         ("L1 cache", hw.cache_l1),
         ("L2 cache", hw.cache_l2),
@@ -1067,9 +1204,10 @@ fn paint_cpu_stats(
     ] {
         if let Some(b) = size {
             format::bytes(&mut facts.text, b);
-            facts.line(dl, name, theme);
+            facts.line(name);
         }
     }
+    facts.paint(dl, theme);
 }
 
 fn paint_memory_head(
@@ -1190,12 +1328,49 @@ fn paint_memory_stats(
         format::bytes(buf, b);
         stat(dl, slot(stats, 2, 1), "Non-paged pool", buf, theme);
     }
+
+    let Some(mut facts) = Facts::beside(stats, 3, theme) else {
+        return;
+    };
+    let hw = &snap.hardware;
+    if let Some(mts) = hw.memory_speed_mts {
+        facts.text.clear();
+        let _ = write!(facts.text, "{mts} MT/s");
+        facts.line("Speed");
+    }
+    match (hw.memory_slots_used, hw.memory_slots) {
+        (Some(used), Some(total)) => {
+            facts.text.clear();
+            let _ = write!(facts.text, "{used} of {total}");
+            facts.line("Slots used");
+        }
+        (Some(used), None) => {
+            format::count(&mut facts.text, used);
+            facts.line("Slots used");
+        }
+        _ => {}
+    }
+    if let Some(ff) = &hw.memory_form_factor {
+        facts.word("Form factor", ff);
+    }
+    // What the firmware has that Windows does not get: memory-mapped devices,
+    // the integrated GPU's share, and the like.
+    if let Some(installed) = hw.installed_memory.filter(|i| i.get() > m.total.get()) {
+        format::bytes(&mut facts.text, Bytes(installed.get() - m.total.get()));
+        facts.line("Hardware reserved");
+    }
+    if let Some(c) = m.compressed {
+        format::bytes(&mut facts.text, c);
+        facts.line("Compressed");
+    }
+    facts.paint(dl, theme);
 }
 
 fn paint_disk_stats(
     dl: &mut DisplayList,
     stats: Rect,
     d: &DiskSample,
+    snap: &Snapshot,
     theme: &Theme,
     buf: &mut String,
 ) {
@@ -1215,14 +1390,57 @@ fn paint_disk_stats(
     };
     if let Some(c) = d.info.capacity {
         format::bytes(&mut facts.text, c);
-        facts.line(dl, "Capacity", theme);
+        facts.line("Capacity");
     }
     if let Some(ssd) = d.info.ssd {
-        facts.word(dl, "Type", if ssd { "SSD" } else { "HDD" }, theme);
+        facts.word("Type", if ssd { "SSD" } else { "HDD" });
     }
     if d.info.removable {
-        facts.word(dl, "Removable", "Yes", theme);
+        facts.word("Removable", "Yes");
     }
+    if let Some(bus) = &d.info.bus {
+        facts.word("Bus", bus);
+    }
+    // The volumes on this disk, two lines each: `C: Windows   250 GB free of
+    // 500 GB`, then what it is and what it holds, `NTFS - System, Page file`.
+    let mut name = String::new();
+    let mut tmp = String::new();
+    for v in snap
+        .volumes
+        .iter()
+        .filter(|v| v.disk == Some(d.info.number))
+    {
+        name.clear();
+        name.push_str(v.mount.trim_end_matches(['\\', '/']));
+        if let Some(label) = v.label.as_deref().filter(|l| !l.is_empty()) {
+            let _ = write!(name, " {label}");
+        }
+        format::bytes(&mut facts.text, v.free);
+        format::bytes(&mut tmp, v.total);
+        let _ = write!(facts.text, " free of {tmp}");
+        facts.line(&name);
+
+        facts.text.clear();
+        if let Some(fs) = &v.filesystem {
+            facts.text.push_str(fs);
+        }
+        let roles = match (v.system, v.page_file) {
+            (true, true) => "System, Page file",
+            (true, false) => "System",
+            (false, true) => "Page file",
+            (false, false) => "",
+        };
+        if !roles.is_empty() {
+            if !facts.text.is_empty() {
+                facts.text.push_str(" \u{b7} ");
+            }
+            facts.text.push_str(roles);
+        }
+        if !facts.text.is_empty() {
+            facts.line("");
+        }
+    }
+    facts.paint(dl, theme);
 }
 
 fn paint_adapter_stats(
@@ -1247,17 +1465,152 @@ fn paint_adapter_stats(
         LinkKind::Virtual => "Tunnel",
         LinkKind::Other => "Other",
     };
-    facts.word(dl, "Connection type", kind, theme);
+    facts.word("Connection type", kind);
     let hardware = if a.info.hardware {
         "Physical"
     } else {
         "Virtual"
     };
-    facts.word(dl, "Adapter", hardware, theme);
+    facts.word("Adapter", hardware);
     if let Some(bps) = a.link_bps {
         format::bits(&mut facts.text, bps as f64);
-        facts.line(dl, "Link speed", theme);
+        facts.line("Link speed");
     }
+    // Two of each family: a machine with many addresses is a server, and its
+    // administrator has other tools.
+    for ip in a.info.addresses.iter().filter(|ip| ip.is_ipv4()).take(2) {
+        facts.text.clear();
+        let _ = write!(facts.text, "{ip}");
+        facts.line("IPv4 address");
+    }
+    for ip in a.info.addresses.iter().filter(|ip| ip.is_ipv6()).take(2) {
+        facts.text.clear();
+        let _ = write!(facts.text, "{ip}");
+        facts.line("IPv6 address");
+    }
+    if let Some(dns) = &a.info.dns_suffix {
+        facts.word("DNS suffix", dns);
+    }
+    if let Some(mac) = &a.info.mac {
+        facts.word("MAC address", mac);
+    }
+    facts.paint(dl, theme);
+}
+
+fn paint_gpu_stats(
+    dl: &mut DisplayList,
+    stats: Rect,
+    g: &GpuSample,
+    theme: &Theme,
+    buf: &mut String,
+) {
+    charts::percent_value(buf, g.utilization.get());
+    stat(dl, slot(stats, 0, 0), "Utilization", buf, theme);
+    match g.info.dedicated_total.filter(|t| t.get() > 0) {
+        Some(total) => format::bytes_of(buf, g.dedicated_used, total),
+        None => format::bytes(buf, g.dedicated_used),
+    }
+    stat(dl, slot(stats, 1, 0), "Dedicated memory", buf, theme);
+    match g.info.shared_total.filter(|t| t.get() > 0) {
+        Some(total) => format::bytes_of(buf, g.shared_used, total),
+        None => format::bytes(buf, g.shared_used),
+    }
+    stat(dl, slot(stats, 2, 0), "Shared memory", buf, theme);
+    // The busiest engines, so "3D 40%, Video Decode 12%" reads off the pane.
+    for (i, e) in g.engines.iter().take(3).enumerate() {
+        charts::percent_value(buf, e.usage.get());
+        stat(dl, slot(stats, i, 1), &e.name, buf, theme);
+    }
+
+    let Some(mut facts) = Facts::beside(stats, 3, theme) else {
+        return;
+    };
+    if let Some(v) = &g.info.driver_version {
+        facts.word("Driver version", v);
+    }
+    if let Some(d) = &g.info.driver_date {
+        facts.word("Driver date", d);
+    }
+    if let Some(l) = &g.info.location {
+        facts.word("Location", l);
+    }
+    facts.paint(dl, theme);
+}
+
+fn paint_battery_stats(
+    dl: &mut DisplayList,
+    stats: Rect,
+    b: &BatterySample,
+    theme: &Theme,
+    buf: &mut String,
+) {
+    let charging = b.state == BatteryState::Charging;
+    if let Some(c) = b.charge {
+        charts::percent_value(buf, c);
+        stat(dl, slot(stats, 0, 0), "Charge", buf, theme);
+    }
+    let doing = b.state.label();
+    if !doing.is_empty() {
+        buf.clear();
+        buf.push_str(doing);
+        stat(dl, slot(stats, 1, 0), "State", buf, theme);
+    }
+    if let Some(w) = b.rate {
+        format::watts(buf, w.0);
+        let label = if charging {
+            "Charging at"
+        } else {
+            "Power draw"
+        };
+        stat(dl, slot(stats, 2, 0), label, buf, theme);
+    }
+    if let Some(t) = b.time_left {
+        format::hms(buf, t.as_secs());
+        let label = if charging {
+            "Time to full"
+        } else {
+            "Time left"
+        };
+        stat(dl, slot(stats, 0, 1), label, buf, theme);
+    }
+    if let Some(ac) = b.ac_power {
+        buf.clear();
+        buf.push_str(if ac { "Plugged in" } else { "On battery" });
+        stat(dl, slot(stats, 1, 1), "Power source", buf, theme);
+    }
+
+    let Some(mut facts) = Facts::beside(stats, 3, theme) else {
+        return;
+    };
+    if let Some(mwh) = b.full_capacity_mwh {
+        facts.text.clear();
+        let _ = write!(facts.text, "{:.1} Wh", f64::from(mwh) / 1000.0);
+        facts.line("Full capacity");
+    }
+    if let Some(mwh) = b.design_capacity_mwh {
+        facts.text.clear();
+        let _ = write!(facts.text, "{:.1} Wh", f64::from(mwh) / 1000.0);
+        facts.line("Design capacity");
+    }
+    if let (Some(full), Some(design)) = (b.full_capacity_mwh, b.design_capacity_mwh) {
+        if design > 0 {
+            facts.text.clear();
+            let health = f64::from(full) / f64::from(design) * 100.0;
+            let _ = write!(facts.text, "{health:.0}%");
+            facts.line("Health");
+        }
+    }
+    if let Some(n) = b.cycle_count {
+        format::count(&mut facts.text, n);
+        facts.line("Cycle count");
+    }
+    if let Some(c) = &b.chemistry {
+        facts.word("Chemistry", c);
+    }
+    if let Some(m) = &b.manufacturer {
+        facts.word("Manufacturer", m);
+    }
+    facts.paint(dl, theme);
 }
 
 #[cfg(test)]
@@ -1265,15 +1618,17 @@ fn paint_adapter_stats(
 mod tests {
     use super::*;
     use ot_model::cpu::{CpuSample, LogicalCore};
-    use ot_model::device::{AdapterInfo, DiskInfo};
+    use ot_model::device::{AdapterInfo, DiskInfo, VolumeSample};
+    use ot_model::gpu::{EngineSample, GpuInfo};
     use ot_model::hardware::Hardware;
     use ot_model::memory::MemorySample;
-    use ot_model::{Percent, Tick};
+    use ot_model::{Percent, Tick, Watts};
     use ot_paint::DrawCmd;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     const GB: u64 = 1 << 30;
+    const MB: u64 = 1 << 20;
 
     fn disk(n: u32) -> DiskSample {
         DiskSample {
@@ -1301,11 +1656,68 @@ mod tests {
                 adapter: "Test Ethernet Controller".to_owned(),
                 kind: LinkKind::Ethernet,
                 hardware: true,
+                addresses: vec!["192.168.1.10".parse().unwrap(), "fe80::1".parse().unwrap()],
+                dns_suffix: Some("lan".to_owned()),
                 ..AdapterInfo::default()
             }),
             rx_per_sec: Bytes(700_000),
             tx_per_sec: Bytes(12_500),
             link_bps: Some(1_000_000_000),
+        }
+    }
+
+    fn gpu(id: u64) -> GpuSample {
+        GpuSample {
+            info: Arc::new(GpuInfo {
+                id,
+                name: format!("GPU {id}"),
+                adapter: "Test Graphics 4000".to_owned(),
+                dedicated_total: Some(Bytes(8 * GB)),
+                shared_total: Some(Bytes(16 * GB)),
+                driver_version: Some("31.0.15".to_owned()),
+                ..GpuInfo::default()
+            }),
+            utilization: Percent(42.0),
+            engines: vec![
+                EngineSample {
+                    name: "3D".into(),
+                    usage: Percent(42.0),
+                },
+                EngineSample {
+                    name: "Copy".into(),
+                    usage: Percent(3.0),
+                },
+            ],
+            dedicated_used: Bytes(2 * GB),
+            shared_used: Bytes(GB),
+        }
+    }
+
+    fn battery() -> BatterySample {
+        BatterySample {
+            charge: Some(80.0),
+            state: BatteryState::Discharging,
+            rate: Some(Watts(12.5)),
+            time_left: Some(Duration::from_secs(3 * 3600 + 600)),
+            ac_power: Some(false),
+            full_capacity_mwh: Some(50_000),
+            design_capacity_mwh: Some(60_000),
+            cycle_count: Some(120),
+            manufacturer: Some("Test Cells".to_owned()),
+            chemistry: Some("LiP".to_owned()),
+        }
+    }
+
+    fn volume(disk: u32) -> VolumeSample {
+        VolumeSample {
+            mount: "C:\\".to_owned(),
+            label: Some("Windows".to_owned()),
+            filesystem: Some("NTFS".to_owned()),
+            total: Bytes(500 * GB),
+            free: Bytes(250 * GB),
+            disk: Some(disk),
+            system: true,
+            page_file: true,
         }
     }
 
@@ -1354,10 +1766,43 @@ mod tests {
                 logical_processors: cores as u32,
                 cache_l2: Some(Bytes(2 << 20)),
                 boot_unix_ms: Some(0),
+                virtualization: Some(true),
+                hypervisor: Some(false),
+                installed_memory: Some(Bytes(16 * GB + 512 * MB)),
+                memory_speed_mts: Some(3200),
+                memory_slots: Some(4),
+                memory_slots_used: Some(2),
+                memory_form_factor: Some("SODIMM".to_owned()),
                 ..Hardware::default()
             }),
             ..Snapshot::default()
         }
+    }
+
+    /// Everything a snapshot can list beyond the CPU and memory.
+    #[derive(Default)]
+    struct Devices {
+        disks: Vec<DiskSample>,
+        adapters: Vec<AdapterSample>,
+        gpus: Vec<GpuSample>,
+        battery: Option<BatterySample>,
+        volumes: Vec<VolumeSample>,
+    }
+
+    /// Twenty seconds of the same snapshot, with the given devices.
+    fn timeline_of(cores: usize, devices: &Devices) -> (Timeline, Snapshot) {
+        let mut tl = Timeline::new(Retention::raw(100));
+        let mut last = snap(1, cores);
+        for t in 1..=20 {
+            last = snap(t, cores);
+            last.disks.clone_from(&devices.disks);
+            last.adapters.clone_from(&devices.adapters);
+            last.gpus.clone_from(&devices.gpus);
+            last.battery.clone_from(&devices.battery);
+            last.volumes.clone_from(&devices.volumes);
+            tl.observe(&last);
+        }
+        (tl, last)
     }
 
     /// Twenty seconds of the same snapshot, with the given disks and adapters.
@@ -1366,15 +1811,15 @@ mod tests {
         disks: &[DiskSample],
         adapters: &[AdapterSample],
     ) -> (Timeline, Snapshot) {
-        let mut tl = Timeline::new(Retention::raw(100));
-        let mut last = snap(1, cores);
-        for t in 1..=20 {
-            last = snap(t, cores);
-            last.disks = disks.to_vec();
-            last.adapters = adapters.to_vec();
-            tl.observe(&last);
-        }
-        (tl, last)
+        timeline_of(
+            cores,
+            &Devices {
+                disks: disks.to_vec(),
+                adapters: adapters.to_vec(),
+                volumes: disks.iter().map(|d| volume(d.info.number)).collect(),
+                ..Devices::default()
+            },
+        )
     }
 
     fn timeline(cores: usize) -> (Timeline, Snapshot) {
@@ -1621,6 +2066,12 @@ mod tests {
             "Link speed",
             "1.00 Gbps",
             "Physical",
+            "IPv4 address",
+            "192.168.1.10",
+            "IPv6 address",
+            "fe80::1",
+            "DNS suffix",
+            "lan",
             // The scale rounds 5.6 Mbps up to the next 1-2-5 step.
             "10.0 Mbps",
         ] {
@@ -1650,8 +2101,107 @@ mod tests {
             "Capacity",
             "Type",
             "SSD",
+            // The volume on it, with its space and roles.
+            "C: Windows",
+            "250 GB free of 500 GB",
+            "NTFS \u{b7} System, Page file",
             // Read peaks at 3 MB/s: the scale is 5 MB/s.
             "5.00 MB/s",
+        ] {
+            assert!(has(&t, want), "{want} missing from {t:?}");
+        }
+    }
+
+    #[test]
+    fn gpus_and_the_battery_are_listed_with_their_own_panes() {
+        let (tl, s) = timeline_of(
+            2,
+            &Devices {
+                gpus: vec![gpu(3)],
+                battery: Some(battery()),
+                ..Devices::default()
+            },
+        );
+        let mut page = PerfPage::default();
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        assert!(has(&t, "GPU 3") && has(&t, "42%  2.0 / 8.0 GB"), "{t:?}");
+        assert!(has(&t, "Battery") && has(&t, "80%  Discharging"), "{t:?}");
+
+        page.handle(UiEvent::Key(Key::End));
+        assert_eq!(page.device(), Device::Battery);
+        let dl = paint_with(&mut page, &tl, &s);
+        let t = texts(&dl);
+        for want in [
+            "Test Cells",
+            "Charge",
+            "80%",
+            "State",
+            "Discharging",
+            "Power draw",
+            "12.5 W",
+            "Time left",
+            "3:10:00",
+            "Power source",
+            "On battery",
+            "Full capacity",
+            "50.0 Wh",
+            "Health",
+            "83%",
+            "Cycle count",
+            "120",
+            "Chemistry",
+            "LiP",
+        ] {
+            assert!(has(&t, want), "{want} missing from {t:?}");
+        }
+        let theme = Theme::dark();
+        assert!(line_colors(&dl).contains(&theme.battery));
+
+        page.handle(UiEvent::Key(Key::Up));
+        assert_eq!(page.device(), Device::Gpu(3));
+        let dl = paint_with(&mut page, &tl, &s);
+        let t = texts(&dl);
+        for want in [
+            "Test Graphics 4000",
+            "Utilization",
+            "Dedicated GPU memory",
+            "42%",
+            "Dedicated memory",
+            "2.0 / 8.0 GB",
+            "Shared memory",
+            "1.0 / 16.0 GB",
+            "3D",
+            "Copy",
+            "3.0%",
+            "Driver version",
+            "31.0.15",
+        ] {
+            assert!(has(&t, want), "{want} missing from {t:?}");
+        }
+        let colors = line_colors(&dl);
+        assert!(colors.contains(&theme.gpu) && colors.contains(&theme.gpu_memory));
+    }
+
+    #[test]
+    fn the_memory_and_cpu_panes_show_the_firmware_facts() {
+        let (tl, s) = timeline(2);
+        let mut page = PerfPage::default();
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        assert!(has(&t, "Virtualization") && has(&t, "Enabled"), "{t:?}");
+        assert!(has(&t, "Hypervisor") && has(&t, "No"), "{t:?}");
+
+        page.handle(UiEvent::Key(Key::Down));
+        assert_eq!(page.device(), Device::Memory);
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        for want in [
+            "Speed",
+            "3200 MT/s",
+            "Slots used",
+            "2 of 4",
+            "Form factor",
+            "SODIMM",
+            "Hardware reserved",
+            "512 MB",
         ] {
             assert!(has(&t, want), "{want} missing from {t:?}");
         }

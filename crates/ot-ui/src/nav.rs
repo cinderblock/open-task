@@ -17,21 +17,50 @@ pub enum Page {
     /// The process table, with the summary charts above it.
     #[default]
     Processes,
-    /// Devices (CPU, memory) with a chart and the numbers for each.
+    /// Devices (CPU, memory, disks, networks, GPUs, the battery) with a chart and
+    /// the numbers for each.
     Performance,
+    /// Logon sessions and their processes.
+    Users,
+    /// Every service of the machine.
+    Services,
+    /// What runs at sign-in.
+    Startup,
+    /// Open network endpoints by process.
+    Connections,
+    /// Installed programs.
+    Apps,
+    /// The machine and its operating system.
+    System,
     /// The app's settings, at the bottom of the rail.
     Settings,
 }
 
 impl Page {
     /// In rail order. Settings is last and drawn at the bottom.
-    pub const ALL: [Self; 3] = [Self::Processes, Self::Performance, Self::Settings];
+    pub const ALL: [Self; 9] = [
+        Self::Processes,
+        Self::Performance,
+        Self::Users,
+        Self::Services,
+        Self::Startup,
+        Self::Connections,
+        Self::Apps,
+        Self::System,
+        Self::Settings,
+    ];
 
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Processes => "Processes",
             Self::Performance => "Performance",
+            Self::Users => "Users",
+            Self::Services => "Services",
+            Self::Startup => "Startup apps",
+            Self::Connections => "Connections",
+            Self::Apps => "Installed apps",
+            Self::System => "System",
             Self::Settings => "Settings",
         }
     }
@@ -41,17 +70,64 @@ impl Page {
         match self {
             Self::Processes => Icon::Processes,
             Self::Performance => Icon::Performance,
+            Self::Users => Icon::Users,
+            Self::Services => Icon::Services,
+            Self::Startup => Icon::Startup,
+            Self::Connections => Icon::Connections,
+            Self::Apps => Icon::Apps,
+            Self::System => Icon::System,
             Self::Settings => Icon::Settings,
         }
     }
 
-    /// Parse a command-line value, case-insensitively, by name or unique prefix.
+    /// Whether the page lists things with a search field of its own, so typing
+    /// on it filters it rather than the process table.
+    #[must_use]
+    pub fn has_search(self) -> bool {
+        matches!(
+            self,
+            Self::Processes
+                | Self::Users
+                | Self::Services
+                | Self::Startup
+                | Self::Connections
+                | Self::Apps
+        )
+    }
+
+    /// The one-word name the command line's `--page` takes.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Processes => "processes",
+            Self::Performance => "performance",
+            Self::Users => "users",
+            Self::Services => "services",
+            Self::Startup => "startup",
+            Self::Connections => "connections",
+            Self::Apps => "apps",
+            Self::System => "system",
+            Self::Settings => "settings",
+        }
+    }
+
+    /// Parse a command-line value, case-insensitively: a page's name or label, or
+    /// a prefix of one that fits only one page.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.to_ascii_lowercase();
+        if s.is_empty() {
+            return None;
+        }
+        if let Some(exact) = Self::ALL
+            .into_iter()
+            .find(|p| p.name() == s || p.label().to_ascii_lowercase() == s)
+        {
+            return Some(exact);
+        }
         let mut hits = Self::ALL
             .into_iter()
-            .filter(|p| !s.is_empty() && p.label().to_ascii_lowercase().starts_with(&s));
+            .filter(|p| p.name().starts_with(&s) || p.label().to_ascii_lowercase().starts_with(&s));
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
     }
@@ -307,17 +383,30 @@ mod tests {
         assert_eq!(Page::parse("perf"), Some(Page::Performance));
         assert_eq!(Page::parse("P"), None, "ambiguous prefix");
         assert_eq!(Page::parse(""), None);
-        assert_eq!(Page::parse("services"), None);
+        assert_eq!(Page::parse("services"), Some(Page::Services));
+        assert_eq!(
+            Page::parse("s"),
+            None,
+            "ambiguous: Services, Startup, System, Settings"
+        );
         assert_eq!(Page::Processes.step(1), Page::Performance);
-        assert_eq!(Page::Performance.step(1), Page::Settings);
+        assert_eq!(Page::Performance.step(1), Page::Users);
         assert_eq!(Page::Settings.step(1), Page::Processes, "wraps");
         assert_eq!(Page::Processes.step(-1), Page::Settings, "wraps back");
         assert_eq!(Page::parse("set"), Some(Page::Settings));
+        assert_eq!(
+            Page::parse("apps"),
+            Some(Page::Apps),
+            "the page's name wins"
+        );
+        assert_eq!(Page::parse("Installed apps"), Some(Page::Apps));
+        assert_eq!(Page::parse("startup"), Some(Page::Startup));
+        assert_eq!(Page::parse("Startup apps"), Some(Page::Startup));
         assert_eq!(Page::nth(1), Some(Page::Processes));
         assert_eq!(Page::nth(2), Some(Page::Performance));
-        assert_eq!(Page::nth(3), None, "Settings has no number");
+        assert_eq!(Page::nth(8), Some(Page::System));
+        assert_eq!(Page::nth(9), None, "Settings has no number");
         assert_eq!(Page::nth(0), None);
-        assert_eq!(Page::nth(9), None);
     }
 
     #[test]
@@ -380,6 +469,12 @@ mod tests {
                 Icon::Menu,
                 Icon::Processes,
                 Icon::Performance,
+                Icon::Users,
+                Icon::Services,
+                Icon::Startup,
+                Icon::Connections,
+                Icon::Apps,
+                Icon::System,
                 Icon::Settings,
                 Icon::Update,
             ]
@@ -397,7 +492,16 @@ mod tests {
             nav.hit(Point::new(20.0, y0 + 2.0 * ITEM_H)),
             Some(NavHit::Page(Page::Performance))
         );
-        assert_eq!(nav.hit(Point::new(20.0, y0 + 3.0 * ITEM_H)), None);
+        assert_eq!(
+            nav.hit(Point::new(20.0, y0 + 3.0 * ITEM_H)),
+            Some(NavHit::Page(Page::Users))
+        );
+        // Eight pages, then nothing until the buttons at the bottom.
+        assert_eq!(
+            nav.hit(Point::new(20.0, y0 + 8.0 * ITEM_H)),
+            Some(NavHit::Page(Page::System))
+        );
+        assert_eq!(nav.hit(Point::new(20.0, y0 + 9.0 * ITEM_H)), None);
         // Settings is at the bottom of the rail, the update button above it.
         assert_eq!(
             nav.hit(Point::new(20.0, 600.0 - theme.gap - ITEM_H * 0.5)),
@@ -417,6 +521,12 @@ mod tests {
             [
                 "Processes",
                 "Performance",
+                "Users",
+                "Services",
+                "Startup apps",
+                "Connections",
+                "Installed apps",
+                "System",
                 "Settings",
                 "v0.2.1",
                 "Check for updates"
@@ -435,7 +545,7 @@ mod tests {
         };
         let mut update = UpdateView::new("0.2.1-20-gdbfe022-dirty", true);
         let dl = painted_with(&mut nav, true, &update);
-        assert_eq!(texts(&dl)[3..], ["dbfe022-dirty", "Check for updates"]);
+        assert_eq!(texts(&dl)[9..], ["dbfe022-dirty", "Check for updates"]);
         // The Performance page's pill is the only accent so far.
         let before = dots(&dl);
 
@@ -446,6 +556,6 @@ mod tests {
         assert!(texts(&dl).is_empty(), "compact: icons only");
         assert_eq!(dots(&dl), before + 1, "a dot on the icon");
         let dl = painted_with(&mut nav, true, &update);
-        assert_eq!(texts(&dl)[4], "Install v0.3.0");
+        assert_eq!(texts(&dl)[10], "Install v0.3.0");
     }
 }

@@ -5,6 +5,7 @@
 //! context menu, a confirmation and kill, opening a folder). The view decides what
 //! should happen; the shell decides how it looks on the platform.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
@@ -12,17 +13,26 @@ use std::time::Instant;
 use ot_core::{ProgramId, Resolution, Retention, Snapshot, Timeline, Usage};
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
+use ot_model::process::Priority;
 use ot_model::ProcessKey;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
 
 use crate::charts::{self, ChartGroup};
 use crate::format;
 use crate::nav::{NavHit, NavRail, Page};
+use crate::pages::apps::AppsPage;
+use crate::pages::connections::ConnectionsPage;
+use crate::pages::services::ServicesPage;
+use crate::pages::startup::StartupPage;
+use crate::pages::system::SystemPage;
+use crate::pages::users::UsersPage;
+use crate::pages::PageOutcome;
 use crate::perf::PerfPage;
 use crate::process_rows::{self, col, columns, process_matches, Layout, ProcessRows, ProcessTree};
+use crate::search::SearchBox;
 use crate::settings::{Context, Settings, SettingsPage};
 use crate::steady::Steady;
-use crate::table::{Hit, RowSource, Table};
+use crate::table::{ColumnLayout, Hit, RowSource, Table};
 use crate::task_manager::TaskManager;
 use crate::theme::Theme;
 use crate::update::{UpdateAction, UpdateView};
@@ -94,19 +104,61 @@ impl ViewMode {
     }
 }
 
-/// An item of the process context menu, and the meaning of a shortcut that does
-/// the same thing (Delete, Shift+Delete).
+/// An item of a context menu, and the meaning of a shortcut that does the same
+/// thing (Delete, Shift+Delete). The process ones act on the selected process;
+/// the rest on the selected row of their page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     /// Terminate the selected process.
     EndTask,
     /// Terminate the selected process and everything below it.
     EndTree,
+    /// End the process and start its command line again, as Process Explorer's
+    /// Restart does.
+    Restart,
+    /// Freeze every thread of the process, and let it go again.
+    Suspend,
+    Resume,
+    /// Turn efficiency mode (power throttling and idle priority) on or off.
+    EfficiencyMode(bool),
+    SetPriority(Priority),
+    /// Restrict the process to these logical processors (bit `i` is processor
+    /// `i`). Chosen in the affinity submenu the shell fills.
+    SetAffinity(u64),
+    /// Bring the process's window to the front.
+    SwitchTo,
     /// Show the selected process's executable in the file manager.
     OpenFileLocation,
+    /// Look the process up in the browser.
+    SearchOnline,
+    /// The file manager's Properties sheet for the executable.
+    Properties,
+    /// Copy the row's visible cells to the clipboard.
+    Copy,
+    /// Write the process's memory to a dump file.
+    CreateDump,
     /// Sample the selected process's CPU for a few seconds: which modules its
     /// threads run, and for a broker service, which clients it served.
     SampleCpu,
+    /// Show or hide a column of the process table (the header's menu).
+    ToggleColumn(usize),
+    /// Put the process table's columns back as they were made.
+    ResetColumns,
+    /// Select the row's process on the Processes page (from another page).
+    GoToProcess,
+    ServiceStart,
+    ServiceStop,
+    ServiceRestart,
+    /// The system's own services console.
+    OpenServices,
+    SessionDisconnect,
+    SessionSignOut,
+    /// Let a startup entry run at sign-in, or stop it.
+    StartupEnable(bool),
+    /// Run an installed program's uninstaller.
+    Uninstall,
+    /// Open an installed program's folder.
+    OpenInstallLocation,
 }
 
 /// One line of a context menu, in order.
@@ -114,10 +166,174 @@ pub enum MenuAction {
 pub enum MenuEntry {
     Item {
         action: MenuAction,
-        label: &'static str,
+        label: Cow<'static, str>,
         enabled: bool,
+        /// Shown with a check mark: a setting that is on, or the chosen one of a
+        /// set.
+        checked: bool,
+    },
+    Submenu {
+        label: &'static str,
+        entries: Vec<MenuEntry>,
+    },
+    /// The "Set affinity" submenu, which the shell fills in: one check item per
+    /// logical processor, from the process's affinity as it stands when the
+    /// menu opens. A choice comes back as [`MenuAction::SetAffinity`] with the
+    /// new mask.
+    Affinity {
+        target: ProcessKey,
     },
     Separator,
+}
+
+impl MenuEntry {
+    #[must_use]
+    pub fn item(action: MenuAction, label: impl Into<Cow<'static, str>>, enabled: bool) -> Self {
+        Self::Item {
+            action,
+            label: label.into(),
+            enabled,
+            checked: false,
+        }
+    }
+
+    #[must_use]
+    pub fn checked(
+        action: MenuAction,
+        label: impl Into<Cow<'static, str>>,
+        enabled: bool,
+        checked: bool,
+    ) -> Self {
+        Self::Item {
+            action,
+            label: label.into(),
+            enabled,
+            checked,
+        }
+    }
+}
+
+/// An action on one process that the shell carries out through the platform's
+/// process control, reporting a failure to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessAction {
+    SetPriority(Priority),
+    SetAffinity(u64),
+    Suspend,
+    Resume,
+    EfficiencyMode(bool),
+    /// Write a dump into the user's temporary directory and reveal it.
+    WriteDump,
+    /// End the process (asking first) and start `command_line` again, in
+    /// `directory` when known.
+    Restart {
+        command_line: String,
+        directory: Option<String>,
+    },
+}
+
+/// What a page asks the shell to read, off the UI thread; the answer comes back
+/// through [`App::set_inventory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Query {
+    Startup,
+    InstalledApps,
+    Connections,
+    System,
+}
+
+/// An answer to a [`Query`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inventory {
+    Startup(Vec<ot_model::startup::StartupEntry>),
+    InstalledApps(Vec<ot_model::apps::InstalledApp>),
+    Connections(Vec<ot_model::connection::Connection>),
+    System(Box<ot_model::system::SystemFacts>),
+}
+
+/// What the shell saves at exit and restores at start: which page and
+/// arrangement were showing, and the process table's sort and columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewLayout {
+    pub page: Page,
+    pub view: ViewMode,
+    /// The sort column's title, and whether it sorts descending.
+    pub sort: String,
+    pub sort_desc: bool,
+    pub columns: Vec<ColumnLayout>,
+}
+
+impl ViewLayout {
+    /// One line the shell can store: `page=Processes;view=List;sort=Cycles;
+    /// desc=1;cols=Name:300:1|PID:70:1|...`.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let mut s = format!(
+            "page={};view={};sort={};desc={};cols=",
+            self.page.label(),
+            match self.view {
+                ViewMode::List => "List",
+                ViewMode::Tree => "Tree",
+                ViewMode::Map => "Map",
+                ViewMode::History => "History",
+            },
+            self.sort,
+            u8::from(self.sort_desc)
+        );
+        for (i, c) in self.columns.iter().enumerate() {
+            if i > 0 {
+                s.push('|');
+            }
+            let _ = write!(s, "{}:{:.0}:{}", c.title, c.width, u8::from(c.visible));
+        }
+        s
+    }
+
+    /// Read what [`ViewLayout::encode`] wrote. Anything malformed is left at its
+    /// default; a line with nothing usable is `None`.
+    #[must_use]
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut layout = Self {
+            page: Page::default(),
+            view: ViewMode::default(),
+            sort: String::new(),
+            sort_desc: true,
+            columns: Vec::new(),
+        };
+        let mut any = false;
+        for field in s.split(';') {
+            let Some((k, v)) = field.split_once('=') else {
+                continue;
+            };
+            any = true;
+            match k {
+                "page" => layout.page = Page::parse(v).unwrap_or_default(),
+                "view" => layout.view = ViewMode::parse(v),
+                "sort" => v.clone_into(&mut layout.sort),
+                "desc" => layout.sort_desc = v != "0",
+                "cols" => {
+                    for c in v.split('|') {
+                        let mut parts = c.rsplitn(3, ':');
+                        let (Some(vis), Some(w), Some(title)) =
+                            (parts.next(), parts.next(), parts.next())
+                        else {
+                            continue;
+                        };
+                        let Ok(width) = w.parse::<f32>() else {
+                            continue;
+                        };
+                        layout.columns.push(ColumnLayout {
+                            title: title.to_owned(),
+                            width,
+                            visible: vis != "0",
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        any.then_some(layout)
+    }
 }
 
 /// A semantic action, as a menu item or accelerator would issue it. The shell maps
@@ -139,6 +355,11 @@ pub enum Command {
     /// Freeze the display, or let it follow the samples again (Space, when the
     /// search field does not have the keyboard). Sampling carries on underneath.
     TogglePause,
+    /// Open the Run dialog to start a program (Ctrl+N).
+    RunTask,
+    /// Start the crosshair: the next window the pointer is released over has its
+    /// process selected.
+    PickWindow,
 }
 
 /// Input from the shell, in DIPs.
@@ -187,6 +408,58 @@ pub enum Effect {
     },
     /// Reveal this file in the platform's file manager.
     OpenFileLocation(String),
+    /// Act on one process; `name` is for the message if it fails.
+    Process {
+        target: ProcessKey,
+        name: String,
+        action: ProcessAction,
+    },
+    /// Bring a window to the front, by the handle the probe reported.
+    SwitchTo(u64),
+    /// Open a web page in the browser.
+    OpenUrl(String),
+    /// The file manager's Properties sheet for a file.
+    Properties(String),
+    /// Put text on the clipboard.
+    CopyText(String),
+    /// The Run dialog: a command line to start, with the choice of starting it as
+    /// administrator.
+    RunTask,
+    /// Start a copy of this program as administrator and, if that works, close
+    /// this one.
+    RunAsAdministrator,
+    /// Start the window crosshair; the shell reports the pick with
+    /// [`App::select_pid`].
+    PickWindow,
+    /// Start, stop or restart a service by its key name.
+    Service {
+        name: String,
+        display_name: String,
+        action: ServiceAction,
+    },
+    /// The system's services console.
+    OpenServices,
+    /// Disconnect a session or sign it out, asking first; `user` names it.
+    Session {
+        id: u32,
+        user: String,
+        action: SessionAction,
+    },
+    /// Let a startup entry run at sign-in, or stop it.
+    Startup {
+        entry: ot_model::startup::StartupEntry,
+        on: bool,
+    },
+    /// Open an installed program's folder: the recorded install location, else
+    /// the folder its uninstaller lives in.
+    OpenInstallLocation {
+        location: Option<String>,
+        uninstall: Option<String>,
+    },
+    /// Run an installed program's uninstall command, asking first.
+    Uninstall { name: String, command: String },
+    /// Read a list off the UI thread; see [`Query`].
+    Query(Query),
     /// Sample `target`'s CPU for `seconds`, off the UI thread, and hand the result
     /// to [`App::set_attribution`] (or [`App::sampling_failed`]).
     SampleCpu { target: ProcessKey, seconds: u32 },
@@ -199,6 +472,19 @@ pub enum Effect {
     /// stop (`false`). What it does afterwards comes back through
     /// [`App::set_task_manager`].
     ReplaceTaskManager(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAction {
+    Disconnect,
+    SignOut,
 }
 
 /// What an event led to.
@@ -277,113 +563,23 @@ macro_rules! rows_of {
             shown: &$app.shown,
             tree_mode: $tree_mode,
             steady: Some(&$app.steady),
+            now_unix_ms: snapshot_unix_ms(&$app.snap),
         }
     };
 }
 
-/// The search field. Type-to-filter: printable keys land here whether or not it has
-/// focus, so focus only decides where Enter and Escape go and whether a caret shows.
-#[derive(Debug, Default)]
-struct SearchBox {
-    text: String,
-    /// Lower-cased `text`, what the matcher uses.
-    needle: String,
-    focused: bool,
-    rect: Rect,
-    /// The clear button at the right end, when there is text.
-    clear_rect: Rect,
-    hover_clear: bool,
-}
-
-impl SearchBox {
-    fn set_text(&mut self, text: &str) {
-        self.text.clear();
-        self.text.push_str(text);
-        self.needle.clear();
-        self.needle
-            .extend(text.chars().map(|c| c.to_ascii_lowercase()));
-    }
-
-    fn push(&mut self, c: char) {
-        self.text.push(c);
-        self.needle.push(c.to_ascii_lowercase());
-    }
-
-    /// Remove the last character, or the last word. Returns false if empty.
-    fn backspace(&mut self, word: bool) -> bool {
-        if self.text.is_empty() {
-            return false;
-        }
-        if word {
-            let trimmed = self.text.trim_end();
-            let cut = trimmed
-                .rfind(|c: char| c.is_whitespace() || c == '\\' || c == '/')
-                .map_or(0, |i| i + 1);
-            self.text.truncate(cut);
-        } else {
-            self.text.pop();
-        }
-        let t = std::mem::take(&mut self.text);
-        self.set_text(&t);
-        true
-    }
-
-    fn clear(&mut self) {
-        self.text.clear();
-        self.needle.clear();
-    }
-
-    fn paint(&mut self, dl: &mut DisplayList, rect: Rect, theme: &Theme) {
-        self.rect = rect;
-        let r = Rect::new(rect.x, rect.y + 2.0, rect.w, rect.h - 4.0);
-        dl.fill_round_rect(r, theme.card_radius, theme.input_bg);
-        let border = if self.focused {
-            theme.accent
-        } else {
-            theme.surface_border
-        };
-        dl.stroke_rect(r, border, 1.0);
-
-        let inner = r.inset(theme.pad, 0.0);
-        if self.text.is_empty() {
-            self.clear_rect = Rect::ZERO;
-            dl.label("Filter (Ctrl+F)", inner, theme.cell, theme.text_dim);
-            if self.focused {
-                dl.fill_rect(
-                    Rect::new(inner.x, inner.y + 5.0, 1.0, inner.h - 10.0),
-                    theme.text,
-                );
-            }
-            return;
-        }
-        let (text_rect, clear) = inner.split_left((inner.w - 18.0).max(0.0));
-        self.clear_rect = clear;
-        dl.field(&self.text, text_rect, theme.cell, theme.text, self.focused);
-        // A small ×, as geometry so it needs no glyph.
-        let c = clear.center();
-        let s = 3.5;
-        let color = if self.hover_clear {
-            theme.text
-        } else {
-            theme.text_dim
-        };
-        dl.line(
-            Point::new(c.x - s, c.y - s),
-            Point::new(c.x + s, c.y + s),
-            color,
-            1.2,
-        );
-        dl.line(
-            Point::new(c.x - s, c.y + s),
-            Point::new(c.x + s, c.y - s),
-            color,
-            1.2,
-        );
-    }
+/// The two buttons at the right of the toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolButton {
+    /// The Run dialog.
+    RunTask,
+    /// The window crosshair.
+    PickWindow,
 }
 
 /// The strip between the cards and the table: the List/Tree switch, the selected
-/// process's ancestry, the search field, and the process count.
+/// process's ancestry, the search field, the Run and crosshair buttons, and the
+/// process count.
 #[derive(Debug, Default)]
 struct Toolbar {
     /// Why the table is standing still, if it is: shown before the search field.
@@ -398,6 +594,9 @@ struct Toolbar {
     hover: Option<usize>,
     chain: Vec<u32>,
     search: SearchBox,
+    /// The Run and crosshair buttons, from the last paint.
+    buttons: [Rect; 2],
+    hover_button: Option<ToolButton>,
 }
 
 const SEGMENTS: [(ViewMode, &str); 4] = [
@@ -408,12 +607,77 @@ const SEGMENTS: [(ViewMode, &str); 4] = [
 ];
 const SEGMENT_W: f32 = 60.0;
 const COUNT_W: f32 = 130.0;
+/// The Run button, with its label, and the crosshair button, icon only.
+const RUN_W: f32 = 104.0;
+const PICK_W: f32 = 28.0;
 /// The toolbar's "Paused" / "Order held" note.
 const STATUS_W: f32 = 150.0;
 
 impl Toolbar {
     fn segment_at(&self, p: Point) -> Option<usize> {
         self.segments.iter().position(|r| r.contains(p))
+    }
+
+    fn button_at(&self, p: Point) -> Option<ToolButton> {
+        if self.buttons[0].contains(p) {
+            Some(ToolButton::RunTask)
+        } else if self.buttons[1].contains(p) {
+            Some(ToolButton::PickWindow)
+        } else {
+            None
+        }
+    }
+
+    /// The Run button and the crosshair, at the right end of `rect`; returns
+    /// what is left of it.
+    fn paint_buttons(&mut self, dl: &mut DisplayList, rect: Rect, theme: &Theme) -> Rect {
+        let (left, pick) = rect.split_left((rect.w - PICK_W).max(0.0));
+        let (left, run) = left.split_left((left.w - RUN_W - theme.pad).max(0.0));
+        let (_, run) = run.split_left(theme.pad.min(run.w));
+        self.buttons = [run, pick];
+        for (i, r) in [run, pick].into_iter().enumerate() {
+            let r = Rect::new(r.x, r.y + 2.0, r.w, r.h - 4.0);
+            let hovered = matches!(
+                (i, self.hover_button),
+                (0, Some(ToolButton::RunTask)) | (1, Some(ToolButton::PickWindow))
+            );
+            let fill = if hovered {
+                theme.button_hover
+            } else {
+                theme.surface
+            };
+            dl.fill_round_rect(r, theme.card_radius, fill);
+            dl.stroke_rect(r, theme.surface_border, 1.0);
+            if i == 0 {
+                dl.text(
+                    "Run new task",
+                    r,
+                    theme.header,
+                    theme.text,
+                    HAlign::Center,
+                    VAlign::Middle,
+                    true,
+                );
+            } else {
+                // A crosshair, as geometry: a small ring with four ticks.
+                let c = r.center();
+                let s = 3.0;
+                dl.stroke_rect(
+                    Rect::new(c.x - s, c.y - s, 2.0 * s, 2.0 * s),
+                    theme.text,
+                    1.2,
+                );
+                for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                    dl.line(
+                        Point::new(c.x + dx * s, c.y + dy * s),
+                        Point::new(c.x + dx * s * 2.6, c.y + dy * s * 2.6),
+                        theme.text,
+                        1.2,
+                    );
+                }
+            }
+        }
+        left
     }
 
     fn paint(
@@ -460,10 +724,11 @@ impl Toolbar {
             );
         }
 
-        // Right to left: the count, then the search field; the breadcrumb gets what
-        // is left in the middle.
+        // Right to left: the count, the two buttons, then the search field; the
+        // breadcrumb gets what is left in the middle.
         let (_, after_group) = rect.split_left(group.w + theme.pad);
         let (middle, count) = after_group.split_left((after_group.w - COUNT_W).max(0.0));
+        let middle = self.paint_buttons(dl, middle, theme);
         let search_w = theme.search_w.min(middle.w);
         let (crumb, search) = middle.split_left((middle.w - search_w - theme.pad).max(0.0));
         let (_, search) = search.split_left(theme.pad.min(search.w));
@@ -573,6 +838,15 @@ pub struct App {
     page: Page,
     nav: NavRail,
     perf: PerfPage,
+    users: UsersPage,
+    services: ServicesPage,
+    startup: StartupPage,
+    connections: ConnectionsPage,
+    apps: AppsPage,
+    system: SystemPage,
+    /// Whether this copy runs as administrator: what the Services page may do,
+    /// and whether Settings offers to restart elevated.
+    elevated: bool,
     /// Sort keys with hysteresis, so noise does not reorder the table. Held while
     /// the pointer is over the table.
     steady: Steady,
@@ -624,6 +898,13 @@ impl App {
             page: Page::default(),
             nav: NavRail::default(),
             perf: PerfPage::default(),
+            users: UsersPage::default(),
+            services: ServicesPage::default(),
+            startup: StartupPage::default(),
+            connections: ConnectionsPage::default(),
+            apps: AppsPage::default(),
+            system: SystemPage::default(),
+            elevated: false,
             steady: Steady::default(),
             paused: None,
             settings: Settings::default(),
@@ -843,6 +1124,48 @@ impl App {
         self.system_animations
     }
 
+    /// Whether this copy runs as administrator. Set once at start.
+    pub fn set_elevated(&mut self, on: bool) {
+        self.elevated = on;
+    }
+
+    /// A list a page asked for ([`Effect::Query`]) has arrived. Returns whether
+    /// a repaint is due.
+    pub fn set_inventory(&mut self, inventory: Inventory) -> bool {
+        match inventory {
+            Inventory::Startup(e) => self.startup.set_entries(e),
+            Inventory::InstalledApps(a) => self.apps.set_apps(a),
+            Inventory::Connections(c) => self.connections.set_connections(c),
+            Inventory::System(f) => self.system.set_facts(*f),
+        }
+        true
+    }
+
+    /// What the page showing needs read now, if anything: the shell runs it
+    /// off the UI thread and answers with [`App::set_inventory`].
+    #[must_use]
+    pub fn page_query(&self) -> Option<Query> {
+        match self.page {
+            Page::Startup => self.startup.query(),
+            Page::Apps => self.apps.query(),
+            Page::Connections => self.connections.query(),
+            Page::System => self.system.query(),
+            _ => None,
+        }
+    }
+
+    /// Turn a page's answer into the app's: a jump to a process selects it on
+    /// the Processes page.
+    fn page_outcome(&mut self, outcome: PageOutcome) -> Reaction {
+        match outcome {
+            PageOutcome::Reaction(r) => r,
+            PageOutcome::SelectPid(pid) => {
+                self.select_pid(pid);
+                Reaction::REPAINT
+            }
+        }
+    }
+
     fn apply_animation(&mut self) {
         self.table
             .set_animate(self.settings.animates_rows(self.system_animations));
@@ -890,8 +1213,14 @@ impl App {
     /// Which pointer to show at the last known mouse position.
     #[must_use]
     pub fn cursor(&self) -> Cursor {
-        if self.page != Page::Processes {
-            return Cursor::Arrow;
+        match self.page {
+            Page::Processes => {}
+            Page::Users => return self.users.cursor(),
+            Page::Services => return self.services.cursor(),
+            Page::Startup => return self.startup.cursor(),
+            Page::Connections => return self.connections.cursor(),
+            Page::Apps => return self.apps.cursor(),
+            _ => return Cursor::Arrow,
         }
         if self.table.resizing() {
             return Cursor::ResizeColumn;
@@ -945,6 +1274,10 @@ impl App {
         }
         self.relayout();
         self.refilter(self.table.tree());
+        self.users.set_snapshot(Arc::clone(&self.snap));
+        self.services.set_snapshot(&self.snap);
+        self.connections.set_snapshot(&self.snap);
+        self.system.set_snapshot(Arc::clone(&self.snap));
     }
 
     /// Recompute the search results against the current snapshot.
@@ -988,11 +1321,21 @@ impl App {
                 system_animations: self.system_animations,
                 update: &self.update,
                 task_manager: &self.task_manager,
+                elevated: self.elevated,
             };
             let _ = self
                 .settings_page
                 .handle(UiEvent::MouseLeave, &mut self.settings, cx);
             self.page = page;
+        }
+    }
+
+    /// Show `page` and ask for what it needs, in one reaction.
+    fn go_to(&mut self, page: Page) -> Reaction {
+        self.set_page(page);
+        Reaction {
+            repaint: true,
+            effect: self.page_query().map(Effect::Query),
         }
     }
 
@@ -1002,6 +1345,7 @@ impl App {
     }
 
     /// Handle input. Says whether to repaint and what else to do.
+    #[allow(clippy::too_many_lines)]
     pub fn handle(&mut self, ev: UiEvent) -> Reaction {
         let mut rail_moved = false;
         match ev {
@@ -1025,10 +1369,7 @@ impl App {
                     self.nav.toggle(self.size.w);
                     return Reaction::REPAINT;
                 }
-                Some(NavHit::Page(page)) => {
-                    self.set_page(page);
-                    return Reaction::REPAINT;
-                }
+                Some(NavHit::Page(page)) => return self.go_to(page),
                 Some(NavHit::Update) => {
                     return self
                         .update
@@ -1037,31 +1378,70 @@ impl App {
                 }
                 None => {}
             },
-            UiEvent::Command(Command::SetPage(page)) => {
-                self.set_page(page);
-                return Reaction::REPAINT;
-            }
-            UiEvent::Command(Command::StepPage(n)) => {
-                self.set_page(self.page.step(n));
-                return Reaction::REPAINT;
-            }
-            // Space pauses, as in Process Explorer, on any page; typed into the
+            UiEvent::Command(Command::SetPage(page)) => return self.go_to(page),
+            UiEvent::Command(Command::StepPage(n)) => return self.go_to(self.page.step(n)),
+            // Space pauses, as in Process Explorer, on any page; typed into a
             // search field it is just a space.
             UiEvent::Command(Command::TogglePause) => return self.toggle_pause(),
-            UiEvent::Char(' ') if !self.toolbar.search.focused => return self.toggle_pause(),
-            // Search belongs to the process table: typing, or Ctrl+F, on another page
-            // goes there, the way Task Manager's search box does.
-            UiEvent::Char(_) | UiEvent::Command(Command::Find) => self.set_page(Page::Processes),
+            UiEvent::Char(' ') if !self.search_focused() => return self.toggle_pause(),
+            // Typing, or Ctrl+F, goes to the page's own search when it has one,
+            // else to the process table's, the way Task Manager's search box does.
+            UiEvent::Char(_) | UiEvent::Command(Command::Find) if !self.page.has_search() => {
+                self.set_page(Page::Processes);
+            }
+            // The Run dialog and the crosshair work from any page.
+            UiEvent::Command(Command::RunTask) => return Reaction::effect(Effect::RunTask),
+            UiEvent::Command(Command::PickWindow) => return Reaction::effect(Effect::PickWindow),
             _ => {}
         }
+        let theme = self.theme.clone();
         let r = match self.page {
             Page::Processes => self.handle_processes(ev),
             Page::Performance => self.perf.handle(ev),
+            Page::Users => {
+                let o = match ev {
+                    UiEvent::Command(Command::Menu(a)) => self.users.menu_action(a),
+                    ev => self.users.handle(ev, &theme),
+                };
+                self.page_outcome(o)
+            }
+            Page::Services => {
+                let o = match ev {
+                    UiEvent::Command(Command::Menu(a)) => self.services.menu_action(a),
+                    ev => self.services.handle(ev, &theme, self.elevated),
+                };
+                self.page_outcome(o)
+            }
+            Page::Startup => {
+                let o = match ev {
+                    UiEvent::Command(Command::Menu(a)) => self.startup.menu_action(a),
+                    ev => self.startup.handle(ev, &theme),
+                };
+                self.page_outcome(o)
+            }
+            Page::Connections => {
+                let o = match ev {
+                    UiEvent::Command(Command::Menu(a)) => {
+                        self.connections.menu_action(a, &self.snap)
+                    }
+                    ev => self.connections.handle(ev, &theme),
+                };
+                self.page_outcome(o)
+            }
+            Page::Apps => {
+                let o = match ev {
+                    UiEvent::Command(Command::Menu(a)) => self.apps.menu_action(a),
+                    ev => self.apps.handle(ev, &theme),
+                };
+                self.page_outcome(o)
+            }
+            Page::System => self.system.handle(ev),
             Page::Settings => {
                 let cx = Context {
                     system_animations: self.system_animations,
                     update: &self.update,
                     task_manager: &self.task_manager,
+                    elevated: self.elevated,
                 };
                 let r = self.settings_page.handle(ev, &mut self.settings, cx);
                 if matches!(r.effect, Some(Effect::SaveSettings(_))) {
@@ -1076,6 +1456,20 @@ impl App {
         }
     }
 
+    /// Whether a search field has the keyboard on the page showing, so Space
+    /// types rather than pauses.
+    fn search_focused(&self) -> bool {
+        match self.page {
+            Page::Processes => self.toolbar.search.focused,
+            Page::Users => self.users.search_focused(),
+            Page::Services => self.services.search_focused(),
+            Page::Startup => self.startup.search_focused(),
+            Page::Connections => self.connections.search_focused(),
+            Page::Apps => self.apps.search_focused(),
+            _ => false,
+        }
+    }
+
     fn handle_processes(&mut self, ev: UiEvent) -> Reaction {
         match ev {
             UiEvent::Resize(s) => {
@@ -1087,6 +1481,9 @@ impl App {
                 if self.table.resizing() {
                     return Reaction::painted(self.table.resize_to(p));
                 }
+                if self.table.header_drag_to(p) {
+                    return Reaction::REPAINT;
+                }
                 // The table's rectangles are stale while the Map or the History
                 // is shown.
                 let hover = match self.table.hit(p, &self.theme) {
@@ -1094,6 +1491,7 @@ impl App {
                     _ => None,
                 };
                 let segment = self.toolbar.segment_at(p);
+                let button = self.toolbar.button_at(p);
                 let clear = self.toolbar.search.clear_rect.contains(p);
                 let crosshair = self.charts.hover(Some(p));
                 let held = self.hold_order(!self.table_off() && self.table.rect().contains(p));
@@ -1102,6 +1500,7 @@ impl App {
                 let history = self.history_on() && self.history.set_pointer(Some(p));
                 let changed = hover != self.table.hover
                     || segment != self.toolbar.hover
+                    || button != self.toolbar.hover_button
                     || clear != self.toolbar.search.hover_clear
                     || crosshair
                     || held
@@ -1109,13 +1508,15 @@ impl App {
                     || history;
                 self.table.hover = hover;
                 self.toolbar.hover = segment;
+                self.toolbar.hover_button = button;
                 self.toolbar.search.hover_clear = clear;
                 Reaction::painted(changed)
             }
             UiEvent::MouseLeave => {
                 self.mouse = None;
                 let row = self.table.hover.take().is_some();
-                let segment = self.toolbar.hover.take().is_some();
+                let segment = self.toolbar.hover.take().is_some()
+                    | self.toolbar.hover_button.take().is_some();
                 let clear = std::mem::take(&mut self.toolbar.search.hover_clear);
                 let crosshair = self.charts.hover(None);
                 let held = self.hold_order(false);
@@ -1136,7 +1537,11 @@ impl App {
                     self.table.end_resize();
                     return Reaction::REPAINT;
                 }
-                Reaction::NONE
+                // A header press released in place sorts; moved, it reordered.
+                if let Some(col) = self.table.end_header_press(at) {
+                    self.table.set_sort(col);
+                }
+                Reaction::REPAINT
             }
             UiEvent::MouseDown {
                 at,
@@ -1175,6 +1580,11 @@ impl App {
             self.toolbar.search.focused = false;
             self.set_view(SEGMENTS[i].0);
             return Reaction::REPAINT;
+        }
+        match self.toolbar.button_at(at) {
+            Some(ToolButton::RunTask) => return Reaction::effect(Effect::RunTask),
+            Some(ToolButton::PickWindow) => return Reaction::effect(Effect::PickWindow),
+            None => {}
         }
         let search = &mut self.toolbar.search;
         if search.clear_rect.contains(at) {
@@ -1215,8 +1625,8 @@ impl App {
                 Reaction::NONE
             }
             Hit::Header(c) => {
-                self.table.set_sort(c);
-                Reaction::REPAINT
+                self.table.begin_header_press(c, at);
+                Reaction::NONE
             }
             Hit::Expander(pos) => Reaction::painted(self.table.toggle_expanded(pos, &rows)),
             Hit::Row(pos) => {
@@ -1348,6 +1758,8 @@ impl App {
                 Reaction::REPAINT
             }
             Command::Menu(action) => self.menu_action(action),
+            Command::RunTask => Reaction::effect(Effect::RunTask),
+            Command::PickWindow => Reaction::effect(Effect::PickWindow),
             // Handled in `handle` before a page sees them.
             Command::SetPage(_) | Command::StepPage(_) | Command::TogglePause => Reaction::NONE,
         }
@@ -1363,7 +1775,37 @@ impl App {
             .map(|row| rows.process_of(row))
     }
 
+    /// The header's menu: one check item per column, and a reset.
+    fn column_chooser(&self, at: Point) -> Reaction {
+        let mut entries: Vec<MenuEntry> = self
+            .table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                MenuEntry::checked(
+                    MenuAction::ToggleColumn(i),
+                    c.title,
+                    i != col::NAME,
+                    c.visible,
+                )
+            })
+            .collect();
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::item(
+            MenuAction::ResetColumns,
+            "Reset columns",
+            true,
+        ));
+        Reaction::effect(Effect::Menu { at, entries })
+    }
+
     fn context_menu(&mut self, at: Option<Point>) -> Reaction {
+        if let Some(p) = at {
+            if !self.table_off() && self.table.header_rect().contains(p) {
+                return self.column_chooser(p);
+            }
+        }
         let anchor = if let Some(p) = at {
             self.select_at(p);
             let over_process = self.map.key_at(p).is_some_and(|(_, alive)| alive)
@@ -1400,29 +1842,54 @@ impl App {
         let p = &self.snap.processes[row];
         let can_sample =
             self.snap.capabilities.cpu_sampling && p.key().pid > 4 && self.sampling.is_none();
+        // The kernel and the idle accounting cannot be acted on.
+        let real = p.key().pid > 4;
+        let has_path = p.statics.image_path.is_some();
+        let priority = Priority::ALL
+            .iter()
+            .map(|&pr| {
+                MenuEntry::checked(
+                    MenuAction::SetPriority(pr),
+                    pr.label(),
+                    real,
+                    pr == p.priority,
+                )
+            })
+            .collect();
         let entries = vec![
-            MenuEntry::Item {
-                action: MenuAction::EndTask,
-                label: "End task",
-                enabled: true,
-            },
-            MenuEntry::Item {
-                action: MenuAction::EndTree,
-                label: "End process tree",
-                enabled: self.tree.rollup(row).descendants > 0,
-            },
+            MenuEntry::item(MenuAction::EndTask, "End task", real),
+            MenuEntry::item(
+                MenuAction::EndTree,
+                "End process tree",
+                real && self.tree.rollup(row).descendants > 0,
+            ),
+            MenuEntry::item(MenuAction::Restart, "Restart", real && has_path),
             MenuEntry::Separator,
-            MenuEntry::Item {
-                action: MenuAction::OpenFileLocation,
-                label: "Open file location",
-                enabled: p.statics.image_path.is_some(),
+            if p.suspended {
+                MenuEntry::item(MenuAction::Resume, "Resume", real)
+            } else {
+                MenuEntry::item(MenuAction::Suspend, "Suspend", real)
             },
+            MenuEntry::checked(
+                MenuAction::EfficiencyMode(p.efficiency_mode != Some(true)),
+                "Efficiency mode",
+                real,
+                p.efficiency_mode == Some(true),
+            ),
+            MenuEntry::Submenu {
+                label: "Set priority",
+                entries: priority,
+            },
+            MenuEntry::Affinity { target: p.key() },
             MenuEntry::Separator,
-            MenuEntry::Item {
-                action: MenuAction::SampleCpu,
-                label: "Sample CPU for 5 s",
-                enabled: can_sample,
-            },
+            MenuEntry::item(MenuAction::SwitchTo, "Switch to", p.window.is_some()),
+            MenuEntry::item(MenuAction::OpenFileLocation, "Open file location", has_path),
+            MenuEntry::item(MenuAction::SearchOnline, "Search online", true),
+            MenuEntry::item(MenuAction::Properties, "Properties", has_path),
+            MenuEntry::item(MenuAction::Copy, "Copy", true),
+            MenuEntry::Separator,
+            MenuEntry::item(MenuAction::CreateDump, "Create dump file", real),
+            MenuEntry::item(MenuAction::SampleCpu, "Sample CPU for 5 s", can_sample),
         ];
         Reaction::effect(Effect::Menu {
             at: anchor,
@@ -1430,7 +1897,44 @@ impl App {
         })
     }
 
+    /// The selected row's visible cells, tab-separated, for the clipboard.
+    fn copy_row(&self) -> Option<String> {
+        let rows = self.rows();
+        let row = self.table.selected.and_then(|id| rows.row_of(id))?;
+        let mut text = String::new();
+        let mut cell = String::new();
+        for (i, (ci, _)) in self.table.shown().enumerate() {
+            rows.cell(row, ci, &mut cell);
+            if i > 0 {
+                text.push('\t');
+            }
+            text.push_str(&cell);
+        }
+        Some(text)
+    }
+
+    /// Act on the Processes page's selected process, or on the table's columns.
+    fn process_action(target: ProcessKey, name: &str, action: ProcessAction) -> Reaction {
+        Reaction::effect(Effect::Process {
+            target,
+            name: name.to_owned(),
+            action,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn menu_action(&mut self, action: MenuAction) -> Reaction {
+        match action {
+            MenuAction::ToggleColumn(c) => {
+                let on = !self.table.columns.get(c).is_some_and(|c| c.visible);
+                return Reaction::painted(self.table.set_visible(c, on));
+            }
+            MenuAction::ResetColumns => {
+                self.table.reset_columns(columns());
+                return Reaction::REPAINT;
+            }
+            _ => {}
+        }
         let Some(row) = self.selected_process() else {
             return Reaction::NONE;
         };
@@ -1472,7 +1976,124 @@ impl App {
                 Some(path) => Reaction::effect(Effect::OpenFileLocation(path.clone())),
                 None => Reaction::NONE,
             },
+            MenuAction::Restart => {
+                let Some(path) = &p.statics.image_path else {
+                    return Reaction::NONE;
+                };
+                // The command line as the process was started, or failing that
+                // its image; started from the image's own folder.
+                let command_line = p
+                    .statics
+                    .command_line
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| format!("\"{path}\""));
+                let directory = path.rfind(['\\', '/']).map(|i| path[..i.max(1)].to_owned());
+                Self::process_action(
+                    p.key(),
+                    p.name(),
+                    ProcessAction::Restart {
+                        command_line,
+                        directory,
+                    },
+                )
+            }
+            MenuAction::Suspend => Self::process_action(p.key(), p.name(), ProcessAction::Suspend),
+            MenuAction::Resume => Self::process_action(p.key(), p.name(), ProcessAction::Resume),
+            MenuAction::EfficiencyMode(on) => {
+                Self::process_action(p.key(), p.name(), ProcessAction::EfficiencyMode(on))
+            }
+            MenuAction::SetPriority(pr) => {
+                Self::process_action(p.key(), p.name(), ProcessAction::SetPriority(pr))
+            }
+            MenuAction::SetAffinity(mask) => {
+                Self::process_action(p.key(), p.name(), ProcessAction::SetAffinity(mask))
+            }
+            MenuAction::CreateDump => {
+                Self::process_action(p.key(), p.name(), ProcessAction::WriteDump)
+            }
+            MenuAction::SwitchTo => match &p.window {
+                Some(w) => Reaction::effect(Effect::SwitchTo(w.handle)),
+                None => Reaction::NONE,
+            },
+            MenuAction::SearchOnline => {
+                let mut query = p.name().to_owned();
+                if let Some(d) = &p.statics.description {
+                    query.push(' ');
+                    query.push_str(d);
+                }
+                Reaction::effect(Effect::OpenUrl(search_url(&query)))
+            }
+            MenuAction::Properties => match &p.statics.image_path {
+                Some(path) => Reaction::effect(Effect::Properties(path.clone())),
+                None => Reaction::NONE,
+            },
+            MenuAction::Copy => self
+                .copy_row()
+                .map_or(Reaction::NONE, |t| Reaction::effect(Effect::CopyText(t))),
+            MenuAction::ToggleColumn(_)
+            | MenuAction::ResetColumns
+            | MenuAction::GoToProcess
+            | MenuAction::ServiceStart
+            | MenuAction::ServiceStop
+            | MenuAction::ServiceRestart
+            | MenuAction::OpenServices
+            | MenuAction::SessionDisconnect
+            | MenuAction::SessionSignOut
+            | MenuAction::StartupEnable(_)
+            | MenuAction::Uninstall
+            | MenuAction::OpenInstallLocation => Reaction::NONE,
         }
+    }
+
+    /// Select the process with `pid` on the Processes page and reveal it, as the
+    /// window crosshair does. Returns whether it was found.
+    pub fn select_pid(&mut self, pid: u32) -> bool {
+        let Some(p) = self.snap.processes.iter().find(|p| p.key().pid == pid) else {
+            return false;
+        };
+        let id = process_rows::row_id(p.key());
+        self.set_page(Page::Processes);
+        self.table.selected = Some(id);
+        if !self.table_off() {
+            let rows = rows_of!(self, self.table.tree());
+            self.table.reveal_selected(&rows, &self.theme);
+        }
+        true
+    }
+
+    /// The page and arrangement showing and the process table's sort and
+    /// columns, for the shell to save.
+    #[must_use]
+    pub fn view_layout(&self) -> ViewLayout {
+        ViewLayout {
+            page: self.page,
+            view: self.view(),
+            sort: self
+                .table
+                .columns
+                .get(self.table.sort_col)
+                .map_or_else(String::new, |c| c.title.to_owned()),
+            sort_desc: self.table.sort_desc,
+            columns: self.table.layout(),
+        }
+    }
+
+    /// Restore what [`App::view_layout`] saved. Call before the first snapshot.
+    pub fn apply_view_layout(&mut self, layout: &ViewLayout) {
+        self.table.apply_layout(&layout.columns);
+        if let Some(c) = self
+            .table
+            .columns
+            .iter()
+            .position(|c| c.title == layout.sort)
+        {
+            self.table.sort_col = c;
+            self.table.sort_desc = layout.sort_desc;
+            self.table.invalidate_order();
+        }
+        self.set_view(layout.view);
+        self.set_page(layout.page);
     }
 
     /// Produce this frame.
@@ -1481,6 +2102,7 @@ impl App {
     }
 
     /// Produce the frame for time `now`, which paces the row slides.
+    #[allow(clippy::too_many_lines)]
     pub fn paint_at(&mut self, dl: &mut DisplayList, now: Instant) {
         self.table.tick(now);
         dl.clear();
@@ -1517,11 +2139,36 @@ impl App {
                     .paint(dl, full, &snap, timeline, theme, &mut self.buf);
                 return;
             }
+            Page::Users => {
+                self.users.paint(dl, full, theme, &mut self.buf);
+                return;
+            }
+            Page::Services => {
+                self.services.paint(dl, full, theme, &mut self.buf);
+                return;
+            }
+            Page::Startup => {
+                self.startup.paint(dl, full, theme, &mut self.buf);
+                return;
+            }
+            Page::Connections => {
+                self.connections.paint(dl, full, theme, &mut self.buf);
+                return;
+            }
+            Page::Apps => {
+                self.apps.paint(dl, full, theme, &mut self.buf);
+                return;
+            }
+            Page::System => {
+                self.system.paint(dl, full, theme);
+                return;
+            }
             Page::Settings => {
                 let cx = Context {
                     system_animations: self.system_animations,
                     update: &self.update,
                     task_manager: &self.task_manager,
+                    elevated: self.elevated,
                 };
                 self.settings_page
                     .paint(dl, full, self.settings, cx, theme, &mut self.buf);
@@ -1612,6 +2259,7 @@ impl App {
             shown: &self.shown,
             tree_mode: self.table.tree(),
             steady: Some(&self.steady),
+            now_unix_ms: snapshot_unix_ms(snap),
         };
         let usage = match &self.paused {
             Some(p) => &p.usage,
@@ -1793,6 +2441,31 @@ fn cycles_core(snap: &Snapshot, usage: &Usage) -> f64 {
     snap.hardware
         .base_frequency
         .map_or(0.0, |f| f.0 as f64 * usage.time_constant())
+}
+
+/// A web search for `query`, with the characters a URL cannot carry escaped.
+pub(crate) fn search_url(query: &str) -> String {
+    let mut url = String::from("https://www.bing.com/search?q=");
+    for b in query.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                url.push(b as char);
+            }
+            b' ' => url.push('+'),
+            _ => {
+                let _ = write!(url, "%{b:02X}");
+            }
+        }
+    }
+    url
+}
+
+/// When the snapshot was taken, milliseconds since the Unix epoch; zero before
+/// the first.
+fn snapshot_unix_ms(snap: &Snapshot) -> i64 {
+    snap.taken_at
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 fn interval_secs(snap: &Snapshot) -> f32 {
@@ -2267,33 +2940,59 @@ mod tests {
             panic!("{r:?}");
         };
         assert_eq!(anchor, at);
-        assert_eq!(
-            entries,
-            vec![
-                MenuEntry::Item {
-                    action: MenuAction::EndTask,
-                    label: "End task",
-                    enabled: true
-                },
-                MenuEntry::Item {
-                    action: MenuAction::EndTree,
-                    label: "End process tree",
-                    enabled: false
-                },
-                MenuEntry::Separator,
-                MenuEntry::Item {
-                    action: MenuAction::OpenFileLocation,
-                    label: "Open file location",
-                    enabled: false
-                },
-                MenuEntry::Separator,
-                MenuEntry::Item {
-                    action: MenuAction::SampleCpu,
-                    label: "Sample CPU for 5 s",
-                    enabled: false
-                },
-            ]
-        );
+        // A leaf with no known path, not sampleable: the entries that need
+        // those are disabled, the rest enabled.
+        let labels: Vec<(String, bool)> = entries
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item { label, enabled, .. } => Some((label.to_string(), *enabled)),
+                MenuEntry::Submenu { label, .. } => Some(((*label).to_owned(), true)),
+                MenuEntry::Affinity { .. } => Some(("Set affinity".to_owned(), true)),
+                MenuEntry::Separator => None,
+            })
+            .collect();
+        let expect = |label: &str, enabled: bool| {
+            assert!(
+                labels.iter().any(|(l, e)| l == label && *e == enabled),
+                "{label} enabled={enabled}: {labels:?}"
+            );
+        };
+        expect("End task", true);
+        expect("End process tree", false);
+        expect("Restart", false);
+        expect("Suspend", true);
+        expect("Efficiency mode", true);
+        expect("Set priority", true);
+        expect("Set affinity", true);
+        expect("Switch to", false);
+        expect("Open file location", false);
+        expect("Search online", true);
+        expect("Properties", false);
+        expect("Copy", true);
+        expect("Create dump file", true);
+        expect("Sample CPU for 5 s", false);
+        assert!(matches!(
+            entries[0],
+            MenuEntry::Item {
+                action: MenuAction::EndTask,
+                ..
+            }
+        ));
+        // The priority submenu checks the current class.
+        let Some(MenuEntry::Submenu { entries: prio, .. }) = entries
+            .iter()
+            .find(|e| matches!(e, MenuEntry::Submenu { .. }))
+        else {
+            panic!("no priority submenu");
+        };
+        assert!(prio.iter().any(|e| matches!(
+            e,
+            MenuEntry::Item {
+                action: MenuAction::SetPriority(Priority::Normal),
+                checked: true,
+                ..
+            }
+        )));
         // Off the rows: nothing.
         assert_eq!(
             app.handle(UiEvent::ContextMenu {
@@ -2374,14 +3073,246 @@ mod tests {
         let Some(Effect::Menu { entries, .. }) = r.effect else {
             panic!("{r:?}");
         };
-        assert!(matches!(
-            entries[3],
+        assert!(entries.iter().any(|e| matches!(
+            e,
             MenuEntry::Item {
                 action: MenuAction::OpenFileLocation,
                 enabled: true,
                 ..
             }
+        )));
+        // With a path, Properties and Restart are offered; Restart carries the
+        // image as the command line and its folder.
+        let r = cmd(&mut app, Command::Menu(MenuAction::Properties));
+        assert_eq!(
+            r.effect,
+            Some(Effect::Properties("C:\\x\\p7.exe".to_owned()))
+        );
+        let r = cmd(&mut app, Command::Menu(MenuAction::Restart));
+        assert_eq!(
+            r.effect,
+            Some(Effect::Process {
+                target: ProcessKey::new(7, 1),
+                name: "p7.exe".to_owned(),
+                action: ProcessAction::Restart {
+                    command_line: "\"C:\\x\\p7.exe\"".to_owned(),
+                    directory: Some("C:\\x".to_owned()),
+                },
+            })
+        );
+        let r = cmd(&mut app, Command::Menu(MenuAction::SearchOnline));
+        assert_eq!(
+            r.effect,
+            Some(Effect::OpenUrl(
+                "https://www.bing.com/search?q=p7.exe".to_owned()
+            ))
+        );
+        let r = cmd(&mut app, Command::Menu(MenuAction::Copy));
+        let Some(Effect::CopyText(text)) = r.effect else {
+            panic!("{r:?}");
+        };
+        assert!(text.starts_with("p7.exe\t7\t"), "{text:?}");
+        let r = cmd(
+            &mut app,
+            Command::Menu(MenuAction::SetPriority(Priority::High)),
+        );
+        assert!(matches!(
+            r.effect,
+            Some(Effect::Process {
+                action: ProcessAction::SetPriority(Priority::High),
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn the_header_menu_toggles_columns_and_a_drag_reorders_them() {
+        let mut app = by_cpu();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let theme = app.theme.clone();
+        let header_y = table_top(&theme) + theme.header_h * 0.5;
+        let at = Point::new(table_left(&theme) + 20.0, header_y);
+        let r = app.handle(UiEvent::ContextMenu { at: Some(at) });
+        let Some(Effect::Menu { entries, .. }) = r.effect else {
+            panic!("{r:?}");
+        };
+        assert!(matches!(
+            entries[col::NAME],
+            MenuEntry::Item {
+                action: MenuAction::ToggleColumn(col::NAME),
+                enabled: false,
+                checked: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            entries[col::KIND],
+            MenuEntry::Item {
+                action: MenuAction::ToggleColumn(col::KIND),
+                enabled: true,
+                checked: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            entries.last(),
+            Some(MenuEntry::Item {
+                action: MenuAction::ResetColumns,
+                ..
+            })
+        ));
+        let shown_before = app.table.shown().count();
+        assert!(cmd(&mut app, Command::Menu(MenuAction::ToggleColumn(col::KIND))).repaint);
+        assert_eq!(app.table.shown().count(), shown_before + 1);
+        assert!(cmd(&mut app, Command::Menu(MenuAction::ToggleColumn(col::PID))).repaint);
+        assert!(!app.table.columns[col::PID].visible);
+        let strings = painted_strings(&mut app);
+        assert!(strings.iter().any(|s| s == "Type"), "{strings:?}");
+        assert!(!strings.iter().any(|s| s == "PID"), "{strings:?}");
+        cmd(&mut app, Command::Menu(MenuAction::ResetColumns));
+        assert_eq!(app.table.shown().count(), shown_before);
+        assert_eq!(app.table.sort_col, col::CPU, "the sort survives a reset");
+
+        // A click on a header sorts; a drag moves the column instead.
+        let pid_x = table_left(&theme) + app.table.columns[col::NAME].width + 10.0;
+        let down = Point::new(pid_x, header_y);
+        app.handle(UiEvent::MouseDown {
+            at: down,
+            button: MouseButton::Left,
+        });
+        app.handle(UiEvent::MouseUp {
+            at: down,
+            button: MouseButton::Left,
+        });
+        assert_eq!(app.table.sort_col, col::PID);
+        app.handle(UiEvent::MouseDown {
+            at: down,
+            button: MouseButton::Left,
+        });
+        let far = Point::new(table_left(&theme) + 5.0, header_y);
+        assert!(app.handle(UiEvent::MouseMove(far)).repaint);
+        assert!(app.table.header_dragging());
+        app.handle(UiEvent::MouseUp {
+            at: far,
+            button: MouseButton::Left,
+        });
+        assert_eq!(app.table.column_at(0), Some(col::PID));
+        assert_eq!(app.table.sort_col, col::PID, "a drag does not sort");
+
+        // The layout round-trips through what the shell saves.
+        let layout = app.view_layout();
+        assert_eq!(layout.sort, "PID");
+        assert_eq!(layout.columns[0].title, "PID");
+        let mut fresh = App::new(Theme::dark());
+        fresh.apply_view_layout(&layout);
+        assert_eq!(fresh.table.column_at(0), Some(col::PID));
+        assert_eq!(fresh.table.sort_col, col::PID);
+    }
+
+    #[test]
+    fn the_toolbar_buttons_ask_for_the_run_dialog_and_the_crosshair() {
+        let mut app = by_cpu();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let run = app.toolbar.buttons[0].center();
+        let pick = app.toolbar.buttons[1].center();
+        assert!(app.toolbar.buttons[0].w > 0.0);
+        assert!(app.handle(UiEvent::MouseMove(run)).repaint);
+        assert_eq!(app.toolbar.hover_button, Some(ToolButton::RunTask));
+        let r = app.handle(UiEvent::MouseDown {
+            at: run,
+            button: MouseButton::Left,
+        });
+        assert_eq!(r.effect, Some(Effect::RunTask));
+        let r = app.handle(UiEvent::MouseDown {
+            at: pick,
+            button: MouseButton::Left,
+        });
+        assert_eq!(r.effect, Some(Effect::PickWindow));
+        assert_eq!(
+            cmd(&mut app, Command::RunTask).effect,
+            Some(Effect::RunTask)
+        );
+        // The crosshair's pick selects the process and reveals it.
+        app.set_page(Page::Performance);
+        assert!(app.select_pid(13));
+        assert_eq!(app.page(), Page::Processes);
+        assert_eq!(app.table.selected, Some(id(13)));
+        assert!(!app.select_pid(999));
+    }
+
+    #[test]
+    fn a_view_layout_round_trips_through_its_text_form() {
+        let mut app = by_cpu();
+        app.set_snapshot(family());
+        ready(&mut app);
+        cmd(&mut app, Command::SetView(ViewMode::Tree));
+        cmd(&mut app, Command::Menu(MenuAction::ToggleColumn(col::KIND)));
+        cmd(&mut app, Command::SetPage(Page::Services));
+        let layout = app.view_layout();
+        let text = layout.encode();
+        assert!(text.starts_with("page=Services;view=Tree;sort=CPU %;desc=1;cols=Name:300:1|"));
+        assert!(text.contains("|Type:90:1"), "{text}");
+        assert_eq!(ViewLayout::decode(&text), Some(layout.clone()));
+        assert_eq!(ViewLayout::decode("garbage"), None);
+        let mut fresh = App::new(Theme::dark());
+        fresh.apply_view_layout(&layout);
+        assert_eq!(fresh.page(), Page::Services);
+        assert_eq!(fresh.view(), ViewMode::Tree);
+        assert!(fresh.table.columns[col::KIND].visible);
+    }
+
+    #[test]
+    fn pages_ask_for_their_lists_and_take_typing() {
+        let mut app = by_cpu();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let r = cmd(&mut app, Command::SetPage(Page::Startup));
+        assert_eq!(r.effect, Some(Effect::Query(Query::Startup)));
+        assert!(app.set_inventory(Inventory::Startup(Vec::new())));
+        assert_eq!(cmd(&mut app, Command::SetPage(Page::Startup)).effect, None);
+        // Connections always wants a fresh list; the others once.
+        assert_eq!(
+            cmd(&mut app, Command::SetPage(Page::Connections)).effect,
+            Some(Effect::Query(Query::Connections))
+        );
+        app.set_inventory(Inventory::Connections(Vec::new()));
+        assert_eq!(app.page_query(), Some(Query::Connections));
+        assert_eq!(
+            cmd(&mut app, Command::SetPage(Page::System)).effect,
+            Some(Effect::Query(Query::System))
+        );
+        // Typing on a list page filters that page, not the process table.
+        cmd(&mut app, Command::SetPage(Page::Services));
+        type_str(&mut app, "spool");
+        assert_eq!(app.page(), Page::Services);
+        assert_eq!(app.search(), "");
+        // On the System page, which has no search, typing goes to Processes.
+        cmd(&mut app, Command::SetPage(Page::System));
+        type_str(&mut app, "p1");
+        assert_eq!(app.page(), Page::Processes);
+        assert_eq!(app.search(), "p1");
+        // Space pauses from the System page.
+        key(&mut app, Key::Escape);
+        cmd(&mut app, Command::SetPage(Page::System));
+        app.handle(UiEvent::Char(' '));
+        assert!(app.paused());
+        painted_strings(&mut app);
+        for page in Page::ALL {
+            cmd(&mut app, Command::SetPage(page));
+            let mut dl = DisplayList::new();
+            app.paint(&mut dl);
+            assert_eq!(dl.clip_depth(), 0, "{page:?}");
+        }
+    }
+
+    #[test]
+    fn search_urls_escape_what_they_must() {
+        assert_eq!(
+            search_url("a b.exe & c"),
+            "https://www.bing.com/search?q=a+b.exe+%26+c"
+        );
     }
 
     #[test]
@@ -2550,13 +3481,14 @@ mod tests {
         assert!(!strings.iter().any(|s| s == "Name"), "no process table");
 
         cmd(&mut app, Command::StepPage(1));
-        assert_eq!(app.page(), Page::Settings);
+        assert_eq!(app.page(), Page::Users);
+        cmd(&mut app, Command::SetPage(Page::Settings));
         cmd(&mut app, Command::StepPage(1));
         assert_eq!(app.page(), Page::Processes, "wraps around");
         cmd(&mut app, Command::StepPage(-1));
         assert_eq!(app.page(), Page::Settings);
         cmd(&mut app, Command::StepPage(-1));
-        assert_eq!(app.page(), Page::Performance);
+        assert_eq!(app.page(), Page::System);
         cmd(&mut app, Command::SetPage(Page::Processes));
         assert_eq!(app.page(), Page::Processes);
     }

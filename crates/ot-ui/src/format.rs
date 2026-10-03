@@ -43,6 +43,24 @@ pub fn rate(out: &mut String, per_interval: Bytes, interval_secs: f32) {
     out.push_str("/s");
 }
 
+/// `h:mm:ss` of CPU time, from whole seconds: `0:00:03`, `12:05:40`.
+pub fn hms(out: &mut String, secs: u64) {
+    out.clear();
+    let _ = write!(
+        out,
+        "{}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    );
+}
+
+/// A count that may exceed `u32`: I/O operations since a process started.
+pub fn count64(out: &mut String, n: u64) {
+    out.clear();
+    let _ = write!(out, "{n}");
+}
+
 /// `0.3`, `12`, `100`, `1,234`. One decimal below ten, none above.
 pub fn percent(out: &mut String, p: f32) {
     out.clear();
@@ -138,6 +156,16 @@ pub fn bytes_per_sec(out: &mut String, b: Bytes) {
 }
 
 /// A short duration in milliseconds: `0.4 ms`, `12 ms`.
+/// Power: `0.8 W`, `12.5 W`, `150 W`.
+pub fn watts(out: &mut String, w: f32) {
+    out.clear();
+    if w >= 100.0 {
+        let _ = write!(out, "{w:.0} W");
+    } else {
+        let _ = write!(out, "{w:.1} W");
+    }
+}
+
 pub fn ms(out: &mut String, ms: f32) {
     out.clear();
     let _ = if ms < 10.0 {

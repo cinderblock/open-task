@@ -201,3 +201,17 @@ impl Default for ThreadBasicInformation {
 pub const TEB_SUB_PROCESS_TAG_OFFSET: usize = 0x1720;
 #[cfg(target_pointer_width = "32")]
 pub const TEB_SUB_PROCESS_TAG_OFFSET: usize = 0x0f60;
+
+// Exported by ntdll since Windows XP and relied on by Process Explorer, System
+// Informer and every debugger, but absent from the public headers and so from the
+// crate's metadata. Both take a process handle opened with `PROCESS_SUSPEND_RESUME`
+// and freeze or thaw every thread in it; a thread suspended more than once needs as
+// many resumes. `raw-dylib` binds to the DLL by name, so no import library is
+// needed at link time.
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    /// `NtSuspendProcess(ProcessHandle)`.
+    pub fn NtSuspendProcess(process: HANDLE) -> NTSTATUS;
+    /// `NtResumeProcess(ProcessHandle)`.
+    pub fn NtResumeProcess(process: HANDLE) -> NTSTATUS;
+}

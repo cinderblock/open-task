@@ -1,6 +1,6 @@
 # Launch the app, wait for its window, screenshot it, and kill it.
 # Dev-time visual smoke test. Usage: pwsh -File scripts/screenshot.ps1 [-Exe path] [-Out path]
-#   [-Click "x,y;x,y"] [-AfterClickMs 3000]
+#   [-Click "x,y;x,y"] [-Keys "End;Up"] [-AfterClickMs 3000]
 param(
     [string]$Exe = "target\debug\open-task.exe",
     [string]$Out = "target\screenshot.png",
@@ -11,7 +11,10 @@ param(
     # Left clicks before the shot, "x,y" separated by ";", in the coordinates of the
     # screenshot itself (so a point can be read off an earlier shot).
     [string]$Click = "",
-    # How long to wait after the last click before the shot.
+    # Keys to press after the clicks, by name, separated by ";": End, Home, Up,
+    # Down, Left, Right, Tab, Enter, Escape, Space, or a single character.
+    [string]$Keys = "",
+    # How long to wait after the last click or key before the shot.
     [int]$AfterClickMs = 1000
 )
 $ErrorActionPreference = "Stop"
@@ -89,6 +92,19 @@ try {
             [Native]::PostMessageW($h, 0x0200, [IntPtr]::Zero, $l) | Out-Null
             [Native]::PostMessageW($h, 0x0201, [IntPtr]1, $l) | Out-Null
             [Native]::PostMessageW($h, 0x0202, [IntPtr]::Zero, $l) | Out-Null
+            Start-Sleep -Milliseconds 200
+        }
+        Start-Sleep -Milliseconds $AfterClickMs
+    }
+
+    if ($Keys -ne "") {
+        $vk = @{ End = 0x23; Home = 0x24; Up = 0x26; Down = 0x28; Left = 0x25; Right = 0x27;
+                 Tab = 0x09; Enter = 0x0D; Escape = 0x1B; Space = 0x20 }
+        foreach ($name in $Keys -split ";") {
+            $code = if ($vk.ContainsKey($name)) { $vk[$name] } else { [int][char]$name.ToUpperInvariant() }
+            # WM_KEYDOWN, WM_KEYUP; the scan code and repeat count are not needed.
+            [Native]::PostMessageW($h, 0x0100, [IntPtr]$code, [IntPtr]0) | Out-Null
+            [Native]::PostMessageW($h, 0x0101, [IntPtr]$code, [IntPtr]0xC0000000) | Out-Null
             Start-Sleep -Milliseconds 200
         }
         Start-Sleep -Milliseconds $AfterClickMs

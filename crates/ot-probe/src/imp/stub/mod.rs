@@ -18,6 +18,12 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct StubProbe;
 
+/// Whether this process runs with administrator rights. Not known here.
+#[must_use]
+pub fn is_elevated() -> bool {
+    false
+}
+
 /// Process actions that do nothing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubControl;

@@ -25,6 +25,8 @@
 //! [`ShellError::Unsupported`], so the workspace builds everywhere.
 
 #[cfg(windows)]
+mod actions;
+#[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
 mod instance;
@@ -33,7 +35,11 @@ pub mod launcher;
 #[cfg(windows)]
 mod prefs;
 #[cfg(windows)]
+mod run_dialog;
+#[cfg(windows)]
 pub mod task_manager;
+#[cfg(windows)]
+mod tray;
 #[cfg(windows)]
 mod window;
 
@@ -72,6 +78,10 @@ pub struct ShellOptions {
     pub view: ViewMode,
     /// The page shown first; the rail and Ctrl+Tab switch at runtime.
     pub page: Page,
+    /// Whether `view` and `page` were asked for on the command line. When not,
+    /// the window opens where the last session left off.
+    pub view_given: bool,
+    pub page_given: bool,
     /// This build's version, as `crates/ot-app/build.rs` made it: shown on the
     /// update button, and what updates are compared with.
     pub version: &'static str,
