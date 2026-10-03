@@ -441,6 +441,18 @@ fn print_devices(snap: &ot_core::Snapshot) {
         let avg = clocks.iter().sum::<u64>() / clocks.len() as u64;
         let _ = write!(extra, "clock {:.2} GHz", avg as f64 / 1e9);
     }
+    if let Some(w) = snap.cpu.package_power {
+        let sep = if extra.is_empty() { "" } else { "  " };
+        let _ = write!(extra, "{sep}power {:.1} W", w.0);
+    }
+    if let Some(c) = snap.cpu.hotspot_celsius {
+        let sep = if extra.is_empty() { "" } else { "  " };
+        let label = snap.hardware.thermal_sensor.map_or("temp", |s| match s {
+            ot_model::cpu::ThermalSensor::Package => "temp",
+            ot_model::cpu::ThermalSensor::Tctl => "Tctl",
+        });
+        let _ = write!(extra, "{sep}{label} {c:.0} °C");
+    }
     for (name, b) in [
         ("modified", mem.modified),
         ("standby", mem.standby),

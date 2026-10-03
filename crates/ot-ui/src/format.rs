@@ -166,6 +166,16 @@ pub fn watts(out: &mut String, w: f32) {
     }
 }
 
+/// A temperature: `61 °C`, with one decimal below ten (`9.5 °C`).
+pub fn celsius(out: &mut String, c: f32) {
+    out.clear();
+    let _ = if c < 10.0 {
+        write!(out, "{c:.1} °C")
+    } else {
+        write!(out, "{c:.0} °C")
+    };
+}
+
 pub fn ms(out: &mut String, ms: f32) {
     out.clear();
     let _ = if ms < 10.0 {
@@ -336,6 +346,13 @@ mod tests {
     fn rate_blanks_zero() {
         assert_eq!(s(|b| rate(b, Bytes(0), 1.0)), "");
         assert_eq!(s(|b| rate(b, Bytes(2048), 2.0)), "1.00 KB/s");
+    }
+
+    #[test]
+    fn celsius_keeps_a_decimal_only_below_ten() {
+        assert_eq!(s(|b| celsius(b, 61.4)), "61 °C");
+        assert_eq!(s(|b| celsius(b, 9.46)), "9.5 °C");
+        assert_eq!(s(|b| celsius(b, 100.0)), "100 °C");
     }
 
     #[test]

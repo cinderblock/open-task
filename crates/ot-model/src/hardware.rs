@@ -1,5 +1,6 @@
 //! Facts about the machine that do not change while it runs.
 
+use crate::cpu::ThermalSensor;
 use crate::units::{Bytes, Hertz};
 
 /// Read once when the probe starts and shared by pointer with every snapshot, the
@@ -41,4 +42,7 @@ pub struct Hardware {
     pub memory_slots_used: Option<u32>,
     /// `DIMM`, `SODIMM`, `Row of chips`, when all modules agree.
     pub memory_form_factor: Option<String>,
+    /// Which sensor `CpuSample::hotspot_celsius` comes from, when the platform
+    /// reads one.
+    pub thermal_sensor: Option<ThermalSensor>,
 }

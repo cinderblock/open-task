@@ -46,7 +46,7 @@ use ot_model::process::{
 };
 use ot_model::service::ServiceInfo;
 use ot_model::thread::{ServiceTag, ThreadSample, ThreadState, WaitReason};
-use ot_model::{Bytes, Hertz, Percent, ProcessKey};
+use ot_model::{Bytes, Hertz, Percent, ProcessKey, Watts};
 
 use windows::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemProcessInformation, SystemProcessorPerformanceInformation,
@@ -75,6 +75,7 @@ mod hardware;
 mod installed;
 mod network;
 mod nt;
+mod pawnio;
 mod profile;
 mod services;
 mod sessions;
@@ -100,6 +101,7 @@ use details::DetailProbe;
 use gpu::GpuProbe;
 use network::NetProbe;
 use nt::{SystemProcessInformation, SystemThreadInformation};
+use pawnio::PawnIo;
 pub use profile::WindowsSampler;
 use services::ServiceProbe;
 use sessions::SessionProbe;
@@ -271,6 +273,9 @@ pub struct WindowsProbe {
     /// The graphics adapters' counters, when this machine has them.
     gpu: Option<GpuProbe>,
     battery: BatteryProbe,
+    /// Package power and temperature, when `PawnIO` is installed and has a module
+    /// for this CPU; see [`pawnio`].
+    pawnio: Option<PawnIo>,
     volumes: VolumeProbe,
     sessions: SessionProbe,
     /// The desktop's app windows, refreshed once per pass.
@@ -297,6 +302,9 @@ impl WindowsProbe {
         let logical_count = si.dwNumberOfProcessors;
 
         let topology = discover_topology(logical_count)?;
+        let pawnio = PawnIo::open();
+        let mut hardware = hardware::read(logical_count);
+        hardware.thermal_sensor = pawnio.as_ref().map(PawnIo::sensor);
 
         Ok(Self {
             proc_buf: AlignedBuf::default(),
@@ -314,7 +322,7 @@ impl WindowsProbe {
             prev_cores: vec![CoreTimes::default(); logical_count as usize],
             topology,
             logical_count,
-            hardware: hardware::read(logical_count),
+            hardware,
             counters: PerfCounters::open(),
             performance: vec![None; logical_count as usize],
             disk_rates: Vec::new(),
@@ -322,6 +330,7 @@ impl WindowsProbe {
             net: NetProbe::default(),
             gpu: GpuProbe::new(),
             battery: BatteryProbe::new(),
+            pawnio,
             volumes: VolumeProbe::new(),
             sessions: SessionProbe::new(),
             windows: WindowList::new(),
@@ -801,8 +810,8 @@ impl SystemProbe for WindowsProbe {
             per_process_power: false,
             core_frequency: self.hardware.base_frequency.is_some()
                 && self.counters.as_ref().is_some_and(PerfCounters::has_clock),
-            package_power: false,
-            thermals: false,
+            package_power: self.pawnio.is_some(),
+            thermals: self.pawnio.as_ref().is_some_and(PawnIo::thermals),
             hybrid_core_kinds: self.topology.iter().any(|(_, k)| *k != CoreKind::Unknown),
             threads: true,
             services: self.services.available(),
@@ -835,6 +844,11 @@ impl SystemProbe for WindowsProbe {
             g.sample(&mut out.gpus);
         }
         self.sample_cores(&mut out.cpu)?;
+        if let Some(p) = self.pawnio.as_mut() {
+            let reading = p.sample();
+            out.cpu.package_power = reading.package_watts.map(Watts);
+            out.cpu.hotspot_celsius = reading.package_celsius;
+        }
         self.sample_processes(&mut out.processes, &mut out.threads, wall_100ns)?;
         out.memory = sample_memory()?;
         if let Some(c) = self.counters.as_mut().filter(|_| collected) {

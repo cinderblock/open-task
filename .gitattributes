@@ -13,3 +13,6 @@
 
 # Signed test fixtures: the signatures cover these exact bytes.
 crates/ot-update/testdata/** -text
+
+# PawnIO module blobs are signed; the signatures cover these exact bytes.
+crates/ot-probe/pawnio/*.bin binary
