@@ -18,6 +18,29 @@ pub enum CoreKind {
     Unknown,
 }
 
+/// Which sensor the CPU temperature is read from, which decides what to call it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThermalSensor {
+    /// Intel's package thermal sensor: the hottest point on the die, read as
+    /// degrees below `TjMax`.
+    Package,
+    /// AMD's control temperature, Tctl: the value the fan curve follows. On some
+    /// models it sits a fixed offset above the die temperature (Tdie); the offset
+    /// is not applied, so the label says Tctl rather than claiming a temperature.
+    Tctl,
+}
+
+impl ThermalSensor {
+    /// What to call the reading in a user interface.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Package => "Temperature",
+            Self::Tctl => "Tctl",
+        }
+    }
+}
+
 /// One logical processor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LogicalCore {

@@ -16,7 +16,7 @@ use std::time::UNIX_EPOCH;
 
 use ot_core::{Retention, Series, Snapshot, Timeline};
 use ot_model::battery::{BatterySample, BatteryState};
-use ot_model::cpu::CoreKind;
+use ot_model::cpu::{CoreKind, ThermalSensor};
 use ot_model::device::{AdapterSample, DiskSample, LinkKind};
 use ot_model::gpu::GpuSample;
 use ot_model::{Bytes, Hertz};
@@ -981,6 +981,11 @@ fn summary(d: Device, snap: &Snapshot, buf: &mut String) {
                 format::clock(&mut tmp, hz);
                 let _ = write!(buf, "  {tmp}");
             }
+            // The temperature fits the line; the power is on the pane.
+            if let Some(c) = snap.cpu.hotspot_celsius {
+                format::celsius(&mut tmp, c);
+                let _ = write!(buf, "  {tmp}");
+            }
         }
         Device::Memory => {
             let m = &snap.memory;
@@ -1165,6 +1170,17 @@ fn paint_cpu_stats(
     if let (Some(now), Some(boot)) = (now_ms, hw.boot_unix_ms) {
         format::uptime(buf, u64::try_from((now - boot) / 1000).unwrap_or(0));
         stat(dl, slot(stats, 0, 2), "Up time", buf, theme);
+    }
+    if let Some(w) = snap.cpu.package_power {
+        format::watts(buf, w.0);
+        stat(dl, slot(stats, 1, 2), "Power", buf, theme);
+    }
+    if let Some(c) = snap.cpu.hotspot_celsius {
+        format::celsius(buf, c);
+        let label = hw
+            .thermal_sensor
+            .map_or("Temperature", ThermalSensor::label);
+        stat(dl, slot(stats, 2, 2), label, buf, theme);
     }
 
     let Some(mut facts) = Facts::beside(stats, 3, theme) else {
@@ -2192,6 +2208,32 @@ mod tests {
         }
         let colors = line_colors(&dl);
         assert!(colors.contains(&theme.gpu) && colors.contains(&theme.gpu_memory));
+    }
+
+    #[test]
+    fn the_cpu_pane_shows_package_power_and_temperature_when_the_probe_has_them() {
+        let (tl, mut s) = timeline(2);
+        s.cpu.package_power = Some(Watts(23.4));
+        s.cpu.hotspot_celsius = Some(61.2);
+        Arc::make_mut(&mut s.hardware).thermal_sensor = Some(ThermalSensor::Package);
+        let mut page = PerfPage::default();
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        for want in ["Power", "23.4 W", "Temperature", "61 °C"] {
+            assert!(has(&t, want), "{want} missing from {t:?}");
+        }
+        // The list's CPU line carries the temperature too.
+        assert!(has(&t, "25%  61 °C"), "{t:?}");
+
+        // An AMD reading is Tctl and says so.
+        Arc::make_mut(&mut s.hardware).thermal_sensor = Some(ThermalSensor::Tctl);
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        assert!(has(&t, "Tctl") && !has(&t, "Temperature"), "{t:?}");
+
+        // Without the readings the slots stay empty.
+        let (tl, s) = timeline(2);
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        assert!(!has(&t, "Power") && !has(&t, "Temperature"), "{t:?}");
+        assert!(has(&t, "25%"), "{t:?}");
     }
 
     #[test]

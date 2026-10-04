@@ -58,7 +58,13 @@ dedicated memory over time, the busiest engines by name, shared memory, and the
 driver's version and date; the counters are the same `GPU Engine` ones Task
 Manager reads. A machine with a **battery** gets its charge over time, the power
 going in or out, time left, and the battery's health (full against design
-capacity), cycle count and chemistry. Connections are the ones a person
+capacity), cycle count and chemistry. With [PawnIO](https://pawnio.eu) installed
+(a signed, scriptable kernel driver; open-task ships none of its own), the CPU
+pane adds the **package power** from the processor's energy counter and its
+**temperature**: the package sensor on Intel, Tctl on AMD Zen, read through the
+LGPL `IntelMSR` and `AMDFamily17` modules embedded from
+[PawnIO.Modules](https://github.com/namazso/PawnIO.Modules). Without PawnIO the
+two figures are simply absent, and the log says where to get it. Connections are the ones a person
 would call connections: physical adapters, Hyper-V `vEthernet` ports and VPNs such
 as Tailscale, not the WAN miniports and virtual-switch internals Windows keeps
 underneath. Rate charts scale themselves to the busiest moment they show.
@@ -330,9 +336,11 @@ thinks it was forgotten:
 
 - **Power usage columns.** Windows computes them from its energy estimation engine,
   which has no public API; TMOG estimates them. A guess is not worth a column.
-- **Package watts and temperatures.** RAPL and the on-die sensors need a kernel
-  driver on Windows (TMOG ships one). The battery's rate is shown where there is a
-  battery.
+- **Package watts and temperatures without PawnIO.** RAPL and the on-die sensors
+  need a kernel driver on Windows (TMOG ships one). open-task reads them through
+  [PawnIO](https://pawnio.eu) when it is installed (see Performance) and ships no
+  driver of its own; without it the battery's rate is the power figure, where
+  there is a battery.
 - **App history.** Cumulative per-app use over 30 days needs usage persisted across
   runs; the fading totals and the History chart answer the live question.
 - **Startup impact.** Windows derives it from boot traces.
