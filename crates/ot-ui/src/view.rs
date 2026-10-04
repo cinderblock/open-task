@@ -30,6 +30,7 @@ use crate::pages::users::UsersPage;
 use crate::pages::PageOutcome;
 use crate::perf::PerfPage;
 use crate::process_rows::{self, col, columns, process_matches, Layout, ProcessRows, ProcessTree};
+use crate::replay::{RecordingView, ReplayAction, ReplayState, Transport};
 use crate::search::SearchBox;
 use crate::settings::{Context, HistoryCost, Settings, SettingsPage};
 use crate::steady::Steady;
@@ -435,6 +436,10 @@ pub enum Effect {
     /// Start a copy of this program as administrator and, if that works, close
     /// this one.
     RunAsAdministrator,
+    /// Drive the replay: a press on the transport bar.
+    Replay(ReplayAction),
+    /// Start recording to a file the user names (`true`), or stop (`false`).
+    Record(bool),
     /// Start the window crosshair; the shell reports the pick with
     /// [`App::select_pid`].
     PickWindow,
@@ -852,6 +857,10 @@ pub struct App {
     paused: Option<Paused>,
     settings: Settings,
     settings_page: SettingsPage,
+    /// The replay transport, while a recording plays instead of the live sampler.
+    transport: Option<Transport>,
+    /// What is being recorded, for the Settings page.
+    recording: Option<RecordingView>,
     /// The version and the update button, on the rail and the Settings page.
     update: UpdateView,
     /// Whether the system opens this copy in Task Manager's place, for the
@@ -908,6 +917,8 @@ impl App {
             paused: None,
             settings: Settings::default(),
             settings_page: SettingsPage::default(),
+            transport: None,
+            recording: None,
             update: UpdateView::default(),
             task_manager: TaskManager::default(),
             system_animations: true,
@@ -1136,6 +1147,46 @@ impl App {
     }
 
     /// Whether this copy runs as administrator. Set once at start.
+    /// Show the replay transport with this state, or hide it (`None`). The shell
+    /// calls this after every frame its player publishes. True when something
+    /// changed.
+    pub fn set_replay(&mut self, state: Option<ReplayState>) -> bool {
+        match (state, self.transport.as_mut()) {
+            (Some(s), Some(t)) => {
+                if t.state == s {
+                    return false;
+                }
+                t.set(s);
+                true
+            }
+            (Some(s), None) => {
+                self.transport = Some(Transport::new(s));
+                true
+            }
+            (None, Some(_)) => {
+                self.transport = None;
+                true
+            }
+            (None, None) => false,
+        }
+    }
+
+    /// Whether a recording is playing instead of the live sampler.
+    #[must_use]
+    pub fn replaying(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    /// What is being recorded (`None` when nothing is), for the Settings page.
+    /// True when something changed.
+    pub fn set_recording(&mut self, recording: Option<RecordingView>) -> bool {
+        if self.recording == recording {
+            return false;
+        }
+        self.recording = recording;
+        true
+    }
+
     pub fn set_elevated(&mut self, on: bool) {
         self.elevated = on;
     }
@@ -1336,6 +1387,8 @@ impl App {
                 task_manager: &self.task_manager,
                 elevated: self.elevated,
                 history: self.history_cost(),
+                recording: self.recording.as_ref(),
+                replaying: self.transport.is_some(),
             };
             let _ = self
                 .settings_page
@@ -1361,6 +1414,11 @@ impl App {
     /// Handle input. Says whether to repaint and what else to do.
     #[allow(clippy::too_many_lines)]
     pub fn handle(&mut self, ev: UiEvent) -> Reaction {
+        if let Some(t) = self.transport.as_mut() {
+            if let Some(r) = t.handle(ev) {
+                return r;
+            }
+        }
         let mut rail_moved = false;
         match ev {
             UiEvent::Resize(s) => {
@@ -1394,6 +1452,10 @@ impl App {
             },
             UiEvent::Command(Command::SetPage(page)) => return self.go_to(page),
             UiEvent::Command(Command::StepPage(n)) => return self.go_to(self.page.step(n)),
+            // In a replay Space is the transport's play/pause.
+            UiEvent::Char(' ') if self.transport.is_some() && !self.search_focused() => {
+                return Reaction::effect(Effect::Replay(ReplayAction::Toggle));
+            }
             // Space pauses, as in Process Explorer, on any page; typed into a
             // search field it is just a space.
             UiEvent::Command(Command::TogglePause) => return self.toggle_pause(),
@@ -1461,6 +1523,8 @@ impl App {
                     task_manager: &self.task_manager,
                     elevated: self.elevated,
                     history: self.history_cost(),
+                    recording: self.recording.as_ref(),
+                    replaying: self.transport.is_some(),
                 };
                 let r = self.settings_page.handle(ev, &mut self.settings, cx);
                 if matches!(r.effect, Some(Effect::SaveSettings(_))) {
@@ -2144,6 +2208,15 @@ impl App {
         });
 
         let window = Rect::from_size(self.size);
+        // A replay's transport takes the bottom of the window, under every page.
+        let window = match self.transport.as_mut() {
+            Some(t) => {
+                let (bar, rest) = window.split_bottom(Transport::H);
+                t.paint(dl, bar, theme, &mut self.buf);
+                rest
+            }
+            None => window,
+        };
         let expanded = self.nav.is_expanded(self.size.w);
         let (rail, content) = window.split_left(self.nav.width(self.size.w));
         self.nav.paint(
@@ -2211,6 +2284,8 @@ impl App {
                     task_manager: &self.task_manager,
                     elevated: self.elevated,
                     history: self.history_cost(),
+                    recording: self.recording.as_ref(),
+                    replaying: self.transport.is_some(),
                 };
                 self.settings_page
                     .paint(dl, full, self.settings, cx, theme, &mut self.buf);
@@ -3424,6 +3499,46 @@ mod tests {
             })
             .collect();
         assert_eq!(images, vec![r"C:\x\a.exe".to_owned()], "one row has a path");
+    }
+
+    #[test]
+    fn a_replay_puts_its_transport_along_the_bottom_and_space_drives_it() {
+        let mut app = by_cpu();
+        ready(&mut app);
+        assert!(!app.replaying());
+        assert!(app.set_replay(Some(ReplayState {
+            name: "run.otrec".to_owned(),
+            position: 3,
+            len: 10,
+            playing: false,
+            speed: 1.0,
+            elapsed_ms: 3000,
+            duration_ms: 9000,
+        })));
+        assert!(app.replaying());
+        let mut dl = DisplayList::new();
+        app.paint(&mut dl);
+        let label = dl
+            .cmds()
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Text(t) if dl.str(t.text) == "Replaying run.otrec" => Some(t.rect),
+                _ => None,
+            })
+            .expect("the transport is painted");
+        assert!(
+            label.y >= app.size.h - Transport::H,
+            "the bar sits at the bottom: {label:?} in {:?}",
+            app.size
+        );
+        // The pages above it still paint: the process table's header is there.
+        assert!(painted_strings(&mut app).iter().any(|t| t == "Name"));
+        assert_eq!(
+            app.handle(UiEvent::Char(' ')).effect,
+            Some(Effect::Replay(ReplayAction::Toggle))
+        );
+        assert!(app.set_replay(None));
+        assert!(!app.replaying());
     }
 
     /// Twenty seconds of history ending at t = 20 s: CPU climbing 5 % a second to

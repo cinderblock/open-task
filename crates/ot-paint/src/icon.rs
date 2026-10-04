@@ -32,11 +32,16 @@ pub enum Icon {
     Apps,
     /// A monitor: the System page.
     System,
+    /// The replay transport's buttons.
+    Play,
+    Pause,
+    Previous,
+    Next,
 }
 
 impl Icon {
     /// Every icon, for backends that want to check their mapping is complete.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Menu,
         Self::Summary,
         Self::Processes,
@@ -49,5 +54,9 @@ impl Icon {
         Self::Connections,
         Self::Apps,
         Self::System,
+        Self::Play,
+        Self::Pause,
+        Self::Previous,
+        Self::Next,
     ];
 }

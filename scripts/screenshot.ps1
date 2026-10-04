@@ -1,6 +1,6 @@
 # Launch the app, wait for its window, screenshot it, and kill it.
 # Dev-time visual smoke test. Usage: pwsh -File scripts/screenshot.ps1 [-Exe path] [-Out path]
-#   [-Click "x,y;x,y"] [-Keys "End;Up"] [-AfterClickMs 3000]
+#   [-Click "x,y;x,y"] [-Keys "End;Up"] [-Wheel -20] [-AfterClickMs 3000]
 param(
     [string]$Exe = "target\debug\open-task.exe",
     [string]$Out = "target\screenshot.png",
@@ -14,6 +14,9 @@ param(
     # Keys to press after the clicks, by name, separated by ";": End, Home, Up,
     # Down, Left, Right, Tab, Enter, Escape, Space, or a single character.
     [string]$Keys = "",
+    # Wheel notches over the middle of the window after the keys: negative scrolls
+    # down (toward the user), as a real wheel does.
+    [int]$Wheel = 0,
     # How long to wait after the last click or key before the shot.
     [int]$AfterClickMs = 1000
 )
@@ -106,6 +109,19 @@ try {
             [Native]::PostMessageW($h, 0x0100, [IntPtr]$code, [IntPtr]0) | Out-Null
             [Native]::PostMessageW($h, 0x0101, [IntPtr]$code, [IntPtr]0xC0000000) | Out-Null
             Start-Sleep -Milliseconds 200
+        }
+        Start-Sleep -Milliseconds $AfterClickMs
+    }
+
+    if ($Wheel -ne 0) {
+        # WM_MOUSEWHEEL takes screen coordinates; one notch is 120.
+        $cx = [int](($rd.L + $rd.R) / 2); $cy = [int](($rd.T + $rd.B) / 2)
+        $lw = [IntPtr](($cy -shl 16) -bor ($cx -band 0xFFFF))
+        $step = if ($Wheel -lt 0) { -120 } else { 120 }
+        for ($i = 0; $i -lt [Math]::Abs($Wheel); $i++) {
+            $ww = [IntPtr](($step -band 0xFFFF) -shl 16)
+            [Native]::PostMessageW($h, 0x020A, $ww, $lw) | Out-Null
+            Start-Sleep -Milliseconds 30
         }
         Start-Sleep -Milliseconds $AfterClickMs
     }

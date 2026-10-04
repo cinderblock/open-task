@@ -396,6 +396,38 @@ fn wait_chain_report(name: &str, pid: u32, chain: &WaitChain) -> String {
     out
 }
 
+/// The Save dialog for a Flight Recorder file: the path chosen, or `None` if the
+/// user cancelled. Modal; pumps messages, so call it with no state borrowed.
+pub(crate) fn save_recording_dialog(owner: HWND) -> Option<String> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let mut file = [0u16; 4096];
+    let default: Vec<u16> = "open-task.otrec".encode_utf16().collect();
+    file[..default.len()].copy_from_slice(&default);
+    // Pairs of description and pattern, each NUL-terminated, then an empty one.
+    let filter: Vec<u16> = "Flight Recorder (*.otrec)\0*.otrec\0All files\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file.as_mut_ptr()),
+        nMaxFile: file.len() as u32,
+        lpstrTitle: w!("Record to"),
+        lpstrDefExt: w!("otrec"),
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+    // SAFETY: every pointer in `ofn` references a local that outlives the call.
+    if !unsafe { GetSaveFileNameW(&raw mut ofn) }.as_bool() {
+        return None;
+    }
+    let end = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Some(String::from_utf16_lossy(&file[..end]))
+}
+
 /// Start `command_line` as a new process, in `directory` when given, with this
 /// process's rights. For Restart, the Run dialog and uninstallers.
 pub(crate) fn launch(command_line: &str, directory: Option<&str>) -> Result<(), String> {

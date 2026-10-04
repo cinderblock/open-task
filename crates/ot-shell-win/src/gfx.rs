@@ -753,6 +753,10 @@ fn glyph(icon: Icon) -> char {
         Icon::Connections => '\u{E774}', // Globe
         Icon::Apps => '\u{E7B8}',        // Package
         Icon::System => '\u{E7F4}',      // Devices, a monitor
+        Icon::Play => '\u{E768}',        // Play
+        Icon::Pause => '\u{E769}',       // Pause
+        Icon::Previous => '\u{E892}',    // Previous
+        Icon::Next => '\u{E893}',        // Next
     }
 }
 

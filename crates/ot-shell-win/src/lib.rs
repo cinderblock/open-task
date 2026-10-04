@@ -73,7 +73,7 @@ impl ThemePreference {
 }
 
 /// Startup options for the shell.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
     pub theme: ThemePreference,
     /// How the process table starts out; Ctrl+T switches at runtime.
@@ -87,6 +87,8 @@ pub struct ShellOptions {
     /// This build's version, as `crates/ot-app/build.rs` made it: shown on the
     /// update button, and what updates are compared with.
     pub version: &'static str,
+    /// Play this recording instead of sampling the machine.
+    pub replay: Option<String>,
 }
 
 /// Why the shell could not run.
@@ -94,6 +96,12 @@ pub struct ShellOptions {
 pub enum ShellError {
     #[error("the Windows shell only runs on Windows")]
     Unsupported,
+    #[error("cannot replay {path}: {source}")]
+    Replay {
+        path: String,
+        #[source]
+        source: ot_core::RecordError,
+    },
     #[cfg(windows)]
     #[error("{context}: {source}")]
     Win {
@@ -150,7 +158,7 @@ pub fn raise_open_window() -> bool {
 pub fn run(
     probe: Box<dyn SystemProbe>,
     config: SamplerConfig,
-    options: ShellOptions,
+    options: &ShellOptions,
 ) -> Result<(), ShellError> {
     #[cfg(windows)]
     {

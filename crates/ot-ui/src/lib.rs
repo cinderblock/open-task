@@ -13,6 +13,7 @@ mod nav;
 mod pages;
 mod perf;
 mod process_rows;
+mod replay;
 mod search;
 mod settings;
 pub mod sparkline;
@@ -27,6 +28,7 @@ mod usage_map;
 pub mod view;
 
 pub use nav::Page;
+pub use replay::{RecordingView, ReplayAction, ReplayState, SPEEDS};
 pub use settings::Settings;
 pub use task_manager::{Replacement, TaskManager};
 pub use theme::Theme;

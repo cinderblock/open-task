@@ -357,9 +357,15 @@ says what the file cost). `open-task --replay session.otrec --headless` prints t
 frames back the way the live headless mode prints passes, and
 `open-task --replay-info session.otrec` says what a file holds: the version that
 wrote it, the machine, when it started, how many frames over how long and what they
-take. Replaying in the window, with play, pause and a scrub bar, is not wired up yet.
-Nothing is written unless `--record` names a file, and a recording cut short (the
-app died, the disk filled) still opens with every complete frame.
+take. `open-task --replay session.otrec` opens the window on the recording instead
+of the live machine: every page works as it does live, and a transport bar along
+the bottom has step back, play/pause (**Space**), step forward, a slider over the
+frames (drag to scrub, wheel to step), the time into the recording, and a speed
+button (0.5x to 8x). Recording can also start from the window: **Record to a
+file** under **Recording** on the Settings page asks where, and the card then
+counts frames and bytes until **Stop**. Nothing is written unless you name a file,
+and a recording cut short (the app died, the disk filled) still opens with every
+complete frame.
 
 A frame is one pass: every process and thread, the CPU, memory, disks, adapters,
 GPUs and battery, everything the pages show. Values shared between passes (a
@@ -390,9 +396,7 @@ thinks it was forgotten:
   debugger), and the **Platform** column (Architecture covers it).
 - **Signature verification** (Process Explorer's Verified Signer), the DLL and
   handle lower pane, thread stacks, VirusTotal.
-- TMOG's **Benchmarks**; the **Flight Recorder**'s transport controls in the window.
-  Recording and replay work from the command line (see [Recording](#recording));
-  the player behind them is built and the UI is next.
+- TMOG's **Benchmarks**.
 - **Minimize on use**, **Start with Windows** (an installer task), and showing
   resource values as percentages.
 

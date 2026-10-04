@@ -39,6 +39,7 @@ use ot_model::Bytes;
 use ot_paint::{DisplayList, HAlign, Point, Rect, VAlign};
 
 use crate::format;
+use crate::replay::RecordingView;
 use crate::task_manager::TaskManager;
 use crate::theme::Theme;
 use crate::update::UpdateView;
@@ -261,6 +262,10 @@ pub(crate) struct Context<'a> {
     pub elevated: bool,
     /// What a history length costs here.
     pub history: HistoryCost,
+    /// What is being recorded, for the Recording card; `None` when nothing is.
+    pub recording: Option<&'a RecordingView>,
+    /// A recording is playing: recording makes no sense, so its card is hidden.
+    pub replaying: bool,
 }
 
 /// One switch on the page.
@@ -392,6 +397,8 @@ enum Card {
     History,
     /// Start a copy as administrator; shown while this one is not.
     RunAsAdministrator,
+    /// Record every pass to a file the user names, or stop.
+    Record,
 }
 
 impl Card {
@@ -400,6 +407,7 @@ impl Card {
         match self {
             Self::TaskManager => cx.task_manager.available(),
             Self::RunAsAdministrator => !cx.elevated,
+            Self::Record => !cx.replaying,
             Self::Toggle(_) | Self::Update | Self::Decay | Self::Speed | Self::History => true,
         }
     }
@@ -416,7 +424,9 @@ impl Card {
             Self::Toggle(t) => t.note(settings, cx),
             Self::Update => cx.update.note(),
             Self::TaskManager => cx.task_manager.note(scratch).then_some(scratch.as_str()),
-            Self::Decay | Self::Speed | Self::History | Self::RunAsAdministrator => None,
+            Self::Decay | Self::Speed | Self::History | Self::RunAsAdministrator | Self::Record => {
+                None
+            }
         }
     }
 
@@ -425,7 +435,7 @@ impl Card {
     fn clickable(self, cx: Context<'_>) -> bool {
         match self {
             Self::Decay | Self::Speed | Self::History => false,
-            Self::Toggle(_) | Self::RunAsAdministrator => true,
+            Self::Toggle(_) | Self::RunAsAdministrator | Self::Record => true,
             Self::Update => cx.update.action().is_some(),
             Self::TaskManager => !cx.task_manager.pending,
         }
@@ -433,7 +443,7 @@ impl Card {
 }
 
 /// The page, top to bottom: each section's heading and its cards.
-const SECTIONS: [(&str, &[Card]); 5] = [
+const SECTIONS: [(&str, &[Card]); 6] = [
     (
         "Process table",
         &[Card::Toggle(Toggle::AnimateRows), Card::Decay, Card::Speed],
@@ -456,8 +466,9 @@ const SECTIONS: [(&str, &[Card]); 5] = [
         ],
     ),
     ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
+    ("Recording", &[Card::Record]),
 ];
-const CARD_COUNT: usize = 12;
+const CARD_COUNT: usize = 13;
 /// The fade card's place among the cards, the speed card's and the history card's.
 const DECAY_CARD: usize = 1;
 const SPEED_CARD: usize = 2;
@@ -490,6 +501,9 @@ const BUTTON_W: f32 = SWITCH_W + STATE_W + 16.0;
 const BUTTON_H: f32 = 28.0;
 /// The fade card's minus and plus buttons.
 const STEP_W: f32 = 28.0;
+/// A stepper's minus, value and plus: room between the buttons for the longest
+/// value, "Normal" ("Norma" was all that showed in a switch's width).
+const STEPPER_W: f32 = 2.0 * STEP_W + 60.0;
 
 #[derive(Debug, Default)]
 pub(crate) struct SettingsPage {
@@ -613,6 +627,7 @@ impl SettingsPage {
                     }
                 }
                 Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
+                Some(Card::Record) => Reaction::effect(Effect::Record(cx.recording.is_none())),
                 Some(Card::TaskManager) | None => Reaction::NONE,
             },
             UiEvent::Wheel {
@@ -669,7 +684,7 @@ impl SettingsPage {
         let pair = |card: Rect| {
             let right = card.right() - 16.0;
             let button = |x: f32| Rect::new(x, card.center().y - BUTTON_H * 0.5, STEP_W, BUTTON_H);
-            [button(right - BUTTON_W), button(right - STEP_W)]
+            [button(right - STEPPER_W), button(right - STEP_W)]
         };
         let [d0, d1] = pair(self.cards[DECAY_CARD]);
         let [s0, s1] = pair(self.cards[SPEED_CARD]);
@@ -845,6 +860,30 @@ impl SettingsPage {
                         theme,
                     );
                     paint_button(dl, control, "Restart", true, theme);
+                }
+                Card::Record => {
+                    let mut detail = String::new();
+                    let (title, button) = if let Some(r) = cx.recording {
+                        let mut size = String::new();
+                        format::bytes(&mut size, Bytes(r.bytes));
+                        let _ = write!(
+                            detail,
+                            "Recording to {}: {} frames, {size}",
+                            r.name, r.frames
+                        );
+                        if r.dropped > 0 {
+                            let _ = write!(detail, ", {} dropped", r.dropped);
+                        }
+                        ("Recording", "Stop")
+                    } else {
+                        detail.push_str(
+                            "Every pass goes to a .otrec file you name, to play back later \
+                             with open-task --replay <file>.",
+                        );
+                        ("Record to a file", "Record\u{2026}")
+                    };
+                    paint_text(dl, text, title, &detail, note, theme);
+                    paint_button(dl, control, button, true, theme);
                 }
                 Card::Update => {
                     let mut title = String::new();
@@ -1042,6 +1081,8 @@ mod tests {
             task_manager: &NO_TASK_MANAGER,
             elevated: true,
             history: HistoryCost::default(),
+            recording: None,
+            replaying: false,
         }
     }
 
@@ -1301,6 +1342,8 @@ mod tests {
     fn the_history_card_steps_the_reach_and_says_what_it_costs() {
         let update = UpdateView::new("0.2.1", true);
         let cx = Context {
+            recording: None,
+            replaying: false,
             history: HistoryCost {
                 series: 50,
                 usage_frame_bytes: 200,
@@ -1501,14 +1544,19 @@ mod tests {
         assert_eq!(wheel(&mut page, &mut s, 50.0), Reaction::REPAINT);
         let mut dl = DisplayList::new();
         page.paint(&mut dl, short, s, cx, &Theme::dark(), &mut String::new());
-        let last = page.cards[TASK_MANAGER];
+        // The Recording card is the last on the page.
+        let last = page.cards[CARD_COUNT - 1];
         assert!(
             (last.bottom() + CARD_GAP - short.bottom()).abs() < 0.01,
             "{last:?}"
         );
-        assert!(texts(&dl).iter().any(|t| t == "Replace Task Manager"));
+        assert!(texts(&dl).iter().any(|t| t == "Record to a file"));
         let r = click(&mut page, last.center(), &mut s, cx);
-        assert_eq!(r.effect, Some(Effect::ReplaceTaskManager(true)));
+        assert_eq!(
+            r.effect,
+            Some(Effect::Record(true)),
+            "nothing recording: start"
+        );
         // Already at the end: nothing moves.
         assert_eq!(wheel(&mut page, &mut s, 1.0), Reaction::NONE);
         // Back to the top.

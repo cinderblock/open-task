@@ -13,15 +13,15 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ot_core::{Sampler, SamplerConfig};
+use ot_core::{Feed, Player, RecordHeader, Recorder, Recording, Sampler, SamplerConfig};
 use ot_model::ProcessKey;
 use ot_paint::{DisplayList, Point, Size};
 use ot_probe::{ControlError, PlatformControl, ProcessControl, SystemProbe};
 use ot_probe::{CpuSampler, PlatformSampler};
 use ot_ui::{
     App, Command, Cursor, Effect, Inventory, Key, MenuAction, MenuEntry, MouseButton, Page,
-    ProcessAction, Query, ServiceAction, SessionAction, Settings, TaskManager, Theme, UiEvent,
-    UpdateAction, UpdateView, ViewMode,
+    ProcessAction, Query, RecordingView, ReplayAction, ReplayState, ServiceAction, SessionAction,
+    Settings, TaskManager, Theme, UiEvent, UpdateAction, UpdateView, ViewMode,
 };
 use ot_update::{Installation, Updater};
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
@@ -160,7 +160,14 @@ struct State {
     gfx: Option<Gfx>,
     app: App,
     dl: DisplayList,
-    sampler: Option<Sampler>,
+    /// Where snapshots come from: the live sampler, or a replay's player.
+    feed: Option<Feed>,
+    /// This build's version, for a recording's header.
+    version: &'static str,
+    /// The file being recorded to, by name, while one is.
+    record_name: Option<String>,
+    /// The recording being played, by name.
+    replay_name: String,
     control: PlatformControl,
     dpi: f32,
     tracking_leave: bool,
@@ -247,7 +254,7 @@ fn win(context: &'static str) -> impl FnOnce(windows::core::Error) -> ShellError
 pub fn run(
     probe: Box<dyn SystemProbe>,
     config: SamplerConfig,
-    options: ShellOptions,
+    options: &ShellOptions,
 ) -> Result<(), ShellError> {
     // A Task Manager stand-in looks for this.
     let _ = instance::mark();
@@ -353,7 +360,7 @@ pub fn run(
     // The sampler posts a message per publish. HWND is a pointer and therefore not
     // Send, so it crosses the thread as an integer.
     let hwnd_bits = hwnd.0 as isize;
-    let sampler = Sampler::start_with_notify(probe, config, move || {
+    let notify = move || {
         // SAFETY: posting to a window handle is thread-safe; if the window is gone
         // the call fails harmlessly.
         let _ = unsafe {
@@ -364,7 +371,21 @@ pub fn run(
                 LPARAM(0),
             )
         };
-    });
+    };
+    // A replay stands in for the sampler: the player publishes frames the same way.
+    let replay_name = options.replay.as_deref().map(file_name).unwrap_or_default();
+    let feed = match &options.replay {
+        Some(path) => {
+            let replay_error = |source| ShellError::Replay {
+                path: path.clone(),
+                source,
+            };
+            let recording = Recording::open(path).map_err(replay_error)?;
+            let player = Player::with_notify(recording, notify).map_err(replay_error)?;
+            Feed::Replay(player)
+        }
+        None => Feed::Live(Sampler::start_with_notify(probe, config, notify)),
+    };
 
     let settings = app.settings();
     let first_query = app.page_query();
@@ -373,7 +394,10 @@ pub fn run(
         gfx: Some(gfx),
         app,
         dl: DisplayList::new(),
-        sampler: Some(sampler),
+        feed: Some(feed),
+        version: options.version,
+        record_name: None,
+        replay_name,
         control: PlatformControl,
         dpi,
         tracking_leave: false,
@@ -407,6 +431,12 @@ pub fn run(
             actions::spawn_query(hwnd, WM_APP_INVENTORY, q);
         }
     }
+    // Show what the feed already holds. A replay's player publishes its first frame
+    // before the window exists and stays paused, so no message would bring it.
+    // SAFETY: hwnd is valid; the message carries nothing.
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_APP_SNAPSHOT, WPARAM(0), LPARAM(0));
+    }
 
     tracing::info!(backdrop, dark, dpi, ?size_px, "window up");
 
@@ -428,8 +458,8 @@ pub fn run(
         let mut state = Box::from_raw(state_ptr);
         // Stop sampling before the rest is torn down so no message is posted to a
         // dead window from the sampler thread.
-        if let Some(mut s) = state.get_mut().sampler.take() {
-            s.stop();
+        if let Some(feed) = state.get_mut().feed.take() {
+            stop_feed(feed);
         }
         drop(state);
     }
@@ -855,8 +885,8 @@ fn apply_settings(cell: &RefCell<State>, hwnd: HWND, settings: &Settings) {
         );
     }
     if let Ok(st) = cell.try_borrow() {
-        if let Some(s) = &st.sampler {
-            s.set_interval(Duration::from_millis(u64::from(
+        if let Some(feed) = &st.feed {
+            feed.set_interval(Duration::from_millis(u64::from(
                 settings.update_interval_ms,
             )));
         }
@@ -864,6 +894,117 @@ fn apply_settings(cell: &RefCell<State>, hwnd: HWND, settings: &Settings) {
 }
 
 /// Tell the user something in a message box.
+/// Stop whatever feeds the window: the sampler's thread, or the player's.
+fn stop_feed(feed: Feed) {
+    match feed {
+        Feed::Live(mut sampler) => sampler.stop(),
+        Feed::Replay(mut player) => player.stop(),
+    }
+}
+
+/// A path's last component, for the transport bar and the Recording card.
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Where the player stands, for the transport bar.
+fn replay_state(player: &Player, name: &str) -> ReplayState {
+    let interval_ms = u64::try_from(player.interval().as_millis()).unwrap_or(1000);
+    ReplayState {
+        name: name.to_owned(),
+        position: player.position(),
+        len: player.len(),
+        playing: player.is_playing(),
+        speed: player.speed(),
+        elapsed_ms: player.position() as u64 * interval_ms,
+        duration_ms: u64::try_from(player.recording().duration().as_millis()).unwrap_or(0),
+    }
+}
+
+/// What the sampler is recording, for the Settings page; `None` when nothing.
+fn recording_view(sampler: &Sampler, name: Option<&str>) -> Option<RecordingView> {
+    sampler.recording().map(|p| RecordingView {
+        name: name.unwrap_or_default().to_owned(),
+        frames: p.frames,
+        bytes: p.bytes,
+        dropped: p.dropped,
+    })
+}
+
+/// Start recording to a file the user picks, or stop and say what was written.
+fn record(cell: &RefCell<State>, hwnd: HWND, start: bool) {
+    if start {
+        // The dialog pumps messages, so no borrow may be held across it.
+        let Some(path) = actions::save_recording_dialog(hwnd) else {
+            return;
+        };
+        let Ok(mut st) = cell.try_borrow_mut() else {
+            return;
+        };
+        let Some(sampler) = st.feed.as_ref().and_then(Feed::sampler) else {
+            return;
+        };
+        let snap = sampler.latest();
+        let header = RecordHeader {
+            app_version: st.version.to_owned(),
+            hardware: (*snap.hardware).clone(),
+            capabilities: snap.capabilities,
+            started: std::time::SystemTime::now(),
+            interval: sampler.interval(),
+        };
+        let recorder = match Recorder::create(&path, &header) {
+            Ok(r) => r,
+            Err(e) => {
+                drop(st);
+                notify(hwnd, &format!("Could not record to {path}.\n\n{e}"));
+                return;
+            }
+        };
+        let _ = sampler.record_to(recorder);
+        let name = file_name(&path);
+        let view = recording_view(sampler, Some(&name));
+        st.record_name = Some(name);
+        st.app.set_recording(view);
+        invalidate(hwnd);
+        return;
+    }
+    let Ok(mut st) = cell.try_borrow_mut() else {
+        return;
+    };
+    let Some(sampler) = st.feed.as_ref().and_then(Feed::sampler) else {
+        return;
+    };
+    let stats = sampler.stop_recording();
+    let name = st.record_name.take().unwrap_or_default();
+    st.app.set_recording(None);
+    drop(st);
+    invalidate(hwnd);
+    match stats {
+        Some(Ok(s)) => {
+            let mut size = String::new();
+            ot_ui::format::bytes(&mut size, ot_model::Bytes(s.written.bytes));
+            let mut text = format!("Recorded {} frames to {name} ({size}).", s.written.frames);
+            if s.dropped > 0 {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut text,
+                    format_args!(
+                        "\n\n{} frames were dropped: the disk could not keep up.",
+                        s.dropped
+                    ),
+                );
+            }
+            notify(hwnd, &text);
+        }
+        Some(Err(e)) => notify(
+            hwnd,
+            &format!("The recording {name} could not be finished.\n\n{e}"),
+        ),
+        None => {}
+    }
+}
+
 fn notify(hwnd: HWND, text: &str) {
     let text = HSTRING::from(text);
     // SAFETY: strings outlive the call; hwnd is valid.
@@ -1215,15 +1356,24 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             Outcome::Default
         }
         WM_APP_SNAPSHOT => {
-            if let Some(s) = &st.sampler {
-                let snap = s.latest();
+            if let Some(feed) = &st.feed {
+                let snap = feed.latest();
                 if let Some(tray) = &mut st.tray {
                     let mem = (snap.memory.total.get() > 0).then(|| {
                         snap.memory.in_use().get() as f32 / snap.memory.total.get() as f32 * 100.0
                     });
                     tray.update(snap.cpu.total.get(), mem);
                 }
-                if st.app.set_snapshot(snap) {
+                let mut changed = st.app.set_snapshot(snap);
+                changed |= match feed {
+                    Feed::Replay(player) => st
+                        .app
+                        .set_replay(Some(replay_state(player, &st.replay_name))),
+                    Feed::Live(sampler) => st
+                        .app
+                        .set_recording(recording_view(sampler, st.record_name.as_deref())),
+                };
+                if changed {
                     invalidate(hwnd);
                 }
             }
@@ -1388,6 +1538,36 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
         }
         Effect::RunTask => {
             run_task(cell, hwnd);
+            None
+        }
+        Effect::Replay(action) => {
+            if let Ok(st) = cell.try_borrow() {
+                if let Some(player) = st.feed.as_ref().and_then(Feed::player) {
+                    match action {
+                        ReplayAction::Toggle => player.toggle(),
+                        ReplayAction::Seek(i) => player.seek(i),
+                        ReplayAction::Step(by) => player.step(by),
+                        ReplayAction::Speed(speed) => player.set_speed(speed),
+                    }
+                }
+            }
+            // A seek or a step publishes a frame, which repaints; a speed change
+            // and a pause do not, so paint the bar's new state now.
+            if let Ok(mut st) = cell.try_borrow_mut() {
+                let state = st
+                    .feed
+                    .as_ref()
+                    .and_then(Feed::player)
+                    .map(|p| replay_state(p, &st.replay_name));
+                if let Some(state) = state {
+                    st.app.set_replay(Some(state));
+                }
+            }
+            invalidate(hwnd);
+            None
+        }
+        Effect::Record(start) => {
+            record(cell, hwnd, start);
             None
         }
         Effect::RunAsAdministrator => {
@@ -1735,8 +1915,8 @@ fn close(st: &mut State) -> Outcome {
     }
     tracing::info!("installing the update as open-task closes");
     st.closing = Closing::InstallingUpdate;
-    if let Some(mut s) = st.sampler.take() {
-        s.stop();
+    if let Some(feed) = st.feed.take() {
+        stop_feed(feed);
     }
     u.install(false);
     Outcome::Hide
@@ -1788,7 +1968,7 @@ fn sample_cpu(cell: &RefCell<State>, hwnd: HWND, target: ProcessKey, seconds: u3
         let Ok(st) = cell.try_borrow() else {
             return;
         };
-        let snap = st.sampler.as_ref().map(Sampler::latest);
+        let snap = st.feed.as_ref().map(Feed::latest);
         let p = snap
             .as_ref()
             .and_then(|s| s.processes.iter().find(|p| p.key() == target));

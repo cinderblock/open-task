@@ -113,13 +113,9 @@ fn main() {
         std::process::exit(run_replay_info(path));
     }
     if let Some(path) = replay {
-        if !args.iter().any(|a| a == "--headless") && cfg!(windows) {
-            eprintln!(
-                "replaying in the window is not wired up yet; use --replay {path} --headless"
-            );
-            std::process::exit(2);
+        if args.iter().any(|a| a == "--headless") {
+            std::process::exit(run_replay(path));
         }
-        std::process::exit(run_replay(path));
     }
     // Started in Task Manager's place with a window already open: bring that one
     // forward, as Task Manager would, before any of the setup below.
@@ -166,7 +162,7 @@ fn main() {
             Some(r) => Box::new(RecordingProbe::new(Box::new(probe), r)),
             None => Box::new(probe),
         };
-        run_gui(probe, config, theme, view, page);
+        run_gui(probe, config, theme, view, page, replay);
     }
 }
 
@@ -438,6 +434,7 @@ fn run_gui(
     theme: &str,
     view: Option<&str>,
     page: Option<&str>,
+    replay: Option<&str>,
 ) {
     let options = ot_shell_win::ShellOptions {
         theme: ot_shell_win::ThemePreference::parse(theme),
@@ -446,8 +443,9 @@ fn run_gui(
         view_given: view.is_some(),
         page_given: page.is_some(),
         version: VERSION,
+        replay: replay.map(str::to_owned),
     };
-    if let Err(e) = ot_shell_win::run(probe, config, options) {
+    if let Err(e) = ot_shell_win::run(probe, config, &options) {
         fail(&format!("shell failed: {e}"), 1, true);
     }
 }
@@ -472,8 +470,9 @@ fn run_gui(
     theme: &str,
     view: Option<&str>,
     page: Option<&str>,
+    replay: Option<&str>,
 ) {
-    let _ = (probe, config, theme, view, page);
+    let _ = (probe, config, theme, view, page, replay);
     eprintln!("no GUI shell on this platform yet; use --headless");
     std::process::exit(3);
 }
