@@ -116,6 +116,11 @@ const FILETIME_UNIX_OFFSET_100NS: i64 = 116_444_736_000_000_000;
 /// takes a few passes to fill in; each later pass only sees a handful of new
 /// processes and finishes well inside the budget.
 const DETAIL_BUDGET: Duration = Duration::from_millis(20);
+/// Details read per pass even when the pass has already used its budget: on a
+/// machine busy enough that enumerating the processes alone takes longer than
+/// [`DETAIL_BUDGET`], the deadline is behind us before the pending list is
+/// touched, and without a floor no process would ever get its path or user.
+const DETAIL_FLOOR: u32 = 8;
 
 /// Hard cap on thread rows per pass, so a runaway process cannot make the snapshot
 /// arbitrarily large. Processes past the cap report no thread rows that pass.
@@ -719,7 +724,7 @@ impl WindowsProbe {
         }
         self.index_by_pid(out);
         let mut done = 0u32;
-        while Instant::now() < deadline {
+        while done < DETAIL_FLOOR || Instant::now() < deadline {
             let Some(key) = self.pending_details.pop() else {
                 break;
             };

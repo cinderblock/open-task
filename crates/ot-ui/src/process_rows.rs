@@ -1088,6 +1088,20 @@ impl RowSource for ProcessRows<'_> {
         self.layout.rows[row].id
     }
 
+    fn images(&self) -> bool {
+        true
+    }
+
+    /// A process row shows its program's icon; the rows under a process (its
+    /// services, threads and samples) show none.
+    fn image(&self, row: usize) -> Option<&str> {
+        let r = self.row(row);
+        match r.kind {
+            RowKind::Process => self.procs[r.proc as usize].statics.image_path.as_deref(),
+            _ => None,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn cell(&self, row: usize, col: usize, out: &mut String) {
         let r = self.row(row);

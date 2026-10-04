@@ -29,6 +29,8 @@ mod actions;
 #[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
+mod icons;
+#[cfg(windows)]
 mod instance;
 #[cfg(windows)]
 pub mod launcher;

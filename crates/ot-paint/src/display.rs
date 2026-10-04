@@ -92,6 +92,14 @@ pub enum DrawCmd {
         size: f32,
         color: Color,
     },
+    /// A raster image the backend finds by its path (a program's icon, say),
+    /// scaled into `rect`. The backend owns the lookup and the loading; a path it
+    /// has not loaded yet draws nothing this frame.
+    Image {
+        /// Indexes [`DisplayList::str`].
+        path: Span,
+        rect: Rect,
+    },
     /// Everything until the matching [`DrawCmd::PopClip`] is clipped to `rect`.
     PushClip(Rect),
     PopClip,
@@ -290,6 +298,21 @@ impl DisplayList {
     }
 
     /// Draw `icon` `size` DIPs tall, centered in `rect`.
+    /// The image at `path` (a file whose icon the backend extracts), scaled into
+    /// `rect`.
+    pub fn image(&mut self, path: &str, rect: Rect) {
+        if rect.is_empty() || path.is_empty() {
+            return;
+        }
+        let start = self.strings.len() as u32;
+        self.strings.push_str(path);
+        let path = Span {
+            start,
+            len: path.len() as u32,
+        };
+        self.cmds.push(DrawCmd::Image { path, rect });
+    }
+
     pub fn icon(&mut self, icon: Icon, rect: Rect, size: f32, color: Color) {
         if !rect.is_empty() && size > 0.0 && color.a > 0.0 {
             self.cmds.push(DrawCmd::Icon {

@@ -67,6 +67,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::actions::{self, ActionOutcome};
 use crate::gfx::Gfx;
+use crate::icons;
 use crate::task_manager::{self, Elevated};
 use crate::tray::Tray;
 use crate::{instance, prefs, run_dialog};
@@ -87,6 +88,8 @@ const WM_APP_INVENTORY: u32 = WM_APP + 5;
 const WM_APP_ACTION: u32 = WM_APP + 6;
 /// The tray icon was clicked; `lparam` is the mouse message.
 const WM_APP_TRAY: u32 = WM_APP + 7;
+/// An icon the worker extracted: `lparam` is a `Box<icons::IconPixels>`.
+const WM_APP_ICON: u32 = WM_APP + 8;
 
 /// The timer for scheduled update checks: first shortly after start, so it does
 /// not compete with the first frames, then hourly to see whether a day has passed.
@@ -174,6 +177,8 @@ struct State {
     elevated: bool,
     /// The notification-area icon with its CPU meter.
     tray: Option<Tray>,
+    /// Extracts program icons the renderer asks for.
+    icons: icons::IconLoader,
     /// The crosshair is out: the mouse is captured until the button comes up.
     picking: bool,
     /// What the Run dialog showed last, shown again next time.
@@ -380,6 +385,7 @@ pub fn run(
         title: window_title(elevated, false),
         elevated,
         tray: Some(Tray::new(hwnd, WM_APP_TRAY)),
+        icons: icons::IconLoader::start(hwnd, WM_APP_ICON),
         picking: false,
         last_run: String::new(),
         updater,
@@ -644,6 +650,11 @@ fn repaint(st: &mut State) {
             tracing::error!(error = %e, "render failed; device will be recreated");
             st.gfx = None;
             invalidate(st.hwnd);
+        } else {
+            // Icons the frame wanted and nobody has loaded: the worker gets them.
+            for path in gfx.take_wanted() {
+                st.icons.request(path);
+            }
         }
     }
     // Rows are sliding: ask for the next frame. `Present` waits for the vertical
@@ -1137,6 +1148,20 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe {
                     SetTimer(Some(hwnd), TIMER_REFRESH, REFRESH_MS, None);
                 }
+            }
+            Outcome::Done(LRESULT(0))
+        }
+        WM_APP_ICON => {
+            // SAFETY: the pointer was made by `Box::into_raw` in the icon worker
+            // and is delivered exactly once.
+            let pixels = unsafe { Box::from_raw(lparam.0 as *mut icons::IconPixels) };
+            if let Some(gfx) = st.gfx.as_mut() {
+                if pixels.pbgra.is_empty() {
+                    gfx.image_missing(&pixels.path);
+                } else {
+                    gfx.add_image(&pixels.path, pixels.width, pixels.height, &pixels.pbgra);
+                }
+                invalidate(hwnd);
             }
             Outcome::Done(LRESULT(0))
         }

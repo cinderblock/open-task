@@ -17,14 +17,15 @@ use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
-    D2D_RECT_F,
+    D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
     ID2D1PathGeometry1, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
-    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -76,6 +77,24 @@ struct FontSet {
 }
 
 /// All GPU and text resources for one window.
+/// What is known about one image path.
+#[derive(Debug)]
+enum ImageSlot {
+    /// Asked for, not yet delivered.
+    Pending,
+    /// There is no image for this path (the file has no icon, or cannot be read).
+    Missing,
+    Ready(ID2D1Bitmap1),
+}
+
+/// The key an image path is cached under.
+fn image_key(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    h.finish()
+}
+
 pub struct Gfx {
     _d3d: ID3D11Device,
     d2d_factory: ID2D1Factory1,
@@ -97,6 +116,11 @@ pub struct Gfx {
     fonts: HashMap<TextStyle, FontSet>,
     layouts: HashMap<u64, CachedLayout>,
     utf16: Vec<u16>,
+    /// Raster images by the hash of their path: a program's icon, loaded by the
+    /// window off this thread and handed in with [`Gfx::add_image`].
+    images: HashMap<u64, ImageSlot>,
+    /// Paths this frame asked for that nobody has loaded yet.
+    wanted: Vec<String>,
 
     frame: u64,
     dpi: f32,
@@ -226,6 +250,8 @@ impl Gfx {
             fonts: HashMap::new(),
             layouts: HashMap::with_capacity(1024),
             utf16: Vec::with_capacity(128),
+            images: HashMap::new(),
+            wanted: Vec::new(),
             frame: 0,
             dpi,
             size_px,
@@ -266,6 +292,58 @@ impl Gfx {
         unsafe { self.dc.SetDpi(dpi, dpi) };
         // Rebind so the bitmap's DPI matches.
         let _ = self.bind_target();
+    }
+
+    /// Image paths the last frames drew that have not been loaded yet. The caller
+    /// loads them (off this thread) and brings each back through
+    /// [`Gfx::add_image`] or [`Gfx::image_missing`].
+    pub fn take_wanted(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.wanted)
+    }
+
+    /// Hand in the pixels for `path`: `width` by `height`, 32-bit premultiplied
+    /// BGRA, rows of `width * 4` bytes.
+    pub fn add_image(&mut self, path: &str, width: u32, height: u32, pbgra: &[u8]) {
+        let key = image_key(path);
+        if width == 0 || height == 0 || pbgra.len() != (width * height * 4) as usize {
+            self.images.insert(key, ImageSlot::Missing);
+            return;
+        }
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+            colorContext: ManuallyDrop::new(None),
+        };
+        let size = D2D_SIZE_U { width, height };
+        // SAFETY: the pixel buffer is `height` rows of `width * 4` bytes, checked
+        // above; D2D copies it during the call.
+        let bitmap = unsafe {
+            self.dc.CreateBitmap(
+                size,
+                Some(pbgra.as_ptr().cast()),
+                width * 4,
+                &raw const props,
+            )
+        };
+        match bitmap {
+            Ok(b) => {
+                self.images.insert(key, ImageSlot::Ready(b));
+            }
+            Err(e) => {
+                tracing::debug!(path, error = %e, "CreateBitmap failed for an icon");
+                self.images.insert(key, ImageSlot::Missing);
+            }
+        }
+    }
+
+    /// There is no image for `path`; stop asking.
+    pub fn image_missing(&mut self, path: &str) {
+        self.images.insert(image_key(path), ImageSlot::Missing);
     }
 
     fn bind_target(&mut self) -> Result<()> {
@@ -452,6 +530,28 @@ impl Gfx {
                             &self.brush,
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         );
+                    }
+                    DrawCmd::Image { path, rect } => {
+                        let path = dl.str(path);
+                        let key = image_key(path);
+                        match self.images.get(&key) {
+                            Some(ImageSlot::Ready(bitmap)) => {
+                                let dest = rectf(rect);
+                                self.dc.DrawBitmap(
+                                    bitmap,
+                                    Some(&raw const dest),
+                                    1.0,
+                                    D2D1_INTERPOLATION_MODE_LINEAR,
+                                    None,
+                                    None,
+                                );
+                            }
+                            Some(ImageSlot::Pending | ImageSlot::Missing) => {}
+                            None => {
+                                self.images.insert(key, ImageSlot::Pending);
+                                self.wanted.push(path.to_owned());
+                            }
+                        }
                     }
                     DrawCmd::PushClip(rect) => {
                         let r = rectf(rect);

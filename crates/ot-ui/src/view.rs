@@ -3360,6 +3360,28 @@ mod tests {
         assert_eq!(app.cursor(), Cursor::Arrow);
     }
 
+    #[test]
+    fn process_rows_draw_their_program_icons() {
+        let mut app = by_cpu();
+        let mut with_path = proc(1, None, 1.0);
+        let mut statics = (*with_path.statics).clone();
+        statics.image_path = Some(r"C:\x\a.exe".to_owned());
+        with_path.statics = Arc::new(statics);
+        app.set_snapshot(snapshot(1, vec![with_path, proc(2, None, 0.5)]));
+        ready(&mut app);
+        let mut dl = DisplayList::new();
+        app.paint(&mut dl);
+        let images: Vec<String> = dl
+            .cmds()
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Image { path, .. } => Some(dl.str(*path).to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images, vec![r"C:\x\a.exe".to_owned()], "one row has a path");
+    }
+
     /// Twenty seconds of history ending at t = 20 s: CPU climbing 5 % a second to
     /// 95 %, memory steady at 60 of 100 bytes.
     fn with_history(app: &mut App) {

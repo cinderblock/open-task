@@ -56,6 +56,18 @@ pub trait RowSource {
         true
     }
 
+    /// Whether rows carry an image (a program's icon) at the start of the first
+    /// column. When true the column reserves the room on every row, so names line
+    /// up whether or not a row has one.
+    fn images(&self) -> bool {
+        false
+    }
+
+    /// The path of the file whose icon stands for this row, when it has one.
+    fn image(&self, _row: usize) -> Option<&str> {
+        None
+    }
+
     /// Whether a listed row is there for context rather than on its own merits (an
     /// ancestor of a search match, say). Painted in the dim text color.
     fn muted(&self, _row: usize) -> bool {
@@ -143,6 +155,9 @@ impl Column {
         }
     }
 }
+
+/// The side of a row's icon, in DIPs: the small icon size at 100 %.
+pub(crate) const ROW_ICON: f32 = 16.0;
 
 /// One column's place in a saved layout: what the shell persists, by title so a
 /// layout survives columns being added between versions.
@@ -1152,7 +1167,7 @@ impl Table {
 
     /// One row at `y`, display position `pos`: background, heat, cells, and in
     /// the tree its guides and chevron.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn paint_row<S: RowSource>(
         &self,
         dl: &mut DisplayList,
@@ -1237,6 +1252,26 @@ impl Table {
                     chevron(dl, center, collapsed, theme.text_dim);
                 }
                 let shift = indent + theme.expander_w;
+                text_rect = Rect::new(
+                    text_rect.x + shift,
+                    text_rect.y,
+                    (text_rect.w - shift).max(0.0),
+                    text_rect.h,
+                );
+            }
+            if slot == 0 && src.images() {
+                // The icon's room is reserved on every row; the icon itself only
+                // where the source has one.
+                if let Some(path) = src.image(row) {
+                    let icon = Rect::new(
+                        text_rect.x,
+                        y + ((row_h - ROW_ICON) * 0.5).floor(),
+                        ROW_ICON,
+                        ROW_ICON,
+                    );
+                    dl.image(path, icon);
+                }
+                let shift = ROW_ICON + theme.pad * 0.5;
                 text_rect = Rect::new(
                     text_rect.x + shift,
                     text_rect.y,
@@ -1467,6 +1502,74 @@ mod tests {
 
     fn table() -> Table {
         Table::new(vec![Column::number("n", 50.0)], 0)
+    }
+
+    /// Rows with a program icon on the even numbers.
+    struct Iconed(Vec<u32>);
+
+    impl RowSource for Iconed {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn id(&self, row: usize) -> RowId {
+            RowId(u64::from(self.0[row]))
+        }
+        fn cell(&self, _row: usize, _col: usize, out: &mut String) {
+            out.clear();
+            out.push('n');
+        }
+        fn compare(&self, a: usize, b: usize, _col: usize) -> Ordering {
+            self.0[a].cmp(&self.0[b])
+        }
+        fn images(&self) -> bool {
+            true
+        }
+        fn image(&self, row: usize) -> Option<&str> {
+            self.0[row].is_multiple_of(2).then_some(r"C:\x\a.exe")
+        }
+    }
+
+    #[test]
+    fn rows_with_images_draw_them_and_every_row_leaves_the_room() {
+        use ot_paint::DrawCmd;
+        let src = Iconed(vec![2, 1, 4]);
+        let mut t = Table::new(vec![Column::text("name", 200.0)], 0);
+        let theme = Theme::dark();
+        let mut dl = DisplayList::new();
+        let mut buf = String::new();
+        t.paint(
+            &mut dl,
+            Rect::new(0.0, 0.0, 300.0, 300.0),
+            &src,
+            &theme,
+            &mut buf,
+        );
+        let images: Vec<(String, Rect)> = dl
+            .cmds()
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Image { path, rect } => Some((dl.str(*path).to_owned(), *rect)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 2, "the two even rows: {images:?}");
+        assert!(images
+            .iter()
+            .all(|(p, r)| p == r"C:\x\a.exe" && r.w == ROW_ICON));
+        // Every row's text starts past the icon's room, icon or not, so names
+        // line up.
+        let texts: Vec<Rect> = dl
+            .cmds()
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text(t) if dl.str(t.text) == "n" => Some(t.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 3);
+        let x0 = theme.pad + ROW_ICON + theme.pad * 0.5;
+        assert!(texts.iter().all(|r| (r.x - x0).abs() < 0.01), "{texts:?}");
+        assert!(images.iter().all(|(_, r)| (r.x - theme.pad).abs() < 0.01));
     }
 
     #[test]
