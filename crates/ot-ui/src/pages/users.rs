@@ -149,6 +149,16 @@ impl RowSource for Rows<'_> {
         }
     }
 
+    fn images(&self) -> bool {
+        true
+    }
+
+    /// A process row shows its program's icon; a session row shows none.
+    fn image(&self, row: usize) -> Option<&str> {
+        self.process(row)
+            .and_then(|p| p.statics.image_path.as_deref())
+    }
+
     fn cell(&self, row: usize, col: usize, out: &mut String) {
         out.clear();
         if let Some(s) = self.session(row) {
@@ -493,6 +503,21 @@ mod tests {
             ..(*p.statics).clone()
         });
         p
+    }
+
+    #[test]
+    fn session_rows_have_no_icon_and_process_rows_have_their_programs() {
+        let mut page = UsersPage::default();
+        let mut s = (*snapshot()).clone();
+        let mut statics = (*s.processes[0].statics).clone();
+        statics.image_path = Some("C:\\x\\a.exe".to_owned());
+        s.processes[0].statics = Arc::new(statics);
+        page.set_snapshot(Arc::new(s));
+        let rows = page.rows();
+        assert!(rows.images());
+        assert!(rows.image(0).is_none(), "a session row");
+        let first_process = rows.sessions();
+        assert_eq!(rows.image(first_process), Some("C:\\x\\a.exe"));
     }
 
     fn snapshot() -> Arc<Snapshot> {

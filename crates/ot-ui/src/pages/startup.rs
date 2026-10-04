@@ -76,6 +76,14 @@ impl RowSource for Rows<'_> {
         )
     }
 
+    fn images(&self) -> bool {
+        true
+    }
+
+    fn image(&self, row: usize) -> Option<&str> {
+        self.entries[row].image_path.as_deref()
+    }
+
     fn cell(&self, row: usize, col: usize, out: &mut String) {
         let e = &self.entries[row];
         out.clear();
@@ -288,6 +296,30 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn entries_draw_their_program_icons() {
+        let mut page = StartupPage::default();
+        page.set_entries(vec![entry("OneDrive", true), entry("Discord", false)]);
+        let mut dl = DisplayList::new();
+        let mut buf = String::new();
+        page.paint(
+            &mut dl,
+            Rect::from_size(Size::new(900.0, 600.0)),
+            &Theme::dark(),
+            &mut buf,
+        );
+        let images: Vec<String> = dl
+            .cmds()
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Image { path, .. } => Some(dl.str(*path).to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 2, "{images:?}");
+        assert!(images.iter().any(|p| p == "C:\\OneDrive.exe"), "{images:?}");
     }
 
     #[test]

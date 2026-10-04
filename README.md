@@ -198,7 +198,9 @@ user, image path and command line, case-insensitively. In tree mode the ancestor
 a match stay listed, dimmed, so the match keeps its place in the hierarchy.
 
 **Columns:** twelve show by default: Name, PID, Status, User, CPU %, Cycles,
-Memory, Working set, Disk read, Disk write, Threads, Handles. Right-click the header
+Memory, Working set, Disk read, Disk write, Threads, Handles. Name carries the
+program's icon, as Task Manager's does, read once per program off the UI thread;
+the Users and Startup apps pages show them too. Right-click the header
 for the rest, every column Task Manager's Details page has: Description, Command
 line, GPU %, GPU engine, Type (App, Background or Windows process), Company,
 Priority, Architecture, Session, Elevated, CPU time, Started, Page faults, Peak
