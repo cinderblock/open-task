@@ -372,7 +372,12 @@ mod tests {
             "expected exactly one current session: {out:?}"
         );
         let me = current[0];
-        assert_eq!(me.state, SessionState::Active);
+        // Active at the console; Disconnected when the user has switched away or an
+        // RDP session dropped while the tests ran (seen on 2026-10-03).
+        assert!(
+            matches!(me.state, SessionState::Active | SessionState::Disconnected),
+            "{me:?}"
+        );
         assert!(me.user.as_deref().is_some_and(|u| !u.is_empty()), "{me:?}");
         assert_ne!(me.station, "");
 
