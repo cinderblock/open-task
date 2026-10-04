@@ -1,13 +1,14 @@
 //! System memory state.
 
 use crate::units::Bytes;
+use serde::{Deserialize, Serialize};
 
 /// Whole-system memory for one sample.
 ///
 /// "Available" rather than "free" is the number that actually predicts whether the
 /// machine is about to start swapping, because it counts reclaimable cache. Reporting
 /// free-only is why so many tools claim a healthy machine is out of RAM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MemorySample {
     /// Total physical RAM installed.
     pub total: Bytes,

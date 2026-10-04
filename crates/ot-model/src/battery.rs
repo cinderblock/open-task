@@ -1,11 +1,12 @@
 //! The battery, where the machine has one.
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::units::Watts;
 
 /// What the battery is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum BatteryState {
     Charging,
     Discharging,
@@ -28,7 +29,7 @@ impl BatteryState {
 }
 
 /// The battery over one sampling interval.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct BatterySample {
     /// Charge as a share of what the battery can hold now, `0..=100`.
     pub charge: Option<f32>,

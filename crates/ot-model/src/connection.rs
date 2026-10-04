@@ -1,8 +1,9 @@
 //! Network endpoints and which process owns each.
 
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Protocol {
     Tcp,
     Tcp6,
@@ -23,7 +24,7 @@ impl Protocol {
 }
 
 /// A TCP connection's state, as RFC 793 names them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum TcpState {
     Closed,
     Listen,
@@ -63,7 +64,7 @@ impl TcpState {
 }
 
 /// One endpoint: a TCP connection or listener, or a bound UDP socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connection {
     pub protocol: Protocol,
     pub local: SocketAddr,

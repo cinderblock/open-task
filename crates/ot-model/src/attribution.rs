@@ -7,19 +7,20 @@
 //! (package, device, task) it was working for. Both are collected for a few seconds
 //! when asked, never continuously, and only by read-only means.
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::identity::ProcessKey;
 
 /// One bucket of a histogram: a label and how many samples or events it got.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Share {
     pub label: String,
     pub count: u32,
 }
 
 /// Where one thread's samples landed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadShares {
     pub tid: u32,
     /// Samples attributed to this thread.
@@ -30,7 +31,7 @@ pub struct ThreadShares {
 
 /// Events from a service's own trace provider during the sample, bucketed by the
 /// field that names its client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientReport {
     /// The service the provider belongs to.
     pub service: String,
@@ -48,7 +49,7 @@ pub struct ClientReport {
 }
 
 /// What a sample of one process found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attribution {
     pub target: ProcessKey,
     /// How long the sample ran.

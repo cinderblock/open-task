@@ -4,9 +4,10 @@
 //! the uptime, which the snapshot's boot time already gives.
 
 use crate::units::Bytes;
+use serde::{Deserialize, Serialize};
 
 /// One memory module, as the firmware describes it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MemoryDevice {
     /// The slot's label on the board: `DIMM A1`, `ChannelA-DIMM0`.
     pub slot: String,
@@ -23,7 +24,7 @@ pub struct MemoryDevice {
 }
 
 /// The machine and its operating system.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SystemFacts {
     pub computer_name: Option<String>,
     /// `Windows 11 Pro`.

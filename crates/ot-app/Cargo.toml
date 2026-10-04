@@ -23,6 +23,7 @@ path = "src/console.rs"
 ot-model.workspace = true
 ot-probe.workspace = true
 ot-core.workspace = true
+ot-record.workspace = true
 ot-update.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

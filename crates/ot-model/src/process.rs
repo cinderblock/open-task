@@ -3,11 +3,12 @@
 use crate::identity::ProcessKey;
 use crate::service::ServiceInfo;
 use crate::units::{Bytes, Percent, Watts};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Elevation / integrity of a process, as far as we can tell without opening it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Integrity {
     /// Sandboxed (`AppContainer`, or a low-integrity browser renderer).
     Low,
@@ -27,7 +28,7 @@ pub enum Integrity {
 /// Held behind an `Arc` and cloned by pointer into every sample, so a 1000-process
 /// refresh does not re-allocate a thousand command line strings each pass. This is
 /// the single most important allocation decision in the sampling path.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProcessStatic {
     pub key: ProcessKey,
     /// Parent's identity, absent for a root or when the parent had already exited
@@ -68,7 +69,7 @@ pub struct ProcessStatic {
 }
 
 /// The instruction set a process runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Architecture {
     X64,
     X86,
@@ -93,7 +94,9 @@ impl Architecture {
 
 /// A process's scheduling priority class, as Task Manager and Process Explorer
 /// name them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub enum Priority {
     Idle,
     BelowNormal,
@@ -156,7 +159,7 @@ impl Priority {
 }
 
 /// What a process is to a person, as Task Manager groups them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ProcessKind {
     /// Has a window of its own on the desktop.
     App,
@@ -179,7 +182,7 @@ impl ProcessKind {
 }
 
 /// A process's main window, when it has one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowInfo {
     /// The platform's window handle, opaque to everything above the probe; the
     /// shell hands it back to bring the window forward.
@@ -193,7 +196,7 @@ pub struct WindowInfo {
 
 /// Cumulative I/O counts and bytes since the process started, every kind of I/O
 /// (file, network, device). Task Manager's Details page shows these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IoCounters {
     pub reads: u64,
     pub writes: u64,
@@ -208,9 +211,12 @@ pub struct IoCounters {
 /// Everything here is a rate or a level measured over the interval that just ended.
 /// Raw monotonic counters stay in the probe layer; by the time a value reaches the UI
 /// it has already been differenced.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ProcessSample {
     /// Immutable facts, shared by pointer across samples.
+    /// Not serialized: shared by pointer between passes, so the Flight Recorder
+    /// writes each distinct value once in a table and restores it on read.
+    #[serde(skip)]
     pub statics: Arc<ProcessStatic>,
 
     /// CPU used over the last interval, as a share of one core. 400.0 means four
@@ -258,6 +264,9 @@ pub struct ProcessSample {
     pub efficiency_mode: Option<bool>,
     /// The process's main window, when it has one on the desktop. Shared by
     /// pointer between passes while unchanged.
+    /// Not serialized: shared by pointer between passes, so the Flight Recorder
+    /// writes each distinct value once in a table and restores it on read.
+    #[serde(skip)]
     pub window: Option<Arc<WindowInfo>>,
     /// App, background or part of Windows.
     pub kind: ProcessKind,
@@ -280,6 +289,9 @@ pub struct ProcessSample {
     /// Services hosted by this process, as the platform's service manager reports
     /// them. Empty for an ordinary program. Shared by pointer between passes while
     /// the set is unchanged.
+    /// Not serialized: shared by pointer between passes, so the Flight Recorder
+    /// writes each distinct value once in a table and restores it on read.
+    #[serde(skip)]
     pub services: Arc<[ServiceInfo]>,
     /// Start and length of this process's rows in the snapshot's thread list, see
     /// [`ProcessSample::thread_range`]. Zero rows when the platform does not sample

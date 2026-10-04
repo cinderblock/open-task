@@ -3,9 +3,12 @@
 //! A task manager mixes bytes, percentages, hertz and watts constantly, and mixing
 //! them up silently is the most common class of bug in this kind of tool. These cost
 //! nothing at runtime and make the errors compile failures instead.
+use serde::{Deserialize, Serialize};
 
 /// A quantity of bytes. Always exact; never pre-scaled to KB/MB.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Bytes(pub u64);
 
 impl Bytes {
@@ -29,7 +32,7 @@ impl Bytes {
 }
 
 /// A fraction expressed in percent. May exceed 100 for multi-core CPU totals.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
 pub struct Percent(pub f32);
 
 impl Percent {
@@ -54,7 +57,9 @@ impl Percent {
 }
 
 /// A frequency in hertz. Stored in Hz to avoid rounding at the MHz boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Hertz(pub u64);
 
 impl Hertz {
@@ -70,5 +75,5 @@ impl Hertz {
 }
 
 /// Instantaneous power draw in watts.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
 pub struct Watts(pub f32);

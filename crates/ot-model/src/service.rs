@@ -7,10 +7,11 @@
 //! service itself but of the threads that carry its tag (see
 //! [`crate::thread::ThreadSample::service`]); consumers sum it from the threads.
 
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Lifecycle state of a service, reduced to what a task manager needs to show.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ServiceState {
     Running,
     StartPending,
@@ -40,7 +41,7 @@ impl ServiceState {
 ///
 /// Strings are shared: a machine has a few hundred services whose names never
 /// change, and the list is republished every pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     /// Key name, e.g. `BrokerInfrastructure`.
     pub name: Arc<str>,
@@ -54,7 +55,7 @@ pub struct ServiceInfo {
 }
 
 /// When a service starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum StartType {
     /// Started by the boot loader (a driver).
     Boot,
@@ -90,7 +91,7 @@ impl StartType {
 ///
 /// [`ServiceInfo`] is the running service seen from its host process; this is the
 /// service as the control manager lists it, whether or not anything hosts it now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceEntry {
     /// Key name, e.g. `BrokerInfrastructure`.
     pub name: Arc<str>,

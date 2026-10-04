@@ -2,11 +2,12 @@
 
 use crate::cpu::ThermalSensor;
 use crate::units::{Bytes, Hertz};
+use serde::{Deserialize, Serialize};
 
 /// Read once when the probe starts and shared by pointer with every snapshot, the
 /// way process statics are. Every field is optional or countable-to-zero, because
 /// each comes from a different OS query and any one of them can be unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Hardware {
     /// The processor's name as its maker reports it, e.g.
     /// `Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz`.

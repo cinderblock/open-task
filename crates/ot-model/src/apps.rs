@@ -1,9 +1,10 @@
 //! Installed programs, as the system's uninstall list has them.
 
 use crate::units::Bytes;
+use serde::{Deserialize, Serialize};
 
 /// One installed program.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledApp {
     pub name: String,
     pub publisher: Option<String>,

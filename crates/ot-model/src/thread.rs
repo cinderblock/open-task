@@ -6,9 +6,10 @@
 //! that produces the process list, so they cost no extra handles or syscalls.
 
 use crate::units::Percent;
+use serde::{Deserialize, Serialize};
 
 /// Scheduler state of a thread at the instant of the sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ThreadState {
     Ready,
     Running,
@@ -33,7 +34,7 @@ impl ThreadState {
 /// Why a waiting thread is waiting, as the platform's raw reason code. Only the
 /// handful of reasons a task manager user cares about are named; the rest show as
 /// a number, which is still enough to tell a suspended thread from a sleeping one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct WaitReason(pub u8);
 
 impl WaitReason {
@@ -52,7 +53,7 @@ impl WaitReason {
 }
 
 /// Which service a thread was working for, when the platform tags threads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ServiceTag {
     /// Not known: the platform has no tags, or this process could not be read.
     #[default]
@@ -65,7 +66,7 @@ pub enum ServiceTag {
 }
 
 /// One thread for one sampling pass.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ThreadSample {
     /// OS thread id. Recycled like PIDs; identity is `(tid, birth)`.
     pub tid: u32,

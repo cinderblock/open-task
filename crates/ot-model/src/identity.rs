@@ -16,8 +16,12 @@
 //! We keep that value opaque. Nothing above this module should interpret it; it is
 //! only ever compared for equality.
 
+use serde::{Deserialize, Serialize};
+
 /// Opaque, platform-defined process birth stamp. Compare only for equality.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct ProcessKeyRaw(pub u64);
 
 /// A process identity that remains correct across PID reuse.
@@ -25,7 +29,9 @@ pub struct ProcessKeyRaw(pub u64);
 /// This is the key for every per-process time series in the application. Two
 /// processes that share a PID but not a birth stamp are different processes and must
 /// never share history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct ProcessKey {
     /// The OS process id. Display this; do not key on it alone.
     pub pid: u32,

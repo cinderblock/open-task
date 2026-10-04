@@ -1,13 +1,14 @@
 //! CPU topology and utilization.
 
 use crate::units::{Hertz, Percent, Watts};
+use serde::{Deserialize, Serialize};
 
 /// What kind of core this is, on a hybrid (big.LITTLE / P+E) processor.
 ///
 /// Attributing load to the wrong core class is the single most misleading thing a
 /// task manager can do on a modern hybrid CPU: 100% on an E-core and 100% on a
 /// P-core mean very different things.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum CoreKind {
     /// Performance core.
     Performance,
@@ -42,7 +43,7 @@ impl ThermalSensor {
 }
 
 /// One logical processor.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LogicalCore {
     /// Index as the OS numbers it.
     pub index: u32,
@@ -57,7 +58,7 @@ pub struct LogicalCore {
 }
 
 /// Whole-package CPU state for one sample.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CpuSample {
     /// Aggregate utilization across all logical processors, 0..=100.
     pub total: Percent,

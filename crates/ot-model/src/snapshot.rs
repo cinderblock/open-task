@@ -1,26 +1,32 @@
 //! An immutable view of the system at one instant.
-
-use std::time::{Duration, SystemTime};
+//!
+//! The sampling core publishes one of these per pass and the UI reads whichever is
+//! newest. It lives in the model, below the core, so the Flight Recorder can write
+//! and read it without depending on the sampler: a recording is a sequence of these,
+//! and replay publishes them where the sampler normally would.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use ot_model::battery::BatterySample;
-use ot_model::cpu::CpuSample;
-use ot_model::device::{AdapterSample, DiskSample, VolumeSample};
-use ot_model::gpu::GpuSample;
-use ot_model::hardware::Hardware;
-use ot_model::memory::MemorySample;
-use ot_model::process::ProcessSample;
-use ot_model::service::ServiceEntry;
-use ot_model::session::SessionInfo;
-use ot_model::thread::ThreadSample;
-use ot_model::{Capabilities, Tick};
+use serde::{Deserialize, Serialize};
+
+use crate::battery::BatterySample;
+use crate::cpu::CpuSample;
+use crate::device::{AdapterSample, DiskSample, VolumeSample};
+use crate::gpu::GpuSample;
+use crate::hardware::Hardware;
+use crate::memory::MemorySample;
+use crate::process::ProcessSample;
+use crate::service::ServiceEntry;
+use crate::session::SessionInfo;
+use crate::thread::ThreadSample;
+use crate::{Capabilities, Tick};
 
 /// Everything the probe measured in one pass, plus timing.
 ///
 /// Snapshots are published behind an `Arc` and never mutated. A reader that holds one
 /// can take as long as it likes; the sampler simply publishes the next one alongside.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Which pass produced this snapshot.
     pub tick: Tick,
@@ -54,11 +60,18 @@ pub struct Snapshot {
     pub sessions: Vec<SessionInfo>,
     /// Every service of the machine, by name, shared by pointer between
     /// snapshots while unchanged.
+    ///
+    /// Not serialized: the Flight Recorder writes each distinct list once in a
+    /// table and restores it on read.
+    #[serde(skip)]
     pub services: Arc<[ServiceEntry]>,
     /// What the probe behind this snapshot can measure, so the UI can explain a
     /// missing column or attribution rather than show a blank.
     pub capabilities: Capabilities,
     /// Static facts about the machine, shared by every snapshot of a session.
+    ///
+    /// Not serialized: the Flight Recorder keeps it in the file's header.
+    #[serde(skip)]
     pub hardware: Arc<Hardware>,
 }
 

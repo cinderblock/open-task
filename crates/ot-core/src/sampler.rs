@@ -1,14 +1,16 @@
 //! The sampling thread and its lock-free publication slot.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use ot_model::Tick;
 use ot_probe::{ProbeError, ProbeOutput, SystemProbe};
+use ot_record::{Error as RecordError, Recorder};
 
+use crate::record::{self, RecordProgress, RecordStats, Sink};
 use crate::snapshot::Snapshot;
 
 /// Tunables for the sampling loop.
@@ -37,6 +39,8 @@ struct Shared {
     /// Consecutive failed passes, so the UI can show "probe failing" rather than a
     /// frozen table.
     consecutive_errors: AtomicU64,
+    /// Where published snapshots also go while recording. Loaded once per pass.
+    sink: ArcSwapOption<Sink>,
 }
 
 /// A running sampler. Dropping it stops the thread and joins it.
@@ -44,6 +48,8 @@ struct Shared {
 pub struct Sampler {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// The writer thread of the recording in progress, if any.
+    recording: Mutex<Option<record::Writer>>,
 }
 
 impl Sampler {
@@ -80,6 +86,7 @@ impl Sampler {
             interval_us: AtomicU64::new(config.interval.as_micros() as u64),
             stop: AtomicBool::new(false),
             consecutive_errors: AtomicU64::new(0),
+            sink: ArcSwapOption::empty(),
         });
 
         let thread = {
@@ -93,6 +100,7 @@ impl Sampler {
         Self {
             shared,
             thread: Some(thread),
+            recording: Mutex::new(None),
         }
     }
 
@@ -120,8 +128,49 @@ impl Sampler {
         self.shared.consecutive_errors.load(Ordering::Relaxed)
     }
 
-    /// Ask the thread to stop and wait for it. Also happens on drop.
+    /// Write every snapshot published from now on to `recorder`, on a writer
+    /// thread (see [`record`](crate::record) for how a slow disk is handled). A
+    /// recording already in progress is finished first and its result returned.
+    pub fn record_to(&self, recorder: Recorder) -> Option<Result<RecordStats, RecordError>> {
+        let previous = self.stop_recording();
+        let writer = record::Writer::spawn(recorder);
+        self.shared.sink.store(Some(Arc::clone(writer.sink())));
+        *self
+            .recording
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(writer);
+        previous
+    }
+
+    /// Finish the recording in progress: the file gets its index and the writer
+    /// thread ends. `None` if nothing was being recorded.
+    pub fn stop_recording(&self) -> Option<Result<RecordStats, RecordError>> {
+        let writer = self
+            .recording
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
+        // No more frames reach the writer; then the channel closes and it finishes.
+        self.shared.sink.store(None);
+        Some(writer.finish())
+    }
+
+    /// The recording in progress, if any.
+    #[must_use]
+    pub fn recording(&self) -> Option<RecordProgress> {
+        self.recording
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(record::Writer::progress)
+    }
+
+    /// Ask the thread to stop and wait for it. Also happens on drop. A recording
+    /// in progress is finished first.
     pub fn stop(&mut self) {
+        if let Some(Err(e)) = self.stop_recording() {
+            tracing::error!(error = %e, "recording failed");
+        }
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -176,7 +225,7 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                 let sessions = std::mem::take(&mut out.sessions);
                 let services = Arc::clone(&out.services);
 
-                shared.current.store(Arc::new(Snapshot {
+                let snap = Arc::new(Snapshot {
                     tick,
                     taken_at: Some(SystemTime::now()),
                     interval,
@@ -194,7 +243,11 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
                     services,
                     capabilities,
                     hardware: Arc::clone(&hardware),
-                }));
+                });
+                if let Some(sink) = shared.sink.load().as_ref() {
+                    sink.offer(Arc::clone(&snap));
+                }
+                shared.current.store(snap);
                 if let Some(n) = notify {
                     n();
                 }
