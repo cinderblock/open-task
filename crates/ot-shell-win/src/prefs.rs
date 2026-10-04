@@ -28,6 +28,11 @@ const DOWNLOAD_UPDATES: PCWSTR = w!("DownloadUpdates");
 const INSTALL_UPDATES: PCWSTR = w!("InstallUpdates");
 const USAGE_DECAY: PCWSTR = w!("UsageDecayPercent");
 const HISTORY_MINUTES: PCWSTR = w!("HistoryMinutes");
+const ALWAYS_ON_TOP: PCWSTR = w!("AlwaysOnTop");
+const HIDE_WHEN_MINIMIZED: PCWSTR = w!("HideWhenMinimized");
+const MINIMIZE_ON_USE: PCWSTR = w!("MinimizeOnUse");
+const RESOURCE_PERCENT: PCWSTR = w!("ResourceValuesAsPercent");
+const UPDATE_INTERVAL: PCWSTR = w!("UpdateIntervalMs");
 const LAYOUT: PCWSTR = w!("Layout");
 
 /// The settings as last saved, defaults for anything never saved.
@@ -39,7 +44,15 @@ pub fn load() -> Settings {
         check_updates: flag(CHECK_UPDATES, defaults.check_updates),
         download_updates: flag(DOWNLOAD_UPDATES, defaults.download_updates),
         install_updates: flag(INSTALL_UPDATES, defaults.install_updates),
+        always_on_top: flag(ALWAYS_ON_TOP, defaults.always_on_top),
+        hide_when_minimized: flag(HIDE_WHEN_MINIMIZED, defaults.hide_when_minimized),
+        minimize_on_use: flag(MINIMIZE_ON_USE, defaults.minimize_on_use),
+        resource_percent: flag(RESOURCE_PERCENT, defaults.resource_percent),
         ..defaults
+    };
+    let settings = match read_dword(UPDATE_INTERVAL) {
+        Some(ms) => settings.with_interval(ms),
+        None => settings,
     };
     let settings = match read_dword(USAGE_DECAY) {
         Some(percent) => settings.with_usage_decay(percent),
@@ -61,6 +74,11 @@ pub fn save(s: &Settings) {
         (INSTALL_UPDATES, Some(u32::from(s.install_updates))),
         (USAGE_DECAY, Some(u32::from(s.usage_decay_percent))),
         (HISTORY_MINUTES, Some(s.history_minutes)),
+        (ALWAYS_ON_TOP, Some(u32::from(s.always_on_top))),
+        (HIDE_WHEN_MINIMIZED, Some(u32::from(s.hide_when_minimized))),
+        (MINIMIZE_ON_USE, Some(u32::from(s.minimize_on_use))),
+        (RESOURCE_PERCENT, Some(u32::from(s.resource_percent))),
+        (UPDATE_INTERVAL, Some(s.update_interval_ms)),
     ];
     let Some(key) = open_for_writing() else {
         return;

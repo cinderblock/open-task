@@ -566,6 +566,8 @@ macro_rules! rows_of {
             tree_mode: $tree_mode,
             steady: Some(&$app.steady),
             now_unix_ms: snapshot_unix_ms(&$app.snap),
+            percent: $app.settings.resource_percent,
+            disk_totals: $app.disk_totals,
         }
     };
 }
@@ -835,6 +837,9 @@ pub struct App {
     /// for the table's Cycles column; and the total one busy core settles at.
     cycles: Vec<f64>,
     cycles_core: f64,
+    /// Every process's disk reads and writes in the snapshot shown, for the Disk
+    /// columns as shares.
+    disk_totals: (u64, u64),
     /// The summary charts above the process table.
     charts: ChartGroup,
     page: Page,
@@ -901,6 +906,7 @@ impl App {
             shown_in_place: InPlace::Table,
             cycles: Vec::new(),
             cycles_core: 0.0,
+            disk_totals: (0, 0),
             charts: ChartGroup::default(),
             page: Page::default(),
             nav: NavRail::default(),
@@ -1319,6 +1325,9 @@ impl App {
 
     /// Make `snap` the one on screen. Its history is already in the timeline.
     fn show_snapshot(&mut self, snap: Arc<Snapshot>) {
+        self.disk_totals = snap.processes.iter().fold((0, 0), |(r, w), p| {
+            (r + p.disk_read.get(), w + p.disk_write.get())
+        });
         self.tree.rebuild(&snap.processes);
         self.cycles.clear();
         self.cycles.extend(
@@ -2378,6 +2387,8 @@ impl App {
             tree_mode: self.table.tree(),
             steady: Some(&self.steady),
             now_unix_ms: snapshot_unix_ms(snap),
+            percent: self.settings.resource_percent,
+            disk_totals: self.disk_totals,
         };
         let usage = match &self.paused {
             Some(p) => &p.usage,

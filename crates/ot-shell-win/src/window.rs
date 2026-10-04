@@ -57,9 +57,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG,
     SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN,
+    SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
     WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
@@ -1520,6 +1520,17 @@ fn perform(cell: &RefCell<State>, hwnd: HWND, effect: Effect) -> Option<UiEvent>
         }
         Effect::SwitchTo(handle) => {
             actions::switch_to(handle);
+            // Minimize on use, as Task Manager's: get out of the way of the window
+            // switched to. "Hide when minimized" applies as for any minimize.
+            let minimize = cell
+                .try_borrow()
+                .is_ok_and(|st| st.app.settings().minimize_on_use);
+            if minimize {
+                // SAFETY: hwnd is valid.
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                }
+            }
             None
         }
         Effect::OpenUrl(url) => {

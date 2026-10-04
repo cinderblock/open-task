@@ -84,6 +84,13 @@ pub struct Settings {
     pub always_on_top: bool,
     /// Minimizing hides the window; the tray icon brings it back.
     pub hide_when_minimized: bool,
+    /// Switch to minimizes open-task, so the window switched to is not covered.
+    /// On, as in Task Manager.
+    pub minimize_on_use: bool,
+    /// The Memory, Working set and Disk columns show shares of the whole instead
+    /// of amounts: memory as a share of physical memory, disk as a share of every
+    /// process's reads or writes this interval.
+    pub resource_percent: bool,
     /// How often the system is sampled, in milliseconds: one of [`SPEED_STEPS`].
     /// Task Manager's update speed: Low, Normal, High.
     pub update_interval_ms: u32,
@@ -106,6 +113,8 @@ impl Default for Settings {
             install_updates: false,
             always_on_top: false,
             hide_when_minimized: false,
+            minimize_on_use: true,
+            resource_percent: false,
             update_interval_ms: SPEED_DEFAULT,
             history_minutes: HISTORY_DEFAULT,
         }
@@ -272,8 +281,10 @@ pub(crate) struct Context<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Toggle {
     AnimateRows,
+    ResourcePercent,
     AlwaysOnTop,
     HideWhenMinimized,
+    MinimizeOnUse,
     CheckUpdates,
     DownloadUpdates,
     InstallUpdates,
@@ -283,8 +294,10 @@ impl Toggle {
     fn title(self) -> &'static str {
         match self {
             Self::AnimateRows => "Animate rows as the order changes",
+            Self::ResourcePercent => "Show resource values as percentages",
             Self::AlwaysOnTop => "Always on top",
             Self::HideWhenMinimized => "Hide when minimized",
+            Self::MinimizeOnUse => "Minimize on use",
             Self::CheckUpdates => "Check for updates automatically",
             Self::DownloadUpdates => "Download updates automatically",
             Self::InstallUpdates => "Install updates automatically",
@@ -302,6 +315,14 @@ impl Toggle {
             (Self::AnimateRows, _, _) => {
                 "Rows slide to their new place when the table re-sorts, instead of \
                  jumping there."
+            }
+            (Self::ResourcePercent, _, _) => {
+                "Memory and working set as a share of physical memory, disk reads and \
+                 writes as a share of every process's, instead of amounts."
+            }
+            (Self::MinimizeOnUse, _, _) => {
+                "Switch to minimizes open-task, so the window you switch to is not \
+                 covered by it."
             }
             (Self::AlwaysOnTop, _, _) => {
                 "Keeps the window above every other, so it stays in view while you \
@@ -345,8 +366,10 @@ impl Toggle {
     fn get(self, s: Settings, cx: Context<'_>) -> bool {
         match self {
             Self::AnimateRows => s.animates_rows(cx.system_animations),
+            Self::ResourcePercent => s.resource_percent,
             Self::AlwaysOnTop => s.always_on_top,
             Self::HideWhenMinimized => s.hide_when_minimized,
+            Self::MinimizeOnUse => s.minimize_on_use,
             Self::CheckUpdates => s.check_updates,
             Self::DownloadUpdates => s.download_updates,
             Self::InstallUpdates => s.install_updates,
@@ -360,8 +383,10 @@ impl Toggle {
         let on = !self.get(*s, cx);
         match self {
             Self::AnimateRows => s.animate_rows = Some(on),
+            Self::ResourcePercent => s.resource_percent = on,
             Self::AlwaysOnTop => s.always_on_top = on,
             Self::HideWhenMinimized => s.hide_when_minimized = on,
+            Self::MinimizeOnUse => s.minimize_on_use = on,
             Self::CheckUpdates => {
                 s.check_updates = on;
                 s.download_updates &= on;
@@ -446,7 +471,12 @@ impl Card {
 const SECTIONS: [(&str, &[Card]); 6] = [
     (
         "Process table",
-        &[Card::Toggle(Toggle::AnimateRows), Card::Decay, Card::Speed],
+        &[
+            Card::Toggle(Toggle::AnimateRows),
+            Card::Decay,
+            Card::Speed,
+            Card::Toggle(Toggle::ResourcePercent),
+        ],
     ),
     ("Charts", &[Card::History]),
     (
@@ -454,6 +484,7 @@ const SECTIONS: [(&str, &[Card]); 6] = [
         &[
             Card::Toggle(Toggle::AlwaysOnTop),
             Card::Toggle(Toggle::HideWhenMinimized),
+            Card::Toggle(Toggle::MinimizeOnUse),
         ],
     ),
     (
@@ -468,11 +499,11 @@ const SECTIONS: [(&str, &[Card]); 6] = [
     ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
     ("Recording", &[Card::Record]),
 ];
-const CARD_COUNT: usize = 13;
+const CARD_COUNT: usize = 15;
 /// The fade card's place among the cards, the speed card's and the history card's.
 const DECAY_CARD: usize = 1;
 const SPEED_CARD: usize = 2;
-const HISTORY_CARD: usize = 3;
+const HISTORY_CARD: usize = 4;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -1087,7 +1118,7 @@ mod tests {
     }
 
     /// The Task Manager card's place among the cards.
-    const TASK_MANAGER: usize = 10;
+    const TASK_MANAGER: usize = 12;
 
     fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
         Context {
@@ -1206,7 +1237,7 @@ mod tests {
         ] {
             assert!(strings.iter().any(|t| t == expected), "{expected}");
         }
-        let card = page.cards[6].center();
+        let card = page.cards[8].center();
         let r = click(&mut page, card, &mut s, cx(true, &update));
         assert_eq!(r.effect, Some(Effect::Update(UpdateAction::Check)));
         assert_eq!(s, Settings::default(), "no setting changed");
@@ -1232,18 +1263,18 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[7]), "On");
-        assert_eq!(state_of(&dl, page.cards[8]), "Off");
+        assert_eq!(state_of(&dl, page.cards[9]), "On");
+        assert_eq!(state_of(&dl, page.cards[10]), "Off");
         // A copy that cannot install says so, once, on the update card.
         let note = update.note().unwrap();
         assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
 
-        let at = page.cards[7].center();
+        let at = page.cards[9].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[8].center();
+        let at = page.cards[10].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
         assert!(s.check_updates, "downloading needs checking");
@@ -1255,27 +1286,27 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[9]), "Off");
+        assert_eq!(state_of(&dl, page.cards[11]), "Off");
         assert!(texts(&dl)
             .iter()
             .any(|t| t == "Install updates automatically"));
 
         // On: downloading and checking come with it.
         s.check_updates = false;
-        let at = page.cards[9].center();
+        let at = page.cards[11].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.install_updates && s.download_updates && s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         // Downloading off: installing goes too, checking stays.
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[8].center();
+        let at = page.cards[10].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.download_updates && !s.install_updates && s.check_updates);
         // Checking off takes everything with it.
         s.download_updates = true;
         s.install_updates = true;
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[7].center();
+        let at = page.cards[9].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
     }
@@ -1525,8 +1556,8 @@ mod tests {
         let last = page.cards[TASK_MANAGER];
         assert!(last.y >= short.bottom(), "starts below the window");
         assert!(!texts(&dl).iter().any(|t| t == "Replace Task Manager"));
-        // Out of view, a click there does nothing.
-        let r = click(&mut page, Point::new(10.0, 299.0), &mut s, cx);
+        // Out of view, a click where the card would be does nothing.
+        let r = click(&mut page, last.center(), &mut s, cx);
         assert_eq!(r, Reaction::NONE);
 
         let wheel = |page: &mut SettingsPage, s: &mut Settings, lines: f32| {

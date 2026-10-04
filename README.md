@@ -206,7 +206,11 @@ line, GPU %, GPU engine, Type (App, Background or Windows process), Company,
 Priority, Architecture, Session, Elevated, CPU time, Started, Page faults, Peak
 working set, Virtual size, Paged pool, NP pool, I/O reads, writes and other (counts
 and bytes), Image path, Window title and Package name (a packaged app's full name), plus
-**Reset columns**. Status says when a
+**Reset columns**. **Show resource values as percentages**, under **Process
+table** on the Settings page, shows Memory and Working set as shares of physical
+memory and Disk read and Disk write as each process's share of every process's
+reads or writes that interval, as Task Manager's View menu does; the order does
+not change. Status says when a
 process is suspended, in efficiency mode or not responding. Drag a header to move
 the column, drag its divider to resize; **Shift+wheel** (or a tilt wheel) scrolls
 sideways when the columns are wider than the window. In the tree, a collapsed row's
@@ -291,7 +295,10 @@ switch. Uninstalling always puts Task Manager back if it was starting that copy.
 administrator rights and closes this one. That copy reads every process's command
 line and user, samples CPU, starts and stops services, and reads service tags.
 
-**Window:** **Always on top** and **Hide when minimized** are on the Settings page.
+**Window:** **Always on top**, **Hide when minimized** and **Minimize on use** are
+on the Settings page. Minimize on use, on unless you turn it off as in Task
+Manager, minimizes open-task when you pick **Switch to**, so the window you
+switched to is not covered.
 A notification-area icon shows the CPU as a live bar, as Task Manager's does, with
 the numbers in its tooltip; a click brings the window back, and its menu has
 **Always on top** and **Exit**. With **Hide when minimized** on, minimizing hides
@@ -398,8 +405,7 @@ thinks it was forgotten:
 - **Signature verification** (Process Explorer's Verified Signer), the DLL and
   handle lower pane, thread stacks, VirusTotal.
 - TMOG's **Benchmarks**.
-- **Minimize on use**, **Start with Windows** (an installer task), and showing
-  resource values as percentages.
+- **Start with Windows**, an installer task rather than an app feature.
 
 ## Why not a webview
 

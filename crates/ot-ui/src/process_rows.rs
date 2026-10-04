@@ -755,6 +755,11 @@ pub(crate) struct ProcessRows<'a> {
     pub steady: Option<&'a Steady>,
     /// When the snapshot was taken, for the Started column's "ago".
     pub now_unix_ms: i64,
+    /// Show Memory, Working set and the Disk columns as shares of the whole.
+    pub percent: bool,
+    /// Every process's disk reads and writes this interval, the whole a Disk
+    /// share is of.
+    pub disk_totals: (u64, u64),
 }
 
 /// The dead band a numeric column's sort keys get, so noise does not reorder rows
@@ -1081,6 +1086,35 @@ impl ProcessRows<'_> {
     }
 }
 
+impl ProcessRows<'_> {
+    /// A Memory, Working set or Disk cell: the amount, or with
+    /// [`ProcessRows::percent`] its share of the whole (physical memory for the
+    /// memory columns, every process's reads or writes this interval for the disk
+    /// ones). A share with no whole to be of (no memory total, an idle disk) is
+    /// shown as zero.
+    fn resource_cell(&self, out: &mut String, col: usize, value: Bytes) {
+        if !self.percent {
+            match col {
+                col::DISK_READ | col::DISK_WRITE => format::rate(out, value, self.interval_secs),
+                _ => format::bytes(out, value),
+            }
+            return;
+        }
+        let whole = match col {
+            col::DISK_READ => self.disk_totals.0 as f64,
+            col::DISK_WRITE => self.disk_totals.1 as f64,
+            _ => f64::from(self.mem_total),
+        };
+        let share = if whole > 0.0 {
+            (value.get() as f64 / whole * 100.0) as f32
+        } else {
+            0.0
+        };
+        format::percent(out, share);
+        out.push('%');
+    }
+}
+
 impl RowSource for ProcessRows<'_> {
     fn len(&self) -> usize {
         self.layout.rows.len()
@@ -1126,10 +1160,15 @@ impl RowSource for ProcessRows<'_> {
                 }
                 col::CPU => format::percent(out, p.cpu.get()),
                 col::CYCLES => format::cycles_cell(out, self.own_cycles(r.proc as usize)),
-                col::MEMORY => format::bytes(out, p.private_bytes),
-                col::WORKING_SET => format::bytes(out, p.working_set),
-                col::DISK_READ => format::rate(out, p.disk_read, self.interval_secs),
-                col::DISK_WRITE => format::rate(out, p.disk_write, self.interval_secs),
+                col::MEMORY | col::WORKING_SET | col::DISK_READ | col::DISK_WRITE => {
+                    let value = match col {
+                        col::MEMORY => p.private_bytes,
+                        col::WORKING_SET => p.working_set,
+                        col::DISK_READ => p.disk_read,
+                        _ => p.disk_write,
+                    };
+                    self.resource_cell(out, col, value);
+                }
                 col::GPU => {
                     out.clear();
                     if let Some(g) = p.gpu.filter(|g| g.get() > 0.0) {
@@ -1387,10 +1426,10 @@ impl RowSource for ProcessRows<'_> {
                     }
                     col::CPU => format::percent(out, ru.cpu),
                     col::CYCLES => format::cycles_cell(out, self.tree.cycles(row)),
-                    col::MEMORY => format::bytes(out, Bytes(ru.private_bytes)),
-                    col::WORKING_SET => format::bytes(out, Bytes(ru.working_set)),
-                    col::DISK_READ => format::rate(out, Bytes(ru.disk_read), self.interval_secs),
-                    col::DISK_WRITE => format::rate(out, Bytes(ru.disk_write), self.interval_secs),
+                    col::MEMORY => self.resource_cell(out, col, Bytes(ru.private_bytes)),
+                    col::WORKING_SET => self.resource_cell(out, col, Bytes(ru.working_set)),
+                    col::DISK_READ => self.resource_cell(out, col, Bytes(ru.disk_read)),
+                    col::DISK_WRITE => self.resource_cell(out, col, Bytes(ru.disk_write)),
                     col::THREADS => format::count(out, ru.threads),
                     col::HANDLES => format::count(out, ru.handles),
                     _ => self.cell(row, col, out),
@@ -1593,6 +1632,8 @@ pub(crate) mod tests {
             tree_mode,
             steady: None,
             now_unix_ms: 0,
+            percent: false,
+            disk_totals: (0, 0),
         }
     }
 
@@ -1600,6 +1641,35 @@ pub(crate) mod tests {
         let mut s = String::new();
         r.cell(row, col, &mut s);
         s
+    }
+
+    #[test]
+    fn resource_values_show_as_amounts_or_as_shares_of_the_whole() {
+        let mut a = proc(4, None, 1.0);
+        a.private_bytes = Bytes(256 << 20);
+        a.working_set = Bytes(512 << 20);
+        a.disk_read = Bytes(3 << 20);
+        a.disk_write = Bytes(0);
+        let snap = Snapshot {
+            processes: vec![a],
+            ..Default::default()
+        };
+        let tree = tree_of(&snap.processes);
+        let layout = layout_of(&snap, None);
+        let mut r = rows(&snap, &tree, &layout, None, false);
+        assert_eq!(cell(&r, 0, col::MEMORY), "256 MB");
+        assert_eq!(cell(&r, 0, col::DISK_READ), "3.00 MB/s");
+        r.percent = true;
+        r.mem_total = (1u64 << 30) as f32;
+        r.disk_totals = (12 << 20, 0);
+        assert_eq!(cell(&r, 0, col::MEMORY), "25%");
+        assert_eq!(cell(&r, 0, col::WORKING_SET), "50%");
+        assert_eq!(cell(&r, 0, col::DISK_READ), "25%");
+        assert_eq!(
+            cell(&r, 0, col::DISK_WRITE),
+            "0.0%",
+            "an idle disk is no one's share"
+        );
     }
 
     #[test]
