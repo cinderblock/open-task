@@ -8,10 +8,18 @@
 //! holds that, and on, up to [`WCT_MAX_NODE_COUNT`] nodes, saying whether the
 //! chain comes back on itself: a deadlock. Each thread's chain is read
 //! synchronously here, with every "look across processes" flag set, so a hang on
-//! a lock in another process is followed into it. The COM flags need a callback
-//! registered with `RegisterWaitChainCOMCallback` to resolve COM calls; that is
-//! not done, so a COM wait shows as what the kernel sees (an ALPC call or an
-//! unknown object).
+//! a lock in another process is followed into it. COM calls are followed through
+//! the callbacks `RegisterWaitChainCOMCallback` takes, `CoGetCallState` and
+//! `CoGetActivationState`, which ole32 exports by name but no header declares;
+//! they are looked up once, as Microsoft's "Using WCT" sample does, and when
+//! they are missing a COM wait shows as what the kernel sees (an ALPC call).
+//!
+//! **One analysis at a time per process.** Two threads each reading chains in
+//! their own sessions crash the process (an access violation inside the API,
+//! 10 runs in 10 with the tests in parallel on 2026-10-04, none once
+//! serialized), so [`analyze`] holds a process-wide lock for its whole run. The
+//! documentation says nothing about this; the lock is cheap, as an analysis is a
+//! user's click.
 //!
 //! Reading another user's threads needs the debug privilege; without it their
 //! nodes come back as `NoAccess`, which the model keeps rather than hiding. The
@@ -24,16 +32,19 @@
 //! a worker thread.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, Once, PoisonError};
 
 use ot_model::process::{ThreadWait, WaitChain, WaitKind, WaitNode, WaitStatus};
 use ot_model::ProcessKey;
-use windows::core::BOOL;
+use windows::core::{s, w, BOOL};
 use windows::Win32::System::Diagnostics::Debug::{
     CloseThreadWaitChainSession, GetThreadWaitChain, OpenThreadWaitChainSession,
-    OPEN_THREAD_WAIT_CHAIN_SESSION_FLAGS, WAITCHAIN_NODE_INFO, WAIT_CHAIN_THREAD_OPTIONS,
-    WCT_MAX_NODE_COUNT, WCT_NETWORK_IO_FLAG, WCT_OBJECT_STATUS, WCT_OBJECT_TYPE,
-    WCT_OUT_OF_PROC_COM_FLAG, WCT_OUT_OF_PROC_CS_FLAG, WCT_OUT_OF_PROC_FLAG,
+    RegisterWaitChainCOMCallback, OPEN_THREAD_WAIT_CHAIN_SESSION_FLAGS, PCOGETACTIVATIONSTATE,
+    PCOGETCALLSTATE, WAITCHAIN_NODE_INFO, WAIT_CHAIN_THREAD_OPTIONS, WCT_MAX_NODE_COUNT,
+    WCT_NETWORK_IO_FLAG, WCT_OBJECT_STATUS, WCT_OBJECT_TYPE, WCT_OUT_OF_PROC_COM_FLAG,
+    WCT_OUT_OF_PROC_CS_FLAG, WCT_OUT_OF_PROC_FLAG,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use super::control::{image_stem, open, os};
@@ -58,8 +69,54 @@ impl Drop for Session {
     }
 }
 
+/// Hand WCT ole32's COM state functions, once per process, so COM waits are
+/// followed. Missing exports leave COM unresolved, which is not an error.
+fn register_com_callbacks() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: loading a system DLL by name; the module stays loaded for the
+        // life of the process, as the callbacks must.
+        let Ok(ole32) = (unsafe { LoadLibraryW(w!("ole32.dll")) }) else {
+            tracing::debug!("ole32 did not load; COM waits are not followed");
+            return;
+        };
+        // SAFETY: names of exported functions; null when absent.
+        let (call, activation) = unsafe {
+            (
+                GetProcAddress(ole32, s!("CoGetCallState")),
+                GetProcAddress(ole32, s!("CoGetActivationState")),
+            )
+        };
+        let (Some(call), Some(activation)) = (call, activation) else {
+            tracing::debug!("ole32 lacks the COM state exports; COM waits are not followed");
+            return;
+        };
+        // SAFETY: both are the functions WCT documents for these slots, whose
+        // signatures `PCOGETCALLSTATE` and `PCOGETACTIVATIONSTATE` describe.
+        unsafe {
+            let call: PCOGETCALLSTATE = Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                unsafe extern "system" fn(i32, *mut u32) -> windows::core::HRESULT,
+            >(call));
+            let activation: PCOGETACTIVATIONSTATE = Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                unsafe extern "system" fn(
+                    windows::core::GUID,
+                    u32,
+                    *mut u32,
+                ) -> windows::core::HRESULT,
+            >(activation));
+            RegisterWaitChainCOMCallback(call, activation);
+        }
+    });
+}
+
 /// The wait chain of each of `threads`, which belong to the process behind `key`.
 pub(super) fn analyze(key: ProcessKey, threads: &[u32]) -> Result<WaitChain, ControlError> {
+    // See the module notes: the API is not safe to use from two threads at once.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    register_com_callbacks();
     // Confirms the process is still the one the key names.
     let _process = open(key, PROCESS_QUERY_LIMITED_INFORMATION)?;
     // SAFETY: a synchronous session needs no callback.
@@ -276,6 +333,27 @@ mod tests {
         // SAFETY: created above, closed once.
         unsafe {
             let _ = CloseHandle(mutex);
+        }
+    }
+
+    /// Analyses from several threads at once take turns rather than crashing the
+    /// process (see the module notes).
+    #[test]
+    fn concurrent_analyses_take_turns() {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..20 {
+                        // SAFETY: plain call.
+                        let me = unsafe { GetCurrentThreadId() };
+                        let chain = analyze(own_key(), &[me]).expect("own process");
+                        assert_eq!(chain.threads.len(), 1);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
         }
     }
 
