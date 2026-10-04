@@ -20,13 +20,13 @@ headless, and measure nothing yet. What is still missing is listed under
 
 ## Using it
 
-**Pages:** the rail down the left edge switches between **Processes**,
+**Pages:** the rail down the left edge switches between **Summary**, **Processes**,
 **Performance**, **Users**, **Services**, **Startup apps**, **Connections**,
 **Installed apps** and **System**, with **Settings** at its bottom and the version
 above it, which is also the update button (see [Updates](#updates)). It shows labels
 when the window is wide and icons alone when it is narrow; the button at its top
 flips that. **Ctrl+Tab** and **Ctrl+Shift+Tab** step through the pages, and
-**Ctrl+1** to **Ctrl+8** jump to one. Typing (or **Ctrl+F**) on any page goes to
+**Ctrl+1** to **Ctrl+9** jump to one. Typing (or **Ctrl+F**) on any page goes to
 that page's search. **Ctrl+N** opens **Run new task**. The page, arrangement, sort
 and columns you leave open come back at the next start (`--page` and `--view` on
 the command line override that). Settings are kept per user, in
@@ -294,6 +294,21 @@ the window and the icon is the way back. **Update speed** (High, Normal, Slow,
 Low: every half second to every four) is beside the fade rate under **Process
 table**; **Space** still pauses. **How far charts reach back** is under **Charts**.
 
+**Summary** puts every other page's headline numbers on one screen, as TMOG's
+Summary view does, in cards that sit two across when the window is wide and one
+when it is narrow: the CPU (utilization and clock, a small graph of the history
+held, processes, threads, handles, up time, and package power and temperature when
+the probe reports them), memory (in use of total with a graph, committed, cached),
+each disk's active time and read and write rates with the busiest one's graph,
+each network connection's traffic with the busiest one's graph (connections at
+rest are left out when there are more than four), each GPU's utilization and
+dedicated memory, the battery's charge, state, rate and time left, the five
+processes using the most CPU right now and the five with the highest cycle
+totals (a click on one selects it on the Processes page), and how many users are
+signed in, how many services are running, the up time and the Windows edition.
+The graphs share one hover line. The app still opens on Processes, as Task
+Manager does; the Summary is one click or **Ctrl+1** away.
+
 **Users** lists the logon sessions: user, session id, state (active, disconnected,
 idle), station, and the CPU, memory and disk of each session's processes added up.
 A session opens to its processes; right-click for **Disconnect** (their programs
@@ -349,8 +364,8 @@ thinks it was forgotten:
   process menu; **Package name** and **Platform** columns.
 - **Signature verification** (Process Explorer's Verified Signer), the DLL and
   handle lower pane, thread stacks, VirusTotal.
-- TMOG's **Summary** page, **Benchmarks**, and the **Flight Recorder**: `ot-record`
-  is a stub and the snapshot stream is designed for it; a release of its own.
+- TMOG's **Benchmarks**, and the **Flight Recorder**: `ot-record` is a stub and the
+  snapshot stream is designed for it; a release of its own.
 - **Minimize on use**, **Start with Windows** (an installer task), and showing
   resource values as percentages.
 

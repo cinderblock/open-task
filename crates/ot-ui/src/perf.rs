@@ -920,7 +920,7 @@ impl PerfPage {
 
 /// The full scale of an adapter's chart, in bytes per second, from its busiest
 /// moment in the last `span_ms`.
-fn net_scale(tl: &Timeline, id: u64, span_ms: f32) -> f32 {
+pub(crate) fn net_scale(tl: &Timeline, id: u64, span_ms: f32) -> f32 {
     let a = tl.adapter(id);
     let top = peak(a.map(|a| &a.rx), span_ms).max(peak(a.map(|a| &a.tx), span_ms));
     nice_bits(top * 8.0, NET_FLOOR_BITS) / 8.0
@@ -1042,7 +1042,7 @@ fn summary(d: Device, snap: &Snapshot, buf: &mut String) {
 }
 
 /// The average clock across logical processors, when the probe reports clocks.
-fn current_clock(snap: &Snapshot) -> Option<Hertz> {
+pub(crate) fn current_clock(snap: &Snapshot) -> Option<Hertz> {
     let (n, sum) = snap
         .cpu
         .cores
@@ -1641,9 +1641,12 @@ fn paint_battery_stats(
     facts.paint(dl, theme);
 }
 
+/// The synthetic machine the Performance tests paint, shared with the Summary
+/// page's tests: a snapshot and twenty seconds of its history, with whichever
+/// devices a test asks for.
 #[cfg(test)]
 #[allow(unused_must_use)] // tests drive the page and ignore most reactions
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ot_model::cpu::{CpuSample, LogicalCore};
     use ot_model::device::{AdapterInfo, DiskInfo, VolumeSample};
@@ -1655,10 +1658,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    const GB: u64 = 1 << 30;
+    pub(crate) const GB: u64 = 1 << 30;
     const MB: u64 = 1 << 20;
 
-    fn disk(n: u32) -> DiskSample {
+    pub(crate) fn disk(n: u32) -> DiskSample {
         DiskSample {
             info: Arc::new(DiskInfo {
                 number: n,
@@ -1676,7 +1679,7 @@ mod tests {
         }
     }
 
-    fn adapter(id: u64, name: &str) -> AdapterSample {
+    pub(crate) fn adapter(id: u64, name: &str) -> AdapterSample {
         AdapterSample {
             info: Arc::new(AdapterInfo {
                 id,
@@ -1694,7 +1697,7 @@ mod tests {
         }
     }
 
-    fn gpu(id: u64) -> GpuSample {
+    pub(crate) fn gpu(id: u64) -> GpuSample {
         GpuSample {
             info: Arc::new(GpuInfo {
                 id,
@@ -1721,7 +1724,7 @@ mod tests {
         }
     }
 
-    fn battery() -> BatterySample {
+    pub(crate) fn battery() -> BatterySample {
         BatterySample {
             charge: Some(80.0),
             state: BatteryState::Discharging,
@@ -1749,7 +1752,7 @@ mod tests {
         }
     }
 
-    fn snap(tick: u64, cores: usize) -> Snapshot {
+    pub(crate) fn snap(tick: u64, cores: usize) -> Snapshot {
         Snapshot {
             tick: Tick(tick),
             taken_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 + tick)),
@@ -1808,17 +1811,17 @@ mod tests {
     }
 
     /// Everything a snapshot can list beyond the CPU and memory.
-    #[derive(Default)]
-    struct Devices {
-        disks: Vec<DiskSample>,
-        adapters: Vec<AdapterSample>,
-        gpus: Vec<GpuSample>,
-        battery: Option<BatterySample>,
-        volumes: Vec<VolumeSample>,
+    #[derive(Debug, Default)]
+    pub(crate) struct Devices {
+        pub disks: Vec<DiskSample>,
+        pub adapters: Vec<AdapterSample>,
+        pub gpus: Vec<GpuSample>,
+        pub battery: Option<BatterySample>,
+        pub volumes: Vec<VolumeSample>,
     }
 
     /// Twenty seconds of the same snapshot, with the given devices.
-    fn timeline_of(cores: usize, devices: &Devices) -> (Timeline, Snapshot) {
+    pub(crate) fn timeline_of(cores: usize, devices: &Devices) -> (Timeline, Snapshot) {
         let mut tl = Timeline::new(Retention::raw(100));
         let mut last = snap(1, cores);
         for t in 1..=20 {

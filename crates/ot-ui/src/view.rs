@@ -24,6 +24,7 @@ use crate::pages::apps::AppsPage;
 use crate::pages::connections::ConnectionsPage;
 use crate::pages::services::ServicesPage;
 use crate::pages::startup::StartupPage;
+use crate::pages::summary::{self, SummaryPage};
 use crate::pages::system::SystemPage;
 use crate::pages::users::UsersPage;
 use crate::pages::PageOutcome;
@@ -827,6 +828,7 @@ pub struct App {
     charts: ChartGroup,
     page: Page,
     nav: NavRail,
+    summary: SummaryPage,
     perf: PerfPage,
     users: UsersPage,
     services: ServicesPage,
@@ -887,6 +889,7 @@ impl App {
             charts: ChartGroup::default(),
             page: Page::default(),
             nav: NavRail::default(),
+            summary: SummaryPage::default(),
             perf: PerfPage::default(),
             users: UsersPage::default(),
             services: ServicesPage::default(),
@@ -1144,14 +1147,15 @@ impl App {
     }
 
     /// What the page showing needs read now, if anything: the shell runs it
-    /// off the UI thread and answers with [`App::set_inventory`].
+    /// off the UI thread and answers with [`App::set_inventory`]. The Summary
+    /// wants the System facts too, for its Windows edition.
     #[must_use]
     pub fn page_query(&self) -> Option<Query> {
         match self.page {
             Page::Startup => self.startup.query(),
             Page::Apps => self.apps.query(),
             Page::Connections => self.connections.query(),
-            Page::System => self.system.query(),
+            Page::Summary | Page::System => self.system.query(),
             _ => None,
         }
     }
@@ -1319,6 +1323,7 @@ impl App {
             self.table.hover = None;
             let _ = self.hold_order(false);
             let _ = self.perf.handle(UiEvent::MouseLeave);
+            let _ = self.summary.handle(UiEvent::MouseLeave);
             let cx = Context {
                 system_animations: self.system_animations,
                 update: &self.update,
@@ -1399,6 +1404,10 @@ impl App {
         }
         let theme = self.theme.clone();
         let r = match self.page {
+            Page::Summary => {
+                let o = self.summary.handle(ev);
+                self.page_outcome(o)
+            }
             Page::Processes => self.handle_processes(ev),
             Page::Performance => self.perf.handle(ev),
             Page::Users => {
@@ -2137,6 +2146,17 @@ impl App {
         };
         match self.page {
             Page::Processes => {}
+            Page::Summary => {
+                let snap = Arc::clone(&self.snap);
+                let inputs = summary::Inputs {
+                    snap: &snap,
+                    timeline,
+                    cycles: &self.cycles,
+                    facts: self.system.facts(),
+                };
+                self.summary.paint(dl, full, inputs, theme, &mut self.buf);
+                return;
+            }
             Page::Performance => {
                 let snap = Arc::clone(&self.snap);
                 self.perf
@@ -3289,6 +3309,13 @@ mod tests {
             cmd(&mut app, Command::SetPage(Page::System)).effect,
             Some(Effect::Query(Query::System))
         );
+        // The Summary wants the same facts, until they have been read.
+        assert_eq!(
+            cmd(&mut app, Command::SetPage(Page::Summary)).effect,
+            Some(Effect::Query(Query::System))
+        );
+        app.set_inventory(Inventory::System(Box::default()));
+        assert_eq!(cmd(&mut app, Command::SetPage(Page::Summary)).effect, None);
         // Typing on a list page filters that page, not the process table.
         cmd(&mut app, Command::SetPage(Page::Services));
         type_str(&mut app, "spool");
@@ -3540,13 +3567,54 @@ mod tests {
         assert_eq!(app.page(), Page::Users);
         cmd(&mut app, Command::SetPage(Page::Settings));
         cmd(&mut app, Command::StepPage(1));
-        assert_eq!(app.page(), Page::Processes, "wraps around");
+        assert_eq!(app.page(), Page::Summary, "wraps around to the first page");
         cmd(&mut app, Command::StepPage(-1));
         assert_eq!(app.page(), Page::Settings);
         cmd(&mut app, Command::StepPage(-1));
         assert_eq!(app.page(), Page::System);
         cmd(&mut app, Command::SetPage(Page::Processes));
         assert_eq!(app.page(), Page::Processes);
+    }
+
+    #[test]
+    fn the_summary_page_sums_the_others_up_and_jumps_to_a_process() {
+        let mut app = by_cpu();
+        with_history(&mut app);
+        ready(&mut app);
+        cmd(&mut app, Command::SetPage(Page::Summary));
+        let strings = painted_strings(&mut app);
+        for want in [
+            "Summary",
+            "CPU",
+            "Memory",
+            "Top processes",
+            "By CPU",
+            "System",
+        ] {
+            assert!(strings.iter().any(|s| s == want), "{want} in {strings:?}");
+        }
+        assert!(!strings.iter().any(|s| s == "Name"), "no process table");
+        // The busiest process leads the list; a click on it selects it on the
+        // Processes page, as the window crosshair's pick does.
+        let busiest = app
+            .snap
+            .processes
+            .iter()
+            .filter(|p| p.key().pid != 0)
+            .max_by(|a, b| a.cpu.get().total_cmp(&b.cpu.get()))
+            .map(|p| p.key().pid)
+            .expect("the family has processes");
+        let row = app
+            .summary
+            .row_rect(busiest)
+            .expect("the busiest process is listed");
+        let r = app.handle(UiEvent::MouseDown {
+            at: row.center(),
+            button: MouseButton::Left,
+        });
+        assert!(r.repaint);
+        assert_eq!(app.page(), Page::Processes);
+        assert_eq!(app.table.selected, Some(id(busiest)));
     }
 
     #[test]

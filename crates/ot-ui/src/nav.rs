@@ -14,6 +14,9 @@ use crate::update::UpdateView;
 /// A top-level page of the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Page {
+    /// Every other page's headline numbers on one screen. First on the rail, as
+    /// in TMOG; the app still opens on Processes, as Task Manager does.
+    Summary,
     /// The process table, with the summary charts above it.
     #[default]
     Processes,
@@ -38,7 +41,8 @@ pub enum Page {
 
 impl Page {
     /// In rail order. Settings is last and drawn at the bottom.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
+        Self::Summary,
         Self::Processes,
         Self::Performance,
         Self::Users,
@@ -53,6 +57,7 @@ impl Page {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
+            Self::Summary => "Summary",
             Self::Processes => "Processes",
             Self::Performance => "Performance",
             Self::Users => "Users",
@@ -68,6 +73,7 @@ impl Page {
     #[must_use]
     pub fn icon(self) -> Icon {
         match self {
+            Self::Summary => Icon::Summary,
             Self::Processes => Icon::Processes,
             Self::Performance => Icon::Performance,
             Self::Users => Icon::Users,
@@ -99,6 +105,7 @@ impl Page {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            Self::Summary => "summary",
             Self::Processes => "processes",
             Self::Performance => "performance",
             Self::Users => "users",
@@ -387,12 +394,14 @@ mod tests {
         assert_eq!(
             Page::parse("s"),
             None,
-            "ambiguous: Services, Startup, System, Settings"
+            "ambiguous: Summary, Services, Startup, System, Settings"
         );
+        assert_eq!(Page::parse("sum"), Some(Page::Summary));
+        assert_eq!(Page::Summary.step(1), Page::Processes);
         assert_eq!(Page::Processes.step(1), Page::Performance);
         assert_eq!(Page::Performance.step(1), Page::Users);
-        assert_eq!(Page::Settings.step(1), Page::Processes, "wraps");
-        assert_eq!(Page::Processes.step(-1), Page::Settings, "wraps back");
+        assert_eq!(Page::Settings.step(1), Page::Summary, "wraps");
+        assert_eq!(Page::Summary.step(-1), Page::Settings, "wraps back");
         assert_eq!(Page::parse("set"), Some(Page::Settings));
         assert_eq!(
             Page::parse("apps"),
@@ -402,10 +411,11 @@ mod tests {
         assert_eq!(Page::parse("Installed apps"), Some(Page::Apps));
         assert_eq!(Page::parse("startup"), Some(Page::Startup));
         assert_eq!(Page::parse("Startup apps"), Some(Page::Startup));
-        assert_eq!(Page::nth(1), Some(Page::Processes));
-        assert_eq!(Page::nth(2), Some(Page::Performance));
-        assert_eq!(Page::nth(8), Some(Page::System));
-        assert_eq!(Page::nth(9), None, "Settings has no number");
+        assert_eq!(Page::nth(1), Some(Page::Summary));
+        assert_eq!(Page::nth(2), Some(Page::Processes));
+        assert_eq!(Page::nth(3), Some(Page::Performance));
+        assert_eq!(Page::nth(9), Some(Page::System));
+        assert_eq!(Page::nth(10), None, "Settings has no number");
         assert_eq!(Page::nth(0), None);
     }
 
@@ -467,6 +477,7 @@ mod tests {
             icons,
             [
                 Icon::Menu,
+                Icon::Summary,
                 Icon::Processes,
                 Icon::Performance,
                 Icon::Users,
@@ -486,22 +497,22 @@ mod tests {
         assert_eq!(nav.hit(Point::new(20.0, y0)), Some(NavHit::Toggle));
         assert_eq!(
             nav.hit(Point::new(20.0, y0 + ITEM_H)),
-            Some(NavHit::Page(Page::Processes))
+            Some(NavHit::Page(Page::Summary))
         );
         assert_eq!(
             nav.hit(Point::new(20.0, y0 + 2.0 * ITEM_H)),
-            Some(NavHit::Page(Page::Performance))
+            Some(NavHit::Page(Page::Processes))
         );
         assert_eq!(
             nav.hit(Point::new(20.0, y0 + 3.0 * ITEM_H)),
-            Some(NavHit::Page(Page::Users))
+            Some(NavHit::Page(Page::Performance))
         );
-        // Eight pages, then nothing until the buttons at the bottom.
+        // Nine pages, then nothing until the buttons at the bottom.
         assert_eq!(
-            nav.hit(Point::new(20.0, y0 + 8.0 * ITEM_H)),
+            nav.hit(Point::new(20.0, y0 + 9.0 * ITEM_H)),
             Some(NavHit::Page(Page::System))
         );
-        assert_eq!(nav.hit(Point::new(20.0, y0 + 9.0 * ITEM_H)), None);
+        assert_eq!(nav.hit(Point::new(20.0, y0 + 10.0 * ITEM_H)), None);
         // Settings is at the bottom of the rail, the update button above it.
         assert_eq!(
             nav.hit(Point::new(20.0, 600.0 - theme.gap - ITEM_H * 0.5)),
@@ -519,6 +530,7 @@ mod tests {
         assert_eq!(
             texts(&dl),
             [
+                "Summary",
                 "Processes",
                 "Performance",
                 "Users",
@@ -545,7 +557,7 @@ mod tests {
         };
         let mut update = UpdateView::new("0.2.1-20-gdbfe022-dirty", true);
         let dl = painted_with(&mut nav, true, &update);
-        assert_eq!(texts(&dl)[9..], ["dbfe022-dirty", "Check for updates"]);
+        assert_eq!(texts(&dl)[10..], ["dbfe022-dirty", "Check for updates"]);
         // The Performance page's pill is the only accent so far.
         let before = dots(&dl);
 
@@ -556,6 +568,6 @@ mod tests {
         assert!(texts(&dl).is_empty(), "compact: icons only");
         assert_eq!(dots(&dl), before + 1, "a dot on the icon");
         let dl = painted_with(&mut nav, true, &update);
-        assert_eq!(texts(&dl)[10], "Install v0.3.0");
+        assert_eq!(texts(&dl)[11], "Install v0.3.0");
     }
 }

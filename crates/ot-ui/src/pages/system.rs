@@ -70,6 +70,12 @@ impl SystemPage {
         self.rebuild();
     }
 
+    /// The facts read so far, for the Summary page's System card.
+    #[must_use]
+    pub fn facts(&self) -> Option<&SystemFacts> {
+        self.facts.as_ref()
+    }
+
     pub fn set_snapshot(&mut self, snap: Arc<Snapshot>) {
         self.snap = snap;
         self.rebuild();
