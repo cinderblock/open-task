@@ -388,8 +388,9 @@ thinks it was forgotten:
   [PawnIO](https://pawnio.eu) when it is installed (see Performance) and ships no
   driver of its own; without it the battery's rate is the power figure, where
   there is a battery.
-- **App history.** Cumulative per-app use over 30 days needs usage persisted across
-  runs; the fading totals and the History chart answer the live question.
+- **App history.** Cumulative per-app use over 30 days needs usage kept across runs,
+  and open-task keeps nothing on disk but its settings (a recording is a file you
+  ask for). The fading totals and the History chart answer the live question.
 - **Startup impact.** Windows derives it from boot traces.
 - **Expand/collapse groups, UAC virtualization, Debug** on the process menu (the
   Type column stands in for the groups; the other two are legacy or need a
