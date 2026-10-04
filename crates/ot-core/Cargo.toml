@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 ot-model.workspace = true
 ot-probe.workspace = true
+ot-record.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
 

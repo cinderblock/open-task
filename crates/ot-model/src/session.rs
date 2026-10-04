@@ -1,7 +1,8 @@
 //! Logon sessions: who is signed in, and how.
+use serde::{Deserialize, Serialize};
 
 /// What a session is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum SessionState {
     /// Signed in and at the console or over a remote connection.
     Active,
@@ -27,7 +28,7 @@ impl SessionState {
 }
 
 /// One logon session, as the platform's session manager describes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     /// The session id processes carry ([`crate::process::ProcessStatic::session_id`]).
     pub id: u32,

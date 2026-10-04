@@ -3,12 +3,13 @@
 //! Each sample points at an `Arc` of facts that do not change while the device is
 //! attached, the same split processes use, so a pass copies pointers, not strings.
 
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::units::{Bytes, Percent};
 
 /// A physical disk's facts.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DiskInfo {
     /// The disk's number (`N` in `\\.\PhysicalDriveN` on Windows). Stable while the
     /// disk is attached; the key its history is kept under.
@@ -28,8 +29,11 @@ pub struct DiskInfo {
 }
 
 /// A disk over one sampling interval.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiskSample {
+    /// Not serialized: shared by pointer between passes, so the Flight Recorder
+    /// writes each distinct value once in a table and restores it on read.
+    #[serde(skip)]
     pub info: Arc<DiskInfo>,
     /// Share of the interval the disk had requests outstanding, `0..=100`. What
     /// Task Manager calls active time; 100% means saturated, not "full".
@@ -41,7 +45,7 @@ pub struct DiskSample {
 }
 
 /// What kind of link an adapter is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum LinkKind {
     Ethernet,
     WiFi,
@@ -53,7 +57,7 @@ pub enum LinkKind {
 }
 
 /// A network adapter's facts.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AdapterInfo {
     /// Stable while the adapter exists (the interface LUID on Windows); the key its
     /// history is kept under.
@@ -75,7 +79,7 @@ pub struct AdapterInfo {
 
 /// A mounted volume (a drive letter, or a mount point), for the disk panes and
 /// TMOG's Disk Space view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeSample {
     /// `C:`, or a mount path.
     pub mount: String,
@@ -94,8 +98,11 @@ pub struct VolumeSample {
 }
 
 /// A network adapter over one sampling interval.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdapterSample {
+    /// Not serialized: shared by pointer between passes, so the Flight Recorder
+    /// writes each distinct value once in a table and restores it on read.
+    #[serde(skip)]
     pub info: Arc<AdapterInfo>,
     pub rx_per_sec: Bytes,
     pub tx_per_sec: Bytes,

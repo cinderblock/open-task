@@ -323,6 +323,27 @@ topology, base speed, caches, virtualization and hypervisor; installed memory, w
 the hardware reserves, each memory module's size, speed, form factor and slot; and
 the volumes and page files.
 
+### Recording
+
+`open-task --record session.otrec` writes every pass to the file named, with the
+window open or with `--headless` (which records its `--passes` passes, then stops and
+says what the file cost). `open-task --replay session.otrec --headless` prints the
+frames back the way the live headless mode prints passes, and
+`open-task --replay-info session.otrec` says what a file holds: the version that
+wrote it, the machine, when it started, how many frames over how long and what they
+take. Replaying in the window, with play, pause and a scrub bar, is not wired up yet.
+Nothing is written unless `--record` names a file, and a recording cut short (the
+app died, the disk filled) still opens with every complete frame.
+
+A frame is one pass: every process and thread, the CPU, memory, disks, adapters,
+GPUs and battery, everything the pages show. Values shared between passes (a
+process's path and command line, a disk's model, a service list) are written once;
+every 60th frame is written whole and the rest as the changes since the frame
+before, so an idle process costs a few bytes; lz4 compresses the result. On the
+development machine (about 450 processes and 6000 threads) a frame is about 13 KB,
+or 15 KB with the keyframes counted in, so an hour of one-second passes is around
+50 MB.
+
 ## Not yet
 
 What the reference tools have that this release does not, and why, so nobody
@@ -341,8 +362,9 @@ thinks it was forgotten:
   process menu; **Package name** and **Platform** columns.
 - **Signature verification** (Process Explorer's Verified Signer), the DLL and
   handle lower pane, thread stacks, VirusTotal.
-- TMOG's **Summary** page, **Benchmarks**, and the **Flight Recorder**: `ot-record`
-  is a stub and the snapshot stream is designed for it; a release of its own.
+- TMOG's **Summary** page and **Benchmarks**; the **Flight Recorder**'s transport
+  controls in the window. Recording and replay work from the command line (see
+  [Recording](#recording)); the player behind them is built and the UI is next.
 - **Minimize on use**, **Start with Windows** (an installer task), and showing
   resource values as percentages.
 
@@ -364,7 +386,7 @@ class: tens of megabytes, not hundreds.
 | `ot-core` | Sampling thread, multi-resolution history, lock-free snapshot publication. |
 | `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
 | `ot-ui` | UI-agnostic view models: theme, the pages, navigation rail, virtualized table with a column chooser, charts. |
-| `ot-record` | Flight Recorder: record and replay a session (planned). |
+| `ot-record` | Flight Recorder: writes the snapshot stream to a file (shared values once, keyframes plus deltas, lz4) and reads it back by frame. |
 | `ot-update` | Self-updater: finds signed releases, downloads, verifies and installs them. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
 | `ot-app` | The binary. |
@@ -480,8 +502,8 @@ cargo install --path crates/ot-app --locked
 ```
 
 Release builds have no console window; the command-line modes (`--version`,
-`--headless`, `--check-update`, `--sample`) attach to the terminal they were started
-from and print there. Output piped into something that stops reading early
+`--headless`, `--check-update`, `--sample`, `--replay`, `--replay-info`) attach to the
+terminal they were started from and print there. Output piped into something that stops reading early
 (`| Select-Object -First 5`) ends the program quietly. `cargo install` also
 installs `open-task-console`, the console launcher the Windows release ships as
 `open-task.com` (see [Install](#install)). On Windows, run that for the

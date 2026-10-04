@@ -5,12 +5,13 @@
 //! the interval, because the engines do not add up, a GPU with 3D at 60 % and copy
 //! at 60 % is not 120 % busy. The engines are reported too, for the chart.
 
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::units::{Bytes, Percent};
 
 /// A graphics adapter's facts.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GpuInfo {
     /// Stable while the adapter is present (the adapter LUID on Windows); the key
     /// its history is kept under.
@@ -32,7 +33,7 @@ pub struct GpuInfo {
 }
 
 /// One engine's load over the interval.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineSample {
     /// `3D`, `Copy`, `Video Decode`, `Compute 0`, as the platform names them.
     pub name: Arc<str>,
@@ -40,8 +41,11 @@ pub struct EngineSample {
 }
 
 /// A graphics adapter over one sampling interval.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuSample {
+    /// Not serialized: shared by pointer between passes, so the Flight Recorder
+    /// writes each distinct value once in a table and restores it on read.
+    #[serde(skip)]
     pub info: Arc<GpuInfo>,
     /// The busiest engine's share of the interval, `0..=100`.
     pub utilization: Percent,

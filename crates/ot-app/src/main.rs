@@ -9,6 +9,11 @@
 //! copy in Task Manager's place, or stop, as the Settings page's switch does (which
 //! runs them elevated when it needs to). When Windows does start it that way, Task
 //! Manager's own path and arguments come first on the command line and are ignored.
+//!
+//! `--record <file>` writes every pass to a Flight Recorder file, with the window or
+//! headless; `--replay <file> --headless` prints a recording back the way the live
+//! headless mode prints passes; `--replay-info <file>` describes one. Only a file
+//! named on the command line is ever written.
 
 #![forbid(unsafe_code)]
 // Release builds are GUI-subsystem so launching the app does not open a terminal.
@@ -22,9 +27,9 @@
 )]
 
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ot_core::{Sampler, SamplerConfig};
+use ot_core::{RecordHeader, Recorder, Recording, RecordingProbe, Sampler, SamplerConfig};
 use ot_model::Bytes;
 use ot_probe::{CpuSampler, PlatformProbe, PlatformSampler, SystemProbe};
 
@@ -44,6 +49,7 @@ macro_rules! out {
     };
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     // First, before any other thread exists: the console launcher that started this
     // process, if one did (it passes an environment variable, which this removes).
@@ -57,9 +63,18 @@ fn main() {
     let replace_task_manager = args.iter().any(|a| a == "--replace-task-manager");
     let restore_task_manager = args.iter().any(|a| a == "--restore-task-manager");
     let task_manager = replace_task_manager || restore_task_manager;
+    let record = arg_value(&args, "--record");
+    let replay = arg_value(&args, "--replay");
+    let replay_info = arg_value(&args, "--replay-info");
     let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
     // Everything but the window is a command-line mode, and prints.
-    let window = !(version || check_update || task_manager || sample.is_some() || headless);
+    let window = !(version
+        || check_update
+        || task_manager
+        || sample.is_some()
+        || replay.is_some()
+        || replay_info.is_some()
+        || headless);
     #[cfg(windows)]
     {
         if window {
@@ -94,6 +109,18 @@ fn main() {
         }
         std::process::exit(run_task_manager(replace_task_manager));
     }
+    if let Some(path) = replay_info {
+        std::process::exit(run_replay_info(path));
+    }
+    if let Some(path) = replay {
+        if !args.iter().any(|a| a == "--headless") && cfg!(windows) {
+            eprintln!(
+                "replaying in the window is not wired up yet; use --replay {path} --headless"
+            );
+            std::process::exit(2);
+        }
+        std::process::exit(run_replay(path));
+    }
     // Started in Task Manager's place with a window already open: bring that one
     // forward, as Task Manager would, before any of the setup below.
     #[cfg(windows)]
@@ -124,15 +151,181 @@ fn main() {
         interval: Duration::from_secs(1),
     };
 
+    let recorder = record.map(|path| open_recorder(path, &probe, config, window));
+
     if let Some(pid) = sample {
         let seconds: u64 = arg_value(&args, "--seconds")
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
         run_sample(Box::new(probe), config, pid, seconds);
     } else if headless {
-        run_headless(Box::new(probe), config, passes);
+        run_headless(Box::new(probe), config, passes, recorder);
     } else {
-        run_gui(Box::new(probe), config, theme, view, page);
+        // The shell builds its own sampler, so the recorder rides on the probe.
+        let probe: Box<dyn SystemProbe> = match recorder {
+            Some(r) => Box::new(RecordingProbe::new(Box::new(probe), r)),
+            None => Box::new(probe),
+        };
+        run_gui(probe, config, theme, view, page);
+    }
+}
+
+/// `--record <file>`: the one file this program ever writes. Exits if it cannot
+/// be created.
+fn open_recorder(
+    path: &str,
+    probe: &dyn SystemProbe,
+    config: SamplerConfig,
+    window: bool,
+) -> Recorder {
+    let header = RecordHeader {
+        app_version: VERSION.to_owned(),
+        hardware: probe.hardware(),
+        capabilities: probe.capabilities(),
+        started: SystemTime::now(),
+        interval: config.interval,
+    };
+    match Recorder::create(path, &header) {
+        Ok(r) => r,
+        Err(e) => fail(&format!("cannot record to {path}: {e}"), 2, window),
+    }
+}
+
+/// `--replay-info <file>`: what a recording holds, without decoding its frames.
+/// Exit code 0, or 1 if the file cannot be read.
+fn run_replay_info(path: &str) -> i32 {
+    let rec = match Recording::open(path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot open {path}: {e}");
+            return 1;
+        }
+    };
+    let h = rec.header();
+    out!("recording   {path} ({})", human(Bytes(rec.file_len())));
+    out!(
+        "written by  open-task v{}, format {}, {}",
+        h.app_version,
+        ot_record::FORMAT_VERSION,
+        if rec.had_index() {
+            "complete"
+        } else {
+            "cut short (no index; the frames were found by scanning)"
+        }
+    );
+    out!(
+        "started     {}, a pass every {}",
+        utc(h.started),
+        duration(h.interval)
+    );
+    let per_frame = if rec.is_empty() {
+        0
+    } else {
+        rec.file_len() / rec.len() as u64
+    };
+    out!(
+        "frames      {} over {}; {} per frame; {} processes seen",
+        rec.len(),
+        duration(rec.duration()),
+        human(Bytes(per_frame)),
+        rec.processes_seen()
+    );
+    print_hardware(&h.hardware);
+    out!("can measure {}", capabilities(&h.capabilities).join(", "));
+    0
+}
+
+/// `--replay <file> --headless`: every frame, printed as the live headless mode
+/// prints passes. Exit code 0, or 1 if the file cannot be read.
+fn run_replay(path: &str) -> i32 {
+    let rec = match Recording::open(path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot open {path}: {e}");
+            return 1;
+        }
+    };
+    out!(
+        "replaying {path}: {} frames over {}, recorded by open-task v{}",
+        rec.len(),
+        duration(rec.duration()),
+        rec.header().app_version
+    );
+    print_hardware(rec.hardware());
+    for i in 0..rec.len() {
+        match rec.frame(i) {
+            Ok(snap) => print_snapshot(&snap),
+            Err(e) => {
+                eprintln!("frame {i}: {e}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// The capability flags that are set, by name.
+fn capabilities(c: &ot_model::Capabilities) -> Vec<&'static str> {
+    [
+        (c.per_process_cpu, "per-process CPU"),
+        (c.per_process_disk, "per-process disk"),
+        (c.per_process_network, "per-process network"),
+        (c.per_process_gpu, "per-process GPU"),
+        (c.per_process_power, "per-process power"),
+        (c.core_frequency, "core frequency"),
+        (c.package_power, "package power"),
+        (c.thermals, "thermals"),
+        (c.hybrid_core_kinds, "hybrid core kinds"),
+        (c.threads, "threads"),
+        (c.services, "services"),
+        (c.service_tags, "service tags"),
+        (c.cpu_sampling, "CPU sampling"),
+        (c.gpu, "GPU"),
+        (c.sessions, "sessions"),
+        (c.service_list, "service list"),
+        (c.elevated, "elevated"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect()
+}
+
+/// `2026-10-03 21:14:05 UTC`, without a date crate: days to a civil date by the
+/// usual proleptic Gregorian arithmetic.
+fn utc(t: SystemTime) -> String {
+    let secs = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
+    };
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// `1.000 s`, `2 min 5 s`, `1 h 3 min`.
+fn duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{:.3} s", d.as_secs_f64())
+    } else if secs < 3600 {
+        format!("{} min {} s", secs / 60, secs % 60)
+    } else {
+        format!("{} h {} min", secs / 3600, secs % 3600 / 60)
     }
 }
 
@@ -285,8 +478,17 @@ fn run_gui(
     std::process::exit(3);
 }
 
-fn run_headless(probe: Box<dyn SystemProbe>, config: SamplerConfig, passes: usize) {
+fn run_headless(
+    probe: Box<dyn SystemProbe>,
+    config: SamplerConfig,
+    passes: usize,
+    recorder: Option<Recorder>,
+) {
     let sampler = Sampler::start(probe, config);
+    let recording = recorder.is_some();
+    if let Some(r) = recorder {
+        sampler.record_to(r);
+    }
 
     let mut last_tick = None;
     let mut printed = 0usize;
@@ -310,6 +512,26 @@ fn run_headless(probe: Box<dyn SystemProbe>, config: SamplerConfig, passes: usiz
         }
         print_snapshot(&snap);
         printed += 1;
+    }
+    if recording {
+        match sampler.stop_recording() {
+            Some(Ok(stats)) => {
+                let w = stats.written;
+                out!(
+                    "recorded {} frames ({} keyframes) in {}: {} per frame; {} dropped",
+                    w.frames,
+                    w.keyframes,
+                    human(Bytes(w.bytes)),
+                    human(Bytes(w.bytes_per_frame() as u64)),
+                    stats.dropped
+                );
+            }
+            Some(Err(e)) => {
+                eprintln!("recording failed: {e}");
+                std::process::exit(1);
+            }
+            None => {}
+        }
     }
 }
 

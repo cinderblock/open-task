@@ -1,7 +1,8 @@
 //! Programs that start when a user signs in.
+use serde::{Deserialize, Serialize};
 
 /// Where a startup entry is registered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StartupLocation {
     /// The user's own `Run` key.
     UserRun,
@@ -38,7 +39,7 @@ impl StartupLocation {
 }
 
 /// One program that starts at sign-in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupEntry {
     /// The entry's own name: the registry value's name, or the shortcut's file
     /// name without its extension.
