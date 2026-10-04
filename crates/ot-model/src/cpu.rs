@@ -20,7 +20,7 @@ pub enum CoreKind {
 }
 
 /// Which sensor the CPU temperature is read from, which decides what to call it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ThermalSensor {
     /// Intel's package thermal sensor: the hottest point on the die, read as
     /// degrees below `TjMax`.

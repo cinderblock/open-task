@@ -379,7 +379,10 @@ mod tests {
             "{me:?}"
         );
         assert!(me.user.as_deref().is_some_and(|u| !u.is_empty()), "{me:?}");
-        assert_ne!(me.station, "");
+        // A disconnected session has no station until someone connects to it.
+        if me.state == SessionState::Active {
+            assert_ne!(me.station, "");
+        }
 
         let services = out.iter().find(|s| s.id == 0).expect("session 0 listed");
         assert_eq!(services.station, "Services");
