@@ -203,7 +203,8 @@ for the rest, every column Task Manager's Details page has: Description, Command
 line, GPU %, GPU engine, Type (App, Background or Windows process), Company,
 Priority, Architecture, Session, Elevated, CPU time, Started, Page faults, Peak
 working set, Virtual size, Paged pool, NP pool, I/O reads, writes and other (counts
-and bytes), Image path and Window title, plus **Reset columns**. Status says when a
+and bytes), Image path, Window title and Package name (a packaged app's full name), plus
+**Reset columns**. Status says when a
 process is suspended, in efficiency mode or not responding. Drag a header to move
 the column, drag its divider to resize; **Shift+wheel** (or a tilt wheel) scrolls
 sideways when the columns are wider than the window. In the tree, a collapsed row's
@@ -220,7 +221,9 @@ and idle priority, as Task Manager's), **Set priority**, **Set affinity** (a che
 per logical processor), **Switch to** (bring its window forward), **Open file
 location**, **Search online**, **Properties** (Explorer's sheet), **Copy** (the row,
 tab-separated), **Create dump file** (a full minidump in `%TEMP%`, then revealed)
-and **Sample CPU for 5 s** (below). **Delete** and **Shift+Delete** are the keyboard
+**Analyze wait chain** (which thread waits on what, held by whom, across
+processes, and whether that is a deadlock: the Wait Chain Traversal API, as Task
+Manager uses it) and **Sample CPU for 5 s** (below). **Delete** and **Shift+Delete** are the keyboard
 shortcuts for the first two; the menu key or **Shift+F10** opens the menu for the
 selected row. Ending a process asks first, with No as the default. Every kill checks
 the process's creation time against the one in the table before it acts, so a PID
@@ -359,9 +362,9 @@ thinks it was forgotten:
 - **App history.** Cumulative per-app use over 30 days needs usage persisted across
   runs; the fading totals and the History chart answer the live question.
 - **Startup impact.** Windows derives it from boot traces.
-- **Process icons in the Name column.** The paint layer has no bitmap support yet.
-- **Expand/collapse groups, UAC virtualization, Analyze wait chain, Debug** on the
-  process menu; **Package name** and **Platform** columns.
+- **Expand/collapse groups, UAC virtualization, Debug** on the process menu (the
+  Type column stands in for the groups; the other two are legacy or need a
+  debugger), and the **Platform** column (Architecture covers it).
 - **Signature verification** (Process Explorer's Verified Signer), the DLL and
   handle lower pane, thread stacks, VirusTotal.
 - TMOG's **Benchmarks**, and the **Flight Recorder**: `ot-record` is a stub and the

@@ -138,6 +138,8 @@ pub enum MenuAction {
     Copy,
     /// Write the process's memory to a dump file.
     CreateDump,
+    /// What each thread of the process waits on, and on whom.
+    WaitChain,
     /// Sample the selected process's CPU for a few seconds: which modules its
     /// threads run, and for a broker service, which clients it served.
     SampleCpu,
@@ -225,6 +227,10 @@ pub enum ProcessAction {
     EfficiencyMode(bool),
     /// Write a dump into the user's temporary directory and reveal it.
     WriteDump,
+    /// Analyze the wait chain of these threads of the process.
+    WaitChain {
+        threads: Vec<u32>,
+    },
     /// End the process (asking first) and start `command_line` again, in
     /// `directory` when known.
     Restart {
@@ -1902,6 +1908,7 @@ impl App {
             MenuEntry::item(MenuAction::Copy, "Copy", true),
             MenuEntry::Separator,
             MenuEntry::item(MenuAction::CreateDump, "Create dump file", real),
+            MenuEntry::item(MenuAction::WaitChain, "Analyze wait chain", real),
             MenuEntry::item(MenuAction::SampleCpu, "Sample CPU for 5 s", can_sample),
         ];
         Reaction::effect(Effect::Menu {
@@ -2024,6 +2031,16 @@ impl App {
             }
             MenuAction::CreateDump => {
                 Self::process_action(p.key(), p.name(), ProcessAction::WriteDump)
+            }
+            MenuAction::WaitChain => {
+                let (first, rows) = (p.thread_first as usize, p.thread_rows as usize);
+                let threads = self
+                    .snap
+                    .threads
+                    .get(first..first + rows)
+                    .map(|ts| ts.iter().map(|t| t.tid).collect())
+                    .unwrap_or_default();
+                Self::process_action(p.key(), p.name(), ProcessAction::WaitChain { threads })
             }
             MenuAction::SwitchTo => match &p.window {
                 Some(w) => Reaction::effect(Effect::SwitchTo(w.handle)),

@@ -70,6 +70,7 @@ pub(crate) mod col {
     pub const IO_OTHER_BYTES: usize = 34;
     pub const IMAGE_PATH: usize = 35;
     pub const WINDOW: usize = 36;
+    pub const PACKAGE: usize = 37;
 }
 
 pub(crate) fn columns() -> Vec<Column> {
@@ -111,6 +112,7 @@ pub(crate) fn columns() -> Vec<Column> {
         Column::number("I/O other bytes", 110.0).hidden(),
         Column::text("Image path", 320.0).hidden(),
         Column::text("Window title", 220.0).hidden(),
+        Column::text("Package name", 260.0).hidden(),
     ]
 }
 
@@ -1148,6 +1150,10 @@ impl RowSource for ProcessRows<'_> {
                     out.clear();
                     out.push_str(p.statics.company.as_deref().unwrap_or(""));
                 }
+                col::PACKAGE => {
+                    out.clear();
+                    out.push_str(p.statics.package.as_deref().unwrap_or(""));
+                }
                 col::KIND => {
                     out.clear();
                     out.push_str(p.kind.label());
@@ -1321,6 +1327,7 @@ impl RowSource for ProcessRows<'_> {
                     b.statics.description.as_deref(),
                 ),
                 col::COMPANY => cmp_opt(a.statics.company.as_deref(), b.statics.company.as_deref()),
+                col::PACKAGE => cmp_opt(a.statics.package.as_deref(), b.statics.package.as_deref()),
                 col::KIND => a.kind.label().cmp(b.kind.label()),
                 col::PRIORITY => a.priority.cmp(&b.priority),
                 col::ARCHITECTURE => cmp_ci(

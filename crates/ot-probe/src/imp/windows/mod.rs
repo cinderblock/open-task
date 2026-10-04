@@ -86,6 +86,7 @@ mod system;
 mod tags;
 mod verinfo;
 mod volumes;
+mod waitchain;
 mod windows_list;
 
 pub use control::WindowsControl;
@@ -1065,6 +1066,7 @@ fn build_statics(p: &SystemProcessInformation, key: ProcessKey) -> ProcessStatic
         architecture: ot_model::process::Architecture::Unknown,
         description: None,
         company: None,
+        package: None,
     }
 }
 
@@ -1378,7 +1380,10 @@ mod tests {
                 .processes
                 .iter()
                 .any(|p| p.key().pid == 4 && p.kind == ProcessKind::Windows);
-            if kernel_known || pass >= 40 {
+            // Under load only DETAIL_FLOOR details land per pass, in no particular
+            // order, so allow one pass per batch plus a margin.
+            let enough = 20 + out.processes.len() as u32 / DETAIL_FLOOR;
+            if kernel_known || pass >= enough {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));

@@ -1554,6 +1554,12 @@ fn process_action(
                 actions::write_dump(target).map(|p| p.map(|p| format!("Dump written to\n{p}")))
             });
         }
+        ProcessAction::WaitChain { threads } => {
+            let name = name.to_owned();
+            actions::spawn_action(hwnd, WM_APP_ACTION, what, move || {
+                actions::wait_chain(target, &name, &threads)
+            });
+        }
         ProcessAction::Restart {
             command_line,
             directory,

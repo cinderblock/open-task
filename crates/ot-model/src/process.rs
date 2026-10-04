@@ -61,6 +61,10 @@ pub struct ProcessStatic {
     pub description: Option<String>,
     /// The image's company from its version resource (`Google LLC`).
     pub company: Option<String>,
+    /// A packaged app's full package name
+    /// (`Microsoft.WindowsTerminal_1.21.2911.0_x64__8wekyb3d8bbwe`), when the
+    /// process runs from a package.
+    pub package: Option<String>,
 }
 
 /// The instruction set a process runs.
@@ -308,5 +312,134 @@ impl ProcessSample {
     #[must_use]
     pub fn is_service_host(&self) -> bool {
         !self.services.is_empty()
+    }
+}
+
+/// What a thread is waiting on: one link of a wait chain, as the operating
+/// system's wait chain traversal reports it. The first node of a chain is the
+/// thread itself; a lock node is followed by the thread that holds it, and so on,
+/// until a running thread, something the system cannot see through, or a cycle (a
+/// deadlock).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitNode {
+    pub kind: WaitKind,
+    pub status: WaitStatus,
+    /// A thread node: which thread, in which process, and the process's image
+    /// name when it could be read.
+    pub pid: u32,
+    pub tid: u32,
+    pub process: Option<String>,
+    /// How long a thread node has been waiting, in milliseconds.
+    pub wait_ms: u32,
+    /// A lock node's object name, when it has one (a named mutex, say).
+    pub name: String,
+}
+
+/// The kind of thing a wait chain node is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WaitKind {
+    Thread,
+    CriticalSection,
+    SendMessage,
+    Mutex,
+    Alpc,
+    Com,
+    ComActivation,
+    /// Waiting for another thread to end.
+    ThreadWait,
+    /// Waiting for another process to end.
+    ProcessWait,
+    SocketIo,
+    SmbIo,
+    Unknown,
+}
+
+impl WaitKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Thread => "thread",
+            Self::CriticalSection => "critical section",
+            Self::SendMessage => "SendMessage",
+            Self::Mutex => "mutex",
+            Self::Alpc => "ALPC call",
+            Self::Com => "COM call",
+            Self::ComActivation => "COM activation",
+            Self::ThreadWait => "thread exit",
+            Self::ProcessWait => "process exit",
+            Self::SocketIo => "socket I/O",
+            Self::SmbIo => "SMB I/O",
+            Self::Unknown => "unknown object",
+        }
+    }
+}
+
+/// What the system knows about a node's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WaitStatus {
+    /// The node could not be read (another user's process, say).
+    NoAccess,
+    Running,
+    Blocked,
+    /// Only the owning process is known, not the thread.
+    PidOnly,
+    /// As `PidOnly`, and the owner is the RPC subsystem.
+    PidOnlyRpcss,
+    /// A lock that a thread holds.
+    Owned,
+    /// A lock nobody holds.
+    NotOwned,
+    /// A mutex whose owner died holding it.
+    Abandoned,
+    Unknown,
+    Error,
+}
+
+impl WaitStatus {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoAccess => "no access",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::PidOnly | Self::PidOnlyRpcss => "process known",
+            Self::Owned => "owned",
+            Self::NotOwned => "not owned",
+            Self::Abandoned => "abandoned",
+            Self::Unknown => "unknown",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One thread's chain.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ThreadWait {
+    pub tid: u32,
+    /// The chain, the thread itself first. Empty when the thread could not be
+    /// examined at all.
+    pub nodes: Vec<WaitNode>,
+    /// The chain comes back to a thread already in it: a deadlock.
+    pub cycle: bool,
+}
+
+/// The wait chains of a process's threads: Task Manager's "Analyze wait chain".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WaitChain {
+    pub threads: Vec<ThreadWait>,
+}
+
+impl WaitChain {
+    /// Threads whose chain goes beyond themselves: waiting on something the system
+    /// could name.
+    #[must_use]
+    pub fn blocked(&self) -> usize {
+        self.threads.iter().filter(|t| t.nodes.len() > 1).count()
+    }
+
+    /// Whether any thread's chain is a cycle.
+    #[must_use]
+    pub fn deadlocked(&self) -> bool {
+        self.threads.iter().any(|t| t.cycle)
     }
 }

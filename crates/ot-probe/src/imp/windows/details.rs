@@ -31,6 +31,7 @@ use ot_model::process::{Architecture, Integrity, ProcessStatic};
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Wdk::System::SystemInformation::NtQuerySystemInformation;
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, STATUS_BUFFER_OVERFLOW,
     STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, STATUS_SUCCESS, UNICODE_STRING,
@@ -42,6 +43,7 @@ use windows::Win32::Security::{
     SID_AND_ATTRIBUTES, SID_NAME_USE, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
+use windows::Win32::Storage::Packaging::Appx::GetPackageFullName;
 use windows::Win32::System::SystemInformation::{
     ComputerNameNetBIOS, GetComputerNameExW, IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_AMD64,
     IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_I386,
@@ -69,6 +71,7 @@ pub(super) struct Details {
     pub architecture: Architecture,
     pub description: Option<String>,
     pub company: Option<String>,
+    pub package: Option<String>,
 }
 
 impl Details {
@@ -80,7 +83,28 @@ impl Details {
         s.architecture = self.architecture;
         s.description = self.description;
         s.company = self.company;
+        s.package = self.package;
     }
+}
+
+/// The full name of the package a process runs from, or `None` for an ordinary
+/// program (`APPMODEL_ERROR_NO_PACKAGE`). Needs only a limited-rights handle.
+pub(super) fn package_name(h: HANDLE) -> Option<String> {
+    let mut len = 0u32;
+    // SAFETY: with no buffer the call reports the length it needs in `len`.
+    let r = unsafe { GetPackageFullName(h, &raw mut len, None) };
+    if r != ERROR_INSUFFICIENT_BUFFER || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; len as usize];
+    // SAFETY: the buffer holds `len` units, as asked for.
+    let r = unsafe { GetPackageFullName(h, &raw mut len, Some(PWSTR(buf.as_mut_ptr()))) };
+    if r != ERROR_SUCCESS {
+        return None;
+    }
+    // `len` counts the terminating NUL.
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    (end > 0).then(|| String::from_utf16_lossy(&buf[..end]))
 }
 
 /// Whether the process is under execution-speed power throttling (efficiency
@@ -238,6 +262,7 @@ impl DetailProbe {
                 d.image_path = self.image_path(h);
                 d.command_line = self.command_line(h);
                 d.architecture = architecture(h);
+                d.package = package_name(h);
                 self.token_details(h, &mut d);
                 // SAFETY: `h` came from OpenProcess and is closed exactly once.
                 unsafe {

@@ -27,7 +27,7 @@ use std::sync::{Mutex, PoisonError};
 
 use ot_model::apps::InstalledApp;
 use ot_model::connection::Connection;
-use ot_model::process::Priority;
+use ot_model::process::{Priority, WaitChain};
 use ot_model::startup::StartupEntry;
 use ot_model::system::SystemFacts;
 use ot_model::ProcessKey;
@@ -61,7 +61,7 @@ use crate::{Affinity, ControlError, ProcessControl};
 pub struct WindowsControl;
 
 /// Closes on drop, so every early return below releases the handle.
-struct Handle(HANDLE);
+pub(super) struct Handle(HANDLE);
 
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -73,7 +73,7 @@ impl Drop for Handle {
 }
 
 /// An OS failure, with access denied named as what it is.
-fn os(context: &'static str, e: windows::core::Error) -> ControlError {
+pub(super) fn os(context: &'static str, e: windows::core::Error) -> ControlError {
     if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
         ControlError::NotPermitted
     } else {
@@ -98,7 +98,7 @@ fn nt(context: &'static str, status: NTSTATUS) -> ControlError {
 
 /// Open the process behind `key` with `access` (plus the right to read its times)
 /// and verify it is still the process the key names.
-fn open(key: ProcessKey, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle, ControlError> {
+pub(super) fn open(key: ProcessKey, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle, ControlError> {
     // SAFETY: plain call; the handle is owned by the guard.
     let h = unsafe { OpenProcess(access | PROCESS_QUERY_LIMITED_INFORMATION, false, key.pid) }
         .map_err(|e| {
@@ -145,7 +145,7 @@ fn set_priority_class(h: HANDLE, class: PROCESS_CREATION_FLAGS) -> Result<(), Co
 }
 
 /// The image's file name without `.exe`, for naming a dump.
-fn image_stem(h: HANDLE, pid: u32) -> String {
+pub(super) fn image_stem(h: HANDLE, pid: u32) -> String {
     let mut buf = vec![0u16; 1024];
     let mut len = buf.len() as u32;
     // SAFETY: the buffer is `len` units long; `len` is a valid in-out pointer.
@@ -305,6 +305,10 @@ impl ProcessControl for WindowsControl {
             NORMAL_PRIORITY_CLASS
         };
         set_priority_class(h.0, class)
+    }
+
+    fn wait_chain(&self, key: ProcessKey, threads: &[u32]) -> Result<WaitChain, ControlError> {
+        super::waitchain::analyze(key, threads)
     }
 
     fn write_dump(&self, key: ProcessKey, dir: &Path) -> Result<PathBuf, ControlError> {

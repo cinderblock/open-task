@@ -25,7 +25,7 @@ use ot_model::device::{AdapterSample, DiskSample, VolumeSample};
 use ot_model::gpu::GpuSample;
 use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
-use ot_model::process::{Priority, ProcessSample};
+use ot_model::process::{Priority, ProcessSample, WaitChain};
 use ot_model::service::ServiceEntry;
 use ot_model::session::SessionInfo;
 use ot_model::startup::StartupEntry;
@@ -259,6 +259,15 @@ pub trait ProcessControl: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// See [`ControlError`].
     fn write_dump(&self, _key: ProcessKey, _dir: &Path) -> Result<PathBuf, ControlError> {
+        Err(ControlError::Unsupported)
+    }
+
+    /// What each of the process's `threads` is waiting on, and on whom: Task
+    /// Manager's "Analyze wait chain". Blocking for a moment per thread.
+    ///
+    /// # Errors
+    /// See [`ControlError`].
+    fn wait_chain(&self, _key: ProcessKey, _threads: &[u32]) -> Result<WaitChain, ControlError> {
         Err(ControlError::Unsupported)
     }
 }
