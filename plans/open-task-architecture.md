@@ -389,6 +389,7 @@ seven untouched lines; see `plans/replace-task-manager.md`).
 rustup update stable
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --target aarch64-pc-windows-msvc -- -D warnings
 cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
 cargo test --workspace

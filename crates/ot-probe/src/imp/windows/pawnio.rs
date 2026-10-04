@@ -135,6 +135,12 @@ type CloseFn = unsafe extern "system" fn(HANDLE) -> HRESULT;
 
 /// Which module is loaded, and so which registers to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Only x86 has CPUID to tell the vendor; elsewhere `vendor()` answers `None` and
+// this is reached from its tests alone, which run on every target.
+#[cfg_attr(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 enum Vendor {
     Intel,
     AmdZen,
@@ -561,6 +567,12 @@ fn vendor() -> Option<Vendor> {
 /// The display family from CPUID leaf 1 EAX: the base family in bits 11:8, plus
 /// the extended family in bits 27:20 when the base is 0xF (which every AMD Zen is:
 /// 0xF + 0x8 = 0x17).
+// Only x86 has CPUID to tell the vendor; elsewhere `vendor()` answers `None` and
+// this is reached from its tests alone, which run on every target.
+#[cfg_attr(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn cpuid_family(eax: u32) -> u32 {
     let base = (eax >> 8) & 0xF;
     if base == 0xF {
@@ -572,6 +584,12 @@ fn cpuid_family(eax: u32) -> u32 {
 
 /// Which module fits a vendor string and family: Intel takes `IntelMSR`; AMD takes
 /// `AMDFamily17` for the Zen families (17h, 19h, 1Ah) and nothing before them.
+// Only x86 has CPUID to tell the vendor; elsewhere `vendor()` answers `None` and
+// this is reached from its tests alone, which run on every target.
+#[cfg_attr(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn classify(name: &[u8; 12], family: u32) -> Option<Vendor> {
     match name {
         b"GenuineIntel" => Some(Vendor::Intel),
