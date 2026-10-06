@@ -122,6 +122,15 @@ impl DisplayList {
         Self::default()
     }
 
+    /// Make this list a copy of `other`, reusing this one's allocations: how a
+    /// backend keeps the last frame to compare the next against.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.cmds.clone_from(&other.cmds);
+        self.points.clone_from(&other.points);
+        self.strings.clone_from(&other.strings);
+        self.clip_depth = other.clip_depth;
+    }
+
     /// Forget this frame's commands, keeping allocations.
     pub fn clear(&mut self) {
         self.cmds.clear();

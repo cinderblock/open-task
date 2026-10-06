@@ -101,7 +101,17 @@ pub struct Gfx {
     _d2d_device: ID2D1Device,
     dc: ID2D1DeviceContext,
     swapchain: IDXGISwapChain1,
+    /// The swap chain's buffer, which each frame is copied into.
     target: Option<ID2D1Bitmap1>,
+    /// The frame as drawn so far, kept between frames: the device context draws
+    /// here, and only where a frame differs from the last ([`Gfx::render`]).
+    canvas: Option<ID2D1Bitmap1>,
+    /// The last frame drawn, to find what the next one changes.
+    last: DisplayList,
+    /// Where the frame being drawn differs from the last, in DIPs.
+    damage: Vec<Rect>,
+    /// Draw the next frame whole: the canvas is new, or holds something stale.
+    redraw_all: bool,
     // Composition objects must stay alive for the visual tree to keep existing.
     _dcomp: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -126,6 +136,9 @@ pub struct Gfx {
     dpi: f32,
     size_px: (u32, u32),
 }
+
+/// Damage over this share of the window is drawn as a whole frame instead.
+const WHOLE_AT: f32 = 0.5;
 
 impl std::fmt::Debug for Gfx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -238,6 +251,10 @@ impl Gfx {
             dc,
             swapchain,
             target: None,
+            canvas: None,
+            last: DisplayList::new(),
+            damage: Vec::new(),
+            redraw_all: true,
             _dcomp: dcomp,
             _dcomp_target: dcomp_target,
             _visual: visual,
@@ -269,6 +286,7 @@ impl Gfx {
         unsafe {
             self.dc.SetTarget(None::<&ID2D1Image>);
             self.target = None;
+            self.canvas = None;
             self.swapchain.ResizeBuffers(
                 0,
                 size_px.0.max(1),
@@ -333,6 +351,8 @@ impl Gfx {
         match bitmap {
             Ok(b) => {
                 self.images.insert(key, ImageSlot::Ready(b));
+                // Wherever the image was asked for, the canvas shows nothing yet.
+                self.redraw_all = true;
             }
             Err(e) => {
                 tracing::debug!(path, error = %e, "CreateBitmap failed for an icon");
@@ -363,208 +383,323 @@ impl Gfx {
             let bitmap = self
                 .dc
                 .CreateBitmapFromDxgiSurface(&surface, Some(&raw const props))?;
-            self.dc.SetTarget(&bitmap);
             self.target = Some(bitmap);
+            // The canvas the frames are drawn on: the buffer's size and format, and
+            // drawable, to be copied from.
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                ..props
+            };
+            let size = D2D_SIZE_U {
+                width: self.size_px.0.max(1),
+                height: self.size_px.1.max(1),
+            };
+            let canvas = self.dc.CreateBitmap(size, None, 0, &raw const props)?;
+            self.dc.SetTarget(&canvas);
+            self.canvas = Some(canvas);
         }
+        self.redraw_all = true;
         Ok(())
     }
 
     /// Draw one frame and present it.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// The frame is drawn into a canvas that keeps it, and only where it differs
+    /// from the last one ([`DisplayList::damage_since`]): each damaged rectangle is
+    /// clipped to and the commands that touch it replayed, so a frame where only a
+    /// chart moved does not redraw the table's text. The canvas is then copied to
+    /// the swap chain's buffer and presented.
     pub fn render(&mut self, dl: &DisplayList) -> Result<()> {
         self.frame += 1;
+        let mut damage = std::mem::take(&mut self.damage);
+        let partial = !self.redraw_all && dl.damage_since(&self.last, &mut damage);
+        let window = self.size_px.0 as f32 * self.size_px.1 as f32;
+        let scale = self.dpi / 96.0;
+        let damaged: f32 = damage.iter().map(|r| r.w * r.h * scale * scale).sum();
+        // Damage over most of the window costs as much as drawing it whole, and
+        // more once rectangles overlap.
+        let partial = partial && damaged < window * WHOLE_AT;
         // SAFETY: every call is on a valid device context between BeginDraw and
         // EndDraw; all pointers passed point at locals that outlive the call.
+        let drawn = unsafe {
+            if partial {
+                self.draw_damage(dl, &damage)
+            } else {
+                self.draw_all(dl)
+            }
+        };
+        self.damage = damage;
+        drawn?;
+        // SAFETY: the canvas and the target are the same size and format; the
+        // canvas's drawing has been flushed by EndDraw.
+        unsafe {
+            if let (Some(target), Some(canvas)) = (&self.target, &self.canvas) {
+                target.CopyFromBitmap(None, canvas, None)?;
+            }
+            self.swapchain.Present(1, DXGI_PRESENT(0)).ok()?;
+        }
+        self.last.copy_from(dl);
+        self.redraw_all = false;
+        self.evict_layouts();
+        Ok(())
+    }
+
+    /// Draw every command into the canvas.
+    unsafe fn draw_all(&mut self, dl: &DisplayList) -> Result<()> {
+        // SAFETY: as for `render`.
         unsafe {
             self.dc.BeginDraw();
             for cmd in dl.cmds() {
-                match *cmd {
-                    DrawCmd::Clear(c) => {
-                        let col = color(c);
-                        self.dc.Clear(Some(&raw const col));
+                self.draw_cmd(dl, cmd)?;
+            }
+            self.dc.EndDraw(None, None)
+        }
+    }
+
+    /// Draw the commands that touch each of `damage` into the canvas, clipped to
+    /// it, over what the canvas holds from the last frame.
+    unsafe fn draw_damage(&mut self, dl: &DisplayList, damage: &[Rect]) -> Result<()> {
+        // Text this frame skips is still on screen: its layout stays cached.
+        self.touch_layouts(dl);
+        if damage.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: as for `render`.
+        unsafe {
+            self.dc.BeginDraw();
+            for &area in damage {
+                // Out to whole pixels, so the clip's edge leaves no pixel half drawn.
+                let area = self.to_pixel_edges(area);
+                let clip = rectf(area);
+                self.dc
+                    .PushAxisAlignedClip(&raw const clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                for cmd in dl.cmds() {
+                    // Clips always, to keep the stack; clears and anything else
+                    // that reaches into the area, in order.
+                    let touches = match cmd {
+                        DrawCmd::PushClip(_) | DrawCmd::PopClip => true,
+                        _ => dl
+                            .bounds(cmd)
+                            .is_none_or(|b| !b.intersect(&area).is_empty()),
+                    };
+                    if touches {
+                        self.draw_cmd(dl, cmd)?;
                     }
-                    DrawCmd::FillRect { rect, color: c } => {
-                        self.set_color(c);
-                        let r = rectf(rect);
-                        self.dc.FillRectangle(&raw const r, &self.brush);
-                    }
-                    DrawCmd::FillRoundRect {
-                        rect,
-                        radius,
-                        color: c,
-                    } => {
-                        self.set_color(c);
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: rectf(rect),
-                            radiusX: radius,
-                            radiusY: radius,
-                        };
-                        self.dc.FillRoundedRectangle(&raw const rr, &self.brush);
-                    }
-                    DrawCmd::StrokeRect {
-                        rect,
-                        color: c,
-                        width,
-                    } => {
-                        self.set_color(c);
-                        // Inset by half the stroke so the outline stays inside `rect`.
-                        let r = rectf(rect.inset(width * 0.5, width * 0.5));
-                        self.dc
-                            .DrawRectangle(&raw const r, &self.brush, width, None);
-                    }
-                    DrawCmd::StrokeRoundRect {
-                        rect,
-                        radius,
-                        color: c,
-                        width,
-                    } => {
-                        self.set_color(c);
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: rectf(rect.inset(width * 0.5, width * 0.5)),
-                            radiusX: radius,
-                            radiusY: radius,
-                        };
-                        self.dc
-                            .DrawRoundedRectangle(&raw const rr, &self.brush, width, None);
-                    }
-                    DrawCmd::Line {
-                        from,
-                        to,
-                        color: c,
-                        width,
-                    } => {
-                        self.set_color(c);
-                        self.dc.DrawLine(v2(from), v2(to), &self.brush, width, None);
-                    }
-                    DrawCmd::Polyline {
-                        points,
-                        color: c,
-                        width,
-                    } => {
-                        let geom = self.path(dl.points(points), false)?;
-                        self.set_color(c);
-                        self.dc.DrawGeometry(&geom, &self.brush, width, None);
-                    }
-                    DrawCmd::FillPolygon { points, color: c } => {
-                        let geom = self.path(dl.points(points), true)?;
-                        self.set_color(c);
-                        self.dc.FillGeometry(&geom, &self.brush, None);
-                    }
-                    DrawCmd::Text(t) if t.field => {
-                        // Measure, then shift left so the end stays in the box, and
-                        // put the caret right after the last character.
-                        let layout = self.layout_for(dl.str(t.text), &t)?;
-                        let mut m = DWRITE_TEXT_METRICS::default();
-                        layout.GetMetrics(&raw mut m)?;
-                        let width = m.widthIncludingTrailingWhitespace;
-                        let shift = (width - t.rect.w).max(0.0);
-                        let clip = rectf(t.rect);
-                        self.dc
-                            .PushAxisAlignedClip(&raw const clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                        self.set_color(t.color);
-                        self.dc.DrawTextLayout(
-                            Vector2 {
-                                X: t.rect.x - shift,
-                                Y: t.rect.y,
-                            },
-                            &layout,
-                            &self.brush,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        );
-                        if t.caret {
-                            let caret = rectf(Rect::new(
-                                (t.rect.x - shift + width).round(),
-                                t.rect.y + m.top,
-                                CARET_W,
-                                m.height,
-                            ));
-                            self.dc.FillRectangle(&raw const caret, &self.brush);
-                        }
-                        self.dc.PopAxisAlignedClip();
-                    }
-                    DrawCmd::Text(t) => {
-                        let layout = self.layout_for(dl.str(t.text), &t)?;
-                        self.set_color(t.color);
-                        self.dc.DrawTextLayout(
-                            Vector2 {
-                                X: t.rect.x,
-                                Y: t.rect.y,
-                            },
-                            &layout,
-                            &self.brush,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        );
-                    }
-                    DrawCmd::Icon {
-                        icon,
-                        rect,
-                        size,
-                        color: c,
-                    } => {
-                        let mut utf8 = [0u8; 4];
-                        let text = glyph(icon).encode_utf8(&mut utf8);
-                        let t = TextCmd {
-                            text: Span::default(),
-                            rect,
-                            style: TextStyle {
-                                family: FontFamily::Icons,
-                                size,
-                                weight: FontWeight::Regular,
-                                tabular_numbers: false,
-                            },
-                            color: c,
-                            halign: HAlign::Center,
-                            valign: VAlign::Middle,
-                            ellipsis: false,
-                            field: false,
-                            caret: false,
-                        };
-                        let layout = self.layout_for(text, &t)?;
-                        self.set_color(c);
-                        self.dc.DrawTextLayout(
-                            Vector2 {
-                                X: rect.x,
-                                Y: rect.y,
-                            },
-                            &layout,
-                            &self.brush,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        );
-                    }
-                    DrawCmd::Image { path, rect } => {
-                        let path = dl.str(path);
-                        let key = image_key(path);
-                        match self.images.get(&key) {
-                            Some(ImageSlot::Ready(bitmap)) => {
-                                let dest = rectf(rect);
-                                self.dc.DrawBitmap(
-                                    bitmap,
-                                    Some(&raw const dest),
-                                    1.0,
-                                    D2D1_INTERPOLATION_MODE_LINEAR,
-                                    None,
-                                    None,
-                                );
-                            }
-                            Some(ImageSlot::Pending | ImageSlot::Missing) => {}
-                            None => {
-                                self.images.insert(key, ImageSlot::Pending);
-                                self.wanted.push(path.to_owned());
-                            }
-                        }
-                    }
-                    DrawCmd::PushClip(rect) => {
-                        let r = rectf(rect);
-                        self.dc
-                            .PushAxisAlignedClip(&raw const r, D2D1_ANTIALIAS_MODE_ALIASED);
-                    }
-                    DrawCmd::PopClip => self.dc.PopAxisAlignedClip(),
+                }
+                self.dc.PopAxisAlignedClip();
+            }
+            self.dc.EndDraw(None, None)
+        }
+    }
+
+    /// `r` grown out to the nearest device pixels, in DIPs.
+    fn to_pixel_edges(&self, r: Rect) -> Rect {
+        let s = self.dpi / 96.0;
+        let (x, y) = ((r.x * s).floor() / s, (r.y * s).floor() / s);
+        let (right, bottom) = ((r.right() * s).ceil() / s, (r.bottom() * s).ceil() / s);
+        Rect::new(x, y, right - x, bottom - y)
+    }
+
+    /// Mark the layouts of every text in `dl` used this frame, drawn or not.
+    fn touch_layouts(&mut self, dl: &DisplayList) {
+        for cmd in dl.cmds() {
+            if let DrawCmd::Text(t) = cmd {
+                let key = layout_key(dl.str(t.text), t);
+                if let Some(c) = self.layouts.get_mut(&key) {
+                    c.last_used = self.frame;
                 }
             }
-            self.dc.EndDraw(None, None)?;
-            self.swapchain.Present(1, DXGI_PRESENT(0)).ok()?;
         }
-        self.evict_layouts();
+    }
+
+    /// Draw one command on the device context, between `BeginDraw` and `EndDraw`.
+    #[allow(clippy::too_many_lines)]
+    unsafe fn draw_cmd(&mut self, dl: &DisplayList, cmd: &DrawCmd) -> Result<()> {
+        // SAFETY: as for `render`.
+        unsafe {
+            match *cmd {
+                DrawCmd::Clear(c) => {
+                    let col = color(c);
+                    self.dc.Clear(Some(&raw const col));
+                }
+                DrawCmd::FillRect { rect, color: c } => {
+                    self.set_color(c);
+                    let r = rectf(rect);
+                    self.dc.FillRectangle(&raw const r, &self.brush);
+                }
+                DrawCmd::FillRoundRect {
+                    rect,
+                    radius,
+                    color: c,
+                } => {
+                    self.set_color(c);
+                    let rr = D2D1_ROUNDED_RECT {
+                        rect: rectf(rect),
+                        radiusX: radius,
+                        radiusY: radius,
+                    };
+                    self.dc.FillRoundedRectangle(&raw const rr, &self.brush);
+                }
+                DrawCmd::StrokeRect {
+                    rect,
+                    color: c,
+                    width,
+                } => {
+                    self.set_color(c);
+                    // Inset by half the stroke so the outline stays inside `rect`.
+                    let r = rectf(rect.inset(width * 0.5, width * 0.5));
+                    self.dc
+                        .DrawRectangle(&raw const r, &self.brush, width, None);
+                }
+                DrawCmd::StrokeRoundRect {
+                    rect,
+                    radius,
+                    color: c,
+                    width,
+                } => {
+                    self.set_color(c);
+                    let rr = D2D1_ROUNDED_RECT {
+                        rect: rectf(rect.inset(width * 0.5, width * 0.5)),
+                        radiusX: radius,
+                        radiusY: radius,
+                    };
+                    self.dc
+                        .DrawRoundedRectangle(&raw const rr, &self.brush, width, None);
+                }
+                DrawCmd::Line {
+                    from,
+                    to,
+                    color: c,
+                    width,
+                } => {
+                    self.set_color(c);
+                    self.dc.DrawLine(v2(from), v2(to), &self.brush, width, None);
+                }
+                DrawCmd::Polyline {
+                    points,
+                    color: c,
+                    width,
+                } => {
+                    let geom = self.path(dl.points(points), false)?;
+                    self.set_color(c);
+                    self.dc.DrawGeometry(&geom, &self.brush, width, None);
+                }
+                DrawCmd::FillPolygon { points, color: c } => {
+                    let geom = self.path(dl.points(points), true)?;
+                    self.set_color(c);
+                    self.dc.FillGeometry(&geom, &self.brush, None);
+                }
+                DrawCmd::Text(t) if t.field => {
+                    // Measure, then shift left so the end stays in the box, and
+                    // put the caret right after the last character.
+                    let layout = self.layout_for(dl.str(t.text), &t)?;
+                    let mut m = DWRITE_TEXT_METRICS::default();
+                    layout.GetMetrics(&raw mut m)?;
+                    let width = m.widthIncludingTrailingWhitespace;
+                    let shift = (width - t.rect.w).max(0.0);
+                    let clip = rectf(t.rect);
+                    self.dc
+                        .PushAxisAlignedClip(&raw const clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                    self.set_color(t.color);
+                    self.dc.DrawTextLayout(
+                        Vector2 {
+                            X: t.rect.x - shift,
+                            Y: t.rect.y,
+                        },
+                        &layout,
+                        &self.brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    );
+                    if t.caret {
+                        let caret = rectf(Rect::new(
+                            (t.rect.x - shift + width).round(),
+                            t.rect.y + m.top,
+                            CARET_W,
+                            m.height,
+                        ));
+                        self.dc.FillRectangle(&raw const caret, &self.brush);
+                    }
+                    self.dc.PopAxisAlignedClip();
+                }
+                DrawCmd::Text(t) => {
+                    let layout = self.layout_for(dl.str(t.text), &t)?;
+                    self.set_color(t.color);
+                    self.dc.DrawTextLayout(
+                        Vector2 {
+                            X: t.rect.x,
+                            Y: t.rect.y,
+                        },
+                        &layout,
+                        &self.brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    );
+                }
+                DrawCmd::Icon {
+                    icon,
+                    rect,
+                    size,
+                    color: c,
+                } => {
+                    let mut utf8 = [0u8; 4];
+                    let text = glyph(icon).encode_utf8(&mut utf8);
+                    let t = TextCmd {
+                        text: Span::default(),
+                        rect,
+                        style: TextStyle {
+                            family: FontFamily::Icons,
+                            size,
+                            weight: FontWeight::Regular,
+                            tabular_numbers: false,
+                        },
+                        color: c,
+                        halign: HAlign::Center,
+                        valign: VAlign::Middle,
+                        ellipsis: false,
+                        field: false,
+                        caret: false,
+                    };
+                    let layout = self.layout_for(text, &t)?;
+                    self.set_color(c);
+                    self.dc.DrawTextLayout(
+                        Vector2 {
+                            X: rect.x,
+                            Y: rect.y,
+                        },
+                        &layout,
+                        &self.brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    );
+                }
+                DrawCmd::Image { path, rect } => {
+                    let path = dl.str(path);
+                    let key = image_key(path);
+                    match self.images.get(&key) {
+                        Some(ImageSlot::Ready(bitmap)) => {
+                            let dest = rectf(rect);
+                            self.dc.DrawBitmap(
+                                bitmap,
+                                Some(&raw const dest),
+                                1.0,
+                                D2D1_INTERPOLATION_MODE_LINEAR,
+                                None,
+                                None,
+                            );
+                        }
+                        Some(ImageSlot::Pending | ImageSlot::Missing) => {}
+                        None => {
+                            self.images.insert(key, ImageSlot::Pending);
+                            self.wanted.push(path.to_owned());
+                        }
+                    }
+                }
+                DrawCmd::PushClip(rect) => {
+                    let r = rectf(rect);
+                    self.dc
+                        .PushAxisAlignedClip(&raw const r, D2D1_ANTIALIAS_MODE_ALIASED);
+                }
+                DrawCmd::PopClip => self.dc.PopAxisAlignedClip(),
+            }
+        }
         Ok(())
     }
 

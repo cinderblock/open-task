@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod color;
+pub mod damage;
 pub mod display;
 pub mod geom;
 pub mod icon;
