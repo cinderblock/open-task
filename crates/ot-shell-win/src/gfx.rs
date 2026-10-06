@@ -126,6 +126,8 @@ pub struct Gfx {
     fonts: HashMap<TextStyle, FontSet>,
     layouts: HashMap<u64, CachedLayout>,
     utf16: Vec<u16>,
+    /// The segments of the path being built, reused between paths.
+    path_pts: Vec<Vector2>,
     /// Raster images by the hash of their path: a program's icon, loaded by the
     /// window off this thread and handed in with [`Gfx::add_image`].
     images: HashMap<u64, ImageSlot>,
@@ -267,6 +269,7 @@ impl Gfx {
             fonts: HashMap::new(),
             layouts: HashMap::with_capacity(1024),
             utf16: Vec::with_capacity(128),
+            path_pts: Vec::with_capacity(1024),
             images: HashMap::new(),
             wanted: Vec::new(),
             frame: 0,
@@ -408,8 +411,9 @@ impl Gfx {
     /// from the last one ([`DisplayList::damage_since`]): each damaged rectangle is
     /// clipped to and the commands that touch it replayed, so a frame where only a
     /// chart moved does not redraw the table's text. The canvas is then copied to
-    /// the swap chain's buffer and presented.
-    pub fn render(&mut self, dl: &DisplayList) -> Result<()> {
+    /// the swap chain's buffer and presented, on the `sync`th vertical blank from
+    /// the last (1 for every one, 2 for every other).
+    pub fn render(&mut self, dl: &DisplayList, sync: u32) -> Result<()> {
         self.frame += 1;
         let mut damage = std::mem::take(&mut self.damage);
         let partial = !self.redraw_all && dl.damage_since(&self.last, &mut damage);
@@ -436,7 +440,7 @@ impl Gfx {
             if let (Some(target), Some(canvas)) = (&self.target, &self.canvas) {
                 target.CopyFromBitmap(None, canvas, None)?;
             }
-            self.swapchain.Present(1, DXGI_PRESENT(0)).ok()?;
+            self.swapchain.Present(sync, DXGI_PRESENT(0)).ok()?;
         }
         self.last.copy_from(dl);
         self.redraw_all = false;
@@ -459,8 +463,13 @@ impl Gfx {
     /// Draw the commands that touch each of `damage` into the canvas, clipped to
     /// it, over what the canvas holds from the last frame.
     unsafe fn draw_damage(&mut self, dl: &DisplayList, damage: &[Rect]) -> Result<()> {
-        // Text this frame skips is still on screen: its layout stays cached.
-        self.touch_layouts(dl);
+        // Text this frame skips is still on screen: its layout stays cached. Often
+        // enough that nothing on screen ages out ([`Gfx::evict_layouts`]), not every
+        // frame: hashing every string is a good part of a frame that only moved a
+        // chart.
+        if self.frame.is_multiple_of(LAYOUT_TTL_FRAMES / 4) {
+            self.touch_layouts(dl);
+        }
         if damage.is_empty() {
             return Ok(());
         }
@@ -709,7 +718,11 @@ impl Gfx {
         unsafe { self.brush.SetColor(&raw const col) };
     }
 
-    fn path(&self, pts: &[Point], closed: bool) -> Result<ID2D1PathGeometry1> {
+    /// A path through `pts`, built with one call for all the segments (a chart's
+    /// line has a point a DIP, and a call each was most of the cost of building it).
+    fn path(&mut self, pts: &[Point], closed: bool) -> Result<ID2D1PathGeometry1> {
+        self.path_pts.clear();
+        self.path_pts.extend(pts[1..].iter().map(|&p| v2(p)));
         // SAFETY: factory is valid; the sink is closed before the geometry is used.
         unsafe {
             let geom = self.d2d_factory.CreatePathGeometry()?;
@@ -722,9 +735,7 @@ impl Gfx {
                     D2D1_FIGURE_BEGIN_HOLLOW
                 },
             );
-            for p in &pts[1..] {
-                sink.AddLine(v2(*p));
-            }
+            sink.AddLines(&self.path_pts);
             sink.EndFigure(if closed {
                 D2D1_FIGURE_END_CLOSED
             } else {

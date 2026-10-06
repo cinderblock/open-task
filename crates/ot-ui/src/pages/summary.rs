@@ -279,6 +279,34 @@ impl Default for SummaryPage {
 }
 
 impl SummaryPage {
+    /// Whether a chart marks a moment (the pointer is over one).
+    pub(crate) fn marking(&self) -> bool {
+        self.charts.marking()
+    }
+
+    /// Start a frame where only the clock moved: the charts stay where the last
+    /// paint put them, on `axis`.
+    pub(crate) fn tick(&mut self, axis: TimeAxis) {
+        self.axis = axis;
+        self.charts.set_axis(axis);
+    }
+
+    /// Paint chart `i`'s line again from `tl`, for a frame where only the clock
+    /// moved; see [`ChartGroup::repaint`].
+    pub(crate) fn repaint_chart(
+        &mut self,
+        i: usize,
+        dl: &mut DisplayList,
+        tl: &Timeline,
+        theme: &Theme,
+    ) {
+        let Some(slot) = self.slots.get(i) else {
+            return;
+        };
+        let series = series(tl, slot.line).unwrap_or(&self.empty);
+        self.charts.repaint(i, dl, series, theme);
+    }
+
     #[cfg(test)]
     pub fn charts(&self) -> &ChartGroup {
         &self.charts

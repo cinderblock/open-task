@@ -105,6 +105,17 @@ pub enum DrawCmd {
     PopClip,
 }
 
+/// A run of commands painted as one piece that a frame can repaint on its own,
+/// such as a chart; see [`DisplayList::begin_layer`] and [`DisplayList::splice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layer {
+    /// Chosen by the painter, to know what to repaint.
+    pub id: u32,
+    /// The commands, as indexes into [`DisplayList::cmds`].
+    pub start: u32,
+    pub end: u32,
+}
+
 /// A frame's draw commands plus the arenas they index.
 ///
 /// Cleared and refilled each frame; capacity is retained.
@@ -114,6 +125,9 @@ pub struct DisplayList {
     points: Vec<Point>,
     strings: String,
     clip_depth: u32,
+    layers: Vec<Layer>,
+    /// The layer being painted: its id and first command.
+    open: Option<(u32, u32)>,
 }
 
 impl DisplayList {
@@ -129,6 +143,98 @@ impl DisplayList {
         self.points.clone_from(&other.points);
         self.strings.clone_from(&other.strings);
         self.clip_depth = other.clip_depth;
+        self.layers.clone_from(&other.layers);
+        self.open = other.open;
+    }
+
+    /// Start a layer: the commands until [`DisplayList::end_layer`] are one piece,
+    /// known by `id`, that [`DisplayList::splice`] can replace. Layers do not nest;
+    /// starting one while another is open ends that one first.
+    pub fn begin_layer(&mut self, id: u32) {
+        self.end_layer();
+        self.open = Some((id, self.cmds.len() as u32));
+    }
+
+    /// End the open layer, if any.
+    pub fn end_layer(&mut self) {
+        if let Some((id, start)) = self.open.take() {
+            self.layers.push(Layer {
+                id,
+                start,
+                end: self.cmds.len() as u32,
+            });
+        }
+    }
+
+    /// The layers painted, in order.
+    #[must_use]
+    pub fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    /// Make this list `kept` with each of its layers painted afresh: everything
+    /// between the layers is copied, and `paint` is called with each layer's id to
+    /// paint it again, in its place. How a frame where only some layers can have
+    /// changed is made without painting the rest again.
+    pub fn splice(&mut self, kept: &DisplayList, mut paint: impl FnMut(u32, &mut DisplayList)) {
+        self.clear();
+        let mut at = 0;
+        for layer in &kept.layers {
+            self.copy_cmds(kept, at, layer.start as usize);
+            self.begin_layer(layer.id);
+            paint(layer.id, self);
+            self.end_layer();
+            at = layer.end as usize;
+        }
+        self.copy_cmds(kept, at, kept.cmds.len());
+    }
+
+    /// Append `from`'s commands `start..end`, with what they index in its arenas.
+    fn copy_cmds(&mut self, from: &DisplayList, start: usize, end: usize) {
+        for cmd in &from.cmds[start..end] {
+            let cmd = match *cmd {
+                DrawCmd::Polyline {
+                    points,
+                    color,
+                    width,
+                } => DrawCmd::Polyline {
+                    points: self.push_points(from.points(points).iter().copied()),
+                    color,
+                    width,
+                },
+                DrawCmd::FillPolygon { points, color } => DrawCmd::FillPolygon {
+                    points: self.push_points(from.points(points).iter().copied()),
+                    color,
+                },
+                DrawCmd::Text(t) => DrawCmd::Text(TextCmd {
+                    text: self.push_str(from.str(t.text)),
+                    ..t
+                }),
+                DrawCmd::Image { path, rect } => DrawCmd::Image {
+                    path: self.push_str(from.str(path)),
+                    rect,
+                },
+                DrawCmd::PushClip(_) => {
+                    self.clip_depth += 1;
+                    *cmd
+                }
+                DrawCmd::PopClip => {
+                    self.clip_depth = self.clip_depth.saturating_sub(1);
+                    *cmd
+                }
+                other => other,
+            };
+            self.cmds.push(cmd);
+        }
+    }
+
+    fn push_str(&mut self, s: &str) -> Span {
+        let start = self.strings.len() as u32;
+        self.strings.push_str(s);
+        Span {
+            start,
+            len: s.len() as u32,
+        }
     }
 
     /// Forget this frame's commands, keeping allocations.
@@ -137,6 +243,8 @@ impl DisplayList {
         self.points.clear();
         self.strings.clear();
         self.clip_depth = 0;
+        self.layers.clear();
+        self.open = None;
     }
 
     #[must_use]
@@ -297,12 +405,7 @@ impl DisplayList {
         if text.is_empty() || cmd.rect.is_empty() || cmd.color.a <= 0.0 {
             return;
         }
-        let start = self.strings.len() as u32;
-        self.strings.push_str(text);
-        cmd.text = Span {
-            start,
-            len: text.len() as u32,
-        };
+        cmd.text = self.push_str(text);
         self.cmds.push(DrawCmd::Text(cmd));
     }
 
@@ -313,12 +416,7 @@ impl DisplayList {
         if rect.is_empty() || path.is_empty() {
             return;
         }
-        let start = self.strings.len() as u32;
-        self.strings.push_str(path);
-        let path = Span {
-            start,
-            len: path.len() as u32,
-        };
+        let path = self.push_str(path);
         self.cmds.push(DrawCmd::Image { path, rect });
     }
 
@@ -410,6 +508,74 @@ mod tests {
             false,
         );
         assert!(dl.is_empty());
+    }
+
+    #[test]
+    fn a_splice_repaints_the_layers_and_keeps_the_rest() {
+        let style = TextStyle::default();
+        let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let mut kept = DisplayList::new();
+        kept.label("before", r, style, Color::WHITE);
+        kept.push_clip(r);
+        kept.begin_layer(7);
+        kept.polyline(
+            [Point::new(0.0, 0.0), Point::new(1.0, 1.0)],
+            Color::WHITE,
+            1.0,
+        );
+        kept.end_layer();
+        kept.pop_clip();
+        kept.label("between", r, style, Color::WHITE);
+        kept.begin_layer(9);
+        kept.label("old", r, style, Color::WHITE);
+        kept.end_layer();
+        kept.image("icon.exe", r);
+        assert_eq!(kept.layers().len(), 2);
+
+        let mut dl = DisplayList::new();
+        dl.label("stale", r, style, Color::WHITE);
+        let mut asked = Vec::new();
+        dl.splice(&kept, |id, dl| {
+            asked.push(id);
+            if id == 7 {
+                dl.polyline(
+                    [
+                        Point::new(0.0, 5.0),
+                        Point::new(1.0, 6.0),
+                        Point::new(2.0, 7.0),
+                    ],
+                    Color::WHITE,
+                    1.0,
+                );
+            } else {
+                dl.label("new", r, style, Color::WHITE);
+                dl.label("newer", r, style, Color::WHITE);
+            }
+        });
+        assert_eq!(asked, [7, 9]);
+        let texts: Vec<&str> = dl
+            .cmds()
+            .iter()
+            .filter_map(|c| match *c {
+                DrawCmd::Text(t) => Some(dl.str(t.text)),
+                DrawCmd::Image { path, .. } => Some(dl.str(path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["before", "between", "new", "newer", "icon.exe"]);
+        let line = dl.cmds().iter().find_map(|c| match *c {
+            DrawCmd::Polyline { points, .. } => Some(dl.points(points).to_vec()),
+            _ => None,
+        });
+        assert_eq!(line.map(|p| p.len()), Some(3));
+        assert_eq!(dl.clip_depth(), 0);
+        // The layers are where the fresh paint went, so the result splices too.
+        let l: Vec<(u32, u32)> = dl
+            .layers()
+            .iter()
+            .map(|l| (l.id, l.end - l.start))
+            .collect();
+        assert_eq!(l, [(7, 1), (9, 2)]);
     }
 
     #[test]

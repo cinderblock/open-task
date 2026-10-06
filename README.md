@@ -82,8 +82,11 @@ machine. With five minutes, the last ten seconds take about two fifths of the wi
 and the rest is compressed toward the left end; with an hour, the last minute takes
 half. The charts scroll smoothly with time rather than stepping once a sample: the
 right edge runs a little over a sample behind the newest, so each new sample slides
-in from past it (**Scroll charts smoothly** under **Charts** turns this off; only
-the parts of the window that changed are redrawn each frame, so it costs little).
+in from past it (**Scroll charts smoothly** under **Charts** turns this off). A
+frame where only the clock moved repaints just the charts, and only the parts of
+the window that changed are redrawn; behind other windows the charts move at half
+the display's rate, and not at all when the window is minimized or on another
+virtual desktop.
 The first sample is on screen a quarter of a second after start, drawn across the
 interval it measured. Recent history is drawn sample by sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point

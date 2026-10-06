@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ot_core::{Feed, Player, RecordHeader, Recorder, Recording, Sampler, SamplerConfig};
 use ot_model::ProcessKey;
@@ -27,8 +27,8 @@ use ot_update::{Installation, Updater};
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-    DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_CLOAKED,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, ValidateRect, PAINTSTRUCT,
@@ -48,10 +48,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, IsIconic,
-    IsWindowVisible, KillTimer, LoadCursorW, LoadImageW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
+    DispatchMessageW, GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadImageW, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HICON,
     HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_CROSS, IDC_IBEAM,
     IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR,
@@ -97,6 +97,14 @@ const TIMER_UPDATE: usize = 1;
 /// Re-reads the Connections page's list while it is showing.
 const TIMER_REFRESH: usize = 2;
 const REFRESH_MS: u32 = 2_000;
+/// Paces the next frame when `Present` stops waiting for the display (see
+/// [`FRAME_TOO_SOON`]).
+const TIMER_FRAME: usize = 3;
+/// A frame's worth of milliseconds at 60 Hz, for that fallback.
+const FRAME_MS: u32 = 16;
+/// Frames closer together than this cannot have waited for a vertical blank:
+/// the display is off, the session locked, or the window out of composition.
+const FRAME_TOO_SOON: Duration = Duration::from_millis(4);
 const FIRST_CHECK_MS: u32 = 10_000;
 const CHECK_TICK_MS: u32 = 3_600_000;
 /// How often a scheduled check runs.
@@ -160,6 +168,8 @@ struct State {
     gfx: Option<Gfx>,
     app: App,
     dl: DisplayList,
+    /// When the last frame was presented, to notice `Present` not waiting.
+    last_frame: Option<Instant>,
     /// Where snapshots come from: the live sampler, or a replay's player.
     feed: Option<Feed>,
     /// This build's version, for a recording's header.
@@ -394,6 +404,7 @@ pub fn run(
         gfx: Some(gfx),
         app,
         dl: DisplayList::new(),
+        last_frame: None,
         feed: Some(feed),
         version: options.version,
         record_name: None,
@@ -661,6 +672,25 @@ fn state_from(hwnd: HWND) -> Option<&'static RefCell<State>> {
     }
 }
 
+/// Whether any of the window can be seen: shown, not minimized, and on the
+/// current virtual desktop.
+fn seen(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    // SAFETY: hwnd is valid; DWMWA_CLOAKED writes one DWORD to the pointer.
+    unsafe {
+        IsWindowVisible(hwnd).as_bool()
+            && !IsIconic(hwnd).as_bool()
+            && (DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                (&raw mut cloaked).cast(),
+                size_of::<u32>() as u32,
+            )
+            .is_err()
+                || cloaked == 0)
+    }
+}
+
 fn repaint(st: &mut State) {
     if st.gfx.is_none() {
         match Gfx::new(st.hwnd, client_size(st.hwnd), st.dpi) {
@@ -675,8 +705,13 @@ fn repaint(st: &mut State) {
         }
     }
     st.app.paint(&mut st.dl);
+    // In the background the window gets every other vertical blank: still smooth,
+    // at half the cost, for a window glanced at rather than watched.
+    // SAFETY: plain query; no pointers.
+    let foreground = unsafe { GetForegroundWindow() } == st.hwnd;
+    let sync = if foreground { 1 } else { 2 };
     if let Some(gfx) = st.gfx.as_mut() {
-        if let Err(e) = gfx.render(&st.dl) {
+        if let Err(e) = gfx.render(&st.dl, sync) {
             tracing::error!(error = %e, "render failed; device will be recreated");
             st.gfx = None;
             invalidate(st.hwnd);
@@ -687,14 +722,26 @@ fn repaint(st: &mut State) {
             }
         }
     }
+    let presented = Instant::now();
+    let too_soon = st
+        .last_frame
+        .replace(presented)
+        .is_some_and(|t| presented.duration_since(t) < FRAME_TOO_SOON);
     // Rows are sliding or charts scrolling: ask for the next frame. `Present`
     // waits for the vertical blank, so this runs at the display's rate and stops
-    // when the motion does. Not while minimized or hidden in the tray, where
-    // nothing is seen and `Present` may not wait; restoring the window paints it.
-    // SAFETY: hwnd is valid.
-    let shown = unsafe { IsWindowVisible(st.hwnd).as_bool() && !IsIconic(st.hwnd).as_bool() };
-    if shown && st.app.animating() {
-        invalidate(st.hwnd);
+    // when the motion does. Not while nothing of the window can be seen:
+    // minimized, hidden in the tray, or on another virtual desktop (cloaked);
+    // showing it again paints it. Should `Present` stop waiting anyway, a timer
+    // paces the frames rather than letting them spin.
+    if seen(st.hwnd) && st.app.animating() {
+        if too_soon {
+            // SAFETY: hwnd is valid; the timer is ours.
+            unsafe {
+                SetTimer(Some(st.hwnd), TIMER_FRAME, FRAME_MS, None);
+            }
+        } else {
+            invalidate(st.hwnd);
+        }
     }
 }
 
@@ -1322,6 +1369,14 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_RBUTTONUP => Outcome::TrayMenu,
             _ => Outcome::Done(LRESULT(0)),
         },
+        WM_TIMER if wparam.0 == TIMER_FRAME => {
+            // SAFETY: hwnd is valid; the timer is ours.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_FRAME);
+            }
+            invalidate(hwnd);
+            Outcome::Done(LRESULT(0))
+        }
         WM_TIMER if wparam.0 == TIMER_REFRESH => {
             // SAFETY: hwnd is valid; the timer is ours.
             unsafe {

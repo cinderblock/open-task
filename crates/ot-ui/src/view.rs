@@ -33,6 +33,7 @@ use crate::process_rows::{self, col, columns, process_matches, Layout, ProcessRo
 use crate::replay::{RecordingView, ReplayAction, ReplayState, Transport};
 use crate::search::SearchBox;
 use crate::settings::{Context, HistoryCost, Settings, SettingsPage};
+use crate::sparkline::TimeAxis;
 use crate::steady::Steady;
 use crate::table::{ColumnLayout, Hit, RowSource, Table};
 use crate::task_manager::TaskManager;
@@ -811,6 +812,8 @@ enum InPlace {
 
 /// The whole application view. One per window.
 #[derive(Debug)]
+// The flags are independent facts about the view; an enum would only obscure them.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     theme: Theme,
     backdrop: bool,
@@ -876,6 +879,16 @@ pub struct App {
     system_animations: bool,
     /// The moment the charts' right edge shows, run smoothly between samples.
     clock: ChartClock,
+    /// The last full paint, whose charts a frame where only the clock moved paints
+    /// again in place ([`DisplayList::splice`]).
+    kept: DisplayList,
+    /// The page `kept` shows.
+    kept_page: Page,
+    /// Something changed since `kept` was painted, beyond the clock: the next frame
+    /// is painted whole. Every public method that changes the app sets it.
+    full_due: bool,
+    /// The program the History highlighted in the last full paint.
+    history_selected: Option<ProgramId>,
     /// Search results per process; empty when there is no search.
     matched: Vec<bool>,
     /// What the table lists: matches, plus their ancestors in tree mode.
@@ -931,6 +944,10 @@ impl App {
             task_manager: TaskManager::default(),
             system_animations: true,
             clock: ChartClock::default(),
+            kept: DisplayList::new(),
+            kept_page: Page::default(),
+            full_due: true,
+            history_selected: None,
             matched: Vec::new(),
             shown: Vec::new(),
             mouse: None,
@@ -945,6 +962,7 @@ impl App {
     /// Whether the shell composites us over a system backdrop. When true, the view
     /// clears to transparent; when false, to an opaque theme color.
     pub fn set_backdrop(&mut self, on: bool) {
+        self.full_due = true;
         self.backdrop = on;
     }
 
@@ -954,6 +972,7 @@ impl App {
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
+        self.full_due = true;
         self.theme = theme;
     }
 
@@ -986,6 +1005,7 @@ impl App {
 
     /// Switch the process table's arrangement, keeping the selection in view.
     pub fn set_view(&mut self, mode: ViewMode) {
+        self.full_due = true;
         self.shown_in_place = match mode {
             ViewMode::Map => InPlace::Map,
             ViewMode::History => InPlace::History,
@@ -1083,6 +1103,7 @@ impl App {
 
     /// Apply settings, as loaded at start or changed on the Settings page.
     pub fn set_settings(&mut self, settings: Settings) {
+        self.full_due = true;
         self.settings = settings;
         self.apply_settings();
     }
@@ -1114,12 +1135,14 @@ impl App {
     /// The running build and whether it can install updates, for the update
     /// button. Set once at start.
     pub fn set_update(&mut self, update: UpdateView) {
+        self.full_due = true;
         self.update = update;
     }
 
     /// The updater's latest status. Returns whether the button changed, so a
     /// repaint is due.
     pub fn set_update_status(&mut self, status: ot_update::Status) -> bool {
+        self.full_due = true;
         self.update.set_status(status)
     }
 
@@ -1133,6 +1156,7 @@ impl App {
     /// and whether a change is under way. Returns whether anything changed, so a
     /// repaint is due.
     pub fn set_task_manager(&mut self, task_manager: TaskManager) -> bool {
+        self.full_due = true;
         std::mem::replace(&mut self.task_manager, task_manager) != self.task_manager
     }
 
@@ -1145,6 +1169,7 @@ impl App {
     /// Whether the platform has animation effects on (Windows: "Animation
     /// effects" in Accessibility > Visual effects). Row slides need it.
     pub fn set_system_animations(&mut self, on: bool) {
+        self.full_due = true;
         self.system_animations = on;
         self.apply_animation();
     }
@@ -1160,6 +1185,7 @@ impl App {
     /// calls this after every frame its player publishes. True when something
     /// changed.
     pub fn set_replay(&mut self, state: Option<ReplayState>) -> bool {
+        self.full_due = true;
         match (state, self.transport.as_mut()) {
             (Some(s), Some(t)) => {
                 if t.state == s {
@@ -1189,6 +1215,7 @@ impl App {
     /// What is being recorded (`None` when nothing is), for the Settings page.
     /// True when something changed.
     pub fn set_recording(&mut self, recording: Option<RecordingView>) -> bool {
+        self.full_due = true;
         if self.recording == recording {
             return false;
         }
@@ -1197,12 +1224,14 @@ impl App {
     }
 
     pub fn set_elevated(&mut self, on: bool) {
+        self.full_due = true;
         self.elevated = on;
     }
 
     /// A list a page asked for ([`Effect::Query`]) has arrived. Returns whether
     /// a repaint is due.
     pub fn set_inventory(&mut self, inventory: Inventory) -> bool {
+        self.full_due = true;
         match inventory {
             Inventory::Startup(e) => self.startup.set_entries(e),
             Inventory::InstalledApps(a) => self.apps.set_apps(a),
@@ -1260,6 +1289,7 @@ impl App {
     /// A CPU sample finished: show it under its process. Returns true if the
     /// process is still in the table.
     pub fn set_attribution(&mut self, a: Arc<Attribution>) -> bool {
+        self.full_due = true;
         if self.sampling == Some(a.target) {
             self.sampling = None;
         }
@@ -1272,6 +1302,7 @@ impl App {
     /// A CPU sample could not run or finish. Clears the marker row; the shell
     /// tells the user why.
     pub fn sampling_failed(&mut self, target: ProcessKey) {
+        self.full_due = true;
         if self.sampling == Some(target) {
             self.sampling = None;
             self.relayout();
@@ -1321,6 +1352,7 @@ impl App {
     /// Offer the newest snapshot. Returns true if it was new and a repaint is due.
     /// While paused it is recorded but not shown, and no repaint is due.
     pub fn set_snapshot(&mut self, snap: Arc<Snapshot>) -> bool {
+        self.full_due = true;
         if snap.is_empty() || (!self.snap.is_empty() && snap.tick == self.snap.tick) {
             return false;
         }
@@ -1393,6 +1425,7 @@ impl App {
 
     /// Show `page`, dropping hover state the page being left would otherwise keep.
     pub fn set_page(&mut self, page: Page) {
+        self.full_due = true;
         if page != self.page {
             let _ = self.charts.hover(None);
             let _ = self.charts.mark(None);
@@ -1434,6 +1467,7 @@ impl App {
     /// Handle input. Says whether to repaint and what else to do.
     #[allow(clippy::too_many_lines)]
     pub fn handle(&mut self, ev: UiEvent) -> Reaction {
+        self.full_due = true;
         if let Some(t) = self.transport.as_mut() {
             if let Some(r) = t.handle(ev) {
                 return r;
@@ -2163,6 +2197,7 @@ impl App {
     /// Select the process with `pid` on the Processes page and reveal it, as the
     /// window crosshair does. Returns whether it was found.
     pub fn select_pid(&mut self, pid: u32) -> bool {
+        self.full_due = true;
         let Some(p) = self.snap.processes.iter().find(|p| p.key().pid == pid) else {
             return false;
         };
@@ -2195,6 +2230,7 @@ impl App {
 
     /// Restore what [`App::view_layout`] saved. Call before the first snapshot.
     pub fn apply_view_layout(&mut self, layout: &ViewLayout) {
+        self.full_due = true;
         self.table.apply_layout(&layout.columns);
         if let Some(c) = self
             .table
@@ -2215,10 +2251,101 @@ impl App {
         self.paint_at(dl, Instant::now());
     }
 
-    /// Produce the frame for time `now`, which paces the row slides.
-    #[allow(clippy::too_many_lines)]
+    /// Produce the frame for time `now`, which paces the row slides and runs the
+    /// chart clock. A frame where only the clock moved since the last full paint
+    /// repaints just the charts' lines, in a copy of that paint.
     pub fn paint_at(&mut self, dl: &mut DisplayList, now: Instant) {
         self.table.tick(now);
+        // The chart clock learns the pace from the live history, paused or not.
+        if let Some((newest, gap)) = charts::newest_gap(&self.timeline.cpu_total) {
+            self.clock.arrive(newest, gap, now);
+        }
+        let now_ms = if self.charts_scroll() {
+            self.clock.read(now)
+        } else {
+            self.clock.stop();
+            None
+        };
+        // While paused, the charts show history as of the pause.
+        let timeline = match &self.paused {
+            Some(p) => &p.timeline,
+            None => &self.timeline,
+        };
+        let axis = charts::axis_of(timeline, now_ms, self.settings.history_ms());
+        if self.only_the_clock_moved() {
+            self.paint_tick(dl, axis);
+            return;
+        }
+        self.paint_full(dl, axis);
+        self.kept.copy_from(dl);
+        self.kept_page = self.page;
+        self.full_due = false;
+    }
+
+    /// Whether this frame differs from the last full paint only by the clock: no
+    /// change to the app since, charts scrolling on the same page, no rows sliding,
+    /// and no chart marking a moment (its readouts follow the clock too).
+    fn only_the_clock_moved(&self) -> bool {
+        let marking = match self.page {
+            Page::Processes => {
+                self.charts.marking() || (self.history_on() && self.history.marking())
+            }
+            Page::Summary => self.summary.marking(),
+            Page::Performance => self.perf.marking(),
+            _ => true,
+        };
+        !self.full_due
+            && self.charts_scroll()
+            && self.kept_page == self.page
+            && !self.table.animating()
+            && !marking
+    }
+
+    /// The last full paint with each chart's line painted again on `axis`.
+    fn paint_tick(&mut self, dl: &mut DisplayList, axis: TimeAxis) {
+        match self.page {
+            Page::Summary => self.summary.tick(axis),
+            Page::Performance => self.perf.tick(axis),
+            _ => self.charts.set_axis(axis),
+        }
+        let kept = std::mem::take(&mut self.kept);
+        dl.splice(&kept, |id, dl| self.repaint_layer(id, dl, axis));
+        self.kept = kept;
+    }
+
+    /// Paint layer `id` of the page again: a chart's line, or the whole History.
+    fn repaint_layer(&mut self, id: u32, dl: &mut DisplayList, axis: TimeAxis) {
+        let i = id as usize;
+        match self.page {
+            Page::Summary => self
+                .summary
+                .repaint_chart(i, dl, &self.timeline, &self.theme),
+            Page::Performance => self.perf.repaint_chart(i, dl, &self.timeline, &self.theme),
+            Page::Processes if id == HISTORY_LAYER => {
+                self.history
+                    .build(self.history.area(), &self.usage, None, axis);
+                self.history.paint(
+                    dl,
+                    &self.usage,
+                    &self.toolbar.search.needle,
+                    self.history_selected,
+                    &self.theme,
+                    &mut self.buf,
+                );
+            }
+            Page::Processes => {
+                let series = [&self.timeline.cpu_total, &self.timeline.mem_in_use];
+                if let Some(s) = series.get(i) {
+                    self.charts.repaint(i, dl, s, &self.theme);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Paint the whole frame on `axis`.
+    #[allow(clippy::too_many_lines)]
+    fn paint_full(&mut self, dl: &mut DisplayList, axis: TimeAxis) {
         dl.clear();
         let theme = &self.theme;
         dl.clear_to(if self.backdrop {
@@ -2249,22 +2376,10 @@ impl App {
             &mut self.buf,
         );
         let full = content.inset(theme.gap, theme.gap);
-        // The chart clock learns the pace from the live history, paused or not.
-        if let Some((newest, gap)) = charts::newest_gap(&self.timeline.cpu_total) {
-            self.clock.arrive(newest, gap, now);
-        }
-        let now_ms = if self.charts_scroll() {
-            self.clock.read(now)
-        } else {
-            self.clock.stop();
-            None
-        };
-        // While paused, the charts show history as of the pause.
         let timeline = match &self.paused {
             Some(p) => &p.timeline,
             None => &self.timeline,
         };
-        let axis = charts::axis_of(timeline, now_ms, self.settings.history_ms());
         match self.page {
             Page::Processes => {}
             Page::Summary => {
@@ -2446,6 +2561,8 @@ impl App {
                 .selected
                 .and_then(|id| rows.row_of(id))
                 .and_then(|row| usage.program(snap.processes[rows.process_of(row)].name()));
+            // All of the History follows the clock: a layer of its own.
+            dl.begin_layer(HISTORY_LAYER);
             self.history.paint(
                 dl,
                 usage,
@@ -2454,6 +2571,8 @@ impl App {
                 theme,
                 &mut self.buf,
             );
+            dl.end_layer();
+            self.history_selected = selected;
         } else if self.map_on() {
             self.map.paint(
                 dl,
@@ -2616,6 +2735,10 @@ pub(crate) fn search_url(query: &str) -> String {
     }
     url
 }
+
+/// The History's layer in the Processes page's display list; the summary charts'
+/// are their indexes.
+const HISTORY_LAYER: u32 = u32::MAX;
 
 /// When the snapshot was taken, milliseconds since the Unix epoch; zero before
 /// the first.
@@ -3603,6 +3726,59 @@ mod tests {
             ..Default::default()
         };
         Arc::new(s)
+    }
+
+    #[test]
+    fn a_frame_where_only_the_clock_moved_repaints_just_the_charts() {
+        let mut app = by_cpu();
+        with_history(&mut app);
+        ready(&mut app);
+        app.set_settings(Settings {
+            smooth_charts: true,
+            ..app.settings()
+        });
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // A new sample, then frames a while after, so the clock is moving.
+        app.paint_at(&mut DisplayList::new(), t0);
+        app.set_snapshot(history_sample(21));
+        for (page, view) in [
+            (Page::Processes, ViewMode::List),
+            (Page::Processes, ViewMode::History),
+            (Page::Summary, ViewMode::List),
+            (Page::Performance, ViewMode::List),
+        ] {
+            cmd(&mut app, Command::SetPage(page));
+            app.set_view(view);
+            let mut full = DisplayList::new();
+            app.paint_at(&mut full, t0 + ms(1000));
+            assert!(!app.full_due, "{page:?}: a full paint is kept");
+            // Only the clock moves: the charts' layers are spliced into the kept
+            // paint, and the result is what a full paint draws at that moment.
+            let at = t0 + ms(1100);
+            let mut tick = DisplayList::new();
+            app.paint_at(&mut tick, at);
+            assert!(app.only_the_clock_moved(), "{page:?}");
+            assert!(!tick.layers().is_empty(), "{page:?}: charts are layers");
+            app.full_due = true;
+            let mut again = DisplayList::new();
+            app.paint_at(&mut again, at);
+            let mut damage = Vec::new();
+            assert!(
+                again.damage_since(&tick, &mut damage) && damage.is_empty(),
+                "{page:?} {view:?}: the splice differs from a full paint at {damage:?}"
+            );
+            // The lines did move since the full paint.
+            assert!(tick.damage_since(&full, &mut damage), "{page:?}");
+            assert!(!damage.is_empty(), "{page:?}: the charts moved");
+        }
+
+        // Anything else that changes, a key or the pointer, paints whole again.
+        cmd(&mut app, Command::SetPage(Page::Processes));
+        app.set_view(ViewMode::List);
+        app.paint_at(&mut DisplayList::new(), t0 + ms(1200));
+        app.handle(UiEvent::MouseLeave);
+        assert!(!app.only_the_clock_moved());
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub mod icon;
 pub mod text;
 
 pub use color::Color;
-pub use display::{DisplayList, DrawCmd, Span, TextCmd};
+pub use display::{DisplayList, DrawCmd, Layer, Span, TextCmd};
 pub use geom::{Point, Rect, Size};
 pub use icon::Icon;
 pub use text::{FontFamily, FontWeight, HAlign, TextStyle, VAlign};

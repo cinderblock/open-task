@@ -238,6 +238,8 @@ pub(crate) struct ChartGroup {
     areas: Vec<Rect>,
     /// Each chart's label band; empty for charts without one.
     bands: Vec<Rect>,
+    /// Each chart's look as last painted, for [`ChartGroup::repaint`].
+    styles: Vec<Option<SparkStyle>>,
     /// Charts in the current frame. The vectors only grow, so a page that switches
     /// between few and many charts does not reallocate.
     len: usize,
@@ -339,6 +341,37 @@ impl ChartGroup {
             self.plots.resize_with(n, Plot::default);
             self.areas.resize(n, Rect::ZERO);
             self.bands.resize(n, Rect::ZERO);
+            self.styles.resize(n, None);
+        }
+    }
+
+    /// Move the charts to a new frame's axis, keeping where they are and how they
+    /// are scaled: a frame where only the clock moved.
+    pub fn set_axis(&mut self, axis: TimeAxis) {
+        self.axis = axis;
+    }
+
+    /// Whether the group marks a moment, for the pointer or for a chart outside it.
+    #[must_use]
+    pub fn marking(&self) -> bool {
+        self.crosshair.is_some()
+    }
+
+    /// Paint chart `i`'s line and time labels again from `series` on the group's
+    /// axis, where it was last built and as it was last painted: the layer
+    /// [`ChartGroup::paint`] marked, for a frame where only the clock moved (so no
+    /// moment is marked).
+    pub fn repaint(&mut self, i: usize, dl: &mut DisplayList, series: &Series, theme: &Theme) {
+        let Some(style) = self.styles.get(i).copied().flatten() else {
+            return;
+        };
+        let plot = &mut self.plots[i];
+        let (rect, max) = (plot.rect(), plot.max());
+        plot.build(series, rect, max, &self.axis);
+        plot.paint(dl, &style, &self.axis, &mut self.scratch);
+        let band = self.bands[i];
+        if !band.is_empty() {
+            sparkline::paint_axis(dl, rect, band, &self.axis, theme.small, theme.text_dim);
         }
     }
 
@@ -374,6 +407,11 @@ impl ChartGroup {
     ) -> Option<PlotPoint> {
         let plot = &self.plots[i];
         let band = self.bands[i];
+        self.styles[i] = Some(*style);
+        // The line and the time labels move with the clock (the labels while the
+        // span grows): a layer of their own, so a frame where nothing else changed
+        // paints just that ([`ChartGroup::repaint`]).
+        dl.begin_layer(i as u32);
         plot.paint(dl, style, &self.axis, &mut self.scratch);
         let Some(c) = self.crosshair else {
             if !band.is_empty() {
@@ -386,8 +424,10 @@ impl ChartGroup {
                     theme.text_dim,
                 );
             }
+            dl.end_layer();
             return None;
         };
+        dl.end_layer();
         let point = plot.paint_crosshair(dl, c.age_ms, style, &self.axis);
         if !band.is_empty() {
             buf.clear();

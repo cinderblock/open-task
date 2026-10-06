@@ -162,6 +162,18 @@ impl UsageChart {
         self.mode
     }
 
+    /// Where the chart was laid out last.
+    #[must_use]
+    pub fn area(&self) -> Rect {
+        self.area
+    }
+
+    /// Whether the chart marks a moment, its own or another chart's.
+    #[must_use]
+    pub fn marking(&self) -> bool {
+        self.crosshair.is_some()
+    }
+
     /// Lay the chart out in `rect` and place the history in it on `time`. `outside`
     /// is the age another chart on the same time axis marks, which this one marks
     /// too while the pointer is not over its own plot.

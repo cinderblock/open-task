@@ -252,6 +252,12 @@ impl Plot {
         self.rect
     }
 
+    /// The value at the top of the plot, from the last build.
+    #[must_use]
+    pub fn max(&self) -> f32 {
+        self.max
+    }
+
     /// Newest first.
     #[must_use]
     pub fn points(&self) -> &[PlotPoint] {

@@ -339,6 +339,40 @@ impl Default for PerfPage {
 }
 
 impl PerfPage {
+    /// Whether a chart marks a moment (the pointer is over one).
+    pub(crate) fn marking(&self) -> bool {
+        self.charts.marking()
+    }
+
+    /// Start a frame where only the clock moved: the charts stay where the last
+    /// paint put them, on `axis`.
+    pub(crate) fn tick(&mut self, axis: TimeAxis) {
+        self.axis = axis;
+        self.charts.set_axis(axis);
+    }
+
+    /// Paint chart `i`'s line again from `tl`, for a frame where only the clock
+    /// moved; see [`ChartGroup::repaint`].
+    pub(crate) fn repaint_chart(
+        &mut self,
+        i: usize,
+        dl: &mut DisplayList,
+        tl: &Timeline,
+        theme: &Theme,
+    ) {
+        if i == PAIR_AXIS_LAYER as usize {
+            let plot = self.charts.plot(self.detail.first).rect();
+            let band = self.detail.pair_band;
+            sparkline::paint_axis(dl, plot, band, &self.axis, theme.small, theme.text_dim);
+            return;
+        }
+        let Some(slot) = self.slots.get(i) else {
+            return;
+        };
+        let series = series(tl, slot.line).unwrap_or(&self.empty);
+        self.charts.repaint(i, dl, series, theme);
+    }
+
     #[cfg(test)]
     pub fn device(&self) -> Device {
         self.device
@@ -894,30 +928,34 @@ impl PerfPage {
         ];
         let plot = self.charts.plot(first).rect();
         let band = self.detail.pair_band;
-        match self.charts.crosshair() {
-            Some(c) => {
-                let mut values = String::with_capacity(48);
-                for (name, p) in names.iter().zip(points) {
-                    if let Some(p) = p {
-                        fmt(buf, p.mean);
-                        if !values.is_empty() {
-                            values.push_str(" \u{b7} ");
-                        }
-                        let _ = write!(values, "{name} {buf}");
-                    }
+        let Some(c) = self.charts.crosshair() else {
+            // The labels under a pair move with the clock while the span grows.
+            dl.begin_layer(PAIR_AXIS_LAYER);
+            sparkline::paint_axis(dl, plot, band, &self.axis, theme.small, theme.text_dim);
+            dl.end_layer();
+            return;
+        };
+        let mut values = String::with_capacity(48);
+        for (name, p) in names.iter().zip(points) {
+            if let Some(p) = p {
+                fmt(buf, p.mean);
+                if !values.is_empty() {
+                    values.push_str(" \u{b7} ");
                 }
-                c.ago(buf);
-                let mut text = String::with_capacity(64);
-                charts::readout(&mut text, &values, buf, c.side);
-                let x = self.axis.x(plot, c.age_ms);
-                sparkline::paint_readout(dl, band, x, c.side, &text, theme.small, theme.text);
-            }
-            None => {
-                sparkline::paint_axis(dl, plot, band, &self.axis, theme.small, theme.text_dim);
+                let _ = write!(values, "{name} {buf}");
             }
         }
+        c.ago(buf);
+        let mut text = String::with_capacity(64);
+        charts::readout(&mut text, &values, buf, c.side);
+        let x = self.axis.x(plot, c.age_ms);
+        sparkline::paint_readout(dl, band, x, c.side, &text, theme.small, theme.text);
     }
 }
+
+/// The layer of the time labels under a pair of charts; the charts' own are their
+/// indexes.
+const PAIR_AXIS_LAYER: u32 = u32::MAX;
 
 /// The full scale of an adapter's chart, in bytes per second, from its busiest
 /// moment in the last `span_ms`.
