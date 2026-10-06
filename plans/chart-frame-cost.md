@@ -1,6 +1,6 @@
 # Cheaper scrolling frames
 
-> **Status:** done; committed on `master` (2026-10-06), not pushed or released · **Started:** 2026-10-06 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done; released as v0.11.1 (2026-10-06) · **Started:** 2026-10-06 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Follows `plans/smooth-chart-scrolling.md` (v0.11.0), whose measurements this starts from.
 
 ## Goal
@@ -84,11 +84,13 @@ Declined: fewer frames where motion is slow ("nah").
 
 ## Progress log
 
-- [x] 2026-10-06: plan written; all steps done; committed.
+- [x] 2026-10-06: plan written; all steps done; committed (`051c42f`).
+- [x] 2026-10-06: released as v0.11.1 (`Release v0.11.1`, tag pushed); the
+  release workflow published nine assets and CI on `master` passed.
 
 ## Open questions for the user
 
-1. Release these as v0.11.1 (or v0.12.0)? Not done without asking.
+None. (Released as v0.11.1 at the user's word.)
 
 ## Things not to do
 
