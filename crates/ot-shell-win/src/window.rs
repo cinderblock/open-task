@@ -687,9 +687,13 @@ fn repaint(st: &mut State) {
             }
         }
     }
-    // Rows are sliding: ask for the next frame. `Present` waits for the vertical
-    // blank, so this runs at the display's rate and stops when the slide lands.
-    if st.app.animating() {
+    // Rows are sliding or charts scrolling: ask for the next frame. `Present`
+    // waits for the vertical blank, so this runs at the display's rate and stops
+    // when the motion does. Not while minimized or hidden in the tray, where
+    // nothing is seen and `Present` may not wait; restoring the window paints it.
+    // SAFETY: hwnd is valid.
+    let shown = unsafe { IsWindowVisible(st.hwnd).as_bool() && !IsIconic(st.hwnd).as_bool() };
+    if shown && st.app.animating() {
         invalidate(st.hwnd);
     }
 }

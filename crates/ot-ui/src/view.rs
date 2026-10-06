@@ -17,7 +17,7 @@ use ot_model::process::Priority;
 use ot_model::ProcessKey;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
 
-use crate::charts::{self, ChartGroup};
+use crate::charts::{self, ChartClock, ChartGroup, Charted};
 use crate::format;
 use crate::nav::{NavHit, NavRail, Page};
 use crate::pages::apps::AppsPage;
@@ -874,6 +874,8 @@ pub struct App {
     /// Whether the platform has animation effects on; row slides need both this
     /// and the setting.
     system_animations: bool,
+    /// The moment the charts' right edge shows, run smoothly between samples.
+    clock: ChartClock,
     /// Search results per process; empty when there is no search.
     matched: Vec<bool>,
     /// What the table lists: matches, plus their ancestors in tree mode.
@@ -928,6 +930,7 @@ impl App {
             update: UpdateView::default(),
             task_manager: TaskManager::default(),
             system_animations: true,
+            clock: ChartClock::default(),
             matched: Vec::new(),
             shown: Vec::new(),
             mouse: None,
@@ -1240,10 +1243,18 @@ impl App {
             .set_animate(self.settings.animates_rows(self.system_animations));
     }
 
-    /// Whether something is moving, so the shell should paint another frame soon.
+    /// Whether something is moving, so the shell should paint another frame soon:
+    /// rows sliding, or charts on screen scrolling.
     #[must_use]
     pub fn animating(&self) -> bool {
-        self.page == Page::Processes && self.table.animating()
+        (self.page == Page::Processes && self.table.animating())
+            || (self.page.has_charts() && self.clock.moving())
+    }
+
+    /// Whether the charts scroll between samples: the setting, not paused, and a
+    /// page with charts on screen.
+    fn charts_scroll(&self) -> bool {
+        self.settings.smooth_charts && self.paused.is_none() && self.page.has_charts()
     }
 
     /// A CPU sample finished: show it under its process. Returns true if the
@@ -2238,11 +2249,22 @@ impl App {
             &mut self.buf,
         );
         let full = content.inset(theme.gap, theme.gap);
+        // The chart clock learns the pace from the live history, paused or not.
+        if let Some((newest, gap)) = charts::newest_gap(&self.timeline.cpu_total) {
+            self.clock.arrive(newest, gap, now);
+        }
+        let now_ms = if self.charts_scroll() {
+            self.clock.read(now)
+        } else {
+            self.clock.stop();
+            None
+        };
         // While paused, the charts show history as of the pause.
         let timeline = match &self.paused {
             Some(p) => &p.timeline,
             None => &self.timeline,
         };
+        let axis = charts::axis_of(timeline, now_ms, self.settings.history_ms());
         match self.page {
             Page::Processes => {}
             Page::Summary => {
@@ -2250,6 +2272,7 @@ impl App {
                 let inputs = summary::Inputs {
                     snap: &snap,
                     timeline,
+                    axis,
                     cycles: &self.cycles,
                     facts: self.system.facts(),
                 };
@@ -2258,8 +2281,14 @@ impl App {
             }
             Page::Performance => {
                 let snap = Arc::clone(&self.snap);
-                self.perf
-                    .paint(dl, full, &snap, timeline, theme, &mut self.buf);
+                self.perf.paint(
+                    dl,
+                    full,
+                    &snap,
+                    Charted { timeline, axis },
+                    theme,
+                    &mut self.buf,
+                );
                 return;
             }
             Page::Users => {
@@ -2319,7 +2348,6 @@ impl App {
         // The History shares the summary charts' time axis, so a moment marked in
         // one is marked in all of them. It is placed first: its own pointer decides
         // what the summary charts mark.
-        let axis = charts::axis_of(timeline);
         if self.history_on() {
             let usage = match &self.paused {
                 Some(p) => &p.usage,
@@ -2712,6 +2740,11 @@ mod tests {
     /// order as it is; the slide has tests of its own.
     fn ready(app: &mut App) {
         app.set_system_animations(false);
+        // Still charts: every frame the same, whenever it is painted.
+        app.set_settings(Settings {
+            smooth_charts: false,
+            ..app.settings()
+        });
         app.handle(UiEvent::Resize(Size::new(900.0, 700.0)));
         let mut dl = DisplayList::new();
         app.paint(&mut dl);
@@ -3556,15 +3589,72 @@ mod tests {
     /// 95 %, memory steady at 60 of 100 bytes.
     fn with_history(app: &mut App) {
         for t in 1..=20u64 {
-            let mut s = (*snapshot(t, vec![proc(1, None, 1.0)])).clone();
-            s.cpu.total = Percent(t as f32 * 5.0 - 5.0);
-            s.memory = MemorySample {
-                total: Bytes(100),
-                available: Bytes(40),
-                ..Default::default()
-            };
-            app.set_snapshot(Arc::new(s));
+            app.set_snapshot(history_sample(t));
         }
+    }
+
+    /// The sample of [`with_history`] at `t` seconds.
+    fn history_sample(t: u64) -> Arc<Snapshot> {
+        let mut s = (*snapshot(t, vec![proc(1, None, 1.0)])).clone();
+        s.cpu.total = Percent(t as f32 * 5.0 - 5.0);
+        s.memory = MemorySample {
+            total: Bytes(100),
+            available: Bytes(40),
+            ..Default::default()
+        };
+        Arc::new(s)
+    }
+
+    #[test]
+    fn charts_scroll_between_samples_where_they_are_shown() {
+        let mut app = by_cpu();
+        with_history(&mut app);
+        ready(&mut app);
+        // Windows' animation effects are off (`ready`); the charts scroll anyway.
+        app.set_settings(Settings {
+            smooth_charts: true,
+            ..app.settings()
+        });
+        let t0 = Instant::now();
+        let mut dl = DisplayList::new();
+        app.paint_at(&mut dl, t0);
+        let newest = app.timeline.cpu_total.latest().unwrap().at_unix_ms;
+        // The newest sample at the right edge at once; nothing moves until the
+        // next one arrives, so the shell has no frames to paint.
+        assert_eq!(app.charts.axis().now_ms, Some(newest));
+        assert!(!app.animating());
+        // The next sample: the charts scroll on, frame by frame, easing back to
+        // trail the newest so the samples after it enter past the edge.
+        assert!(app.set_snapshot(history_sample(21)));
+        let ms = Duration::from_millis;
+        app.paint_at(&mut dl, t0 + ms(1000));
+        let a = app.charts.axis().now_ms.unwrap();
+        assert!((newest..newest + 1000).contains(&a), "{a}");
+        assert!(app.animating(), "the shell keeps the frames coming");
+        app.paint_at(&mut dl, t0 + ms(1016));
+        assert!(app.charts.axis().now_ms.unwrap() > a);
+
+        // Paused: the charts hold still at the newest sample they had.
+        app.handle(UiEvent::Char(' '));
+        app.paint_at(&mut dl, t0 + ms(1032));
+        assert_eq!(app.charts.axis().now_ms, None);
+        assert!(!app.animating());
+        app.handle(UiEvent::Char(' '));
+        app.paint_at(&mut dl, t0 + ms(1048));
+        assert!(app.animating());
+
+        // A page without charts, or the setting off: no frames for nothing.
+        cmd(&mut app, Command::SetPage(Page::Services));
+        app.paint_at(&mut dl, t0 + ms(1064));
+        assert!(!app.animating());
+        cmd(&mut app, Command::SetPage(Page::Processes));
+        app.set_settings(Settings {
+            smooth_charts: false,
+            ..app.settings()
+        });
+        app.paint_at(&mut dl, t0 + ms(1080));
+        assert_eq!(app.charts.axis().now_ms, None);
+        assert!(!app.animating());
     }
 
     #[test]
@@ -3578,7 +3668,7 @@ mod tests {
             (tl.cpu_total.latest().unwrap().at_unix_ms - tl.cpu_total.oldest_ms().unwrap()) as f32;
         assert!(held > crate::sparkline::TimeAxis::MIN_SPAN_MS, "{held}");
         assert_eq!(app.charts.axis().span_ms, held, "the chart fills its width");
-        assert_eq!(app.timeline.retention(), &Retention::covering(3_600_000));
+        assert_eq!(app.timeline.retention(), &Retention::covering(300_000));
 
         let mut s = app.settings();
         s.history_minutes = 1440;
@@ -3588,7 +3678,7 @@ mod tests {
             &Retention::covering(24 * 3_600_000)
         );
         assert_eq!(app.usage.history_span(), 24 * 3_600_000);
-        assert_eq!(app.timeline.cpu_total.len(), 20, "nothing held was lost");
+        assert_eq!(app.timeline.cpu_total.len(), 21, "nothing held was lost");
     }
 
     #[test]
@@ -3879,11 +3969,12 @@ mod tests {
         let newer = snapshot(21, vec![proc(1, None, 1.0), proc(3, None, 50.0)]);
         assert!(!app.set_snapshot(newer), "nothing to repaint while paused");
         assert!(!painted_names(&mut app).contains(&"p3.exe".to_owned()));
-        // Recorded underneath, but the charts show the moment of the pause.
-        assert_eq!(app.timeline.cpu_total.len(), 21);
+        // Recorded underneath, but the charts show the moment of the pause. (The
+        // first sample is held twice: at the start of its interval and its end.)
+        assert_eq!(app.timeline.cpu_total.len(), 22);
         assert_eq!(
             app.paused.as_ref().map(|p| p.timeline.cpu_total.len()),
-            Some(20)
+            Some(21)
         );
 
         // Space on another page pauses (and resumes) there too.
@@ -3915,6 +4006,11 @@ mod tests {
     #[test]
     fn a_reorder_slides_unless_animation_is_off() {
         let mut app = by_cpu();
+        // The charts above the table would keep the frames coming on their own.
+        app.set_settings(Settings {
+            smooth_charts: false,
+            ..app.settings()
+        });
         app.set_snapshot(two(1, 10.0, 50.0));
         ready(&mut app);
         app.set_system_animations(true);
@@ -3949,6 +4045,7 @@ mod tests {
             r.effect,
             Some(Effect::SaveSettings(Settings {
                 animate_rows: Some(false),
+                smooth_charts: false,
                 ..Settings::default()
             }))
         );

@@ -1,10 +1,17 @@
 //! Compact time-series chart on a log-scale time axis.
 //!
-//! The newest sample sits on the right edge and age grows leftward on a log scale:
-//! the last seconds get a wide stretch at full resolution, the oldest history is
+//! The present sits on the right edge and age grows leftward on a log scale: the
+//! last seconds get a wide stretch at full resolution, the oldest history is
 //! compressed into the left end. The axis spans whatever history is held
-//! ([`TimeAxis::spanning`]), so a chart fills its width from a session's first
-//! seconds and the span settles once the history is as long as it is kept.
+//! ([`TimeAxis::at`]), so a chart fills its width from a session's first seconds
+//! and the span settles once the history is as long as it is kept.
+//!
+//! The right edge is a moment on a clock ([`TimeAxis::now_ms`]) that the view runs
+//! smoothly between samples, so the charts scroll rather than step: a new sample
+//! enters from just past the right edge, the oldest leaves past the left one, and
+//! [`Plot::paint`] clips both. Samples that share a column are grouped by bins
+//! anchored in time, not on screen ([`TimeAxis::bin`]), so a summarized stretch
+//! keeps its members as it scrolls and the compressed end does not shimmer.
 //!
 //! Drawing is split in two so several charts can share one hover. [`Plot::build`]
 //! places a series' history into columns one DIP wide, keeping each column's
@@ -31,12 +38,17 @@ pub struct SparkStyle {
 
 /// Where an age lands across a chart: `ln(1 + age / tau)`, scaled so that `span`
 /// reaches the left edge. Ages much shorter than `tau` spread out almost linearly;
-/// much longer ones compress logarithmically.
+/// much longer ones compress logarithmically. Negative ages, samples newer than the
+/// moment at the right edge, continue past it linearly, at the log's slope there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimeAxis {
     /// The oldest age shown, at the left edge, in milliseconds.
     pub span_ms: f32,
     pub tau_ms: f32,
+    /// The moment at the right edge, on the series' clock (Unix milliseconds), that
+    /// ages are measured from. `None` puts each series' newest sample there, for a
+    /// chart that only moves when a sample arrives.
+    pub now_ms: Option<i64>,
 }
 
 impl TimeAxis {
@@ -45,20 +57,31 @@ impl TimeAxis {
     pub const DEFAULT: Self = Self {
         span_ms: 3_600_000.0,
         tau_ms: 1_000.0,
+        now_ms: None,
     };
 
-    /// The shortest span a chart shows. With one sample a log axis has no width to
-    /// give, and a session's first seconds would stretch across the whole chart.
-    pub const MIN_SPAN_MS: f32 = 10_000.0;
+    /// The shortest span a chart shows, only so that a log axis over no time at
+    /// all still has a scale. Anything longer is the history held, so a session's
+    /// first second already reaches across the chart.
+    pub const MIN_SPAN_MS: f32 = 100.0;
 
-    /// The axis for a history reaching back `oldest_age_ms`, so a chart fills its
-    /// width: at least [`Self::MIN_SPAN_MS`], with the default knee.
+    /// The axis with `now_ms` at the right edge and the history reaching back
+    /// `reach_ms` from it at the left, so a chart fills its width: at least
+    /// [`Self::MIN_SPAN_MS`], with the default knee.
     #[must_use]
-    pub fn spanning(oldest_age_ms: f32) -> Self {
+    pub fn at(now_ms: Option<i64>, reach_ms: f32) -> Self {
         Self {
-            span_ms: oldest_age_ms.max(Self::MIN_SPAN_MS),
+            span_ms: reach_ms.max(Self::MIN_SPAN_MS),
             tau_ms: Self::DEFAULT.tau_ms,
+            now_ms,
         }
+    }
+
+    /// How old a sample at `at_ms` is on this axis, given the newest sample of its
+    /// series. Negative for a sample newer than the right edge.
+    #[must_use]
+    pub fn age(self, newest_ms: i64, at_ms: i64) -> f32 {
+        (self.now_ms.unwrap_or(newest_ms) - at_ms) as f32
     }
 
     /// Labeled ages, newest first. Those older than the span are skipped.
@@ -76,16 +99,55 @@ impl TimeAxis {
         (self.span_ms / self.tau_ms).ln_1p()
     }
 
+    /// `0.0` at age zero (the right edge) to `1.0` at the span (the left edge), and
+    /// on past either end: negative for negative ages, over one beyond the span.
+    fn unclamped(self, age_ms: f32) -> f32 {
+        let t = age_ms / self.tau_ms;
+        let f = if t >= 0.0 { t.ln_1p() } else { t };
+        f / self.scale()
+    }
+
     /// `0.0` at age zero (the right edge) to `1.0` at the span (the left edge).
     #[must_use]
     pub fn fraction(self, age_ms: f32) -> f32 {
-        ((age_ms.max(0.0) / self.tau_ms).ln_1p() / self.scale()).min(1.0)
+        self.unclamped(age_ms).clamp(0.0, 1.0)
     }
 
-    /// The x of an age in `rect`. Ages beyond the span land on the left edge.
+    /// The x of an age in `rect`. Ages beyond the span land on the left edge, and
+    /// negative ones on the right.
     #[must_use]
     pub fn x(self, rect: Rect, age_ms: f32) -> f32 {
         rect.right() - rect.w * self.fraction(age_ms)
+    }
+
+    /// The x of an age in `rect`, past its edges where the age is off the axis, for
+    /// a line that is clipped to `rect` rather than flattened against its edges.
+    #[must_use]
+    pub fn x_unclamped(self, rect: Rect, age_ms: f32) -> f32 {
+        rect.right() - rect.w * self.unclamped(age_ms)
+    }
+
+    /// How many milliseconds one DIP spans at `age_ms` on a chart `width` wide: the
+    /// inverse of the axis's slope there.
+    #[must_use]
+    pub fn ms_per_dip(self, width: f32, age_ms: f32) -> f32 {
+        if width <= 0.0 {
+            return f32::INFINITY;
+        }
+        (age_ms.max(0.0) + self.tau_ms) * self.scale() / width
+    }
+
+    /// The bin a sample at `at_ms`, `age_ms` old, is summarized in on a chart
+    /// `width` wide: a power-of-two number of milliseconds, at least a column wide
+    /// at that age, aligned to the clock. A sample keeps its bin as the chart
+    /// scrolls, until the columns around it grow wider than the bin.
+    #[must_use]
+    pub fn bin(self, width: f32, age_ms: f32, at_ms: i64) -> (i64, i64) {
+        let column = (self.ms_per_dip(width, age_ms) * COLUMN_W).ceil();
+        let size = (column.clamp(1.0, MAX_BIN_MS) as u64)
+            .next_power_of_two()
+            .cast_signed();
+        (size, at_ms.div_euclid(size))
     }
 
     /// The age at `x` in `rect`, the inverse of [`TimeAxis::x`].
@@ -105,9 +167,11 @@ impl Default for TimeAxis {
     }
 }
 
-/// Width of one plotted column. Everything that lands in the same column is
-/// summarized into one point, so a chart never draws more points than it has DIPs.
-const COLUMN_W: f32 = 1.0;
+/// Width of one plotted column. Samples in the same column-wide time bin are
+/// summarized into one point, so a chart draws at most about one point a DIP.
+pub(crate) const COLUMN_W: f32 = 1.0;
+/// The widest bin, about twelve days.
+const MAX_BIN_MS: f32 = 1_073_741_824.0;
 
 /// One column of a built plot. Values are in the series' own units.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,13 +210,17 @@ impl Plot {
         if rect.is_empty() {
             return;
         }
-        let mut column = i64::MIN;
+        let mut bin = (0, i64::MIN);
         for b in series.history() {
-            let age = (newest.at_unix_ms - b.mid_ms()).max(0) as f32;
-            let x = axis.x(rect, age);
-            let c = ((rect.right() - x) / COLUMN_W).floor() as i64;
+            let at = b.mid_ms();
+            let age = axis.age(newest.at_unix_ms, at);
+            let x = axis.x_unclamped(rect, age);
+            let key = axis.bin(rect.w, age, at);
+            // The first point past the span keeps its own place, past the left
+            // edge, so the line reaches that edge.
+            let past = age >= axis.span_ms;
             match self.points.last_mut() {
-                Some(p) if c == column => {
+                Some(p) if key == bin && !past => {
                     let n = p.count + b.count;
                     p.mean = (p.mean * p.count as f32 + b.mean * b.count as f32) / n as f32;
                     p.min = p.min.min(b.min);
@@ -160,7 +228,7 @@ impl Plot {
                     p.count = n;
                 }
                 _ => {
-                    column = c;
+                    bin = key;
                     self.points.push(PlotPoint {
                         x,
                         age_ms: age,
@@ -171,9 +239,8 @@ impl Plot {
                     });
                 }
             }
-            // The first point past the span sits on the left edge and carries the
-            // line all the way there; anything older is off the chart.
-            if age >= axis.span_ms {
+            // Anything older than the first point past the span is off the chart.
+            if past {
                 break;
             }
         }
@@ -191,12 +258,17 @@ impl Plot {
         &self.points
     }
 
+    /// The point nearest `x` of those inside the plot: one sliding in past the
+    /// right edge or out past the left is drawn, clipped, but not pointed at.
     fn nearest_index(&self, x: f32) -> Option<usize> {
-        (0..self.points.len()).min_by(|&a, &b| {
-            (self.points[a].x - x)
-                .abs()
-                .total_cmp(&(self.points[b].x - x).abs())
-        })
+        let inside = self.rect.x..=self.rect.right();
+        (0..self.points.len())
+            .filter(|&i| inside.contains(&self.points[i].x))
+            .min_by(|&a, &b| {
+                (self.points[a].x - x)
+                    .abs()
+                    .total_cmp(&(self.points[b].x - x).abs())
+            })
     }
 
     /// The point whose column is nearest `x`, for snapping a pointer.
@@ -263,6 +335,8 @@ impl Plot {
         }
         let bottom = rect.bottom();
         let (first, last) = (self.points[0].x, self.points[self.points.len() - 1].x);
+        // The ends lie past the edges while they slide in and out.
+        dl.push_clip(rect);
 
         scratch.clear();
         scratch.extend(self.points.iter().map(|p| Point::new(p.x, self.y(p.mean))));
@@ -285,6 +359,7 @@ impl Plot {
         }
 
         dl.polyline(scratch.iter().copied(), style.line, style.width);
+        dl.pop_clip();
     }
 
     /// Mark `age_ms`: a hairline across the plot and a dot on the mean line.
@@ -549,7 +624,7 @@ mod tests {
             "strictly right to left"
         );
         assert!(
-            p.points().last().unwrap().x.abs() < 1e-3,
+            p.points().last().unwrap().x <= rect.x,
             "two hours of history reach the left edge"
         );
         let hit = p
@@ -706,5 +781,129 @@ mod tests {
             walk(Left, &[0.49, 0.51, 0.49, 0.54, 0.56, 0.51, 0.46, 0.44]),
             [Left, Left, Left, Left, Right, Right, Right, Left]
         );
+    }
+
+    /// The default axis with `now_ms` at the right edge.
+    fn running(now_ms: i64, span_ms: f32) -> TimeAxis {
+        TimeAxis {
+            span_ms,
+            now_ms: Some(now_ms),
+            ..AXIS
+        }
+    }
+
+    #[test]
+    fn past_the_right_edge_the_axis_runs_on_linearly() {
+        let r = Rect::new(0.0, 0.0, 1000.0, 50.0);
+        let x = |age: f32| AXIS.x_unclamped(r, age);
+        assert!((x(0.0) - 1000.0).abs() < 1e-3);
+        assert!(
+            x(-500.0) > 1000.0 && x(-1500.0) > x(-500.0),
+            "newer is further right"
+        );
+        // The slope matches on both sides of the edge.
+        let (left, right) = (x(1.0) - x(0.0), x(0.0) - x(-1.0));
+        assert!(
+            (left - right).abs() < 1e-3 * right.abs(),
+            "{left} vs {right}"
+        );
+        assert!(
+            x(2.0 * AXIS.span_ms) < 0.0,
+            "older runs on past the left edge"
+        );
+        assert_eq!(
+            AXIS.x(r, -500.0),
+            1000.0,
+            "the clamped x stays on the chart"
+        );
+        assert!(AXIS.ms_per_dip(r.w, 0.0) < AXIS.ms_per_dip(r.w, 60_000.0));
+    }
+
+    #[test]
+    fn a_running_clock_slides_samples_in_past_the_right_edge_clipped() {
+        let s = per_second(Retention::raw(100), (0..30).map(|i| i as f32));
+        let rect = Rect::new(0.0, 0.0, 400.0, 50.0);
+        // The right edge 1.25 s before the newest sample.
+        let axis = running(27_750, 20_000.0);
+        let mut p = Plot::default();
+        p.build(&s, rect, 100.0, &axis);
+        let newest = p.points()[0];
+        assert!(newest.age_ms < 0.0 && newest.x > rect.right(), "{newest:?}");
+        assert!(
+            p.points()[1].x > rect.right(),
+            "29 s and 28 s are still to come"
+        );
+        assert!(p.points()[2].x <= rect.right(), "27 s has slid in");
+        assert!(
+            p.points().last().unwrap().x < rect.x,
+            "the oldest in view slides out"
+        );
+        // The pointer only finds what is in view.
+        assert!(p.nearest_x(rect.right()).unwrap().x <= rect.right());
+        // Drawn inside a clip, so neither end spills out of the chart.
+        let mut dl = DisplayList::new();
+        p.paint(&mut dl, &style(), &axis, &mut Vec::new());
+        let cmds = dl.cmds();
+        let open = cmds
+            .iter()
+            .position(|c| matches!(c, DrawCmd::PushClip(r) if *r == rect))
+            .expect("a clip to the plot");
+        let line = cmds
+            .iter()
+            .position(|c| matches!(c, DrawCmd::Polyline { .. }))
+            .unwrap();
+        let close = cmds
+            .iter()
+            .position(|c| matches!(c, DrawCmd::PopClip))
+            .unwrap();
+        assert!(open < line && line < close);
+    }
+
+    #[test]
+    fn summarized_columns_keep_their_samples_as_the_chart_scrolls() {
+        // Two hours at 1 Hz, varying, on a narrow chart: the old end summarizes many
+        // samples a column. A frame later the clock has moved 16 ms; a column's
+        // summary should be the same samples, only a hair further left.
+        let r = Retention {
+            raw: 600,
+            tiers: vec![Resolution {
+                bucket_ms: 10_000,
+                capacity: 720,
+            }],
+        };
+        let s = per_second(r, (0..7200).map(|i| ((i * 37) % 100) as f32));
+        let rect = Rect::new(0.0, 0.0, 300.0, 60.0);
+        let build = |now: i64| {
+            let mut p = Plot::default();
+            p.build(&s, rect, 100.0, &running(now, 3_600_000.0));
+            p.points().to_vec()
+        };
+        let (a, b) = (build(7_198_000), build(7_198_016));
+        let summarized = |pts: &[PlotPoint]| {
+            pts.iter()
+                .filter(|p| p.count > 1)
+                .map(|p| {
+                    let key = (p.count, p.mean.to_bits(), p.min.to_bits(), p.max.to_bits());
+                    (key, p.x)
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let (a, b) = (summarized(&a), summarized(&b));
+        assert!(a.len() > 50, "the old end is summarized: {}", a.len());
+        // A column regroups only where a sample crosses into a wider bin, at a
+        // place or two along the chart; every other keeps its samples.
+        let kept: Vec<(f32, f32)> = a
+            .iter()
+            .filter_map(|(k, &x)| b.get(k).map(|&y| (x, y)))
+            .collect();
+        assert!(
+            kept.len() + 2 >= a.len(),
+            "{} of {} kept",
+            kept.len(),
+            a.len()
+        );
+        for (x, y) in kept {
+            assert!(y <= x && x - y < 0.1, "{x} -> {y}");
+        }
     }
 }

@@ -86,6 +86,12 @@ impl Page {
         }
     }
 
+    /// Whether the page shows time charts, which scroll while it is on screen.
+    #[must_use]
+    pub fn has_charts(self) -> bool {
+        matches!(self, Self::Summary | Self::Processes | Self::Performance)
+    }
+
     /// Whether the page lists things with a search field of its own, so typing
     /// on it filters it rather than the process table.
     #[must_use]

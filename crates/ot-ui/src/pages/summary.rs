@@ -58,6 +58,8 @@ const WHEEL_STEP: f32 = 48.0;
 pub(crate) struct Inputs<'a> {
     pub snap: &'a Snapshot,
     pub timeline: &'a Timeline,
+    /// The time axis of the frame, shared with every other chart.
+    pub axis: TimeAxis,
     /// Each process's fading cycle total, parallel to the snapshot's process list.
     pub cycles: &'a [f64],
     /// The System page's facts, once read.
@@ -353,7 +355,7 @@ impl SummaryPage {
         let (_, view) = body.split_top(theme.gap * 0.5);
         self.view = view;
         self.rows.clear();
-        self.axis = charts::axis_of(inputs.timeline);
+        self.axis = inputs.axis;
         if inputs.snap.is_empty() {
             self.cards.clear();
             self.slots.clear();
@@ -878,6 +880,7 @@ mod tests {
             Inputs {
                 snap: s,
                 timeline: tl,
+                axis: charts::axis_of(tl, None, i64::MAX),
                 cycles: &CYCLES,
                 facts: Some(&facts),
             },
@@ -994,6 +997,7 @@ mod tests {
             Inputs {
                 snap: &s,
                 timeline: &tl,
+                axis: charts::axis_of(&tl, None, i64::MAX),
                 cycles: &CYCLES,
                 facts: None,
             },

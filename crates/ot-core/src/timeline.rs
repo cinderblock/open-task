@@ -514,6 +514,36 @@ impl Timeline {
             .or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_millis() as i64);
 
+        // A sample is the average over the interval before it. The first one is
+        // also put at that interval's start, so a chart draws it across the
+        // interval it measured and has a line from the first sample on, rather
+        // than a lone point until the second.
+        if self.cpu_total.is_empty() {
+            let interval = i64::try_from(snap.interval.as_millis()).unwrap_or(i64::MAX);
+            self.record(snap, at - interval.clamp(1, at.max(1)));
+        }
+        self.record(snap, at);
+
+        // A device that is gone takes its history with it. An empty list is more
+        // likely a failed read than every disk (or every adapter) vanishing at once,
+        // so it prunes nothing.
+        if !snap.disks.is_empty() {
+            self.disks
+                .retain(|s| snap.disks.iter().any(|d| d.info.number == s.number));
+        }
+        if !snap.adapters.is_empty() {
+            self.adapters
+                .retain(|s| snap.adapters.iter().any(|a| a.info.id == s.id));
+        }
+        if !snap.gpus.is_empty() {
+            self.gpus
+                .retain(|s| snap.gpus.iter().any(|g| g.info.id == s.id));
+        }
+    }
+
+    /// Push every series' value from `snap` at `at`, adding series for devices
+    /// seen for the first time.
+    fn record(&mut self, snap: &Snapshot, at: i64) {
         self.cpu_total.push(at, snap.cpu.total.get());
         self.mem_in_use.push(at, snap.memory.in_use().get() as f32);
 
@@ -591,21 +621,6 @@ impl Timeline {
                 self.battery_rate.push(at, rate.0);
             }
         }
-        // A device that is gone takes its history with it. An empty list is more
-        // likely a failed read than every disk (or every adapter) vanishing at once,
-        // so it prunes nothing.
-        if !snap.disks.is_empty() {
-            self.disks
-                .retain(|s| snap.disks.iter().any(|d| d.info.number == s.number));
-        }
-        if !snap.adapters.is_empty() {
-            self.adapters
-                .retain(|s| snap.adapters.iter().any(|a| a.info.id == s.id));
-        }
-        if !snap.gpus.is_empty() {
-            self.gpus
-                .retain(|s| snap.gpus.iter().any(|g| g.info.id == s.id));
-        }
     }
 
     #[must_use]
@@ -679,9 +694,10 @@ mod tests {
         let s = snap(1, 50.0, 2);
         t.observe(&s);
         t.observe(&s);
-        assert_eq!(t.cpu_total.len(), 1);
+        // The first sample at its interval's start and its end.
+        assert_eq!(t.cpu_total.len(), 2);
         assert_eq!(t.cores.len(), 2);
-        assert_eq!(t.cores[0].len(), 1);
+        assert_eq!(t.cores[0].len(), 2);
         assert_eq!(t.mem_in_use.latest().map(|s| s.value), Some(60.0));
     }
 
@@ -693,8 +709,24 @@ mod tests {
         t.observe(&first);
         assert!(t.cpu_total.is_empty());
         assert_eq!(t.last_tick(), Some(Tick(1)));
-        t.observe(&snap(2, 30.0, 2));
-        assert_eq!(t.cpu_total.len(), 1);
+        let second = snap(2, 30.0, 2);
+        t.observe(&second);
+        // The first sample with rates spans the interval it measured, so a chart
+        // has a line from it alone.
+        let at = |s: &Snapshot| {
+            s.taken_at
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        };
+        let held: Vec<(i64, f32)> = t
+            .cpu_total
+            .history()
+            .map(|b| (b.mid_ms(), b.mean))
+            .collect();
+        let interval = second.interval.as_millis() as i64;
+        assert_eq!(held, [(at(&second), 30.0), (at(&second) - interval, 30.0)]);
     }
 
     #[test]
@@ -733,14 +765,14 @@ mod tests {
             t.disk(0).map(|d| d.write.latest().unwrap().value),
             Some(200.0)
         );
-        assert_eq!(t.adapter(7).map(|a| a.tx.len()), Some(1));
+        assert_eq!(t.adapter(7).map(|a| a.tx.len()), Some(2));
 
         // Disk 1 is unplugged; the adapter read failed this pass.
         let mut s = snap(2, 1.0, 1);
         s.disks = vec![disk(0, 30.0)];
         t.observe(&s);
         assert!(t.disk(1).is_none());
-        assert_eq!(t.disk(0).map(|d| d.active.len()), Some(2));
+        assert_eq!(t.disk(0).map(|d| d.active.len()), Some(3));
         assert!(t.adapter(7).is_some(), "an empty list prunes nothing");
     }
 
@@ -785,8 +817,8 @@ mod tests {
         s.gpus = vec![gpu(3, 50.0)];
         t.observe(&s);
         assert!(t.gpu(4).is_none());
-        assert_eq!(t.gpu(3).map(|g| g.utilization.len()), Some(2));
-        assert_eq!(t.battery_charge.len(), 1, "nothing to push, nothing lost");
+        assert_eq!(t.gpu(3).map(|g| g.utilization.len()), Some(3));
+        assert_eq!(t.battery_charge.len(), 2, "nothing to push, nothing lost");
     }
 
     #[test]

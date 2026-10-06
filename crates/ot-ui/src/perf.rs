@@ -22,7 +22,7 @@ use ot_model::gpu::GpuSample;
 use ot_model::{Bytes, Hertz};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
-use crate::charts::{self, ChartGroup, ValueFmt, AXIS_BAND_H};
+use crate::charts::{self, ChartGroup, Charted, ValueFmt, AXIS_BAND_H};
 use crate::format;
 use crate::sparkline::{self, PlotPoint, TimeAxis};
 use crate::theme::Theme;
@@ -555,11 +555,12 @@ impl PerfPage {
         dl: &mut DisplayList,
         rect: Rect,
         snap: &Snapshot,
-        tl: &Timeline,
+        charted: Charted<'_>,
         theme: &Theme,
         buf: &mut String,
     ) {
-        self.axis = charts::axis_of(tl);
+        let Charted { timeline: tl, axis } = charted;
+        self.axis = axis;
         self.devices.clear();
         self.devices.extend([Device::Cpu, Device::Memory]);
         self.devices
@@ -1864,7 +1865,7 @@ pub(crate) mod tests {
             &mut dl,
             Rect::new(0.0, 0.0, 1000.0, 640.0),
             s,
-            tl,
+            Charted::still(tl),
             &Theme::dark(),
             &mut buf,
         );

@@ -72,15 +72,20 @@ The list scrolls when there are more devices than fit. Every graph on the page, 
 small ones in the list included, shares one hover line.
 
 **Charts:** the CPU and memory graphs share a log-scale time axis, labeled
-`1h 10m 1m 10s now` underneath. The newest sample is on the right edge and the
-oldest one held is on the left, so a chart fills its width from a session's first
-seconds and the axis grows with the history until it reaches the length set on the
-Settings page: **How far charts reach back**, ten minutes to a day, an hour unless
-changed. Older samples are dropped; the card says how many points a chart keeps at
-that length and about how much memory that is for the charts on this machine. With
-an hour, the last ten seconds take about a third of the width, the last minute
-half, and the rest of the hour is compressed into the left end. Recent history is drawn sample by
-sample. Older stretches are summarized, with a faint band from the lowest to the
+`1h 10m 1m 10s now` underneath. The present is on the right edge and the oldest
+sample held is on the left, so a chart fills its width from a session's first
+second and the axis grows with the history until it reaches the length set on the
+Settings page: **How far charts reach back**, five minutes to a day, five minutes
+unless changed. Older samples are dropped; the card says how many points a chart
+keeps at that length and about how much memory that is for the charts on this
+machine. With five minutes, the last ten seconds take about two fifths of the width
+and the rest is compressed toward the left end; with an hour, the last minute takes
+half. The charts scroll smoothly with time rather than stepping once a sample: the
+right edge runs a little over a sample behind the newest, so each new sample slides
+in from past it (**Scroll charts smoothly** under **Charts** turns this off; only
+the parts of the window that changed are redrawn each frame, so it costs little).
+The first sample is on screen a quarter of a second after start, drawn across the
+interval it measured. Recent history is drawn sample by sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point
 at either graph and a hairline marks the same moment in both, with each graph's
 value there and how long ago it was (where a point summarizes several samples, the
@@ -134,7 +139,7 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   selects it (the ancestry line and the other arrangements keep the selection),
   right-click gives the process menu, and the search dims what does not match. The
   line under the map gives the cycles used by everything together.
-- **History** shows the cycles used over the last hour, as a chart: a stack of
+- **History** shows the cycles used over the charts' reach, as a chart: a stack of
   bands, one per program, on the same time axis as the graphs above it. A program is
   every process of one name, so twelve `chrome.exe`, or the two hundred `rustc.exe`
   of a build, are one band. The switch above the chart picks what a band's thickness
@@ -304,7 +309,8 @@ the numbers in its tooltip; a click brings the window back, and its menu has
 **Always on top** and **Exit**. With **Hide when minimized** on, minimizing hides
 the window and the icon is the way back. **Update speed** (High, Normal, Slow,
 Low: every half second to every four) is beside the fade rate under **Process
-table**; **Space** still pauses. **How far charts reach back** is under **Charts**.
+table**; **Space** still pauses. **How far charts reach back** and **Scroll charts
+smoothly** are under **Charts**.
 
 **Summary** puts every other page's headline numbers on one screen, as TMOG's
 Summary view does, in cards that sit two across when the window is wide and one

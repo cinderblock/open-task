@@ -11,6 +11,8 @@
 //! [`ChartGroup::paint`] for each. Building every chart before painting any is what
 //! lets the chart under the pointer decide the age the others mark.
 
+use std::time::Instant;
+
 use ot_core::{Series, Timeline};
 use ot_model::Bytes;
 use ot_paint::{Color, DisplayList, Point, Rect};
@@ -19,10 +21,177 @@ use crate::format::{self, AgoFields};
 use crate::sparkline::{self, Plot, PlotPoint, Side, SparkStyle, TimeAxis};
 use crate::theme::Theme;
 
-/// The time axis for a frame: the charts fill their width with whatever history
-/// `timeline` holds, which the history setting bounds.
-pub(crate) fn axis_of(timeline: &Timeline) -> TimeAxis {
-    TimeAxis::spanning(timeline.span_ms().unwrap_or(0) as f32)
+/// The time axis for a frame: `now_ms` at the right edge (the newest sample when
+/// `None`), and the charts filling their width with whatever history `timeline`
+/// holds back from there, up to `length_ms`, the history setting.
+pub(crate) fn axis_of(timeline: &Timeline, now_ms: Option<i64>, length_ms: i64) -> TimeAxis {
+    let s = &timeline.cpu_total;
+    let now = now_ms.or_else(|| s.latest().map(|n| n.at_unix_ms));
+    let reach = match (now, s.oldest_ms()) {
+        (Some(now), Some(oldest)) => (now - oldest).clamp(0, length_ms.max(0)),
+        _ => 0,
+    };
+    TimeAxis::at(now_ms, reach as f32)
+}
+
+/// A timeline and the axis a frame charts it on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Charted<'a> {
+    pub timeline: &'a Timeline,
+    pub axis: TimeAxis,
+}
+
+impl Charted<'_> {
+    /// `timeline` with its newest sample at the right edge and all of it in view.
+    #[cfg(test)]
+    pub fn still(timeline: &Timeline) -> Charted<'_> {
+        Charted {
+            timeline,
+            axis: axis_of(timeline, None, i64::MAX),
+        }
+    }
+}
+
+/// The newest sample of `series` and how long after the one before it it came, in
+/// milliseconds; `None` before there are two.
+pub(crate) fn newest_gap(series: &Series) -> Option<(i64, i64)> {
+    let mut h = series.history();
+    let newest = h.next()?.mid_ms();
+    let before = h.next()?.mid_ms();
+    Some((newest, newest - before))
+}
+
+/// The moment the charts' right edge shows, run smoothly between samples so the
+/// charts scroll rather than step.
+///
+/// The clock trails the newest sample by a little over the interval between
+/// samples, so each new one arrives past the right edge and slides in. It runs at
+/// the pace samples arrive: real time live, the playback speed in a replay.
+/// Arrival jitter is taken up gradually and a jump (a seek, a change of speed) at
+/// once, and the clock never passes the newest sample: a feed that stalls stops at
+/// the edge rather than scrolling into nothing.
+///
+/// Arrivals are timed by the frame that first sees them, so the clock reads the same
+/// for the same frames, and a window that was not painting (minimized) still learns
+/// the right pace once it does.
+#[derive(Debug, Default)]
+pub(crate) struct ChartClock {
+    /// The newest sample, and the frame that first saw it.
+    newest: Option<(i64, Instant)>,
+    /// Milliseconds between the newest two samples.
+    gap_ms: f64,
+    /// Sample time per real time, from the arrivals so far; zero before two.
+    rate: f64,
+    /// The clock as last read, and when.
+    read: Option<(f64, Instant)>,
+    /// No read since the history started (or started over): the next one puts the
+    /// newest sample at the edge, so the first samples are in view at once, and
+    /// the clock eases back to its lag from there.
+    fresh: bool,
+}
+
+impl ChartClock {
+    /// Intervals the clock trails the newest sample by: over one, so a sample that
+    /// arrives a little late is still past the edge when it does.
+    const LAG: f64 = 1.25;
+    /// The clock runs faster or slower to take up its difference from where it
+    /// should be, by this much more or less a second per second it is off: half a
+    /// second off, it runs at twice or half the pace. Never backward.
+    const SLEW_MS: f64 = 500.0;
+    /// The slowest and fastest it runs while taking up a difference.
+    const PACES: (f64, f64) = (0.5, 2.0);
+    /// Off by more than this many intervals, the clock jumps instead.
+    const JUMP: f64 = 2.0;
+    /// Paces past these, one way or the other, are not a feed's.
+    const RATES: (f64, f64) = (1.0 / 64.0, 64.0);
+
+    /// The frame at `now` sees `newest_ms` as the newest sample, `gap_ms` after the
+    /// one before it.
+    pub fn arrive(&mut self, newest_ms: i64, gap_ms: i64, now: Instant) {
+        match self.newest {
+            Some((prev, _)) if prev == newest_ms => return,
+            Some((prev, seen)) if newest_ms > prev => {
+                let real = now.saturating_duration_since(seen).as_secs_f64() * 1000.0;
+                if real > 0.0 {
+                    let rate =
+                        ((newest_ms - prev) as f64 / real).clamp(Self::RATES.0, Self::RATES.1);
+                    self.rate = if self.rate > 0.0 {
+                        f64::midpoint(self.rate, rate)
+                    } else {
+                        rate
+                    };
+                }
+            }
+            // The first sample, or a history that went back (a replay seeking):
+            // the pace so far means nothing.
+            _ => {
+                self.rate = 0.0;
+                self.read = None;
+                self.fresh = true;
+            }
+        }
+        self.newest = Some((newest_ms, now));
+        self.gap_ms = gap_ms.max(0) as f64;
+    }
+
+    /// The moment at the right edge for the frame at `now`, or `None` before there
+    /// are two samples to pace by.
+    pub fn read(&mut self, now: Instant) -> Option<i64> {
+        let (newest, seen) = self.newest?;
+        if self.gap_ms <= 0.0 {
+            self.read = None;
+            return None;
+        }
+        let newest = newest as f64;
+        let rate = if self.rate > 0.0 { self.rate } else { 1.0 };
+        let since = now.saturating_duration_since(seen).as_secs_f64() * 1000.0;
+        let target = newest - self.gap_ms * Self::LAG + rate * since;
+        let clock = match self.read {
+            Some((was, last)) => {
+                let dt = now.saturating_duration_since(last).as_secs_f64() * 1000.0;
+                let run = was + rate * dt;
+                let off = target - run;
+                if off.abs() > self.gap_ms * Self::JUMP {
+                    target
+                } else {
+                    // Faster or slower in proportion to how far off it is, within
+                    // the paces, and never past where it should be: a frame long
+                    // after the last (a fast replay, a busy machine) must not
+                    // overshoot and swing back.
+                    let step = rate * dt;
+                    let take = (step * off / Self::SLEW_MS)
+                        .clamp(step * (Self::PACES.0 - 1.0), step * (Self::PACES.1 - 1.0));
+                    run + if off >= 0.0 {
+                        take.min(off)
+                    } else {
+                        take.max(off)
+                    }
+                }
+            }
+            None if self.fresh => newest,
+            None => target,
+        };
+        self.fresh = false;
+        let clock = clock.min(newest);
+        self.read = Some((clock, now));
+        Some(clock.round() as i64)
+    }
+
+    /// Stop running: the next read starts where the clock should be by then, not
+    /// from where it stopped.
+    pub fn stop(&mut self) {
+        self.read = None;
+    }
+
+    /// Whether the clock is running and has not caught up with the newest sample,
+    /// so the next frame would show the charts moved.
+    #[must_use]
+    pub fn moving(&self) -> bool {
+        match (self.newest, self.read) {
+            (Some((newest, _)), Some((clock, _))) => clock < newest as f64,
+            _ => false,
+        }
+    }
 }
 
 /// Height of the time labels (or the hover readout) under a chart that has them.
@@ -406,5 +575,135 @@ mod tests {
             texts[0].starts_with(&format!("{ago} \u{b7} ")) && texts[0].matches('%').count() == 1,
             "the time next to the line, then one value: {texts:?}"
         );
+    }
+
+    use std::time::Duration;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Read the clock every 16 ms from `from` to `to` (milliseconds after `t0`),
+    /// with a sample `gap` ms of sample time apart arriving every `every` ms of
+    /// real time; the clock must never run backward. Returns the last reading.
+    fn run_frames(
+        c: &mut ChartClock,
+        t0: Instant,
+        (from, to): (u64, u64),
+        (gap, every): (i64, u64),
+        first: i64,
+    ) -> i64 {
+        let mut prev = i64::MIN;
+        let mut arrived = from / every;
+        for t in (from..=to).step_by(16) {
+            if t / every > arrived {
+                arrived = t / every;
+                c.arrive(first + arrived.cast_signed() * gap, gap, t0 + ms(t));
+            }
+            let now = c.read(t0 + ms(t)).unwrap();
+            assert!(now >= prev, "backward at {t} ms: {prev} -> {now}");
+            prev = now;
+        }
+        prev
+    }
+
+    #[test]
+    fn the_clock_starts_at_the_newest_sample_and_eases_back_to_its_lag() {
+        let t0 = Instant::now();
+        let mut c = ChartClock::default();
+        assert_eq!(c.read(t0), None, "nothing to show yet");
+        // The first samples are in view at once, the newest at the edge, and the
+        // clock waits there for the next.
+        c.arrive(10_000, 1000, t0);
+        assert_eq!(c.read(t0), Some(10_000));
+        assert_eq!(c.read(t0 + ms(500)), Some(10_000));
+        assert!(!c.moving(), "nothing moves until the next sample");
+        // Samples on time from here: it falls back to trailing the newest by a
+        // sample and a quarter, slowing down rather than running backward.
+        let _ = run_frames(&mut c, t0, (516, 7_996), (1000, 1000), 10_000);
+        c.arrive(18_000, 1000, t0 + ms(8_000));
+        let settled = c.read(t0 + ms(8_000)).unwrap();
+        // Within a frame: the earlier arrivals were timed by the frames that saw them.
+        assert!((settled - (18_000 - 1250)).abs() <= 16, "{settled}");
+        assert!(c.moving());
+        // Settled, it runs in real time, frame by frame.
+        let next = c.read(t0 + ms(8_016)).unwrap();
+        assert!(
+            (15..=17).contains(&(next - settled)),
+            "{} ms in 16",
+            next - settled
+        );
+    }
+
+    #[test]
+    fn the_clock_takes_up_jitter_gradually_and_waits_at_a_stalled_feed() {
+        let t0 = Instant::now();
+        let mut c = ChartClock::default();
+        c.arrive(10_000, 1000, t0);
+        let _ = c.read(t0);
+        // The next sample 100 ms late: the clock does not leap to make it up.
+        let mut prev = c.read(t0 + ms(1000)).unwrap();
+        for f in 1..=60 {
+            let at = t0 + ms(1000 + 16 * f);
+            if f == 7 {
+                c.arrive(11_000, 1000, at);
+            }
+            let now = c.read(at).unwrap();
+            let step = now - prev;
+            assert!((0..=40).contains(&step), "frame {f}: a step of {step} ms");
+            prev = now;
+        }
+        // No more samples: the clock stops at the newest rather than run past it.
+        for f in 0..400 {
+            let _ = c.read(t0 + ms(2000 + 16 * f));
+        }
+        assert_eq!(c.read(t0 + ms(9000)), Some(11_000));
+        assert!(!c.moving(), "nothing left to show moving");
+    }
+
+    #[test]
+    fn the_clock_runs_at_the_feeds_pace_and_starts_over_when_it_goes_back() {
+        let t0 = Instant::now();
+        let mut c = ChartClock::default();
+        // A replay at 4x: a second of samples every 250 ms.
+        c.arrive(10_000, 1000, t0);
+        let _ = c.read(t0);
+        let last = run_frames(&mut c, t0, (16, 6_000), (1000, 250), 10_000);
+        let next = c.read(t0 + ms(6_100)).unwrap();
+        // About 400 ms: arrivals timed by 16 ms frames are 64 ms of samples off.
+        assert!(
+            (340..=460).contains(&(next - last)),
+            "{} ms in 100",
+            next - last
+        );
+        // Seeking back: the pace so far means nothing, and the newest is shown at
+        // once again.
+        c.arrive(3_000, 1000, t0 + ms(6_200));
+        assert_eq!(c.read(t0 + ms(6_200)), Some(3_000));
+        // Stopped (paused, or a page without charts): it resumes where it should
+        // be by then, not where it stopped.
+        c.arrive(4_000, 1000, t0 + ms(7_200));
+        let _ = c.read(t0 + ms(7_200));
+        c.stop();
+        assert!(!c.moving());
+        let resumed = c.read(t0 + ms(7_300)).unwrap();
+        assert!((resumed - (4_000 - 1250 + 100)).abs() <= 1, "{resumed}");
+    }
+
+    #[test]
+    fn the_axis_reaches_from_the_clock_back_to_the_oldest_sample_held() {
+        let mut tl = Timeline::new(Retention::raw(100));
+        for i in 0..30 {
+            tl.cpu_total.push(10_000 + i * 1000, 5.0);
+        }
+        // Still: the newest sample at the edge, everything held in view.
+        let still = axis_of(&tl, None, 3_600_000);
+        assert_eq!((still.now_ms, still.span_ms), (None, 29_000.0));
+        // Running: from the clock, a little behind the newest.
+        let running = axis_of(&tl, Some(37_750), 3_600_000);
+        assert_eq!((running.now_ms, running.span_ms), (Some(37_750), 27_750.0));
+        // Never longer than the history setting.
+        assert_eq!(axis_of(&tl, Some(37_750), 20_000).span_ms, 20_000.0);
+        assert_eq!(newest_gap(&tl.cpu_total), Some((39_000, 1000)));
     }
 }

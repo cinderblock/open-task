@@ -51,10 +51,11 @@ pub const DECAY_STEPS: [u8; 10] = [1, 2, 3, 5, 7, 10, 15, 20, 30, 50];
 /// The rate unless changed.
 pub const DECAY_DEFAULT: u8 = 5;
 
-/// How far back the charts can reach, in minutes: ten minutes to a day.
-pub const HISTORY_STEPS: [u32; 8] = [10, 30, 60, 120, 180, 360, 720, 1440];
-/// The reach unless changed: an hour.
-pub const HISTORY_DEFAULT: u32 = 60;
+/// How far back the charts can reach, in minutes: five minutes to a day.
+pub const HISTORY_STEPS: [u32; 9] = [5, 10, 30, 60, 120, 180, 360, 720, 1440];
+/// The reach unless changed: five minutes, of which the log time axis gives the
+/// last ten seconds about two fifths of the chart.
+pub const HISTORY_DEFAULT: u32 = 5;
 
 /// Everything the user can set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,10 @@ pub struct Settings {
     /// jumping. `None` until the user chooses: then it follows the platform's
     /// animation setting.
     pub animate_rows: Option<bool>,
+    /// The charts scroll smoothly with time, redrawn every frame, rather than
+    /// stepping once a sample. On unless turned off, whatever Windows' animation
+    /// effects are: it is what the charts are for, and costs little.
+    pub smooth_charts: bool,
     /// Look for a new release at start and once a day, and say so on the update
     /// button. On unless turned off.
     pub check_updates: bool,
@@ -108,6 +113,7 @@ impl Default for Settings {
         Self {
             usage_decay_percent: DECAY_DEFAULT,
             animate_rows: None,
+            smooth_charts: true,
             check_updates: true,
             download_updates: false,
             install_updates: false,
@@ -281,6 +287,7 @@ pub(crate) struct Context<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Toggle {
     AnimateRows,
+    SmoothCharts,
     ResourcePercent,
     AlwaysOnTop,
     HideWhenMinimized,
@@ -294,6 +301,7 @@ impl Toggle {
     fn title(self) -> &'static str {
         match self {
             Self::AnimateRows => "Animate rows as the order changes",
+            Self::SmoothCharts => "Scroll charts smoothly",
             Self::ResourcePercent => "Show resource values as percentages",
             Self::AlwaysOnTop => "Always on top",
             Self::HideWhenMinimized => "Hide when minimized",
@@ -315,6 +323,10 @@ impl Toggle {
             (Self::AnimateRows, _, _) => {
                 "Rows slide to their new place when the table re-sorts, instead of \
                  jumping there."
+            }
+            (Self::SmoothCharts, _, _) => {
+                "Charts glide with time between samples, redrawn every frame, instead \
+                 of stepping once a sample."
             }
             (Self::ResourcePercent, _, _) => {
                 "Memory and working set as a share of physical memory, disk reads and \
@@ -366,6 +378,7 @@ impl Toggle {
     fn get(self, s: Settings, cx: Context<'_>) -> bool {
         match self {
             Self::AnimateRows => s.animates_rows(cx.system_animations),
+            Self::SmoothCharts => s.smooth_charts,
             Self::ResourcePercent => s.resource_percent,
             Self::AlwaysOnTop => s.always_on_top,
             Self::HideWhenMinimized => s.hide_when_minimized,
@@ -383,6 +396,7 @@ impl Toggle {
         let on = !self.get(*s, cx);
         match self {
             Self::AnimateRows => s.animate_rows = Some(on),
+            Self::SmoothCharts => s.smooth_charts = on,
             Self::ResourcePercent => s.resource_percent = on,
             Self::AlwaysOnTop => s.always_on_top = on,
             Self::HideWhenMinimized => s.hide_when_minimized = on,
@@ -478,7 +492,10 @@ const SECTIONS: [(&str, &[Card]); 6] = [
             Card::Toggle(Toggle::ResourcePercent),
         ],
     ),
-    ("Charts", &[Card::History]),
+    (
+        "Charts",
+        &[Card::History, Card::Toggle(Toggle::SmoothCharts)],
+    ),
     (
         "Window",
         &[
@@ -499,7 +516,7 @@ const SECTIONS: [(&str, &[Card]); 6] = [
     ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
     ("Recording", &[Card::Record]),
 ];
-const CARD_COUNT: usize = 15;
+const CARD_COUNT: usize = 16;
 /// The fade card's place among the cards, the speed card's and the history card's.
 const DECAY_CARD: usize = 1;
 const SPEED_CARD: usize = 2;
@@ -1070,7 +1087,7 @@ mod tests {
     use ot_update::{Scope, Status, Version};
 
     /// Tall enough for every card at once; the scrolling test shortens it.
-    const PAGE: Rect = Rect::new(0.0, 0.0, 600.0, 1100.0);
+    const PAGE: Rect = Rect::new(0.0, 0.0, 600.0, 1200.0);
 
     fn texts(dl: &DisplayList) -> Vec<String> {
         dl.cmds()
@@ -1118,7 +1135,7 @@ mod tests {
     }
 
     /// The Task Manager card's place among the cards.
-    const TASK_MANAGER: usize = 12;
+    const TASK_MANAGER: usize = 13;
 
     fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
         Context {
@@ -1237,7 +1254,7 @@ mod tests {
         ] {
             assert!(strings.iter().any(|t| t == expected), "{expected}");
         }
-        let card = page.cards[8].center();
+        let card = page.cards[9].center();
         let r = click(&mut page, card, &mut s, cx(true, &update));
         assert_eq!(r.effect, Some(Effect::Update(UpdateAction::Check)));
         assert_eq!(s, Settings::default(), "no setting changed");
@@ -1263,18 +1280,18 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[9]), "On");
-        assert_eq!(state_of(&dl, page.cards[10]), "Off");
+        assert_eq!(state_of(&dl, page.cards[10]), "On");
+        assert_eq!(state_of(&dl, page.cards[11]), "Off");
         // A copy that cannot install says so, once, on the update card.
         let note = update.note().unwrap();
         assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
 
-        let at = page.cards[9].center();
+        let at = page.cards[10].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[10].center();
+        let at = page.cards[11].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
         assert!(s.check_updates, "downloading needs checking");
@@ -1286,27 +1303,27 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[11]), "Off");
+        assert_eq!(state_of(&dl, page.cards[12]), "Off");
         assert!(texts(&dl)
             .iter()
             .any(|t| t == "Install updates automatically"));
 
         // On: downloading and checking come with it.
         s.check_updates = false;
-        let at = page.cards[11].center();
+        let at = page.cards[12].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.install_updates && s.download_updates && s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         // Downloading off: installing goes too, checking stays.
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[10].center();
+        let at = page.cards[11].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.download_updates && !s.install_updates && s.check_updates);
         // Checking off takes everything with it.
         s.download_updates = true;
         s.install_updates = true;
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[9].center();
+        let at = page.cards[10].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
     }
@@ -1383,17 +1400,17 @@ mod tests {
         };
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
-        assert_eq!(s.history_minutes, 60);
-        assert_eq!(s.history_ms(), 3_600_000);
+        assert_eq!(s.history_minutes, 5);
+        assert_eq!(s.history_ms(), 300_000);
         let strings = texts(&paint(&mut page, s, cx));
         assert!(strings.iter().any(|t| t == "How far charts reach back"));
-        assert!(strings.iter().any(|t| t == "1 h"), "{strings:?}");
+        assert!(strings.iter().any(|t| t == "5 min"), "{strings:?}");
         let detail = strings
             .iter()
             .find(|t| t.contains("points a chart"))
             .expect("the cost");
-        assert!(detail.contains("963 points"), "{detail}");
-        assert!(detail.contains("MB"), "{detail}");
+        assert!(detail.contains("633 points"), "{detail}");
+        assert!(detail.contains("KB"), "{detail}");
 
         // The card itself does nothing; its buttons step the reach.
         let card = page.cards[HISTORY_CARD];
@@ -1407,7 +1424,7 @@ mod tests {
         let [_, _, _, _, minus, plus] = page.steppers;
         assert!(card.contains(minus.center()) && card.contains(plus.center()));
         let r = click(&mut page, plus.center(), &mut s, cx);
-        assert_eq!(s.history_minutes, 120);
+        assert_eq!(s.history_minutes, 10);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         for _ in 0..HISTORY_STEPS.len() {
             let _ = click(&mut page, plus.center(), &mut s, cx);
@@ -1419,18 +1436,38 @@ mod tests {
         for _ in 0..HISTORY_STEPS.len() {
             let _ = click(&mut page, minus.center(), &mut s, cx);
         }
-        assert_eq!(s.history_minutes, 10);
+        assert_eq!(s.history_minutes, 5);
         assert_eq!(click(&mut page, minus.center(), &mut s, cx), Reaction::NONE);
-        assert!(texts(&paint(&mut page, s, cx))
-            .iter()
-            .any(|t| t == "10 min"));
+        assert!(texts(&paint(&mut page, s, cx)).iter().any(|t| t == "5 min"));
 
         // A stored value that is not a step reads as the nearest one; a longer
         // reach costs more.
         assert_eq!(s.with_history_minutes(100).history_minutes, 120);
-        assert_eq!(s.with_history_minutes(0).history_minutes, 10);
+        assert_eq!(s.with_history_minutes(0).history_minutes, 5);
         assert_eq!(s.with_history_minutes(100_000).history_minutes, 1440);
         assert!(cx.history.bytes(24 * 3_600_000) > cx.history.bytes(3_600_000));
+    }
+
+    #[test]
+    fn charts_scroll_smoothly_unless_turned_off_whatever_windows_says() {
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        assert!(s.smooth_charts);
+        // Under the history card, on even with Windows' animation effects off.
+        let dl = paint(&mut page, s, cx(false, &update));
+        let card = page.cards[HISTORY_CARD + 1];
+        assert_eq!(state_of(&dl, card), "On");
+        assert!(texts(&dl).iter().any(|t| t == "Scroll charts smoothly"));
+        assert!(
+            (card.h - CARD_H).abs() < f32::EPSILON,
+            "no note about Windows"
+        );
+        let r = click(&mut page, card.center(), &mut s, cx(false, &update));
+        assert!(!s.smooth_charts);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let dl = paint(&mut page, s, cx(false, &update));
+        assert_eq!(state_of(&dl, page.cards[HISTORY_CARD + 1]), "Off");
     }
 
     #[test]

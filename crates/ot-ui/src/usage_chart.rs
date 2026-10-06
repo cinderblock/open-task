@@ -1,5 +1,5 @@
 //! History: the process table's area drawn as a chart of who has been using the
-//! CPU over the last hour, the fourth arrangement beside List, Tree and Map.
+//! CPU over the charts' reach, the fourth arrangement beside List, Tree and Map.
 //!
 //! The chart is a stack of bands, one per program (every process of one name
 //! together, see [`ot_core::Usage`]), on the time axis every other chart uses. It
@@ -25,7 +25,7 @@ use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 use crate::charts::{self, Crosshair, AXIS_BAND_H};
 use crate::format;
 use crate::process_rows::contains_ci;
-use crate::sparkline::{self, TimeAxis};
+use crate::sparkline::{self, TimeAxis, COLUMN_W};
 use crate::theme::Theme;
 
 /// Programs with a band of their own, and the bands in all: those and "everything
@@ -43,8 +43,6 @@ const LEGEND_ROW_H: f32 = 22.0;
 const SWATCH: f32 = 10.0;
 /// A legend row's share for its value.
 const LEGEND_VALUE_W: f32 = 76.0;
-/// Width of one plotted column, as in [`sparkline`].
-const COLUMN_W: f32 = 1.0;
 /// A program needs this share of the chart to be given a band, and half of it to
 /// keep one.
 const BAND_SHARE: f32 = 0.005;
@@ -88,7 +86,8 @@ pub(crate) enum ChartHit {
 /// One stretch of the history, its cycles sorted into bands.
 #[derive(Debug, Clone, Copy)]
 struct Row {
-    /// Age of the stretch's end, and its length in seconds.
+    /// When the stretch ended, its age on the axis, and its length in seconds.
+    end_ms: i64,
     age_ms: f32,
     secs: f32,
     v: [f32; BANDS],
@@ -212,7 +211,7 @@ impl UsageChart {
         self.weight.clear();
         self.weight.resize(usage.programs(), 0.0);
         for f in usage.frames() {
-            let age = (now - f.end_ms).max(0) as f32;
+            let age = self.time.age(now, f.end_ms);
             if age >= self.time.span_ms || f.span_ms <= 0 {
                 break;
             }
@@ -278,7 +277,7 @@ impl UsageChart {
             if f.span_ms <= 0 {
                 continue;
             }
-            let age_ms = (now - f.end_ms).max(0) as f32;
+            let age_ms = self.time.age(now, f.end_ms);
             let mut v = [0.0; BANDS];
             for &(g, cycles) in f.cycles {
                 let band = self
@@ -288,6 +287,7 @@ impl UsageChart {
                 v[band] += cycles;
             }
             self.history.push(Row {
+                end_ms: f.end_ms,
                 age_ms,
                 secs: f.span_ms as f32 / 1000.0,
                 v,
@@ -324,14 +324,17 @@ impl UsageChart {
         if self.plot.is_empty() {
             return;
         }
-        let mut column = i64::MIN;
+        // Grouped by bins anchored in time, as the line charts are, so a stretch
+        // keeps its column's company as the chart scrolls; the newest stretch
+        // slides in past the right edge and the oldest out past the left, clipped.
+        let mut bin = (0, i64::MIN);
         let mut secs = 0.0;
         for r in &self.history {
-            let x = self.time.x(self.plot, r.age_ms);
-            let c = ((self.plot.right() - x) / COLUMN_W).floor() as i64;
+            let x = self.time.x_unclamped(self.plot, r.age_ms);
+            let key = self.time.bin(self.plot.w, r.age_ms, r.end_ms);
             match self.points.last_mut() {
                 // Several stretches in one column: their average over time.
-                Some(p) if c == column => {
+                Some(p) if key == bin => {
                     let n = secs + r.secs;
                     for (a, b) in p.v.iter_mut().zip(r.v) {
                         *a = (*a * secs + b * r.secs) / n;
@@ -339,7 +342,7 @@ impl UsageChart {
                     secs = n;
                 }
                 _ => {
-                    column = c;
+                    bin = key;
                     secs = r.secs;
                     self.points.push(Pt {
                         x,
@@ -392,12 +395,16 @@ impl UsageChart {
         self.pointed_age()
     }
 
+    /// The column nearest `x` of those inside the plot.
     fn nearest(&self, x: f32) -> Option<usize> {
-        (0..self.points.len()).min_by(|&a, &b| {
-            (self.points[a].x - x)
-                .abs()
-                .total_cmp(&(self.points[b].x - x).abs())
-        })
+        let inside = self.plot.x..=self.plot.right();
+        (0..self.points.len())
+            .filter(|&i| inside.contains(&self.points[i].x))
+            .min_by(|&a, &b| {
+                (self.points[a].x - x)
+                    .abs()
+                    .total_cmp(&(self.points[b].x - x).abs())
+            })
     }
 
     /// The column at an age, if the history reaches back that far.

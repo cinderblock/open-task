@@ -2,10 +2,10 @@
 //! follows.
 //!
 //! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each
-//! (`AnimateRows`, `CheckForUpdates`, `DownloadUpdates`, `InstallUpdates`, and the
-//! numbers `UsageDecayPercent` and `HistoryMinutes`) plus `Layout`, a `REG_SZ` with the page,
-//! arrangement, sort and columns the last session ended on, per user like every
-//! other per-user preference on Windows. A missing key or value means the
+//! (`AnimateRows`, `SmoothCharts`, `CheckForUpdates`, `DownloadUpdates`,
+//! `InstallUpdates`, and the numbers `UsageDecayPercent` and `HistoryMinutes`) plus
+//! `Layout`, a `REG_SZ` with the page, arrangement, sort and columns the last
+//! session ended on, per user like every other per-user preference on Windows. A missing key or value means the
 //! default. Nothing here is fatal: a value that cannot be read or written is
 //! logged and the app carries on with what it has.
 
@@ -23,6 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const KEY: PCWSTR = w!(r"Software\open-task");
 const ANIMATE_ROWS: PCWSTR = w!("AnimateRows");
+const SMOOTH_CHARTS: PCWSTR = w!("SmoothCharts");
 const CHECK_UPDATES: PCWSTR = w!("CheckForUpdates");
 const DOWNLOAD_UPDATES: PCWSTR = w!("DownloadUpdates");
 const INSTALL_UPDATES: PCWSTR = w!("InstallUpdates");
@@ -41,6 +42,7 @@ pub fn load() -> Settings {
     let flag = |name, default| read_dword(name).map_or(default, |v| v != 0);
     let settings = Settings {
         animate_rows: read_dword(ANIMATE_ROWS).map(|v| v != 0),
+        smooth_charts: flag(SMOOTH_CHARTS, defaults.smooth_charts),
         check_updates: flag(CHECK_UPDATES, defaults.check_updates),
         download_updates: flag(DOWNLOAD_UPDATES, defaults.download_updates),
         install_updates: flag(INSTALL_UPDATES, defaults.install_updates),
@@ -69,6 +71,7 @@ pub fn load() -> Settings {
 pub fn save(s: &Settings) {
     let values = [
         (ANIMATE_ROWS, s.animate_rows.map(u32::from)),
+        (SMOOTH_CHARTS, Some(u32::from(s.smooth_charts))),
         (CHECK_UPDATES, Some(u32::from(s.check_updates))),
         (DOWNLOAD_UPDATES, Some(u32::from(s.download_updates))),
         (INSTALL_UPDATES, Some(u32::from(s.install_updates))),

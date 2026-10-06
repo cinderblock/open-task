@@ -186,6 +186,10 @@ impl Drop for Sampler {
 
 type Notify = Box<dyn Fn() + Send>;
 
+/// How long after the first pass the second runs: long enough for the rates it
+/// measures to mean something, short enough that the charts start at once.
+const FIRST_RATES_AFTER: Duration = Duration::from_millis(250);
+
 fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn() + Send)>) {
     let mut out = ProbeOutput::default();
     let capabilities = probe.capabilities();
@@ -266,8 +270,16 @@ fn run(mut probe: Box<dyn SystemProbe>, shared: &Shared, notify: Option<&(dyn Fn
         }
 
         // Sleep for the remainder of the interval, re-reading it so `set_interval`
-        // applies promptly. Sleep in short slices so `stop` is responsive.
+        // applies promptly. Sleep in short slices so `stop` is responsive. The
+        // first pass only sets the baseline the rates are measured from, so the
+        // second, the first with rates, follows it shortly rather than a whole
+        // interval later.
         let target = Duration::from_micros(shared.interval_us.load(Ordering::Relaxed));
+        let target = if tick == Tick::default().next() {
+            target.min(FIRST_RATES_AFTER)
+        } else {
+            target
+        };
         let deadline = start + target;
         while !shared.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
