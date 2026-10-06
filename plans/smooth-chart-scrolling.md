@@ -1,6 +1,6 @@
 # Charts scroll smoothly; five minutes by default; on screen at once
 
-> **Status:** done; checked in the running app, committed on `master` (2026-10-06), not pushed · **Started:** 2026-10-06 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done; released as v0.11.0 (2026-10-06) · **Started:** 2026-10-06 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Follows `plans/chart-span-and-history-length.md` and `plans/charts-log-time-and-live-table.md`.
 
 ## Goal
@@ -114,7 +114,10 @@ The user's requests on 2026-10-06:
   15–19 %.
 - [x] 2026-10-06: fast start (user's follow-up): first sample on screen at 0.6 s
   in the screenshot (`target/start-600ms.png`).
-- [x] 2026-10-06: committed.
+- [x] 2026-10-06: committed (`98f7408`, `af5a21c`).
+- [x] 2026-10-06: released as v0.11.0 (`525b066`, tag pushed). The release
+  workflow published nine assets (installer, Windows x64/ARM zips, macOS and
+  Linux archives, signed `SHA256SUMS`); CI on `master` passed.
 
 ## Open questions for the user
 
