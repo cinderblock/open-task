@@ -21,11 +21,13 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
-    ID2D1PathGeometry1, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
+    ID2D1PathGeometry1, ID2D1SolidColorBrush, ID2D1StrokeStyle1, D2D1_ANTIALIAS_MODE_ALIASED,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR,
-    D2D1_MAP_OPTIONS_READ, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_FLAT,
+    D2D1_DASH_STYLE_SOLID, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_BEVEL,
+    D2D1_MAP_OPTIONS_READ, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1,
+    D2D1_STROKE_TRANSFORM_TYPE_NORMAL, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -122,6 +124,11 @@ pub struct Gfx {
 
     dwrite: IDWriteFactory,
     brush: ID2D1SolidColorBrush,
+    /// For polylines: bevelled joins. Direct2D's default, mitred, reaches up to five
+    /// widths past a sharp corner, outside the area the damage diff gives a line
+    /// ([`DisplayList::bounds`]), so a spike left pixels behind; a bevel stays
+    /// within half the width of the points.
+    line_style: ID2D1StrokeStyle1,
     tabular: IDWriteTypography,
     ui_family: HSTRING,
     mono_family: HSTRING,
@@ -194,7 +201,7 @@ impl Gfx {
         };
 
         // SAFETY: factory options are optional; device objects are valid.
-        let (d2d_factory, d2d_device, dc, brush) = unsafe {
+        let (d2d_factory, d2d_device, dc, brush, line_style) = unsafe {
             let d2d_factory: ID2D1Factory1 =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let d2d_device = d2d_factory.CreateDevice(&dxgi_device)?;
@@ -210,7 +217,18 @@ impl Gfx {
                 a: 1.0,
             };
             let brush = dc.CreateSolidColorBrush(&raw const white, None)?;
-            (d2d_factory, d2d_device, dc, brush)
+            let line = D2D1_STROKE_STYLE_PROPERTIES1 {
+                startCap: D2D1_CAP_STYLE_FLAT,
+                endCap: D2D1_CAP_STYLE_FLAT,
+                dashCap: D2D1_CAP_STYLE_FLAT,
+                lineJoin: D2D1_LINE_JOIN_BEVEL,
+                miterLimit: 1.0,
+                dashStyle: D2D1_DASH_STYLE_SOLID,
+                dashOffset: 0.0,
+                transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+            };
+            let line_style = d2d_factory.CreateStrokeStyle(&raw const line, None)?;
+            (d2d_factory, d2d_device, dc, brush, line_style)
         };
 
         // SAFETY: the DirectWrite factory is process-wide shared; typography and
@@ -266,6 +284,7 @@ impl Gfx {
             _visual: visual,
             dwrite,
             brush,
+            line_style,
             tabular,
             ui_family,
             mono_family,
@@ -617,6 +636,9 @@ impl Gfx {
             return;
         };
         check.frames += 1;
+        if check.frames.is_multiple_of(1000) {
+            tracing::info!(bad = check.bad, of = check.frames, "damage check");
+        }
         if count == 0 {
             return;
         }
@@ -776,7 +798,8 @@ impl Gfx {
                 } => {
                     let geom = self.path(dl.points(points), false)?;
                     self.set_color(c);
-                    self.dc.DrawGeometry(&geom, &self.brush, width, None);
+                    self.dc
+                        .DrawGeometry(&geom, &self.brush, width, &self.line_style);
                 }
                 DrawCmd::FillPolygon { points, color: c } => {
                     let geom = self.path(dl.points(points), true)?;
