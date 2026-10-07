@@ -576,6 +576,14 @@ The build names itself from git: a clean checkout of a release tag is that relea
 (`0.2.1-21-g25c2e9c`), with `-dirty` for uncommitted changes. On Windows the exe
 carries it as its version resource too (Properties > Details).
 
+Two environment variables help with drawing faults on Windows. With
+`OT_CHECK_DAMAGE=1` (or a directory path) every frame drawn in part over the last one
+is also drawn whole and the two compared; frames that differ are logged and the first
+twenty dumped as BMPs, with the commands under the difference, in
+`%TEMP%\open-task-damage-check` (or the path given). It costs a full frame and two
+read-backs per frame, so it is for diagnosis only. `OT_WARP=1` draws with Direct3D's
+software rasterizer instead of the GPU, to tell a driver's faults from the app's.
+
 ## Releases
 
 CI builds every push. Pushing a tag `vX.Y.Z` builds Windows (x64, ARM64), Linux (x64,

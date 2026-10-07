@@ -22,10 +22,10 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
     ID2D1PathGeometry1, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
-    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
+    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_MAP_OPTIONS_READ, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -112,6 +112,9 @@ pub struct Gfx {
     damage: Vec<Rect>,
     /// Draw the next frame whole: the canvas is new, or holds something stale.
     redraw_all: bool,
+    /// With `OT_CHECK_DAMAGE` set, every partial frame is also drawn whole and the
+    /// two compared ([`Gfx::check_damage`]).
+    check: Option<DamageCheck>,
     // Composition objects must stay alive for the visual tree to keep existing.
     _dcomp: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -257,6 +260,7 @@ impl Gfx {
             last: DisplayList::new(),
             damage: Vec::new(),
             redraw_all: true,
+            check: DamageCheck::from_env(),
             _dcomp: dcomp,
             _dcomp_target: dcomp_target,
             _visual: visual,
@@ -401,6 +405,10 @@ impl Gfx {
             self.dc.SetTarget(&canvas);
             self.canvas = Some(canvas);
         }
+        if let Some(c) = self.check.as_mut() {
+            // Made again at the new size and DPI.
+            c.size = (0, 0);
+        }
         self.redraw_all = true;
         Ok(())
     }
@@ -432,6 +440,12 @@ impl Gfx {
                 self.draw_all(dl)
             }
         };
+        if partial && drawn.is_ok() && self.check.is_some() {
+            // SAFETY: as above; the canvas's drawing has been flushed by EndDraw.
+            if let Err(e) = unsafe { self.check_damage(dl, &damage) } {
+                tracing::warn!(error = %e, "damage check failed");
+            }
+        }
         self.damage = damage;
         drawn?;
         // SAFETY: the canvas and the target are the same size and format; the
@@ -499,6 +513,177 @@ impl Gfx {
             }
             self.dc.EndDraw(None, None)
         }
+    }
+
+    /// Draw `dl` whole into a second bitmap and compare it with the canvas, just
+    /// drawn in part over the last frame: where they differ, the partial drawing is
+    /// wrong. Each such frame is logged and the first few dumped as BMPs (canvas,
+    /// whole, difference) beside a text file of the damage and the commands under
+    /// the difference, in [`DamageCheck::dir`].
+    unsafe fn check_damage(&mut self, dl: &DisplayList, damage: &[Rect]) -> Result<()> {
+        let (width, height) = (self.size_px.0.max(1), self.size_px.1.max(1));
+        // SAFETY: as for `render`; the mapped rows are `pitch` apart and at least
+        // `width * 4` bytes long, for `height` rows.
+        unsafe {
+            if self
+                .check
+                .as_ref()
+                .is_some_and(|c| c.size != (width, height))
+            {
+                let props = |options| D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: self.dpi,
+                    dpiY: self.dpi,
+                    bitmapOptions: options,
+                    colorContext: ManuallyDrop::new(None),
+                };
+                let size = D2D_SIZE_U { width, height };
+                let target = props(D2D1_BITMAP_OPTIONS_TARGET);
+                let full = self.dc.CreateBitmap(size, None, 0, &raw const target)?;
+                let read = props(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW);
+                let read_a = self.dc.CreateBitmap(size, None, 0, &raw const read)?;
+                let read_b = self.dc.CreateBitmap(size, None, 0, &raw const read)?;
+                if let Some(c) = self.check.as_mut() {
+                    c.size = (width, height);
+                    c.bitmaps = Some((full, read_a, read_b));
+                }
+            }
+            let (Some((full, read_a, read_b)), Some(canvas)) = (
+                self.check.as_ref().and_then(|c| c.bitmaps.clone()),
+                self.canvas.clone(),
+            ) else {
+                return Ok(());
+            };
+            self.dc.SetTarget(&full);
+            let whole = self.draw_all(dl);
+            self.dc.SetTarget(&canvas);
+            whole?;
+            read_a.CopyFromBitmap(None, &canvas, None)?;
+            read_b.CopyFromBitmap(None, &full, None)?;
+            let row = (width * 4) as usize;
+            let mut drawn = vec![0u8; row * height as usize];
+            let mut whole_px = vec![0u8; row * height as usize];
+            for (bitmap, out) in [(&read_a, &mut drawn), (&read_b, &mut whole_px)] {
+                let mapped = bitmap.Map(D2D1_MAP_OPTIONS_READ)?;
+                for y in 0..height as usize {
+                    let src = mapped.bits.add(y * mapped.pitch as usize);
+                    std::ptr::copy_nonoverlapping(src, out[y * row..].as_mut_ptr(), row);
+                }
+                bitmap.Unmap()?;
+            }
+            self.report_damage_check(dl, damage, (width, height), &drawn, &whole_px);
+        }
+        Ok(())
+    }
+
+    /// Compare the canvas `drawn` with the whole frame `whole` (`size` pixels, BGRA) and
+    /// report where they differ.
+    fn report_damage_check(
+        &mut self,
+        dl: &DisplayList,
+        damage: &[Rect],
+        size: (u32, u32),
+        drawn: &[u8],
+        whole: &[u8],
+    ) {
+        use std::fmt::Write as _;
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let (mut count, mut worst) = (0usize, 0u8);
+        let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0, 0);
+        for y in 0..height {
+            for x in 0..width {
+                let at = (y * width + x) * 4;
+                let diff = drawn[at..at + 4]
+                    .iter()
+                    .zip(&whole[at..at + 4])
+                    .map(|(p, q)| p.abs_diff(*q))
+                    .max()
+                    .unwrap_or(0);
+                if diff > 0 {
+                    count += 1;
+                    worst = worst.max(diff);
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x);
+                    bottom = bottom.max(y);
+                }
+            }
+        }
+        let frame = self.frame;
+        let Some(check) = self.check.as_mut() else {
+            return;
+        };
+        check.frames += 1;
+        if count == 0 {
+            return;
+        }
+        check.bad += 1;
+        let dip = 96.0 / self.dpi;
+        let bbox = Rect::new(
+            left as f32 * dip,
+            top as f32 * dip,
+            (right + 1 - left) as f32 * dip,
+            (bottom + 1 - top) as f32 * dip,
+        );
+        tracing::warn!(
+            frame,
+            pixels = count,
+            worst,
+            ?bbox,
+            ?damage,
+            bad = check.bad,
+            of = check.frames,
+            "partial frame differs from the whole frame"
+        );
+        if check.dumped >= DamageCheck::MAX_DUMPS {
+            return;
+        }
+        check.dumped += 1;
+        let _ = std::fs::create_dir_all(&check.dir);
+        let stem = check.dir.join(format!("frame-{frame:06}"));
+        let marked: Vec<u8> = drawn
+            .chunks_exact(4)
+            .zip(whole.chunks_exact(4))
+            .flat_map(|(p, q)| {
+                if p == q {
+                    [q[0] / 3, q[1] / 3, q[2] / 3, 255]
+                } else {
+                    [255, 0, 255, 255]
+                }
+            })
+            .collect();
+        for (name, px) in [("canvas", drawn), ("whole", whole), ("diff", &marked[..])] {
+            let _ = write_bmp(&stem.with_extension(format!("{name}.bmp")), size, px);
+        }
+        let mut txt = String::new();
+        let _ = writeln!(txt, "frame {frame}");
+        let _ = writeln!(txt, "pixels differing: {count}, worst channel {worst}");
+        let _ = writeln!(txt, "difference bbox (DIPs): {bbox:?}");
+        let _ = writeln!(txt, "damage (DIPs): {damage:?}");
+        let _ = writeln!(txt, "\ncommands touching the difference:");
+        let prev = self.last.cmds();
+        for (i, cmd) in dl.cmds().iter().enumerate() {
+            let hit = |list: &DisplayList, c: &DrawCmd| {
+                list.bounds(c)
+                    .is_none_or(|r| !r.intersect(&bbox).is_empty())
+            };
+            if !hit(dl, cmd) && !prev.get(i).is_some_and(|p| hit(&self.last, p)) {
+                continue;
+            }
+            let now = describe(dl, cmd);
+            match prev.get(i).map(|p| describe(&self.last, p)) {
+                Some(then) if then != now => {
+                    let _ = writeln!(txt, "{i}: {now}\n    was {then}");
+                }
+                _ => {
+                    let _ = writeln!(txt, "{i}: {now}");
+                }
+            }
+        }
+        let _ = std::fs::write(stem.with_extension("txt"), txt);
     }
 
     /// `r` grown out to the nearest device pixels, in DIPs.
@@ -852,7 +1037,12 @@ impl Gfx {
 
 fn create_d3d_device() -> Result<ID3D11Device> {
     let mut last = None;
+    // `OT_WARP` set: software only, to tell a GPU driver's faults from ours.
+    let warp_only = std::env::var_os("OT_WARP").is_some();
     for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+        if warp_only && driver == D3D_DRIVER_TYPE_HARDWARE {
+            continue;
+        }
         let mut device: Option<ID3D11Device> = None;
         // SAFETY: out-pointer is a valid local; other pointers are optional and absent.
         let r = unsafe {
@@ -939,4 +1129,87 @@ fn rectf(r: Rect) -> D2D_RECT_F {
 
 fn v2(p: Point) -> Vector2 {
     Vector2 { X: p.x, Y: p.y }
+}
+
+/// The `OT_CHECK_DAMAGE` diagnostic ([`Gfx::check_damage`]).
+struct DamageCheck {
+    /// Where dumps go: the variable's value when it is a path, else
+    /// `%TEMP%\open-task-damage-check`.
+    dir: std::path::PathBuf,
+    /// The window size the bitmaps were made for.
+    size: (u32, u32),
+    /// The whole frame, and two bitmaps the CPU reads the canvas and it through.
+    bitmaps: Option<(ID2D1Bitmap1, ID2D1Bitmap1, ID2D1Bitmap1)>,
+    frames: u64,
+    bad: u64,
+    dumped: u32,
+}
+
+impl DamageCheck {
+    const MAX_DUMPS: u32 = 20;
+
+    fn from_env() -> Option<Self> {
+        let v = std::env::var_os("OT_CHECK_DAMAGE")?;
+        let dir = if v.is_empty() || v == "1" {
+            std::env::temp_dir().join("open-task-damage-check")
+        } else {
+            std::path::PathBuf::from(v)
+        };
+        tracing::info!(dir = %dir.display(), "checking every partial frame against a whole one");
+        Some(Self {
+            dir,
+            size: (0, 0),
+            bitmaps: None,
+            frames: 0,
+            bad: 0,
+            dumped: 0,
+        })
+    }
+}
+
+/// One command, with what it indexes resolved, for the damage check's report.
+fn describe(dl: &DisplayList, cmd: &DrawCmd) -> String {
+    let bounds = dl.bounds(cmd);
+    match *cmd {
+        DrawCmd::Text(t) => format!(
+            "Text {:?} at {:?}, color {:?}",
+            dl.str(t.text),
+            t.rect,
+            t.color
+        ),
+        DrawCmd::Polyline {
+            points,
+            color,
+            width,
+        } => format!(
+            "Polyline of {} points, width {width}, color {color:?}, bounds {bounds:?}",
+            dl.points(points).len()
+        ),
+        DrawCmd::FillPolygon { points, color } => format!(
+            "FillPolygon of {} points, color {color:?}, bounds {bounds:?}",
+            dl.points(points).len()
+        ),
+        DrawCmd::Image { path, rect } => format!("Image {:?} at {rect:?}", dl.str(path)),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Write `px` (`size` pixels, BGRA, top row first) as a 32-bit BMP.
+fn write_bmp(path: &std::path::Path, size: (u32, u32), px: &[u8]) -> std::io::Result<()> {
+    let (w, h) = size;
+    let data = w * h * 4;
+    let mut out = Vec::with_capacity(54 + data as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54 + data).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.cast_signed().to_le_bytes());
+    // Negative: the top row comes first.
+    out.extend_from_slice(&(-h.cast_signed()).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&[0u8; 24]);
+    out.extend_from_slice(px);
+    std::fs::write(path, out)
 }
