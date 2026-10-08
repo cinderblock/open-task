@@ -69,8 +69,9 @@ drawing off that path with two new renderers, compare them, and let the user pic
 8. ~~CPU rasterizer sped up (`683221a`).~~
 9. ~~Report the comparison to the user.~~ Released in v0.12.0.
 10. ~~The user asked for the CPU path faster still (2026-10-08).~~ Lines
-    vectorized (`e875b24`). Still possible: hand SIMD for the bands' edge
-    pixels; threads would cut wall time only, not CPU.
+    vectorized (`e875b24`).
+11. ~~Hand SIMD (user, 2026-10-08: "do the vector code").~~ Bands in SIMD with
+    `wide` (`12f3ee7`). Threads would cut wall time only, not CPU.
 
 ## Findings / gotchas
 
@@ -118,6 +119,18 @@ drawing off that path with two new renderers, compare them, and let the user pic
 - What did help: each line segment's squared distance for a column's whole run
   of rows in one vectorizable loop (`e875b24`): lines 0.74-1.0 -> 0.67-0.73 ms in
   the History-sized timing (670 x 290), A/B interleaved on the same load.
+- **SIMD (`12f3ee7`, `wide` 0.7: safe, SSE/AVX/NEON).** A column's four
+  samples as one `f32x4` (interpolation and edge coverage), and the per-row
+  "which columns cover this row" scan eight columns a comparison (`i32x8`) into
+  bits, runs by bit counts. Bands 0.85-0.94 -> 0.72-0.80 ms (History-sized
+  timing, interleaved A/B); full-size History through the CPU path 2.0-2.2 ->
+  1.7-1.9 ms of chart preparation (`chart_frame_timing`). Also fixed: the old
+  scan started at row 0 whenever a column had no sample inside.
+  Explicit `f32x8` for the line distances: no faster than the loop the
+  compiler already vectorizes (0.65-0.70 vs 0.62-0.67 ms); not kept.
+- **Gotcha:** the first `next_run` looped forever when a run ended exactly on a
+  64-bit word boundary followed by a clear bit (a zero count left the position
+  on the boundary); the randomized test caught it. Run tests with `timeout`.
 - Live measurements were not possible on 2026-10-08 morning: with the displays
   asleep `Present` does not return frames (an app run showed 1.1 % CPU and no
   frames). The renderer and raster timing tests need no display.
@@ -136,6 +149,7 @@ drawing off that path with two new renderers, compare them, and let the user pic
 - [x] 2026-10-08: reported; released in v0.12.0
 - [x] 2026-10-08: CPU path, round 3: lines vectorized (`e875b24`); dead ends
   recorded; stats draw time fixed (`e50c440`)
+- [x] 2026-10-08: SIMD bands (`12f3ee7`)
 
 ## Open questions for the user
 

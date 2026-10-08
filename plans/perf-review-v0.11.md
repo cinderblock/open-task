@@ -163,7 +163,7 @@ Ranked by its estimated impact:
 
 ## Open questions for the user
 
-1. Release `e50c440` and `e875b24` as v0.12.1? (Pushed to `master`, not
-   tagged.) Recommendation: yes, once the CI run on `master` passes.
+1. Release `e50c440`, `e875b24` and `12f3ee7` (SIMD bands) as v0.12.1? (On
+   `master`, not tagged.) Recommendation: yes, once CI on `master` passes.
 2. ~~Earlier questions~~ answered 2026-10-08 (bricks: leave; CPU path: faster;
    bounds cache: do it; v0.12.0: released).
