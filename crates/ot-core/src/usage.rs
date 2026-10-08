@@ -162,6 +162,16 @@ pub struct Usage {
     interval: Vec<(ProgramId, f32)>,
     /// How far back the history reaches, in milliseconds.
     history_ms: i64,
+    /// Changes whenever anything here does, and no two `Usage`s share one
+    /// ([`Usage::revision`]).
+    revision: u64,
+}
+
+/// A number no `Usage` has had: a view can keep what it worked out from one
+/// until its revision changes.
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// One step of a fading total: the share of it left after `secs`, and the share
@@ -197,13 +207,22 @@ impl Usage {
             open: None,
             interval: Vec::new(),
             history_ms: DEFAULT_HISTORY_MS,
+            revision: next_revision(),
         }
+    }
+
+    /// Changes whenever the totals, the history, the fade rate or the reach do,
+    /// and differs between any two `Usage`s that are not copies of each other.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Change how fast the totals fade. What has accumulated stays, and fades at the
     /// new rate from here on.
     pub fn set_decay(&mut self, decay: f64) {
         self.decay = clamp_decay(decay);
+        self.revision = next_revision();
     }
 
     /// Keep history reaching back `ms` milliseconds (at least ten seconds). What is
@@ -211,6 +230,7 @@ impl Usage {
     /// new ones take the width the new reach calls for ([`step_ms`]).
     pub fn set_history_span(&mut self, ms: i64) {
         self.history_ms = ms.max(STEP_MIN_MS);
+        self.revision = next_revision();
     }
 
     /// How far back the history reaches, in milliseconds.
@@ -267,6 +287,7 @@ impl Usage {
             return;
         }
         self.last_tick = Some(snap.tick);
+        self.revision = next_revision();
         let now = snap
             .taken_at
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -576,6 +597,25 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
+    }
+
+    #[test]
+    fn the_revision_changes_with_every_change_and_is_never_shared() {
+        let mut u = Usage::new(0.05);
+        let other = Usage::new(0.05);
+        assert_ne!(u.revision(), other.revision(), "two of them, even both empty");
+        let r = u.revision();
+        u.observe(&snap(1000, vec![proc(1, Some(0), 5 * G)]));
+        assert_ne!(u.revision(), r, "a snapshot");
+        let r = u.revision();
+        u.observe(&snap(1000, vec![proc(1, Some(0), 6 * G)]));
+        assert_eq!(u.revision(), r, "a repeat of the last tick is ignored");
+        u.set_decay(0.1);
+        assert_ne!(u.revision(), r, "the fade rate");
+        let r = u.revision();
+        u.set_history_span(60_000);
+        assert_ne!(u.revision(), r, "the reach");
+        assert_eq!(u.clone().revision(), u.revision(), "a copy is the same");
     }
 
     #[test]

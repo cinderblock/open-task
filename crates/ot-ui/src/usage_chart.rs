@@ -86,9 +86,8 @@ pub(crate) enum ChartHit {
 /// One stretch of the history, its cycles sorted into bands.
 #[derive(Debug, Clone, Copy)]
 struct Row {
-    /// When the stretch ended, its age on the axis, and its length in seconds.
+    /// When the stretch ended, and its length in seconds.
     end_ms: i64,
-    age_ms: f32,
     secs: f32,
     v: [f32; BANDS],
 }
@@ -137,6 +136,12 @@ pub(crate) struct UsageChart {
     order: Vec<ProgramId>,
     band_of: Vec<u8>,
     history: Vec<Row>,
+    /// What the bands and `history` were worked out from: the usage's revision,
+    /// the mode and the plot's width. They change with a sample, not with a
+    /// frame; the columns are placed again every frame, as the time axis moves.
+    rows_key: Option<(u64, ChartMode, u32)>,
+    /// The usage's newest moment at the last build.
+    now_ms: i64,
     poly: Vec<Point>,
     cum: Vec<f32>,
     ago: String,
@@ -198,8 +203,14 @@ impl UsageChart {
         self.plot = plot.split_left(GUTTER_W.min(plot.w)).1;
         self.axis = axis.split_left(GUTTER_W.min(axis.w)).1;
 
-        self.assign_bands(usage);
-        self.place(usage);
+        self.now_ms = usage.now_ms();
+        let key = (usage.revision(), self.mode, self.plot.w.to_bits());
+        if self.rows_key != Some(key) {
+            self.assign_bands(usage);
+            self.fill_rows(usage);
+            self.rows_key = Some(key);
+        }
+        self.place();
         self.rescale();
 
         // The moment to mark: under the pointer, or what another chart marks.
@@ -280,16 +291,14 @@ impl UsageChart {
         }
     }
 
-    /// Sort the history into bands, turn it into the mode's values, and place it
-    /// in columns across the plot.
-    fn place(&mut self, usage: &Usage) {
-        let now = usage.now_ms();
+    /// Sort the history into bands and turn it into the mode's values: once a
+    /// sample, since neither depends on where the time axis is.
+    fn fill_rows(&mut self, usage: &Usage) {
         self.history.clear();
         for f in usage.frames() {
             if f.span_ms <= 0 {
                 continue;
             }
-            let age_ms = self.time.age(now, f.end_ms);
             let mut v = [0.0; BANDS];
             for &(g, cycles) in f.cycles {
                 let band = self
@@ -300,14 +309,9 @@ impl UsageChart {
             }
             self.history.push(Row {
                 end_ms: f.end_ms,
-                age_ms,
                 secs: f.span_ms as f32 / 1000.0,
                 v,
             });
-            // The first stretch past the span carries the bands to the left edge.
-            if age_ms >= self.time.span_ms {
-                break;
-            }
         }
         match self.mode {
             ChartMode::Rate => {
@@ -331,7 +335,10 @@ impl UsageChart {
                 }
             }
         }
+    }
 
+    /// Place the rows in columns across the plot, on this frame's time axis.
+    fn place(&mut self) {
         self.points.clear();
         if self.plot.is_empty() {
             return;
@@ -342,8 +349,9 @@ impl UsageChart {
         let mut bin = (0, i64::MIN);
         let mut secs = 0.0;
         for r in &self.history {
-            let x = self.time.x_unclamped(self.plot, r.age_ms);
-            let key = self.time.bin(self.plot.w, r.age_ms, r.end_ms);
+            let age_ms = self.time.age(self.now_ms, r.end_ms);
+            let x = self.time.x_unclamped(self.plot, age_ms);
+            let key = self.time.bin(self.plot.w, age_ms, r.end_ms);
             match self.points.last_mut() {
                 // Several stretches in one column: their average over time.
                 Some(p) if key == bin => {
@@ -356,12 +364,12 @@ impl UsageChart {
                 _ => {
                     bin = key;
                     secs = r.secs;
-                    self.points.push(Pt {
-                        x,
-                        age_ms: r.age_ms,
-                        v: r.v,
-                    });
+                    self.points.push(Pt { x, age_ms, v: r.v });
                 }
+            }
+            // The first stretch past the span carries the bands to the left edge.
+            if age_ms >= self.time.span_ms {
+                break;
             }
         }
     }
