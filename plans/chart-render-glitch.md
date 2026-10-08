@@ -28,10 +28,9 @@ first (they asked what it is from), then fix it.
    pixels that differ. `OT_WARP=1` forces the software rasterizer.~~
 2. ~~Run it, hover the charts, read the dumps.~~ Cause: the Intel GPU driver (see
    Findings).
-3. **[current]** The user is updating the Intel driver in another thread
-   (2026-10-07). After it lands: run with `OT_CHECK_DAMAGE=1` and
-   `target/tmp/check-run.ps1` and confirm no 8 x 4 blocks remain. No software
-   (WARP) fallback: the user does not want a slow path.
+3. ~~The user updated the Intel driver (2026-10-07) to 31.0.101.2145.~~
+4. **[current]** Report: the blocks are rarer but not gone. No software (WARP)
+   fallback: the user does not want a slow path.
 
 ## Findings / gotchas
 
@@ -63,6 +62,12 @@ first (they asked what it is from), then fix it.
 - A GDI-compatible canvas (`D2D1_BITMAP_OPTIONS_GDI_COMPATIBLE`) showed no 8 x 4
   blocks in one run (3670 frames with small differences instead, mostly the miter
   issue above). Not pursued: the user chose the driver update.
+- **After the driver update (31.0.101.2145)**, `OT_CHECK_DAMAGE`, GPU chart
+  drawing, 60 s each: History view 0 differing frames; list view 2 (both 8 x 4
+  blocks, at y 124 and 708, in Direct2D-drawn content). On the old driver with
+  Direct2D drawing the History chart, 30 in 30 s (29 of them 8 x 4 blocks inside
+  the chart). So: much rarer, not gone; the GPU chart renderer (now the default)
+  also keeps them out of the charts.
 - Hovering sets `full_due` (every `App::handle` does), so hover frames are full
   paints diffed by the renderer, not spliced frames.
 
@@ -71,12 +76,14 @@ first (they asked what it is from), then fix it.
 - [x] 2026-10-07: diagnostic built (`OT_CHECK_DAMAGE`, `OT_WARP`), README notes
 - [x] 2026-10-07: glitch caught; Intel driver tile corruption, WARP clean
 - [x] 2026-10-07: miter-join leftovers fixed with bevel joins (`4257222`)
-- [ ] Driver updated (user, other thread); re-run the check to confirm
+- [x] 2026-10-07: driver updated by the user; re-checked: rarer, not gone
 
 ## Open questions for the user
 
-None. (Answered 2026-10-07: the user is updating the driver; no software
-fallback.)
+1. The driver update made the blocks rare (2 in about 2000 list-view frames, none
+   in the History with GPU charts) but did not remove them. Leave it there, or
+   look further (a newer Intel driver, a report to Intel)? Recommendation: leave
+   it; it is a driver fault and now rare.
 
 ## Things not to do
 

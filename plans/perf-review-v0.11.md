@@ -55,7 +55,7 @@ Ranked by its estimated impact:
 
 1. ~~Baseline: CPU per state and a sampled CPU profile.~~ Diagnostics added:
    `OT_FRAME_STATS`, `[profile.profiling]`.
-2. **[current]** Steady-state (full history) profile of the History view.
+2. ~~Steady-state (full history) profile of the History view.~~
 3. Fixes, each measured with the same method:
    a. ~~`WM_PAINT`: `ValidateRect` instead of `BeginPaint`/`EndPaint`.~~ (made,
       unmeasured)
@@ -64,9 +64,16 @@ Ranked by its estimated impact:
       `683221a`). History view at full history: 21-23 % (Direct2D) -> 5.9 % (GPU)
       at 30 fps.
    b2. ~~The History rebuilt its bands every frame~~ (`e4b3035`, Usage revision).
-   c. Row slides when sorting by a volatile column.
-   d. Per-sample work while minimized or for hidden pages; the sampler's own cost.
-4. Re-measure everything after the driver update.
+   c. ~~Row slides when sorting by a volatile column~~: measured, nothing to gain
+      from the whole-frame threshold (see Findings).
+   d. ~~No frames while the window cannot be seen~~ (`947e8cc`). Per-sample UI
+      work for hidden pages: not done (small).
+   e. ~~Present only what changed~~ (`6c1a09e`): dwm.exe 21 -> 18 % foreground,
+      25 -> 15 % background on the Map view.
+4. ~~Re-measure after the driver update~~ (31.0.101.2145; the second
+   full-history set and everything after are on it).
+5. **[current]** Report to the user; remaining items are small (see Open
+   questions).
 
 ## Findings / gotchas
 
@@ -113,6 +120,27 @@ Ranked by its estimated impact:
   (fixed, `defb530`); text 1.8 %; canvas copy 0.9 %.
 - Minimized: about 2–4 % (per-sample work and one frame a sample, `repaint`
   draws on `WM_APP_SNAPSHOT` even when not `seen`); Settings page about 1.7 %.
+- **Now (`6c1a09e`), History view, full history, foreground, 60 fps, symbol
+  build, `target/tmp/steady-profile2.ps1`: 10.7 % of a core** (33.4 % this
+  morning). Samples: `render` 65 % (of it `EndDraw` 21 %, `Present1` 13 %, the
+  canvas copy 5 %, the chart runs' `DrawInstanced` 4 %), the Intel driver spread
+  through those; the sampler thread 15 % (`sample_processes` 11 %, of it
+  `NtQuerySystemInformation` 8.6 %); `DisplayList::bounds` 3.9 % (recomputed per
+  damage area); sparkline `Plot::build` 3.5 %; History paint + build 5 %.
+  What remains is mostly the fixed cost of submitting and presenting 60 frames a
+  second.
+- **GPU mode, full history, `modes-long.ps1`:** 10.8 % at 60 fps in the
+  foreground (paint 0.21 ms, chart prep 0.23 ms, draw 0.76 ms a frame).
+- **Minimized** after `947e8cc`: 1.2-2.2 % (was 2-4 %).
+- **Whole-frame threshold** (`WHOLE_AT`), list view sorted by Cycles: 0.5 vs 0.95,
+  two interleaved rounds: draw 1.36 / 1.37 ms vs 1.39 / 1.37 ms. No gain: only
+  about 16 frames in 5 s were whole; slides are mostly drawn in part already.
+- **Partial presents** (`6c1a09e`), Map view, three alternating rounds with a
+  temporary full-present switch: dwm.exe 21.3 -> 17.8 % (foreground), 25.4 ->
+  15.2 % (background); open-task itself unchanged. `OT_CHECK_DAMAGE` now also
+  compares the buffer to present with the canvas: 0 of 3000 frames differed.
+- PowerShell gotcha: the harness blocks a `Remove-Item` whose line also holds a
+  regex like `\d+` (it reads it as a path); clear variables with `$env:X = $null`.
 - The machine is busy (about 39 % total load from Electron/Chrome), so process-CPU
   numbers wander by several points between identical runs; draw times from
   `OT_FRAME_STATS` and profile shares are steadier.
@@ -122,10 +150,20 @@ Ranked by its estimated impact:
 - [x] 2026-10-07: static review
 - [x] 2026-10-07: baseline measured (per view, 6-min growth run, steady profile)
 - [x] 2026-10-07: `ValidateRect` paint (`defb530`); diagnostics (`c131cdd`)
-- [ ] Fixes chosen, made, measured
-- [ ] After-driver re-measure
+- [x] 2026-10-07: chart renderers (`7d7fa5c`, `683221a`), History bands once a
+  sample (`e4b3035`), no hidden frames (`947e8cc`), partial presents (`6c1a09e`)
+- [x] 2026-10-07: re-measured on driver 31.0.101.2145
+- [ ] Reported; the user's call on the small remaining items
 
 ## Open questions for the user
 
-None. (Chart drawing: the user chose both a Direct3D and a CPU renderer, compared,
-with a setting defaulting to the GPU; done, see `plans/chart-renderers.md`.)
+1. The CPU chart renderer matches Direct2D at the History's full size (24 vs 21 %
+   at 30 fps; GPU 5.9 %). Leave it, or make it faster (hand SIMD for edges and
+   lines, rasterize only damaged columns)? Recommendation: leave it; the GPU is the
+   default and the CPU path is there as a choice.
+2. Smaller remaining items, each about 0.5-1 % of a core: cache each command's
+   bounds once a frame; draw chart runs straight into the canvas instead of a
+   texture each; skip per-sample work for pages not shown. Worth doing?
+   Recommendation: the bounds cache only (simple, safe); the rest is little for
+   its risk.
+3. Release these as v0.12.0? (Nothing is pushed.)
