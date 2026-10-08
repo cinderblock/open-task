@@ -36,6 +36,8 @@ pub struct ChartRaster {
     inner: Vec<(u32, u32)>,
     /// The segments of the line being drawn ([`Seg`]).
     segs: Vec<Seg>,
+    /// The squared distance of each pixel in a column's run to the line.
+    d2: Vec<f32>,
 }
 
 impl ChartRaster {
@@ -230,17 +232,32 @@ impl ChartRaster {
             }
             let r0 = (lo - reach).floor().max(0.0) as u32;
             let r1 = ((hi + reach).ceil().max(0.0) as u32).min(self.height);
-            let near = &segs[first..last];
-            for row in r0..r1 {
-                let p = Point::new(cx, row as f32 + 0.5);
-                let d2 = near
-                    .iter()
-                    .map(|s| s.distance2(p))
-                    .fold(f32::INFINITY, f32::min);
-                if d2 < reach2 {
-                    self.blend(col, row, ink, reach - d2.sqrt());
+            if r1 <= r0 {
+                continue;
+            }
+            // Each nearby segment's squared distance to every pixel center in the
+            // column's run of rows, the nearest kept: one plain loop over the rows a
+            // segment, which compiles to vector code.
+            let mut d2 = std::mem::take(&mut self.d2);
+            d2.clear();
+            d2.resize((r1 - r0) as usize, f32::INFINITY);
+            let top = r0 as f32 + 0.5;
+            for s in &segs[first..last] {
+                let px = cx - s.a.x;
+                let py0 = top - s.a.y;
+                for (k, d) in d2.iter_mut().enumerate() {
+                    let py = py0 + k as f32;
+                    let t = ((px * s.dx + py * s.dy) * s.inv_len2).clamp(0.0, 1.0);
+                    let (qx, qy) = (t * s.dx - px, t * s.dy - py);
+                    *d = d.min(qx * qx + qy * qy);
                 }
             }
+            for (k, &d) in d2.iter().enumerate() {
+                if d < reach2 {
+                    self.blend(col, r0 + k as u32, ink, reach - d.sqrt());
+                }
+            }
+            self.d2 = d2;
         }
         self.segs = segs;
     }
@@ -349,14 +366,6 @@ impl Seg {
             dy,
             inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 },
         }
-    }
-
-    /// The squared distance from `p` to the segment.
-    fn distance2(&self, p: Point) -> f32 {
-        let (px, py) = (p.x - self.a.x, p.y - self.a.y);
-        let t = ((px * self.dx + py * self.dy) * self.inv_len2).clamp(0.0, 1.0);
-        let (qx, qy) = (t * self.dx - px, t * self.dy - py);
-        qx * qx + qy * qy
     }
 }
 
