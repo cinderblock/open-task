@@ -59,8 +59,11 @@ Ranked by its estimated impact:
 3. Fixes, each measured with the same method:
    a. ~~`WM_PAINT`: `ValidateRect` instead of `BeginPaint`/`EndPaint`.~~ (made,
       unmeasured)
-   b. The chart drawing cost that grows with history (the big one; approach to be
-      chosen with the user).
+   b. ~~The chart drawing cost that grows with history:~~ GPU and CPU chart
+      renderers with a setting (`plans/chart-renderers.md`, `7d7fa5c`,
+      `683221a`). History view at full history: 21-23 % (Direct2D) -> 5.9 % (GPU)
+      at 30 fps.
+   b2. ~~The History rebuilt its bands every frame~~ (`e4b3035`, Usage revision).
    c. Row slides when sorting by a volatile column.
    d. Per-sample work while minimized or for hidden pages; the sampler's own cost.
 4. Re-measure everything after the driver update.
@@ -124,10 +127,5 @@ Ranked by its estimated impact:
 
 ## Open questions for the user
 
-1. How to take the chart drawing off Direct2D's path rasterizer (about 70 % of the
-   CPU at full history)? Recommendation: our own column rasterizer for chart areas
-   and lines (a chart is a function of x, so exact per-pixel coverage is a short
-   loop per column), uploaded as one bitmap per chart; Direct2D keeps text, grid,
-   everything else. Alternatives: Direct2D tweaks only (aliased fills, fewer
-   points, no band hairlines: perhaps a third off), or a Direct3D shader path
-   (fastest draw, most code).
+None. (Chart drawing: the user chose both a Direct3D and a CPU renderer, compared,
+with a setting defaulting to the GPU; done, see `plans/chart-renderers.md`.)

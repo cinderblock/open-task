@@ -65,8 +65,12 @@ drawing off that path with two new renderers, compare them, and let the user pic
    README.~~
 6. ~~Parity test on WARP (`gfx::tests::the_gpu_and_cpu_chart_renderers_draw_what_direct2d_draws`);
    screenshots; `OT_CHECK_DAMAGE`.~~
-7. **[current]** Frame stats and profiles for each at full history (6 min runs).
-8. Report the comparison to the user.
+7. ~~Frame stats for each at full history (6 min runs).~~
+8. ~~CPU rasterizer sped up (`683221a`).~~
+9. **[current]** Report the comparison to the user.
+10. Possible later, if the user wants the CPU path faster still: SIMD by hand for
+    the edge pixels and lines, rasterizing only the columns a partial frame
+    damages, or sharing the work across threads (wall time only, not CPU).
 
 ## Findings / gotchas
 
@@ -78,6 +82,25 @@ drawing off that path with two new renderers, compare them, and let the user pic
 - **The driver's 8 x 4 bricks follow Direct2D's chart fills.** `OT_CHECK_DAMAGE`,
   History, 30 s each: Direct2D 30 differing frames (29 of them 8 x 4 blocks inside
   the History chart); CPU 1; GPU 1 (each a few pixels).
+- **Full history, History view, 6 min runs, window in the background (30 fps),
+  `target/tmp/modes-long.ps1`, averages over the last minute** (Intel driver
+  31.0.101.2145 for the second set):
+
+  | Run | GPU | CPU | Direct2D |
+  | --- | --- | --- | --- |
+  | first (`7d7fa5c`) | 7.2 % | 51.6 % | 23.0 % |
+  | after the CPU speed-up (`683221a`) | **5.9 %** | 24.2 % | 21.3 % |
+
+  Per frame (second set): GPU chart prep 0.18 ms + draw 0.71 ms; CPU chart prep
+  6.6 ms + draw 7.3 ms; Direct2D draw 6.0 ms. Paint (display list) 0.45-0.5 ms in
+  all three, the History's per-frame rebuild (fixed in `e4b3035`).
+- CPU rasterizer timing test (`chart_raster::tests::history_sized_frame_timing`,
+  670 x 290, nine bands + hairlines, fastest of 15 batches): 9.3 ms -> 2.3 ms after
+  row-run fills (vectorizable 16-byte steps), packed blending and precomputed
+  segments. In the app the History is larger (about 670 x 430) and the bitmap is
+  uploaded, so CPU mode only matches Direct2D there.
+- Micro-timings on this busy machine wander +-40 % run to run; take the fastest
+  of several batches, and interleave A/B runs.
 - `OT_CHECK_DAMAGE` makes `draw_ms` meaningless (the whole frame is drawn again
   inside it): measure with the check off.
 - Git Bash heredocs break on an apostrophe in the text (`open-task's`): write patch
@@ -87,7 +110,8 @@ drawing off that path with two new renderers, compare them, and let the user pic
 
 - [x] 2026-10-07: commands, CPU rasterizer, painters, renderer (D2D, CPU, GPU),
   setting, parity test; clippy on three targets, all tests
-- [ ] Measured at full history and reported
+- [x] 2026-10-07: measured at full history (two sets); CPU path sped up
+- [ ] Reported to the user
 
 ## Open questions for the user
 

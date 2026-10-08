@@ -694,6 +694,13 @@ fn seen(hwnd: HWND) -> bool {
 }
 
 fn repaint(st: &mut State) {
+    // Minimized, hidden in the tray or on another virtual desktop: nothing to
+    // draw for. Each snapshot still asks for a frame; the first after the window
+    // shows again (restoring sends one at once, the next snapshot otherwise)
+    // draws what changed meanwhile.
+    if !seen(st.hwnd) {
+        return;
+    }
     if st.gfx.is_none() {
         match Gfx::new(st.hwnd, client_size(st.hwnd), st.dpi) {
             Ok(mut g) => {
