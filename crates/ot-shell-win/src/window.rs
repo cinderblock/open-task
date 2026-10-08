@@ -30,9 +30,7 @@ use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_CLOAKED,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, ValidateRect, PAINTSTRUCT,
-};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, ScreenToClient, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -1077,11 +1075,13 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            // SAFETY: validates the update region; we do not draw with the HDC.
+            // The frame is drawn through Direct2D, never a DC: validating the update
+            // region is all `BeginPaint`/`EndPaint` did for us, and they took and
+            // released a DC every frame (about a twentieth of the app's CPU in a
+            // profile at 60 Hz).
+            // SAFETY: hwnd is valid.
             unsafe {
-                let _ = BeginPaint(hwnd, &raw mut ps);
-                let _ = EndPaint(hwnd, &raw const ps);
+                let _ = ValidateRect(Some(hwnd), None);
             }
             repaint(st);
             Outcome::Done(LRESULT(0))
