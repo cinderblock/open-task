@@ -24,14 +24,17 @@
 //!   process that lives and dies between two samples, are never seen.
 //!
 //! [`Usage`] also keeps the history behind the usage chart: for every interval, the
-//! cycles each *program* used, a program being every process of one name
-//! (twelve `chrome.exe`, or the two hundred `rustc.exe` of a build, are one line of
-//! the chart). As much is kept as the charts reach back ([`Usage::set_history_span`],
+//! cycles each *program* used, a program being every process of one label (the two
+//! hundred `rustc.exe` of a build are one line of the chart). The label is the
+//! name, and for the children of a Chromium-based program also their role, so
+//! Chrome's renderers, `chrome.exe (Renderer)`, are one line and its GPU process,
+//! `chrome.exe (GPU)`, another. As much is kept as the charts reach back ([`Usage::set_history_span`],
 //! an hour unless set otherwise): the last ten minutes sample by sample, the rest in
 //! steps of ten seconds, or wider when the reach is long, so a day is at most 720
 //! steps. Each step lists only the programs that ran in it, so the cost is set by how
 //! many programs are busy, not by how many processes exist.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,7 +75,7 @@ pub fn history_bytes(span_ms: i64, frame_bytes: usize) -> usize {
     (RAW_FRAMES + steps) * frame_bytes
 }
 
-/// A program in the usage history: every process of one name. An index into
+/// A program in the usage history: every process of one label. An index into
 /// [`Usage::program_name`], stable for the session.
 pub type ProgramId = u32;
 
@@ -294,7 +297,7 @@ impl Usage {
                     last: p.cycles,
                     total: 0.0,
                     alive: true,
-                    program: program_id(programs, ids, p.name()),
+                    program: program_id(programs, ids, &p.statics),
                 }
             });
             e.alive = true;
@@ -422,7 +425,8 @@ impl Usage {
         self.now_ms
     }
 
-    /// The name every process of `program` runs under.
+    /// The label every process of `program` runs under: `chrome.exe`, or with a
+    /// role `chrome.exe (GPU)`.
     #[must_use]
     pub fn program_name(&self, program: ProgramId) -> &str {
         self.programs
@@ -430,10 +434,17 @@ impl Usage {
             .map_or("", String::as_str)
     }
 
-    /// The program processes named `name` are charted under, if any has been seen.
+    /// The program processes labelled `label` are charted under, if any has been
+    /// seen.
     #[must_use]
-    pub fn program(&self, name: &str) -> Option<ProgramId> {
-        self.program_ids.get(name).copied()
+    pub fn program(&self, label: &str) -> Option<ProgramId> {
+        self.program_ids.get(label).copied()
+    }
+
+    /// The program a process is charted under, if one like it has been seen.
+    #[must_use]
+    pub fn program_of(&self, statics: &ProcessStatic) -> Option<ProgramId> {
+        self.program(&label(statics))
     }
 
     /// Programs seen this session; ids run from zero to this.
@@ -482,15 +493,24 @@ fn clamp_decay(decay: f64) -> f64 {
 fn program_id(
     programs: &mut Vec<String>,
     ids: &mut HashMap<String, ProgramId>,
-    name: &str,
+    statics: &ProcessStatic,
 ) -> ProgramId {
-    if let Some(&id) = ids.get(name) {
+    let label = label(statics);
+    if let Some(&id) = ids.get(&*label) {
         return id;
     }
     let id = ProgramId::try_from(programs.len()).unwrap_or(ProgramId::MAX);
-    programs.push(name.to_owned());
-    ids.insert(name.to_owned(), id);
+    programs.push(label.clone().into_owned());
+    ids.insert(label.into_owned(), id);
     id
+}
+
+/// A process's label, borrowed when it is just the name, as most are.
+fn label(statics: &ProcessStatic) -> Cow<'_, str> {
+    match statics.role() {
+        None => Cow::Borrowed(&statics.name),
+        Some(_) => Cow::Owned(statics.label().to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -764,6 +784,38 @@ mod tests {
         assert_eq!(of(&frames[1], "chrome.exe"), Some(5.0 * G as f32));
         assert_eq!(of(&frames[1], "code.exe"), Some(G as f32));
         assert_eq!(of(&frames[1], "idle.exe"), None, "nothing used, not listed");
+    }
+
+    #[test]
+    fn chromium_children_are_charted_by_role() {
+        let mut u = Usage::new(0.05);
+        let child = |pid: u32, cycles: u64, args: &str| {
+            let mut p = named(pid, "chrome.exe", Some(0), cycles);
+            let s = Arc::make_mut(&mut p.statics);
+            s.command_line = Some(format!(
+                "chrome.exe {args} --mojo-platform-channel-handle=1"
+            ));
+            p
+        };
+        let procs = |c: u64| {
+            vec![
+                named(1, "chrome.exe", Some(0), c),
+                child(2, c, "--type=renderer"),
+                child(3, c, "--type=renderer"),
+                child(4, c, "--type=gpu-process"),
+            ]
+        };
+        u.observe(&snap(1000, procs(0)));
+        u.observe(&snap(1001, procs(G)));
+        assert_eq!(u.programs(), 3);
+        let renderers = u.program("chrome.exe (Renderer)").unwrap();
+        assert_eq!(u.program_name(renderers), "chrome.exe (Renderer)");
+        assert_eq!(u.program_of(&procs(0)[2].statics), Some(renderers));
+        let frame = u.frames().next().unwrap();
+        let of = |g| frame.cycles.iter().find(|c| c.0 == g).map(|c| c.1);
+        assert_eq!(of(renderers), Some(2.0 * G as f32));
+        assert_eq!(of(u.program("chrome.exe (GPU)").unwrap()), Some(G as f32));
+        assert_eq!(of(u.program("chrome.exe").unwrap()), Some(G as f32));
     }
 
     #[test]

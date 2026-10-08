@@ -148,8 +148,10 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   line under the map gives the cycles used by everything together.
 - **History** shows the cycles used over the charts' reach, as a chart: a stack of
   bands, one per program, on the same time axis as the graphs above it. A program is
-  every process of one name, so twelve `chrome.exe`, or the two hundred `rustc.exe`
-  of a build, are one band. The switch above the chart picks what a band's thickness
+  every process of one name, so the two hundred `rustc.exe` of a build are one band.
+  Chromium-based programs (Chrome, Edge, WebView2 and Electron apps such as Slack,
+  Discord or VS Code) are split by role, so Chrome's renderers are one band and its
+  GPU process another (see below). The switch above the chart picks what a band's thickness
   is. **Fading total** is the number the Cycles column shows, over time: a band
   swells while its program works and sags once it stops. **Rate** is the cycles the
   program was using each second: the CPU graph cut up by program, of which the
@@ -252,6 +254,15 @@ that need rights this copy does not have are shown disabled with the reason.
 a command line, Browse, and **Create this task with administrator privileges**.
 The crosshair button beside it is Process Explorer's **Find window's process**:
 drag it onto any window and that window's process is selected in the table.
+
+**Chromium roles.** A Chromium-based program runs as one main process and a crowd
+of children of the same name, each started for one job. open-task reads the job
+from the child's command line and adds it to the name: `chrome.exe (Renderer)`,
+`chrome.exe (Extension)`, `chrome.exe (GPU)`, `chrome.exe (Network)`,
+`slack.exe (Audio)`. The main process keeps its plain name. This works for
+anything built on Chromium, with nothing installed in the browser. Which site a
+renderer is serving is not visible from outside the browser, so the renderers are
+told apart only by PID.
 
 **Inside a process.** In tree mode every process can be opened one level further.
 Under it sit the **services** it hosts (from the service control manager, so a

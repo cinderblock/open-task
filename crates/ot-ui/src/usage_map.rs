@@ -441,7 +441,8 @@ impl UsageMap {
         let _ = write!(
             out,
             "{} \u{b7} PID {} \u{b7} ",
-            n.statics.name, n.statics.key.pid
+            n.statics.label(),
+            n.statics.key.pid
         );
         push_cycles(out, n.total);
         out.push_str(" cycles");
@@ -506,7 +507,7 @@ impl UsageMap {
                 out.push_str(" \u{203a} ");
             }
             first = false;
-            out.push_str(&self.nodes[i].statics.name);
+            let _ = write!(out, "{}", self.nodes[i].statics.label());
         }
     }
 

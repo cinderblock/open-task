@@ -16,6 +16,7 @@
 pub mod apps;
 pub mod attribution;
 pub mod battery;
+pub mod chromium;
 pub mod connection;
 pub mod cpu;
 pub mod device;

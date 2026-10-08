@@ -1808,8 +1808,8 @@ impl App {
 
     /// The program the selected process is charted under.
     fn selected_program(&self) -> Option<ProgramId> {
-        let name = self.snap.processes.get(self.selected_process()?)?.name();
-        self.usage.program(name)
+        let p = self.snap.processes.get(self.selected_process()?)?;
+        self.usage.program_of(&p.statics)
     }
 
     /// Select the row under `at`, if there is one. Returns whether anything changed.
@@ -2586,7 +2586,7 @@ impl App {
                 .table
                 .selected
                 .and_then(|id| rows.row_of(id))
-                .and_then(|row| usage.program(snap.processes[rows.process_of(row)].name()));
+                .and_then(|row| usage.program_of(&snap.processes[rows.process_of(row)].statics));
             // All of the History follows the clock: a layer of its own.
             dl.begin_layer(HISTORY_LAYER);
             self.history.paint(

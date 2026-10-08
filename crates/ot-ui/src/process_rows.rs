@@ -977,7 +977,9 @@ impl ProcessRows<'_> {
         let r = self.row(row);
         let p = &self.procs[r.proc as usize];
         match r.kind {
-            RowKind::Process => out.push_str(p.name()),
+            RowKind::Process => {
+                let _ = write!(out, "{}", p.statics.label());
+            }
             RowKind::Service(k) => {
                 out.push_str(p.services.get(usize::from(k)).map_or("", |s| &s.name));
             }
@@ -1036,12 +1038,13 @@ impl ProcessRows<'_> {
         }
     }
 
-    /// The Name cell of a process: its name, and for a service host the group and
-    /// the services it runs, busiest first when per-service CPU is known.
+    /// The Name cell of a process: its name, with its role for a child of a
+    /// Chromium-based program (`chrome.exe (GPU)`), and for a service host the group
+    /// and the services it runs, busiest first when per-service CPU is known.
     fn process_name_cell(&self, proc: usize, out: &mut String) {
         let p = &self.procs[proc];
         out.clear();
-        out.push_str(p.name());
+        let _ = write!(out, "{}", p.statics.label());
         if p.services.is_empty() {
             return;
         }

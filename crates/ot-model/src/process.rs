@@ -68,6 +68,36 @@ pub struct ProcessStatic {
     pub package: Option<String>,
 }
 
+impl ProcessStatic {
+    /// What this child of a Chromium-based program does (`GPU`, `Renderer`), read
+    /// from its command line; `None` for anything else. See [`crate::chromium`].
+    #[must_use]
+    pub fn role(&self) -> Option<&str> {
+        self.command_line.as_deref().and_then(crate::chromium::role)
+    }
+
+    /// The name to show and to chart the process under: its name, with its role
+    /// when it has one (`chrome.exe (GPU)`).
+    #[must_use]
+    pub fn label(&self) -> Label<'_> {
+        Label(self)
+    }
+}
+
+/// [`ProcessStatic::label`], written without allocating.
+#[derive(Debug, Clone, Copy)]
+pub struct Label<'a>(&'a ProcessStatic);
+
+impl std::fmt::Display for Label<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.name)?;
+        match self.0.role() {
+            Some(role) => write!(f, " ({role})"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The instruction set a process runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Architecture {
