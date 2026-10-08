@@ -51,7 +51,7 @@ drawing off that path with two new renderers, compare them, and let the user pic
   - Graph: distance d from the pixel center to the nearest segment; coverage =
     clamp(w/2 + 0.5 - d, 0, 1).
 - **Choice:** Settings ("Chart drawing": GPU / CPU / Direct2D), saved as
-  `ChartRenderer` in `HKCU\Software\open-task`; `OT_CHARTS=gpu|cpu|d2d` overrides it
+  `ChartDrawing` (0 GPU, 1 CPU, 2 Direct2D) in `HKCU\Software\open-task`; `OT_CHARTS=gpu|cpu|d2d` overrides it
   for measurement.
 
 ## Plan / steps

@@ -29,10 +29,13 @@ pub const SAMPLES: u32 = 4;
 pub struct ChartRaster {
     width: u32,
     height: u32,
+    /// Premultiplied BGRA, four bytes a pixel; blended as one little-endian `u32`
+    /// (blue in the low byte).
     px: Vec<u8>,
-    /// A graph's coverage, the strongest from any of its segments, before it is
-    /// blended once: blending each segment would darken every joint.
-    cover: Vec<f32>,
+    /// For each column of the band being filled, the rows it covers whole.
+    inner: Vec<(u32, u32)>,
+    /// The segments of the line being drawn ([`Seg`]).
+    segs: Vec<Seg>,
 }
 
 impl ChartRaster {
@@ -65,6 +68,13 @@ impl ChartRaster {
         &self.px
     }
 
+    /// Blend `src` over pixel `i` (counted in pixels, not bytes).
+    fn put(&mut self, i: usize, src: Src) {
+        let at = &mut self.px[i * 4..i * 4 + 4];
+        let dst = u32::from_le_bytes([at[0], at[1], at[2], at[3]]);
+        at.copy_from_slice(&over(dst, src).to_le_bytes());
+    }
+
     /// Fill the region between `top` and `bottom` (each ascending in x) over the
     /// x-range both cover.
     pub fn fill_band(&mut self, top: &[Point], bottom: &[Point], color: Color) {
@@ -79,12 +89,13 @@ impl ChartRaster {
         if x1.partial_cmp(&x0) != Some(std::cmp::Ordering::Greater) || self.height == 0 {
             return;
         }
-        let ink = premultiply(color);
+        let ink = ink(color);
         let (mut ti, mut bi) = (0, 0);
         let first = x0.floor() as u32;
         let last = (x1.ceil() as u32).min(self.width);
         let mut lo = [0.0f32; SAMPLES as usize];
         let mut hi = [0.0f32; SAMPLES as usize];
+        self.inner.clear();
         for col in first..last {
             // The samples inside the band's x-range, with its top and bottom there.
             let mut n = 0;
@@ -100,6 +111,7 @@ impl ChartRaster {
                 n += 1;
             }
             if n == 0 {
+                self.inner.push((0, 0));
                 continue;
             }
             let (lo, hi) = (&lo[..n], &hi[..n]);
@@ -110,90 +122,139 @@ impl ChartRaster {
             // Rows every sample covers whole: the same coverage all the way down.
             let inner0 = lo.iter().copied().fold(f32::NEG_INFINITY, f32::max).ceil();
             let inner1 = hi.iter().copied().fold(f32::INFINITY, f32::min).floor();
-            let whole = n as f32 / SAMPLES as f32;
-            for row in r0..r1 {
+            // Rows every sample covers whole are filled below, a row at a time;
+            // only a column with all its samples inside takes part.
+            let (in0, in1) = if n == SAMPLES as usize && inner1 > inner0 {
+                (
+                    (inner0.max(0.0) as u32).clamp(r0, r1),
+                    (inner1.max(0.0) as u32).clamp(r0, r1),
+                )
+            } else {
+                (r1, r1)
+            };
+            for row in (r0..in0).chain(in1.max(in0)..r1) {
                 let (y0, y1) = (row as f32, row as f32 + 1.0);
-                let cov = if y0 >= inner0 && y1 <= inner1 {
-                    whole
-                } else {
-                    lo.iter()
-                        .zip(hi)
-                        .map(|(&l, &h)| (h.min(y1) - l.max(y0)).max(0.0))
-                        .sum::<f32>()
-                        / SAMPLES as f32
-                };
+                let cov = lo
+                    .iter()
+                    .zip(hi)
+                    .map(|(&l, &h)| (h.min(y1) - l.max(y0)).max(0.0))
+                    .sum::<f32>()
+                    / SAMPLES as f32;
                 self.blend(col, row, ink, cov);
             }
+            self.inner.push((in0, in1.max(in0)));
+        }
+        // The whole rows, as runs along each row: contiguous pixels, one color.
+        let whole = scaled(ink, 256);
+        let inner = std::mem::take(&mut self.inner);
+        let top_row = inner.iter().map(|r| r.0).min().unwrap_or(0);
+        let bottom_row = inner.iter().map(|r| r.1).max().unwrap_or(0);
+        for row in top_row..bottom_row {
+            let mut c = 0;
+            while c < inner.len() {
+                if !(inner[c].0..inner[c].1).contains(&row) {
+                    c += 1;
+                    continue;
+                }
+                let start = c;
+                while c < inner.len() && (inner[c].0..inner[c].1).contains(&row) {
+                    c += 1;
+                }
+                let at = row as usize * self.width as usize + first as usize + start;
+                self.fill_span(at, c - start, whole);
+            }
+        }
+        self.inner = inner;
+    }
+
+    /// Blend `src` over `len` pixels from pixel `at` along a row: byte by byte
+    /// with the same weight, sixteen bytes a step, which compiles to vector code.
+    fn fill_span(&mut self, at: usize, len: usize, src: Src) {
+        let bytes = src.px.to_le_bytes();
+        let mut pattern = [0u16; 16];
+        for (k, p) in pattern.iter_mut().enumerate() {
+            *p = u16::from(bytes[k % 4]);
+        }
+        // At most 256, so a byte times it fits in 16 bits.
+        let keep = src.keep as u16;
+        let span = &mut self.px[at * 4..(at + len) * 4];
+        let mut chunks = span.chunks_exact_mut(16);
+        for chunk in &mut chunks {
+            for (d, &p) in chunk.iter_mut().zip(&pattern) {
+                let v = p + ((u16::from(*d) * keep + 128) >> 8);
+                *d = v.min(255) as u8;
+            }
+        }
+        for (d, &p) in chunks.into_remainder().iter_mut().zip(&pattern) {
+            let v = p + ((u16::from(*d) * keep + 128) >> 8);
+            *d = v.min(255) as u8;
         }
     }
 
     /// Draw a line `width` pixels wide through `points` (ascending in x).
+    ///
+    /// Column by column: the segments that come within reach of a column are a few
+    /// neighbours, since the points ascend in x; each pixel takes its distance to
+    /// the nearest of them, so a joint is blended once.
     pub fn stroke_graph(&mut self, points: &[Point], width: f32, color: Color) {
-        if points.len() < 2 || self.width == 0 || self.height == 0 || width <= 0.0 {
+        let n = points.len();
+        if n < 2 || self.width == 0 || self.height == 0 || width <= 0.0 {
             return;
         }
         let reach = width * 0.5 + 0.5;
-        // The pixels the line can touch.
-        let (mut x0, mut y0, mut x1, mut y1) = (
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        );
-        for p in points {
-            (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
-        }
-        let c0 = (x0 - reach).floor().max(0.0) as u32;
-        let r0 = (y0 - reach).floor().max(0.0) as u32;
-        let c1 = ((x1 + reach).ceil().max(0.0) as u32).min(self.width);
-        let r1 = ((y1 + reach).ceil().max(0.0) as u32).min(self.height);
-        if c1 <= c0 || r1 <= r0 {
-            return;
-        }
-        let (bw, bh) = ((c1 - c0) as usize, (r1 - r0) as usize);
-        let mut cover = std::mem::take(&mut self.cover);
-        cover.clear();
-        cover.resize(bw * bh, 0.0);
-        for seg in points.windows(2) {
-            let (a, b) = (seg[0], seg[1]);
-            let sc0 = ((a.x.min(b.x) - reach).floor().max(c0 as f32) as u32).min(c1);
-            let sc1 = ((a.x.max(b.x) + reach).ceil().max(c0 as f32) as u32).min(c1);
-            let sr0 = ((a.y.min(b.y) - reach).floor().max(r0 as f32) as u32).min(r1);
-            let sr1 = ((a.y.max(b.y) + reach).ceil().max(r0 as f32) as u32).min(r1);
-            for row in sr0..sr1 {
-                for col in sc0..sc1 {
-                    let p = Point::new(col as f32 + 0.5, row as f32 + 0.5);
-                    let cov = (reach - distance_to_segment(p, a, b)).clamp(0.0, 1.0);
-                    let i = (row - r0) as usize * bw + (col - c0) as usize;
-                    if cov > cover[i] {
-                        cover[i] = cov;
-                    }
+        let reach2 = reach * reach;
+        let ink = ink(color);
+        let mut segs = std::mem::take(&mut self.segs);
+        segs.clear();
+        segs.extend(points.windows(2).map(|w| Seg::new(w[0], w[1])));
+        let c0 = (points[0].x - reach).floor().max(0.0) as u32;
+        let c1 = ((points[n - 1].x + reach).ceil().max(0.0) as u32).min(self.width);
+        let mut first = 0;
+        for col in c0..c1 {
+            let cx = col as f32 + 0.5;
+            let (left, right) = (cx - reach, cx + reach);
+            // Segment j runs from point j to point j + 1.
+            while first + 1 < segs.len() && points[first + 1].x < left {
+                first += 1;
+            }
+            let mut last = first;
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            while last < segs.len() && points[last].x <= right {
+                let (a, b) = (points[last], points[last + 1]);
+                lo = lo.min(a.y.min(b.y));
+                hi = hi.max(a.y.max(b.y));
+                last += 1;
+            }
+            if last == first {
+                continue;
+            }
+            let r0 = (lo - reach).floor().max(0.0) as u32;
+            let r1 = ((hi + reach).ceil().max(0.0) as u32).min(self.height);
+            let near = &segs[first..last];
+            for row in r0..r1 {
+                let p = Point::new(cx, row as f32 + 0.5);
+                let d2 = near
+                    .iter()
+                    .map(|s| s.distance2(p))
+                    .fold(f32::INFINITY, f32::min);
+                if d2 < reach2 {
+                    self.blend(col, row, ink, reach - d2.sqrt());
                 }
             }
         }
-        let ink = premultiply(color);
-        for row in 0..bh {
-            for col in 0..bw {
-                let cov = cover[row * bw + col];
-                if cov > 0.0 {
-                    self.blend(c0 + col as u32, r0 + row as u32, ink, cov);
-                }
-            }
-        }
-        self.cover = cover;
+        self.segs = segs;
     }
 
-    /// Source-over `ink` (premultiplied BGRA, 0..1) at `cov` onto one pixel.
-    fn blend(&mut self, col: u32, row: u32, ink: [f32; 4], cov: f32) {
-        if cov <= 0.0 {
+    /// Source-over `ink` at coverage `cov` (clamped to 0..1) onto one pixel.
+    fn blend(&mut self, col: u32, row: u32, ink: [u32; 4], cov: f32) {
+        let c = (cov.clamp(0.0, 1.0) * 256.0 + 0.5) as u32;
+        if c == 0 {
             return;
         }
-        let i = (row as usize * self.width as usize + col as usize) * 4;
-        let keep = 1.0 - ink[3] * cov;
-        for (dst, ink) in self.px[i..i + 4].iter_mut().zip(ink) {
-            let v = ink * cov + f32::from(*dst) / 255.0 * keep;
-            *dst = (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-        }
+        self.put(
+            row as usize * self.width as usize + col as usize,
+            scaled(ink, c),
+        );
     }
 }
 
@@ -208,10 +269,43 @@ pub fn to_pixels(points: &[Point], scale: f32, origin: Point, out: &mut Vec<Poin
     );
 }
 
-/// `color` premultiplied, in BGRA order.
-fn premultiply(c: Color) -> [f32; 4] {
+/// `color` premultiplied, in BGRA order, 0..=255.
+fn ink(c: Color) -> [u32; 4] {
     let a = c.a.clamp(0.0, 1.0);
-    [c.b * a, c.g * a, c.r * a, a]
+    let q = |v: f32| (v.clamp(0.0, 1.0) * a * 255.0 + 0.5) as u32;
+    [q(c.b), q(c.g), q(c.r), (a * 255.0 + 0.5) as u32]
+}
+
+/// A premultiplied pixel to blend: the pixel itself, and how much of what is under
+/// it shows through, of 256.
+#[derive(Debug, Clone, Copy)]
+struct Src {
+    px: u32,
+    keep: u32,
+}
+
+/// `ink` at coverage `cover` of 256, packed.
+fn scaled(ink: [u32; 4], cover: u32) -> Src {
+    let [blue, green, red, alpha] = ink.map(|v| ((v * cover + 128) >> 8).min(255));
+    Src {
+        px: blue | (green << 8) | (red << 16) | (alpha << 24),
+        // 256 - alpha, rounding so an opaque source leaves nothing under it.
+        keep: 256 - (alpha + (alpha >> 7)),
+    }
+}
+
+/// Source-over `src` onto the packed BGRA pixel `dst`: two channels a multiply.
+fn over(dst: u32, src: Src) -> u32 {
+    let rb = (((dst & 0x00FF_00FF) * src.keep) >> 8) & 0x00FF_00FF;
+    let ag = (((dst >> 8) & 0x00FF_00FF) * src.keep) & 0xFF00_FF00;
+    let under = rb | ag;
+    // Channel by channel, so a rounding overflow saturates rather than carries.
+    let mut out = 0;
+    for shift in [0, 8, 16, 24] {
+        let v = ((src.px >> shift) & 0xFF) + ((under >> shift) & 0xFF);
+        out |= v.min(255) << shift;
+    }
+    out
 }
 
 /// The line through `pts` (ascending in x) at `x`, by linear interpolation; the end
@@ -235,17 +329,35 @@ fn at(pts: &[Point], cursor: &mut usize, x: f32) -> f32 {
     a.y + (b.y - a.y) * ((x - a.x) / span).min(1.0)
 }
 
-/// The distance from `p` to the segment `a`-`b`.
-fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
-    let (dx, dy) = (b.x - a.x, b.y - a.y);
-    let len2 = dx * dx + dy * dy;
-    let t = if len2 > 0.0 {
-        (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let (qx, qy) = (a.x + t * dx - p.x, a.y + t * dy - p.y);
-    (qx * qx + qy * qy).sqrt()
+/// A line segment, with what finding a point's distance to it needs.
+#[derive(Debug, Clone, Copy)]
+struct Seg {
+    a: Point,
+    dx: f32,
+    dy: f32,
+    /// One over the squared length; zero for a point.
+    inv_len2: f32,
+}
+
+impl Seg {
+    fn new(a: Point, b: Point) -> Self {
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len2 = dx * dx + dy * dy;
+        Self {
+            a,
+            dx,
+            dy,
+            inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 },
+        }
+    }
+
+    /// The squared distance from `p` to the segment.
+    fn distance2(&self, p: Point) -> f32 {
+        let (px, py) = (p.x - self.a.x, p.y - self.a.y);
+        let t = ((px * self.dx + py * self.dy) * self.inv_len2).clamp(0.0, 1.0);
+        let (qx, qy) = (t * self.dx - px, t * self.dy - py);
+        qx * qx + qy * qy
+    }
 }
 
 #[cfg(test)]
@@ -356,6 +468,56 @@ mod tests {
         // Both segments end on the joint's pixel; it gets the color's alpha, not
         // the alpha of two layers.
         assert!(near(alpha(&r, 5, 5), 0.5));
+    }
+
+    /// A full History chart at 96 DPI: nine stacked bands with hairlines across
+    /// 670 x 290 pixels, a point a pixel. `cargo test -p ot-paint --release --
+    /// --ignored --nocapture history_sized` prints the time a frame: the fastest of
+    /// several batches, since a busy machine slows some.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn history_sized_frame_timing() {
+        use std::time::{Duration, Instant};
+        let (w, h) = (670u32, 290u32);
+        let mut edges = vec![(0..=w)
+            .map(|i| p(i as f32 + 0.3, h as f32))
+            .collect::<Vec<_>>()];
+        for b in 0..9 {
+            let next = edges[b]
+                .iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    let k = (i as f32 * 0.05 + b as f32).sin();
+                    p(q.x, q.y - 12.0 - 10.0 * k.abs())
+                })
+                .collect();
+            edges.push(next);
+        }
+        let mut raster = ChartRaster::new();
+        let (mut best_bands, mut best_lines) = (Duration::MAX, Duration::MAX);
+        for _ in 0..15 {
+            let (mut bands, mut lines) = (Duration::ZERO, Duration::ZERO);
+            for _ in 0..30 {
+                raster.reset(w, h);
+                for b in 0..9 {
+                    let t0 = Instant::now();
+                    raster.fill_band(&edges[b + 1], &edges[b], Color::rgba(0.4, 0.6, 0.9, 0.9));
+                    let t1 = Instant::now();
+                    raster.stroke_graph(&edges[b + 1], 1.0, Color::rgb(0.12, 0.12, 0.12));
+                    bands += t1 - t0;
+                    lines += t1.elapsed();
+                }
+            }
+            best_bands = best_bands.min(bands / 30);
+            best_lines = best_lines.min(lines / 30);
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        eprintln!(
+            "history-sized frame: {:.3} ms (bands {:.3}, lines {:.3})",
+            ms(best_bands + best_lines),
+            ms(best_bands),
+            ms(best_lines)
+        );
     }
 
     #[test]
