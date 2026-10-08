@@ -28,8 +28,10 @@ first (they asked what it is from), then fix it.
    pixels that differ. `OT_WARP=1` forces the software rasterizer.~~
 2. ~~Run it, hover the charts, read the dumps.~~ Cause: the Intel GPU driver (see
    Findings).
-3. **[current]** Waiting on the user: update the Intel driver and re-check, and/or
-   try a workaround in the renderer (open question 1).
+3. **[current]** The user is updating the Intel driver in another thread
+   (2026-10-07). After it lands: run with `OT_CHECK_DAMAGE=1` and
+   `target/tmp/check-run.ps1` and confirm no 8 x 4 blocks remain. No software
+   (WARP) fallback: the user does not want a slow path.
 
 ## Findings / gotchas
 
@@ -51,6 +53,16 @@ first (they asked what it is from), then fix it.
   - Apart from those blocks, partial and whole frames were pixel-identical: the
     damage tracking itself is sound.
   - The machine also has a Fresco Logic IDDCX (USB display) adapter, driver 2020.
+- A second, real bug the check found: Direct2D's default mitred joins let a sharp
+  chart-line corner reach up to five widths past its point, outside the line's
+  damage bounds, leaving 1-3 px behind just above a chart's redrawn area (seen
+  with a GDI-compatible canvas experiment: 1-px differences at the row above the
+  damage, e.g. damage top y 18.45, difference at y 17). Fixed with bevel joins
+  (`4257222`). Not yet re-verified with the check (the driver update interrupted
+  the run).
+- A GDI-compatible canvas (`D2D1_BITMAP_OPTIONS_GDI_COMPATIBLE`) showed no 8 x 4
+  blocks in one run (3670 frames with small differences instead, mostly the miter
+  issue above). Not pursued: the user chose the driver update.
 - Hovering sets `full_due` (every `App::handle` does), so hover frames are full
   paints diffed by the renderer, not spliced frames.
 
@@ -58,15 +70,13 @@ first (they asked what it is from), then fix it.
 
 - [x] 2026-10-07: diagnostic built (`OT_CHECK_DAMAGE`, `OT_WARP`), README notes
 - [x] 2026-10-07: glitch caught; Intel driver tile corruption, WARP clean
-- [ ] Fix or workaround, checked, committed
+- [x] 2026-10-07: miter-join leftovers fixed with bevel joins (`4257222`)
+- [ ] Driver updated (user, other thread); re-run the check to confirm
 
 ## Open questions for the user
 
-1. Next step? Recommendation: update the Intel graphics driver first (yours is
-   from March 2022), then run with `OT_CHECK_DAMAGE=1` to see whether the blocks
-   are gone. If they are not, or if other users on older Intel drivers matter,
-   try a renderer workaround (a canvas the driver will not compress, e.g. a
-   GDI-compatible or shared texture), measured with the same check.
+None. (Answered 2026-10-07: the user is updating the driver; no software
+fallback.)
 
 ## Things not to do
 

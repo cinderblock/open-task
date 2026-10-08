@@ -810,6 +810,17 @@ enum InPlace {
     History,
 }
 
+/// How [`App::paint_at`] made a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintKind {
+    /// Only the chart clock moved: the charts spliced into the last full paint.
+    Tick,
+    /// A full paint while the table's rows slide.
+    Slide,
+    /// Any other full paint.
+    Full,
+}
+
 /// The whole application view. One per window.
 #[derive(Debug)]
 // The flags are independent facts about the view; an enum would only obscure them.
@@ -889,6 +900,8 @@ pub struct App {
     full_due: bool,
     /// The program the History highlighted in the last full paint.
     history_selected: Option<ProgramId>,
+    /// What the last frame painted, for frame statistics.
+    last_paint: PaintKind,
     /// Search results per process; empty when there is no search.
     matched: Vec<bool>,
     /// What the table lists: matches, plus their ancestors in tree mode.
@@ -948,6 +961,7 @@ impl App {
             kept_page: Page::default(),
             full_due: true,
             history_selected: None,
+            last_paint: PaintKind::Full,
             matched: Vec::new(),
             shown: Vec::new(),
             mouse: None,
@@ -2273,13 +2287,25 @@ impl App {
         };
         let axis = charts::axis_of(timeline, now_ms, self.settings.history_ms());
         if self.only_the_clock_moved() {
+            self.last_paint = PaintKind::Tick;
             self.paint_tick(dl, axis);
             return;
         }
+        self.last_paint = if self.page == Page::Processes && self.table.animating() {
+            PaintKind::Slide
+        } else {
+            PaintKind::Full
+        };
         self.paint_full(dl, axis);
         self.kept.copy_from(dl);
         self.kept_page = self.page;
         self.full_due = false;
+    }
+
+    /// What the last frame painted.
+    #[must_use]
+    pub fn last_paint(&self) -> PaintKind {
+        self.last_paint
     }
 
     /// Whether this frame differs from the last full paint only by the clock: no

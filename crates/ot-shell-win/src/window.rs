@@ -64,6 +64,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::actions::{self, ActionOutcome};
+use crate::frame_stats::FrameLog;
 use crate::gfx::Gfx;
 use crate::icons;
 use crate::task_manager::{self, Elevated};
@@ -168,6 +169,8 @@ struct State {
     dl: DisplayList,
     /// When the last frame was presented, to notice `Present` not waiting.
     last_frame: Option<Instant>,
+    /// With `OT_FRAME_STATS` set: what the frames cost.
+    frame_log: Option<FrameLog>,
     /// Where snapshots come from: the live sampler, or a replay's player.
     feed: Option<Feed>,
     /// This build's version, for a recording's header.
@@ -403,6 +406,7 @@ pub fn run(
         app,
         dl: DisplayList::new(),
         last_frame: None,
+        frame_log: FrameLog::from_env(),
         feed: Some(feed),
         version: options.version,
         record_name: None,
@@ -702,7 +706,9 @@ fn repaint(st: &mut State) {
             }
         }
     }
+    let painting = Instant::now();
     st.app.paint(&mut st.dl);
+    let paint = painting.elapsed();
     // In the background the window gets every other vertical blank: still smooth,
     // at half the cost, for a window glanced at rather than watched.
     // SAFETY: plain query; no pointers.
@@ -714,6 +720,14 @@ fn repaint(st: &mut State) {
             st.gfx = None;
             invalidate(st.hwnd);
         } else {
+            if let Some(log) = st.frame_log.as_mut() {
+                log.add(
+                    st.app.last_paint(),
+                    paint,
+                    gfx.last_stats(),
+                    gfx.last_damage(),
+                );
+            }
             // Icons the frame wanted and nobody has loaded: the worker gets them.
             for path in gfx.take_wanted() {
                 st.icons.request(path);

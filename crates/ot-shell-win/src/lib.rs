@@ -27,6 +27,8 @@
 #[cfg(windows)]
 mod actions;
 #[cfg(windows)]
+mod frame_stats;
+#[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
 mod icons;

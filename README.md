@@ -576,6 +576,12 @@ The build names itself from git: a clean checkout of a release tag is that relea
 (`0.2.1-21-g25c2e9c`), with `-dirty` for uncommitted changes. On Windows the exe
 carries it as its version resource too (Properties > Details).
 
+For performance work, `OT_FRAME_STATS=1` logs every five seconds what the frames
+cost: frames a second by kind (charts only, rows sliding, whole), how many were drawn
+in part and how much of the window, the time to build, diff, draw, copy and present
+a frame, and the process's CPU. `cargo build --profile profiling` is the release build
+with symbols kept, for a sampling profiler such as WPR or xperf.
+
 Two environment variables help with drawing faults on Windows. With
 `OT_CHECK_DAMAGE=1` (or a directory path) every frame drawn in part over the last one
 is also drawn whole and the two compared; frames that differ are logged and the first

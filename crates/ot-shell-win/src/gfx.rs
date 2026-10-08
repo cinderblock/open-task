@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 
 use ot_paint::{
     Color, DisplayList, DrawCmd, FontFamily, FontWeight, HAlign, Icon, Point, Rect, Span, TextCmd,
@@ -145,8 +146,29 @@ pub struct Gfx {
     wanted: Vec<String>,
 
     frame: u64,
+    /// How the last frame went, for frame statistics.
+    stats: FrameStats,
     dpi: f32,
     size_px: (u32, u32),
+}
+
+/// How one [`Gfx::render`] went, for `OT_FRAME_STATS`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameStats {
+    /// Drawn in part, over the last frame, rather than whole.
+    pub partial: bool,
+    /// The share of the window drawn: 1 for a whole frame.
+    pub damaged: f32,
+    /// Comparing the display list with the last one.
+    pub diff: Duration,
+    /// Drawing into the canvas, `EndDraw` included.
+    pub draw: Duration,
+    /// Copying the canvas to the swap chain's buffer.
+    pub copy: Duration,
+    /// `Present`, which may wait for the display.
+    pub present: Duration,
+    /// Keeping the display list and evicting layouts, after `Present`.
+    pub rest: Duration,
 }
 
 /// Damage over this share of the window is drawn as a whole frame instead.
@@ -296,6 +318,7 @@ impl Gfx {
             images: HashMap::new(),
             wanted: Vec::new(),
             frame: 0,
+            stats: FrameStats::default(),
             dpi,
             size_px,
         };
@@ -442,8 +465,10 @@ impl Gfx {
     /// the last (1 for every one, 2 for every other).
     pub fn render(&mut self, dl: &DisplayList, sync: u32) -> Result<()> {
         self.frame += 1;
+        let started = Instant::now();
         let mut damage = std::mem::take(&mut self.damage);
         let partial = !self.redraw_all && dl.damage_since(&self.last, &mut damage);
+        let diffed = Instant::now();
         let window = self.size_px.0 as f32 * self.size_px.1 as f32;
         let scale = self.dpi / 96.0;
         let damaged: f32 = damage.iter().map(|r| r.w * r.h * scale * scale).sum();
@@ -467,18 +492,48 @@ impl Gfx {
         }
         self.damage = damage;
         drawn?;
+        let drawn_at = Instant::now();
         // SAFETY: the canvas and the target are the same size and format; the
         // canvas's drawing has been flushed by EndDraw.
         unsafe {
             if let (Some(target), Some(canvas)) = (&self.target, &self.canvas) {
                 target.CopyFromBitmap(None, canvas, None)?;
             }
-            self.swapchain.Present(sync, DXGI_PRESENT(0)).ok()?;
         }
+        let copied = Instant::now();
+        // SAFETY: the swap chain is valid.
+        unsafe { self.swapchain.Present(sync, DXGI_PRESENT(0)).ok()? };
+        let presented = Instant::now();
         self.last.copy_from(dl);
         self.redraw_all = false;
         self.evict_layouts();
+        self.stats = FrameStats {
+            partial,
+            damaged: if partial {
+                damaged / window.max(1.0)
+            } else {
+                1.0
+            },
+            diff: diffed - started,
+            draw: drawn_at - diffed,
+            copy: copied - drawn_at,
+            present: presented - copied,
+            rest: presented.elapsed(),
+        };
         Ok(())
+    }
+
+    /// How the last frame went.
+    #[must_use]
+    pub fn last_stats(&self) -> FrameStats {
+        self.stats
+    }
+
+    /// Where the last frame differed from the one before, in DIPs; meaningful when
+    /// it was drawn in part.
+    #[must_use]
+    pub fn last_damage(&self) -> &[Rect] {
+        &self.damage
     }
 
     /// Draw every command into the canvas.
