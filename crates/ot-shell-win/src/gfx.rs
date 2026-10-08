@@ -121,6 +121,9 @@ pub struct Gfx {
     damage: Vec<Rect>,
     /// Draw the next frame whole: the canvas is new, or holds something stale.
     redraw_all: bool,
+    /// Each of this frame's commands' bounds ([`DisplayList::bounds`]), worked out
+    /// once: a partial frame tests every command against every damaged area.
+    cmd_bounds: Vec<Option<Rect>>,
     /// What the last frame presented changed, in device pixels; `None` for a whole
     /// frame, or when the buffers hold nothing known (after a resize).
     shown: Option<Vec<RECT>>,
@@ -174,7 +177,8 @@ pub struct FrameStats {
     pub damaged: f32,
     /// Comparing the display list with the last one.
     pub diff: Duration,
-    /// Drawing into the canvas, `EndDraw` included.
+    /// Drawing into the canvas, `EndDraw` included; not the chart runs' bitmaps
+    /// ([`FrameStats::charts`]).
     pub draw: Duration,
     /// Copying the canvas to the swap chain's buffer.
     pub copy: Duration,
@@ -208,7 +212,7 @@ impl Gfx {
             hwnd,
             size_px,
             dpi,
-            created3d_device(std::env::var_os("OT_WARP").is_some())?,
+            create_d3d_device(std::env::var_os("OT_WARP").is_some())?,
         )
     }
 
@@ -327,6 +331,7 @@ impl Gfx {
             damage: Vec::new(),
             redraw_all: true,
             shown: None,
+            cmd_bounds: Vec::new(),
             check: DamageCheck::from_env(),
             charts: Charts::new(),
             _dcomp: dcomp,
@@ -496,6 +501,9 @@ impl Gfx {
     pub fn render(&mut self, dl: &DisplayList, sync: u32) -> Result<()> {
         self.frame += 1;
         let started = Instant::now();
+        self.cmd_bounds.clear();
+        self.cmd_bounds
+            .extend(dl.cmds().iter().map(|cmd| dl.bounds(cmd)));
         let mut damage = std::mem::take(&mut self.damage);
         let partial = !self.redraw_all && dl.damage_since(&self.last, &mut damage);
         let diffed = Instant::now();
@@ -513,7 +521,8 @@ impl Gfx {
             self.charts.fall_back(ChartDrawing::Direct2D);
             self.charts.runs.clear();
         }
-        let charts = charting.elapsed();
+        let charted = Instant::now();
+        let charts = charted - charting;
         // SAFETY: every call is on a valid device context between BeginDraw and
         // EndDraw; all pointers passed point at locals that outlive the call.
         let drawn = unsafe {
@@ -560,7 +569,7 @@ impl Gfx {
                 1.0
             },
             diff: diffed - started,
-            draw: drawn_at - diffed,
+            draw: drawn_at - charted,
             copy: copied - drawn_at,
             charts,
             present: presented - copied,
@@ -783,9 +792,7 @@ impl Gfx {
             // reaches into the area, in order.
             let touches = area.is_none_or(|area| match cmd {
                 DrawCmd::PushClip(_) | DrawCmd::PopClip => true,
-                _ => dl
-                    .bounds(cmd)
-                    .is_none_or(|b| !b.intersect(&area).is_empty()),
+                _ => self.cmd_bounds[i - 1].is_none_or(|b| !b.intersect(&area).is_empty()),
             });
             if touches {
                 // SAFETY: as for `render`.
@@ -1526,7 +1533,7 @@ impl Gfx {
     }
 }
 
-fn created3d_device(warp_only: bool) -> Result<ID3D11Device> {
+fn create_d3d_device(warp_only: bool) -> Result<ID3D11Device> {
     let mut last = None;
     for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
         if warp_only && driver == D3D_DRIVER_TYPE_HARDWARE {
@@ -1996,6 +2003,91 @@ mod tests {
         (worst, sum as f64 / n, far as f64 / n)
     }
 
+    /// A History at full history, as the app draws it at 96 DPI: nine bands with
+    /// hairlines across 670 x 430, a point a DIP, inside a 1164 x 721 window.
+    fn history_frame(dl: &mut DisplayList, shift: f32) {
+        dl.clear();
+        dl.clear_to(Color::hex(0x20_20_20));
+        let plot = Rect::new(240.0, 270.0, 670.0, 430.0);
+        dl.push_clip(plot);
+        let xs: Vec<f32> = (0..=670).map(|i| plot.x + i as f32 + shift).collect();
+        let mut lower: Vec<Point> = xs.iter().map(|&x| Point::new(x, plot.bottom())).collect();
+        for b in 0..9 {
+            let upper: Vec<Point> = lower
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let k = (i as f32 * 0.03 + b as f32 * 1.7 + shift).sin();
+                    Point::new(p.x, p.y - 20.0 - 18.0 * k.abs())
+                })
+                .collect();
+            dl.band(
+                upper.iter().copied(),
+                lower.iter().copied(),
+                Color::hex(0x39_87_E5).with_alpha(0.9),
+            );
+            dl.graph(upper.iter().copied(), Color::hex(0x20_20_20), 1.0);
+            lower = upper;
+        }
+        dl.pop_clip();
+    }
+
+    /// `cargo test -p ot-shell-win --release -- --ignored --nocapture
+    /// chart_frame_timing`: the time a full-history History frame takes to draw,
+    /// chart preparation (shapes, raster or GPU, upload) and the Direct2D pass
+    /// apart, on this machine's GPU, for each way of drawing charts. The fastest of
+    /// several batches, since a busy machine slows some.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn chart_frame_timing() {
+        // SAFETY: a hidden popup of a system class, destroyed below.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("chart timing"),
+                WS_POPUP,
+                0,
+                0,
+                1164,
+                721,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a window");
+        let device = create_d3d_device(false).expect("a device");
+        let mut gfx = Gfx::on_device(hwnd, (1164, 721), 96.0, device).expect("graphics");
+        let mut dl = DisplayList::new();
+        for mode in [ChartDrawing::Gpu, ChartDrawing::Cpu, ChartDrawing::Direct2D] {
+            gfx.charts.forced = Some(mode);
+            let (mut best_charts, mut best_draw) = (Duration::MAX, Duration::MAX);
+            for batch in 0..8 {
+                let (mut charts, mut draw) = (Duration::ZERO, Duration::ZERO);
+                for f in 0..20 {
+                    history_frame(&mut dl, (batch * 20 + f) as f32 * 0.37);
+                    gfx.render(&dl, 0).expect("a frame");
+                    charts += gfx.stats.charts;
+                    draw += gfx.stats.draw;
+                }
+                best_charts = best_charts.min(charts / 20);
+                best_draw = best_draw.min(draw / 20);
+            }
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "{mode:?}: charts {:.3} ms, draw {:.3} ms",
+                ms(best_charts),
+                ms(best_draw)
+            );
+        }
+        // SAFETY: created above.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
     #[test]
     fn the_gpu_and_cpu_chart_renderers_draw_what_direct2d_draws() {
         // SAFETY: a hidden popup of a system class, destroyed below.
@@ -2021,7 +2113,7 @@ mod tests {
         for dpi in [96.0, 144.0] {
             let size = ((300.0 * dpi / 96.0) as u32, (300.0 * dpi / 96.0) as u32);
             // WARP: the same pixels on every machine, CI's included.
-            let device = created3d_device(true).expect("WARP");
+            let device = create_d3d_device(true).expect("WARP");
             let mut gfx = Gfx::on_device(hwnd, size, dpi, device).expect("graphics");
             let mut frames = Vec::new();
             for mode in [ChartDrawing::Direct2D, ChartDrawing::Cpu, ChartDrawing::Gpu] {
