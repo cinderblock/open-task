@@ -603,7 +603,11 @@ mod tests {
     fn the_revision_changes_with_every_change_and_is_never_shared() {
         let mut u = Usage::new(0.05);
         let other = Usage::new(0.05);
-        assert_ne!(u.revision(), other.revision(), "two of them, even both empty");
+        assert_ne!(
+            u.revision(),
+            other.revision(),
+            "two of them, even both empty"
+        );
         let r = u.revision();
         u.observe(&snap(1000, vec![proc(1, Some(0), 5 * G)]));
         assert_ne!(u.revision(), r, "a snapshot");
