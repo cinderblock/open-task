@@ -72,8 +72,12 @@ Ranked by its estimated impact:
       25 -> 15 % background on the Map view.
 4. ~~Re-measure after the driver update~~ (31.0.101.2145; the second
    full-history set and everything after are on it).
-5. **[current]** Report to the user; remaining items are small (see Open
-   questions).
+5. ~~Report to the user.~~ Released v0.12.0 (2026-10-08).
+6. ~~The user's picks (2026-10-08): leave the bricks; make the CPU chart path
+   faster; the bounds cache.~~ Bounds once a frame and the stats fix
+   (`e50c440`); CPU lines (`e875b24`). Not released yet (open question 1).
+   The other two small items (chart runs straight into the canvas, per-sample
+   work for hidden pages) were not asked for and are not done.
 
 ## Findings / gotchas
 
@@ -155,17 +159,11 @@ Ranked by its estimated impact:
 - [x] 2026-10-07: re-measured on driver 31.0.101.2145
 - [x] 2026-10-08: reported; released as v0.12.0 at the user's word (`b5d1e78`,
   tag pushed; Release and CI workflows passed; nine assets published)
-- [ ] The user's call on the small remaining items (open questions 1 and 2)
+- [x] 2026-10-08: the user's picks done (`e50c440`, `e875b24`)
 
 ## Open questions for the user
 
-1. The CPU chart renderer matches Direct2D at the History's full size (24 vs 21 %
-   at 30 fps; GPU 5.9 %). Leave it, or make it faster (hand SIMD for edges and
-   lines, rasterize only damaged columns)? Recommendation: leave it; the GPU is the
-   default and the CPU path is there as a choice.
-2. Smaller remaining items, each about 0.5-1 % of a core: cache each command's
-   bounds once a frame; draw chart runs straight into the canvas instead of a
-   texture each; skip per-sample work for pages not shown. Worth doing?
-   Recommendation: the bounds cache only (simple, safe); the rest is little for
-   its risk.
-3. ~~Release these as v0.12.0?~~ Released 2026-10-08.
+1. Release `e50c440` and `e875b24` as v0.12.1? (Pushed to `master`, not
+   tagged.) Recommendation: yes, once the CI run on `master` passes.
+2. ~~Earlier questions~~ answered 2026-10-08 (bricks: leave; CPU path: faster;
+   bounds cache: do it; v0.12.0: released).

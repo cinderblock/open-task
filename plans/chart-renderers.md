@@ -68,9 +68,9 @@ drawing off that path with two new renderers, compare them, and let the user pic
 7. ~~Frame stats for each at full history (6 min runs).~~
 8. ~~CPU rasterizer sped up (`683221a`).~~
 9. ~~Report the comparison to the user.~~ Released in v0.12.0.
-10. Possible later, if the user wants the CPU path faster still: SIMD by hand for
-    the edge pixels and lines, rasterizing only the columns a partial frame
-    damages, or sharing the work across threads (wall time only, not CPU).
+10. ~~The user asked for the CPU path faster still (2026-10-08).~~ Lines
+    vectorized (`e875b24`). Still possible: hand SIMD for the bands' edge
+    pixels; threads would cut wall time only, not CPU.
 
 ## Findings / gotchas
 
@@ -99,6 +99,28 @@ drawing off that path with two new renderers, compare them, and let the user pic
   row-run fills (vectorizable 16-byte steps), packed blending and precomputed
   segments. In the app the History is larger (about 670 x 430) and the bitmap is
   uploaded, so CPU mode only matches Direct2D there.
+- **Correction:** `OT_FRAME_STATS`' `draw_ms` included the chart runs' bitmaps
+  until `e50c440`, so "CPU chart prep 6.6 ms + draw 7.3 ms" above was 6.6 ms of
+  chart prep and about 0.7 ms of Direct2D. The Direct2D pass in CPU mode is about
+  0.15-0.3 ms, as in GPU mode; there was no upload stall.
+- `gfx::tests::chart_frame_timing` (ignored; 670 x 430 History, nine bands and
+  hairlines, 1164 x 721 window, the real GPU, fastest of 8 batches): GPU chart
+  prep 0.10-0.19 ms + draw 0.11-0.21 ms; CPU chart prep 2.0-2.2 ms (quiet machine)
+  + draw 0.14-0.3 ms; Direct2D draw 5.0-7.6 ms.
+- **Dead ends (2026-10-08), all measured:**
+  - A dynamic staging texture for the CPU upload (map with discard, GPU copy):
+    no change; the "stall" was the stats bug above. Reverted.
+  - Drawing by columns (column-major buffer, uploaded on its side, drawn back
+    through a swap-x-and-y transform): pixel-exact (parity unchanged), but bands
+    no faster (0.84-0.87 vs 0.84-1.16 ms) since their whole rows were already
+    vector runs; the transpose cost 0.18-0.36 ms. Not kept.
+  - Caching a segment's slope during band sampling: no measurable change.
+- What did help: each line segment's squared distance for a column's whole run
+  of rows in one vectorizable loop (`e875b24`): lines 0.74-1.0 -> 0.67-0.73 ms in
+  the History-sized timing (670 x 290), A/B interleaved on the same load.
+- Live measurements were not possible on 2026-10-08 morning: with the displays
+  asleep `Present` does not return frames (an app run showed 1.1 % CPU and no
+  frames). The renderer and raster timing tests need no display.
 - Micro-timings on this busy machine wander +-40 % run to run; take the fastest
   of several batches, and interleave A/B runs.
 - `OT_CHECK_DAMAGE` makes `draw_ms` meaningless (the whole frame is drawn again
@@ -112,6 +134,8 @@ drawing off that path with two new renderers, compare them, and let the user pic
   setting, parity test; clippy on three targets, all tests
 - [x] 2026-10-07: measured at full history (two sets); CPU path sped up
 - [x] 2026-10-08: reported; released in v0.12.0
+- [x] 2026-10-08: CPU path, round 3: lines vectorized (`e875b24`); dead ends
+  recorded; stats draw time fixed (`e50c440`)
 
 ## Open questions for the user
 

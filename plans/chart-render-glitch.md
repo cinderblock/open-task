@@ -29,8 +29,8 @@ first (they asked what it is from), then fix it.
 2. ~~Run it, hover the charts, read the dumps.~~ Cause: the Intel GPU driver (see
    Findings).
 3. ~~The user updated the Intel driver (2026-10-07) to 31.0.101.2145.~~
-4. **[current]** Report: the blocks are rarer but not gone. No software (WARP)
-   fallback: the user does not want a slow path.
+4. ~~Report.~~ The user chose to leave them (2026-10-08): rare since the
+   driver update, a driver fault, kept out of the charts by GPU drawing.
 
 ## Findings / gotchas
 
@@ -80,10 +80,7 @@ first (they asked what it is from), then fix it.
 
 ## Open questions for the user
 
-1. The driver update made the blocks rare (2 in about 2000 list-view frames, none
-   in the History with GPU charts) but did not remove them. Leave it there, or
-   look further (a newer Intel driver, a report to Intel)? Recommendation: leave
-   it; it is a driver fault and now rare.
+None. (2026-10-08: leave them.)
 
 ## Things not to do
 
