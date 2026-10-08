@@ -10,15 +10,15 @@ use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
 
 use ot_paint::{
-    Color, DisplayList, DrawCmd, FontFamily, FontWeight, HAlign, Icon, Point, Rect, Span, TextCmd,
-    TextStyle, VAlign,
+    ChartRaster, Color, DisplayList, DrawCmd, FontFamily, FontWeight, HAlign, Icon, Point, Rect,
+    Span, TextCmd, TextStyle, VAlign,
 };
 use windows::core::{Interface, Result, BOOL, HSTRING};
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
-    D2D_RECT_F, D2D_SIZE_U,
+    D2D_RECT_F, D2D_RECT_U, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
@@ -26,14 +26,20 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_FLAT,
     D2D1_DASH_STYLE_SOLID, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_BEVEL,
-    D2D1_MAP_OPTIONS_READ, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1,
-    D2D1_STROKE_TRANSFORM_TYPE_NORMAL, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LINE_JOIN_BEVEL, D2D1_MAP_OPTIONS_READ,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11RenderTargetView, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
+
+use crate::chart_gpu::GpuCharts;
+use crate::charts::{find_runs, ChartDrawing, ChartRun, Shapes};
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
@@ -99,7 +105,7 @@ fn image_key(path: &str) -> u64 {
 }
 
 pub struct Gfx {
-    _d3d: ID3D11Device,
+    d3d: ID3D11Device,
     d2d_factory: ID2D1Factory1,
     _d2d_device: ID2D1Device,
     dc: ID2D1DeviceContext,
@@ -118,6 +124,8 @@ pub struct Gfx {
     /// With `OT_CHECK_DAMAGE` set, every partial frame is also drawn whole and the
     /// two compared ([`Gfx::check_damage`]).
     check: Option<DamageCheck>,
+    /// How chart shapes are drawn, and their bitmaps ([`Charts`]).
+    charts: Charts,
     // Composition objects must stay alive for the visual tree to keep existing.
     _dcomp: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -139,6 +147,8 @@ pub struct Gfx {
     utf16: Vec<u16>,
     /// The segments of the path being built, reused between paths.
     path_pts: Vec<Vector2>,
+    /// A band's outline for Direct2D, reused between bands.
+    band_pts: Vec<Point>,
     /// Raster images by the hash of their path: a program's icon, loaded by the
     /// window off this thread and handed in with [`Gfx::add_image`].
     images: HashMap<u64, ImageSlot>,
@@ -165,6 +175,8 @@ pub struct FrameStats {
     pub draw: Duration,
     /// Copying the canvas to the swap chain's buffer.
     pub copy: Duration,
+    /// Drawing chart runs into their bitmaps (GPU or CPU), before the draw.
+    pub charts: Duration,
     /// `Present`, which may wait for the display.
     pub present: Duration,
     /// Keeping the display list and evicting layouts, after `Present`.
@@ -188,7 +200,18 @@ impl Gfx {
     /// Create all device objects and bind the swap chain to `hwnd` via composition.
     #[allow(clippy::too_many_lines)]
     pub fn new(hwnd: HWND, size_px: (u32, u32), dpi: f32) -> Result<Self> {
-        let d3d = create_d3d_device()?;
+        // `OT_WARP` set: software only, to tell a GPU driver's faults from ours.
+        Self::on_device(
+            hwnd,
+            size_px,
+            dpi,
+            created3d_device(std::env::var_os("OT_WARP").is_some())?,
+        )
+    }
+
+    /// As [`Gfx::new`], on `d3d`.
+    #[allow(clippy::too_many_lines)]
+    fn on_device(hwnd: HWND, size_px: (u32, u32), dpi: f32, d3d: ID3D11Device) -> Result<Self> {
         let dxgi_device: IDXGIDevice = d3d.cast()?;
 
         // SAFETY: all objects are valid; the descriptor is fully initialized.
@@ -290,7 +313,7 @@ impl Gfx {
         };
 
         let mut gfx = Self {
-            _d3d: d3d,
+            d3d,
             d2d_factory,
             _d2d_device: d2d_device,
             dc,
@@ -301,6 +324,7 @@ impl Gfx {
             damage: Vec::new(),
             redraw_all: true,
             check: DamageCheck::from_env(),
+            charts: Charts::new(),
             _dcomp: dcomp,
             _dcomp_target: dcomp_target,
             _visual: visual,
@@ -315,6 +339,7 @@ impl Gfx {
             layouts: HashMap::with_capacity(1024),
             utf16: Vec::with_capacity(128),
             path_pts: Vec::with_capacity(1024),
+            band_pts: Vec::new(),
             images: HashMap::new(),
             wanted: Vec::new(),
             frame: 0,
@@ -475,6 +500,15 @@ impl Gfx {
         // Damage over most of the window costs as much as drawing it whole, and
         // more once rectangles overlap.
         let partial = partial && damaged < window * WHOLE_AT;
+        // Chart runs into their bitmaps, before Direct2D's pass, which draws them.
+        let charting = Instant::now();
+        let all = !partial || self.check.is_some();
+        if let Err(e) = self.prepare_charts(dl, if all { None } else { Some(&damage) }) {
+            tracing::warn!(error = %e, "chart drawing failed; drawing charts with Direct2D");
+            self.charts.fall_back(ChartDrawing::Direct2D);
+            self.charts.runs.clear();
+        }
+        let charts = charting.elapsed();
         // SAFETY: every call is on a valid device context between BeginDraw and
         // EndDraw; all pointers passed point at locals that outlive the call.
         let drawn = unsafe {
@@ -517,6 +551,7 @@ impl Gfx {
             diff: diffed - started,
             draw: drawn_at - diffed,
             copy: copied - drawn_at,
+            charts,
             present: presented - copied,
             rest: presented.elapsed(),
         };
@@ -541,11 +576,198 @@ impl Gfx {
         // SAFETY: as for `render`.
         unsafe {
             self.dc.BeginDraw();
-            for cmd in dl.cmds() {
-                self.draw_cmd(dl, cmd)?;
-            }
-            self.dc.EndDraw(None, None)
+            let drawn = self.draw_cmds(dl, None);
+            self.dc.EndDraw(None, None)?;
+            drawn
         }
+    }
+
+    /// Draw `dl`'s commands in order, or only those reaching into `area`, with
+    /// each chart run as its bitmap, between `BeginDraw` and `EndDraw`.
+    unsafe fn draw_cmds(&mut self, dl: &DisplayList, area: Option<Rect>) -> Result<()> {
+        let cmds = dl.cmds();
+        let mut i = 0;
+        let mut run = 0;
+        while i < cmds.len() {
+            if let Some(r) = self.charts.runs.get(run).copied() {
+                if r.start == i {
+                    run += 1;
+                    i = r.end;
+                    if area.is_none_or(|a| !r.dip.intersect(&a).is_empty()) {
+                        // SAFETY: as for `render`.
+                        unsafe { self.draw_run(run - 1, r) };
+                    }
+                    continue;
+                }
+            }
+            let cmd = &cmds[i];
+            i += 1;
+            // Clips always, to keep the stack; clears and anything else that
+            // reaches into the area, in order.
+            let touches = area.is_none_or(|area| match cmd {
+                DrawCmd::PushClip(_) | DrawCmd::PopClip => true,
+                _ => dl
+                    .bounds(cmd)
+                    .is_none_or(|b| !b.intersect(&area).is_empty()),
+            });
+            if touches {
+                // SAFETY: as for `render`.
+                unsafe { self.draw_cmd(dl, cmd)? };
+            }
+        }
+        Ok(())
+    }
+
+    /// Draw chart run `i`'s bitmap in its place, 1:1 with the device's pixels.
+    unsafe fn draw_run(&self, i: usize, run: ChartRun) {
+        let Some(Some(slot)) = self.charts.slots.get(i) else {
+            return;
+        };
+        if !self.charts.ready.get(i).copied().unwrap_or(false) {
+            return;
+        }
+        let dest = rectf(run.dip);
+        let src = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: run.px.w as f32,
+            bottom: run.px.h as f32,
+        };
+        // SAFETY: between BeginDraw and EndDraw; the rects are locals.
+        unsafe {
+            self.dc.DrawBitmap(
+                &slot.bitmap,
+                Some(&raw const dest),
+                1.0,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                Some(&raw const src),
+                None,
+            );
+        }
+    }
+
+    /// Choose how chart shapes are drawn (the user's setting; `OT_CHARTS`
+    /// overrides it).
+    pub fn set_chart_drawing(&mut self, choice: ChartDrawing) {
+        if self.charts.choose(choice) {
+            self.redraw_all = true;
+        }
+    }
+
+    /// Find this frame's chart runs and draw into their bitmaps the ones it needs:
+    /// every one for a whole frame, those reaching into `damage` for a partial one.
+    fn prepare_charts(&mut self, dl: &DisplayList, damage: Option<&[Rect]>) -> Result<()> {
+        let charts = &mut self.charts;
+        charts.runs.clear();
+        let mode = charts.mode();
+        if mode == ChartDrawing::Direct2D {
+            return Ok(());
+        }
+        if mode == ChartDrawing::Gpu && charts.gpu.is_none() {
+            match GpuCharts::new(&self.d3d) {
+                Ok(g) => charts.gpu = Some(g),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no GPU chart drawing; drawing charts on the CPU");
+                    charts.fall_back(ChartDrawing::Cpu);
+                }
+            }
+        }
+        let mode = charts.mode();
+        let scale = self.dpi / 96.0;
+        find_runs(dl, scale, self.size_px, &mut charts.runs);
+        let n = charts.runs.len();
+        charts.ready.clear();
+        charts.ready.resize(n, false);
+        charts.ranges.clear();
+        charts.ranges.resize(n, (0, 0));
+        charts.shapes.clear();
+        let mut any = false;
+        for (i, run) in charts.runs.iter().enumerate() {
+            let wanted = !run.px.is_empty()
+                && damage.is_none_or(|d| d.iter().any(|a| !run.dip.intersect(a).is_empty()));
+            if wanted {
+                charts.ranges[i] = charts.shapes.add_run(dl, run, scale);
+                charts.ready[i] = true;
+                any = true;
+            }
+        }
+        if !any {
+            return Ok(());
+        }
+        self.draw_runs(mode)
+    }
+
+    /// Draw the runs [`Gfx::prepare_charts`] marked ready into their bitmaps, with
+    /// `mode`.
+    fn draw_runs(&mut self, mode: ChartDrawing) -> Result<()> {
+        let charts = &mut self.charts;
+        let n = charts.runs.len();
+        if charts.slots.len() < n {
+            charts.slots.resize_with(n, || None);
+        }
+        for i in 0..n {
+            if !charts.ready[i] {
+                continue;
+            }
+            let run = charts.runs[i];
+            charts.slots[i] = Some(slot_for(
+                &self.dc,
+                &self.d3d,
+                charts.slots[i].take(),
+                run.px.w,
+                run.px.h,
+                mode == ChartDrawing::Gpu,
+            )?);
+        }
+        match mode {
+            ChartDrawing::Gpu => {
+                let Some(gpu) = charts.gpu.as_mut() else {
+                    return Ok(());
+                };
+                gpu.upload(&charts.shapes)?;
+                for i in 0..n {
+                    let (true, Some(slot)) = (charts.ready[i], &charts.slots[i]) else {
+                        continue;
+                    };
+                    if let Some(rtv) = &slot.target {
+                        let run = charts.runs[i];
+                        gpu.draw(rtv, run.px.w, run.px.h, charts.ranges[i])?;
+                    }
+                }
+                gpu.finish();
+            }
+            ChartDrawing::Cpu => {
+                for i in 0..n {
+                    let (true, Some(slot)) = (charts.ready[i], &charts.slots[i]) else {
+                        continue;
+                    };
+                    let run = charts.runs[i];
+                    charts.shapes.rasterize(
+                        charts.ranges[i],
+                        run.px.w,
+                        run.px.h,
+                        &mut charts.raster,
+                    );
+                    let dst = D2D_RECT_U {
+                        left: 0,
+                        top: 0,
+                        right: run.px.w,
+                        bottom: run.px.h,
+                    };
+                    // SAFETY: the raster holds `h` rows of `w * 4` bytes, the rect's
+                    // size, within the bitmap.
+                    unsafe {
+                        slot.bitmap.CopyFromMemory(
+                            Some(&raw const dst),
+                            charts.raster.pixels().as_ptr().cast(),
+                            run.px.w * 4,
+                        )?;
+                    }
+                }
+            }
+            ChartDrawing::Direct2D => {}
+        }
+        Ok(())
     }
 
     /// Draw the commands that touch each of `damage` into the canvas, clipped to
@@ -564,28 +786,21 @@ impl Gfx {
         // SAFETY: as for `render`.
         unsafe {
             self.dc.BeginDraw();
+            let mut drawn = Ok(());
             for &area in damage {
                 // Out to whole pixels, so the clip's edge leaves no pixel half drawn.
                 let area = self.to_pixel_edges(area);
                 let clip = rectf(area);
                 self.dc
                     .PushAxisAlignedClip(&raw const clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                for cmd in dl.cmds() {
-                    // Clips always, to keep the stack; clears and anything else
-                    // that reaches into the area, in order.
-                    let touches = match cmd {
-                        DrawCmd::PushClip(_) | DrawCmd::PopClip => true,
-                        _ => dl
-                            .bounds(cmd)
-                            .is_none_or(|b| !b.intersect(&area).is_empty()),
-                    };
-                    if touches {
-                        self.draw_cmd(dl, cmd)?;
-                    }
-                }
+                drawn = self.draw_cmds(dl, Some(area));
                 self.dc.PopAxisAlignedClip();
+                if drawn.is_err() {
+                    break;
+                }
             }
-            self.dc.EndDraw(None, None)
+            self.dc.EndDraw(None, None)?;
+            drawn
         }
     }
 
@@ -850,11 +1065,32 @@ impl Gfx {
                     points,
                     color: c,
                     width,
+                }
+                | DrawCmd::Graph {
+                    points,
+                    color: c,
+                    width,
                 } => {
                     let geom = self.path(dl.points(points), false)?;
                     self.set_color(c);
                     self.dc
                         .DrawGeometry(&geom, &self.brush, width, &self.line_style);
+                }
+                DrawCmd::Band {
+                    top,
+                    bottom,
+                    color: c,
+                } => {
+                    // Along the top, then back along the bottom.
+                    let mut pts = std::mem::take(&mut self.band_pts);
+                    pts.clear();
+                    pts.extend_from_slice(dl.points(top));
+                    pts.extend(dl.points(bottom).iter().rev());
+                    let geom = self.path(&pts, true);
+                    self.band_pts = pts;
+                    let geom = geom?;
+                    self.set_color(c);
+                    self.dc.FillGeometry(&geom, &self.brush, None);
                 }
                 DrawCmd::FillPolygon { points, color: c } => {
                     let geom = self.path(dl.points(points), true)?;
@@ -1113,10 +1349,8 @@ impl Gfx {
     }
 }
 
-fn create_d3d_device() -> Result<ID3D11Device> {
+fn created3d_device(warp_only: bool) -> Result<ID3D11Device> {
     let mut last = None;
-    // `OT_WARP` set: software only, to tell a GPU driver's faults from ours.
-    let warp_only = std::env::var_os("OT_WARP").is_some();
     for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
         if warp_only && driver == D3D_DRIVER_TYPE_HARDWARE {
             continue;
@@ -1290,4 +1524,353 @@ fn write_bmp(path: &std::path::Path, size: (u32, u32), px: &[u8]) -> std::io::Re
     out.extend_from_slice(&[0u8; 24]);
     out.extend_from_slice(px);
     std::fs::write(path, out)
+}
+
+/// How chart shapes are drawn, and what drawing them needs between frames.
+struct Charts {
+    /// The user's choice ([`Gfx::set_chart_drawing`]).
+    choice: ChartDrawing,
+    /// `OT_CHARTS`, which overrides it.
+    forced: Option<ChartDrawing>,
+    /// What to use instead after the choice failed (the GPU's shaders, say).
+    fallback: Option<ChartDrawing>,
+    gpu: Option<GpuCharts>,
+    raster: ChartRaster,
+    shapes: Shapes,
+    /// This frame's runs, whether each was drawn this frame, its shapes, and its
+    /// bitmap, by the run's place.
+    runs: Vec<ChartRun>,
+    ready: Vec<bool>,
+    ranges: Vec<(u32, u32)>,
+    slots: Vec<Option<RunSlot>>,
+}
+
+impl Charts {
+    fn new() -> Self {
+        let forced = std::env::var("OT_CHARTS")
+            .ok()
+            .and_then(|v| ChartDrawing::parse(&v));
+        if let Some(f) = forced {
+            tracing::info!(drawing = ?f, "chart drawing set by OT_CHARTS");
+        }
+        Self {
+            choice: ChartDrawing::default(),
+            forced,
+            fallback: None,
+            gpu: None,
+            raster: ChartRaster::new(),
+            shapes: Shapes::default(),
+            runs: Vec::new(),
+            ready: Vec::new(),
+            ranges: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+
+    /// What draws the charts now.
+    fn mode(&self) -> ChartDrawing {
+        let wanted = self.forced.unwrap_or(self.choice);
+        match self.fallback {
+            Some(f) if wanted == ChartDrawing::Gpu || f == ChartDrawing::Direct2D => f,
+            _ => wanted,
+        }
+    }
+
+    /// Take the user's choice. Returns whether what draws the charts changed.
+    fn choose(&mut self, choice: ChartDrawing) -> bool {
+        let before = self.mode();
+        self.choice = choice;
+        // A new choice gets a fresh try.
+        self.fallback = None;
+        let changed = self.mode() != before;
+        if changed {
+            self.slots.clear();
+        }
+        changed
+    }
+
+    /// Stop using what failed: draw with `instead` from now on.
+    fn fall_back(&mut self, instead: ChartDrawing) {
+        self.fallback = Some(instead);
+        self.slots.clear();
+    }
+}
+
+/// A chart run's bitmap: the GPU draws into its texture through `target`, the CPU
+/// copies its pixels in; Direct2D draws it.
+struct RunSlot {
+    bitmap: ID2D1Bitmap1,
+    target: Option<ID3D11RenderTargetView>,
+    /// The size made, in pixels: at least the run's.
+    w: u32,
+    h: u32,
+}
+
+/// A bitmap for a `w` x `h` run: `slot` again when it is big enough and of the
+/// right kind, else a new one with room to grow.
+fn slot_for(
+    dc: &ID2D1DeviceContext,
+    device: &ID3D11Device,
+    slot: Option<RunSlot>,
+    w: u32,
+    h: u32,
+    gpu: bool,
+) -> Result<RunSlot> {
+    if let Some(s) = slot {
+        if s.w >= w && s.h >= h && s.target.is_some() == gpu {
+            return Ok(s);
+        }
+    }
+    // Room to grow, so a chart's bounds moving by a pixel does not make a new one.
+    let (w, h) = (
+        w.next_multiple_of(64).max(64),
+        h.next_multiple_of(64).max(64),
+    );
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        // One bitmap pixel a DIP: the draw maps it 1:1 to the device's pixels.
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        colorContext: ManuallyDrop::new(None),
+    };
+    // SAFETY: the descriptors are complete locals; out-pointers are locals.
+    unsafe {
+        if !gpu {
+            let size = D2D_SIZE_U {
+                width: w,
+                height: h,
+            };
+            let bitmap = dc.CreateBitmap(size, None, 0, &raw const props)?;
+            return Ok(RunSlot {
+                bitmap,
+                target: None,
+                w,
+                h,
+            });
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        device.CreateTexture2D(&raw const desc, None, Some(&raw mut texture))?;
+        let texture = texture.ok_or_else(|| {
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)
+        })?;
+        let mut target = None;
+        device.CreateRenderTargetView(&texture, None, Some(&raw mut target))?;
+        let surface: IDXGISurface = texture.cast()?;
+        let bitmap = dc.CreateBitmapFromDxgiSurface(&surface, Some(&raw const props))?;
+        Ok(RunSlot {
+            bitmap,
+            target,
+            w,
+            h,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ot_paint::{Color, Point};
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+    };
+
+    impl Gfx {
+        /// The canvas's pixels, premultiplied BGRA, top row first.
+        fn canvas_pixels(&self) -> Vec<u8> {
+            let (w, h) = self.size_px;
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: self.dpi,
+                dpiY: self.dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                colorContext: ManuallyDrop::new(None),
+            };
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            // SAFETY: the mapped rows are `pitch` apart, each at least `w * 4` bytes.
+            unsafe {
+                let read = self
+                    .dc
+                    .CreateBitmap(
+                        D2D_SIZE_U {
+                            width: w,
+                            height: h,
+                        },
+                        None,
+                        0,
+                        &raw const props,
+                    )
+                    .unwrap();
+                read.CopyFromBitmap(None, self.canvas.as_ref().unwrap(), None)
+                    .unwrap();
+                let m = read.Map(D2D1_MAP_OPTIONS_READ).unwrap();
+                for y in 0..h as usize {
+                    std::ptr::copy_nonoverlapping(
+                        m.bits.add(y * m.pitch as usize),
+                        out[y * (w as usize) * 4..].as_mut_ptr(),
+                        w as usize * 4,
+                    );
+                }
+                read.Unmap().unwrap();
+            }
+            out
+        }
+    }
+
+    /// A frame of chart shapes at awkward places: a stack of bands with hairlines,
+    /// a spiky line with its wash and envelope, steep and flat segments, all at
+    /// fractional coordinates, in a clip, over an opaque background.
+    fn charts_frame(dl: &mut DisplayList) {
+        dl.clear();
+        dl.clear_to(Color::hex(0x20_20_20));
+        dl.push_clip(Rect::new(10.3, 8.7, 280.0, 180.0));
+        let xs: Vec<f32> = (0..120).map(|i| 6.0 + i as f32 * 2.37).collect();
+        let wave =
+            |i: usize, k: f32| 0.5 + 0.45 * ((i as f32 * 0.31 + k).sin() * (i as f32 * 0.07).cos());
+        let mut lower: Vec<Point> = xs.iter().map(|&x| Point::new(x, 185.5)).collect();
+        let colors = [0x39_87_E5, 0xD9_59_26, 0x19_9E_70, 0xC9_85_00];
+        for (b, c) in colors.into_iter().enumerate() {
+            let upper: Vec<Point> = lower
+                .iter()
+                .enumerate()
+                .map(|(i, p)| Point::new(p.x, p.y - 30.0 * wave(i, b as f32)))
+                .collect();
+            dl.band(
+                upper.iter().copied(),
+                lower.iter().copied(),
+                Color::hex(c).with_alpha(0.9),
+            );
+            dl.graph(upper.iter().copied(), Color::hex(0x20_20_20), 1.0);
+            lower = upper;
+        }
+        dl.pop_clip();
+        dl.push_clip(Rect::new(20.0, 200.0, 260.0, 90.0));
+        let line: Vec<Point> = (0..90)
+            .map(|i| {
+                let spike = if i % 17 == 0 { -60.0 } else { 0.0 };
+                Point::new(18.0 + i as f32 * 3.1, 270.0 - 40.0 * wave(i, 2.0) + spike)
+            })
+            .collect();
+        dl.band(
+            line.iter().copied(),
+            [
+                Point::new(18.0, 290.0),
+                Point::new(18.0 + 89.0 * 3.1, 290.0),
+            ],
+            Color::hex(0x60_CD_FF).with_alpha(0.15),
+        );
+        dl.band(
+            line.iter().map(|p| Point::new(p.x, p.y - 6.0)),
+            line.iter().map(|p| Point::new(p.x, p.y + 5.0)),
+            Color::hex(0x60_CD_FF).with_alpha(0.25),
+        );
+        dl.graph(line.iter().copied(), Color::hex(0x60_CD_FF), 1.5);
+        dl.pop_clip();
+    }
+
+    /// How two frames differ: the largest channel difference, the mean, and the
+    /// share of pixels more than 8 apart.
+    fn compare(a: &[u8], b: &[u8]) -> (u8, f64, f64) {
+        let mut worst = 0u8;
+        let mut sum = 0u64;
+        let mut far = 0usize;
+        for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+            let d = p
+                .iter()
+                .zip(q)
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap_or(0);
+            worst = worst.max(d);
+            sum += u64::from(d);
+            far += usize::from(d > 8);
+        }
+        let n = (a.len() / 4) as f64;
+        (worst, sum as f64 / n, far as f64 / n)
+    }
+
+    #[test]
+    fn the_gpu_and_cpu_chart_renderers_draw_what_direct2d_draws() {
+        // SAFETY: a hidden popup of a system class, destroyed below.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("chart parity"),
+                WS_POPUP,
+                0,
+                0,
+                450,
+                450,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a window");
+        let mut dl = DisplayList::new();
+        charts_frame(&mut dl);
+        for dpi in [96.0, 144.0] {
+            let size = ((300.0 * dpi / 96.0) as u32, (300.0 * dpi / 96.0) as u32);
+            // WARP: the same pixels on every machine, CI's included.
+            let device = created3d_device(true).expect("WARP");
+            let mut gfx = Gfx::on_device(hwnd, size, dpi, device).expect("graphics");
+            let mut frames = Vec::new();
+            for mode in [ChartDrawing::Direct2D, ChartDrawing::Cpu, ChartDrawing::Gpu] {
+                gfx.charts.forced = Some(mode);
+                gfx.redraw_all = true;
+                gfx.render(&dl, 0).expect("a frame");
+                assert_eq!(gfx.charts.mode(), mode, "no fallback");
+                frames.push(gfx.canvas_pixels());
+            }
+            let (d2d, cpu, gpu) = (&frames[0], &frames[1], &frames[2]);
+            let cpu_gpu = compare(cpu, gpu);
+            let cpu_d2d = compare(cpu, d2d);
+            let gpu_d2d = compare(gpu, d2d);
+            eprintln!("dpi {dpi}: cpu/gpu {cpu_gpu:?} cpu/d2d {cpu_d2d:?} gpu/d2d {gpu_d2d:?}");
+            // `OT_PARITY_DUMP=<dir>`: the three frames as BMPs, to look at.
+            if let Some(dir) = std::env::var_os("OT_PARITY_DUMP") {
+                let dir = std::path::PathBuf::from(dir);
+                let _ = std::fs::create_dir_all(&dir);
+                for (name, px) in [("d2d", d2d), ("cpu", cpu), ("gpu", gpu)] {
+                    let _ = write_bmp(&dir.join(format!("{name}-{dpi}.bmp")), size, px);
+                }
+            }
+            // The two of ours compute the same coverage: rounding apart.
+            assert!(cpu_gpu.0 <= 3, "cpu/gpu {cpu_gpu:?}");
+            // Against Direct2D's antialiasing: the same shapes, edges a little
+            // apart (a different coverage filter), nothing missing or extra.
+            for (name, d) in [("cpu", cpu_d2d), ("gpu", gpu_d2d)] {
+                assert!(d.1 < 1.5, "{name}/d2d mean {d:?}");
+                assert!(d.2 < 0.03, "{name}/d2d pixels far apart {d:?}");
+            }
+        }
+        // SAFETY: created above.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }

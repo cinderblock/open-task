@@ -33,6 +33,7 @@ pub struct FrameLog {
     draw: Duration,
     draw_partial: Duration,
     copy: Duration,
+    charts: Duration,
     present: Duration,
     rest: Duration,
     worst: Duration,
@@ -63,6 +64,7 @@ impl FrameLog {
             draw: Duration::ZERO,
             draw_partial: Duration::ZERO,
             copy: Duration::ZERO,
+            charts: Duration::ZERO,
             present: Duration::ZERO,
             rest: Duration::ZERO,
             worst: Duration::ZERO,
@@ -92,9 +94,10 @@ impl FrameLog {
         self.diff += gfx.diff;
         self.draw += gfx.draw;
         self.copy += gfx.copy;
+        self.charts += gfx.charts;
         self.present += gfx.present;
         self.rest += gfx.rest;
-        let busy = paint + gfx.diff + gfx.draw + gfx.copy + gfx.rest;
+        let busy = paint + gfx.diff + gfx.charts + gfx.draw + gfx.copy + gfx.rest;
         self.worst = self.worst.max(busy);
         if self.since.elapsed() >= PERIOD {
             self.log();
@@ -129,6 +132,7 @@ impl FrameLog {
                     / f64::from(whole.max(1))
             ),
             copy_ms = format!("{:.3}", ms(self.copy)),
+            charts_ms = format!("{:.3}", ms(self.charts)),
             present_ms = format!("{:.3}", ms(self.present)),
             rest_ms = format!("{:.3}", ms(self.rest)),
             worst_ms = format!("{:.2}", self.worst.as_secs_f64() * 1000.0),

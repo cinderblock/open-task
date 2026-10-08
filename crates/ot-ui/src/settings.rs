@@ -102,6 +102,69 @@ pub struct Settings {
     /// How far back the charts reach, in minutes: one of [`HISTORY_STEPS`]. Older
     /// samples are dropped, and the time axis spans what is held.
     pub history_minutes: u32,
+    /// How the charts' lines and areas are drawn.
+    pub chart_drawing: ChartDrawing,
+}
+
+/// How the charts' lines and filled areas are drawn. All three look the same;
+/// they differ in what does the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum ChartDrawing {
+    /// Direct3D shaders: the GPU works out every pixel's coverage, the CPU only
+    /// hands over the points. The least CPU.
+    #[default]
+    Gpu,
+    /// open-task's own rasterizer for chart shapes, on the CPU.
+    Cpu,
+    /// Direct2D's general path renderer, which antialiases on the CPU: the most
+    /// CPU, and the reference the other two match.
+    Direct2D,
+}
+
+impl ChartDrawing {
+    /// In the order the card steps through.
+    pub const ALL: [Self; 3] = [Self::Gpu, Self::Cpu, Self::Direct2D];
+
+    /// The card's name for it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gpu => "GPU",
+            Self::Cpu => "CPU",
+            Self::Direct2D => "Direct2D",
+        }
+    }
+
+    /// From a name: `gpu`, `cpu`, `d2d` or `direct2d`, any case.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "gpu" | "d3d" | "direct3d" => Some(Self::Gpu),
+            "cpu" => Some(Self::Cpu),
+            "d2d" | "direct2d" => Some(Self::Direct2D),
+            _ => None,
+        }
+    }
+
+    /// Its number for saving: its place in [`ChartDrawing::ALL`].
+    #[must_use]
+    pub fn index(self) -> u32 {
+        Self::ALL.iter().position(|&d| d == self).unwrap_or(0) as u32
+    }
+
+    /// From a saved number; the default for one that is not.
+    #[must_use]
+    pub fn from_index(i: u32) -> Self {
+        Self::ALL.get(i as usize).copied().unwrap_or_default()
+    }
+
+    /// The next one along (`1`) or back (`-1`), or `None` past either end.
+    fn step(self, by: isize) -> Option<Self> {
+        (self.index() as usize)
+            .checked_add_signed(by)
+            .and_then(|i| Self::ALL.get(i))
+            .copied()
+    }
 }
 
 /// The sampling intervals, slowest first, in milliseconds.
@@ -123,6 +186,7 @@ impl Default for Settings {
             resource_percent: false,
             update_interval_ms: SPEED_DEFAULT,
             history_minutes: HISTORY_DEFAULT,
+            chart_drawing: ChartDrawing::Gpu,
         }
     }
 }
@@ -434,6 +498,8 @@ enum Card {
     Speed,
     /// How far back the charts reach: a length with a minus and a plus button.
     History,
+    /// How chart shapes are drawn: GPU, CPU or Direct2D, stepped.
+    ChartDrawing,
     /// Start a copy as administrator; shown while this one is not.
     RunAsAdministrator,
     /// Record every pass to a file the user names, or stop.
@@ -447,7 +513,12 @@ impl Card {
             Self::TaskManager => cx.task_manager.available(),
             Self::RunAsAdministrator => !cx.elevated,
             Self::Record => !cx.replaying,
-            Self::Toggle(_) | Self::Update | Self::Decay | Self::Speed | Self::History => true,
+            Self::Toggle(_)
+            | Self::Update
+            | Self::Decay
+            | Self::Speed
+            | Self::History
+            | Self::ChartDrawing => true,
         }
     }
 
@@ -463,9 +534,12 @@ impl Card {
             Self::Toggle(t) => t.note(settings, cx),
             Self::Update => cx.update.note(),
             Self::TaskManager => cx.task_manager.note(scratch).then_some(scratch.as_str()),
-            Self::Decay | Self::Speed | Self::History | Self::RunAsAdministrator | Self::Record => {
-                None
-            }
+            Self::Decay
+            | Self::Speed
+            | Self::History
+            | Self::ChartDrawing
+            | Self::RunAsAdministrator
+            | Self::Record => None,
         }
     }
 
@@ -473,7 +547,7 @@ impl Card {
     /// cards answer only on their two buttons.
     fn clickable(self, cx: Context<'_>) -> bool {
         match self {
-            Self::Decay | Self::Speed | Self::History => false,
+            Self::Decay | Self::Speed | Self::History | Self::ChartDrawing => false,
             Self::Toggle(_) | Self::RunAsAdministrator | Self::Record => true,
             Self::Update => cx.update.action().is_some(),
             Self::TaskManager => !cx.task_manager.pending,
@@ -494,7 +568,11 @@ const SECTIONS: [(&str, &[Card]); 6] = [
     ),
     (
         "Charts",
-        &[Card::History, Card::Toggle(Toggle::SmoothCharts)],
+        &[
+            Card::History,
+            Card::Toggle(Toggle::SmoothCharts),
+            Card::ChartDrawing,
+        ],
     ),
     (
         "Window",
@@ -516,11 +594,13 @@ const SECTIONS: [(&str, &[Card]); 6] = [
     ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
     ("Recording", &[Card::Record]),
 ];
-const CARD_COUNT: usize = 16;
-/// The fade card's place among the cards, the speed card's and the history card's.
+const CARD_COUNT: usize = 17;
+/// The fade card's place among the cards, the speed card's, the history card's and
+/// the chart drawing card's.
 const DECAY_CARD: usize = 1;
 const SPEED_CARD: usize = 2;
 const HISTORY_CARD: usize = 4;
+const DRAWING_CARD: usize = 6;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -561,9 +641,9 @@ pub(crate) struct SettingsPage {
     /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
-    /// The fade card's minus and plus buttons, then the speed card's, then the
-    /// history card's, and the one under the pointer.
-    steppers: [Rect; 6],
+    /// The fade card's minus and plus buttons, then the speed card's, the history
+    /// card's and the chart drawing card's, and the one under the pointer.
+    steppers: [Rect; 8],
     hover_step: Option<usize>,
     /// Where the sections scroll: the page below its title.
     view: Rect,
@@ -588,12 +668,53 @@ impl SettingsPage {
     }
 
     /// The stepper button under `p`: 0 and 1 for the fade card's minus and plus,
-    /// 2 and 3 for the speed card's, 4 and 5 for the history card's.
+    /// 2 and 3 for the speed card's, 4 and 5 for the history card's, 6 and 7 for
+    /// the chart drawing card's.
     fn step_at(&self, p: Point) -> Option<usize> {
         if !self.view.contains(p) {
             return None;
         }
         self.steppers.iter().position(|r| r.contains(p))
+    }
+
+    /// A stepper card's minus or plus under `at`: step its setting one along, and
+    /// ask for it to be saved. Nothing at either end of the steps.
+    fn step(&self, card: Card, at: Point, settings: &mut Settings) -> Reaction {
+        let first = match card {
+            Card::Decay => 0,
+            Card::Speed => 2,
+            Card::History => 4,
+            Card::ChartDrawing => 6,
+            _ => return Reaction::NONE,
+        };
+        let by = match self.step_at(at) {
+            Some(i) if i == first => -1,
+            Some(i) if i == first + 1 => 1,
+            _ => return Reaction::NONE,
+        };
+        let stepped = match card {
+            Card::Decay => settings
+                .decay_step(by)
+                .map(|v| settings.usage_decay_percent = v),
+            Card::Speed => settings
+                .speed_step(by)
+                .map(|v| settings.update_interval_ms = v),
+            Card::History => settings
+                .history_step(by)
+                .map(|v| settings.history_minutes = v),
+            Card::ChartDrawing => settings
+                .chart_drawing
+                .step(by)
+                .map(|v| settings.chart_drawing = v),
+            _ => None,
+        };
+        if stepped.is_none() {
+            return Reaction::NONE;
+        }
+        Reaction {
+            repaint: true,
+            effect: Some(Effect::SaveSettings(*settings)),
+        }
     }
 
     /// Handle input on the page: flip a switch (changing `settings`), press the
@@ -629,50 +750,8 @@ impl SettingsPage {
                 Some(Card::TaskManager) if !cx.task_manager.pending => {
                     Reaction::effect(Effect::ReplaceTaskManager(!cx.task_manager.on()))
                 }
-                Some(Card::Decay) => {
-                    let by = match self.step_at(at) {
-                        Some(0) => -1,
-                        Some(1) => 1,
-                        _ => return Reaction::NONE,
-                    };
-                    let Some(percent) = settings.decay_step(by) else {
-                        return Reaction::NONE;
-                    };
-                    settings.usage_decay_percent = percent;
-                    Reaction {
-                        repaint: true,
-                        effect: Some(Effect::SaveSettings(*settings)),
-                    }
-                }
-                Some(Card::Speed) => {
-                    let by = match self.step_at(at) {
-                        Some(2) => -1,
-                        Some(3) => 1,
-                        _ => return Reaction::NONE,
-                    };
-                    let Some(ms) = settings.speed_step(by) else {
-                        return Reaction::NONE;
-                    };
-                    settings.update_interval_ms = ms;
-                    Reaction {
-                        repaint: true,
-                        effect: Some(Effect::SaveSettings(*settings)),
-                    }
-                }
-                Some(Card::History) => {
-                    let by = match self.step_at(at) {
-                        Some(4) => -1,
-                        Some(5) => 1,
-                        _ => return Reaction::NONE,
-                    };
-                    let Some(minutes) = settings.history_step(by) else {
-                        return Reaction::NONE;
-                    };
-                    settings.history_minutes = minutes;
-                    Reaction {
-                        repaint: true,
-                        effect: Some(Effect::SaveSettings(*settings)),
-                    }
+                Some(card @ (Card::Decay | Card::Speed | Card::History | Card::ChartDrawing)) => {
+                    self.step(card, at, settings)
                 }
                 Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
                 Some(Card::Record) => Reaction::effect(Effect::Record(cx.recording.is_none())),
@@ -737,7 +816,8 @@ impl SettingsPage {
         let [d0, d1] = pair(self.cards[DECAY_CARD]);
         let [s0, s1] = pair(self.cards[SPEED_CARD]);
         let [h0, h1] = pair(self.cards[HISTORY_CARD]);
-        self.steppers = [d0, d1, s0, s1, h0, h1];
+        let [c0, c1] = pair(self.cards[DRAWING_CARD]);
+        self.steppers = [d0, d1, s0, s1, h0, h1, c0, c1];
         self.max_scroll = (y - view.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
         self.shift(view.y - self.scroll);
@@ -850,7 +930,7 @@ impl SettingsPage {
                         settings.speed_label().to_ascii_lowercase()
                     );
                     paint_text(dl, text, "Update speed", buf, note, theme);
-                    let [_, _, minus, plus, _, _] = self.steppers;
+                    let [_, _, minus, plus, ..] = self.steppers;
                     for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
                         let enabled = settings.speed_step(by).is_some();
                         let hover = enabled && self.hover_step == Some(i + 2);
@@ -879,7 +959,7 @@ impl SettingsPage {
                          chart, about {size} for the charts on this machine."
                     );
                     paint_text(dl, text, "How far charts reach back", buf, note, theme);
-                    let [_, _, _, _, minus, plus] = self.steppers;
+                    let [_, _, _, _, minus, plus, ..] = self.steppers;
                     for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
                         let enabled = settings.history_step(by).is_some();
                         let hover = enabled && self.hover_step == Some(i + 4);
@@ -889,6 +969,39 @@ impl SettingsPage {
                     let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
                     dl.text(
                         buf,
+                        value,
+                        theme.cell_num,
+                        theme.text,
+                        HAlign::Center,
+                        VAlign::Middle,
+                        false,
+                    );
+                }
+                Card::ChartDrawing => {
+                    let detail = match settings.chart_drawing {
+                        ChartDrawing::Gpu => {
+                            "Direct3D shaders on the graphics card work out every pixel: \
+                             the least CPU."
+                        }
+                        ChartDrawing::Cpu => {
+                            "open-task's own rasterizer for chart shapes, on the CPU: \
+                             much less than Direct2D's."
+                        }
+                        ChartDrawing::Direct2D => {
+                            "Direct2D's general path renderer, which antialiases on the \
+                             CPU: the most CPU at full history."
+                        }
+                    };
+                    paint_text(dl, text, "Chart drawing", detail, note, theme);
+                    let [.., minus, plus] = self.steppers;
+                    for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
+                        let enabled = settings.chart_drawing.step(by).is_some();
+                        let hover = enabled && self.hover_step == Some(i + 6);
+                        paint_stepper(dl, r, by > 0, enabled, hover, theme);
+                    }
+                    let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
+                    dl.text(
+                        settings.chart_drawing.label(),
                         value,
                         theme.cell_num,
                         theme.text,
@@ -1135,7 +1248,7 @@ mod tests {
     }
 
     /// The Task Manager card's place among the cards.
-    const TASK_MANAGER: usize = 13;
+    const TASK_MANAGER: usize = 14;
 
     fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
         Context {
@@ -1188,13 +1301,9 @@ mod tests {
         let dl = paint(&mut page, s, cx(true, &update));
         assert_eq!(state_of(&dl, page.cards[0]), "Off");
 
-        // Off the cards: nothing.
-        let r = click(
-            &mut page,
-            Point::new(5.0, PAGE.bottom() - 5.0),
-            &mut s,
-            cx(true, &update),
-        );
+        // Off the cards (on a section's heading): nothing.
+        let heading = page.headings[0].expect("the first section is shown");
+        let r = click(&mut page, heading.center(), &mut s, cx(true, &update));
         assert_eq!(r, Reaction::NONE);
         assert!(
             page.handle(UiEvent::MouseLeave, &mut s, cx(true, &update))
@@ -1254,7 +1363,7 @@ mod tests {
         ] {
             assert!(strings.iter().any(|t| t == expected), "{expected}");
         }
-        let card = page.cards[9].center();
+        let card = page.cards[10].center();
         let r = click(&mut page, card, &mut s, cx(true, &update));
         assert_eq!(r.effect, Some(Effect::Update(UpdateAction::Check)));
         assert_eq!(s, Settings::default(), "no setting changed");
@@ -1280,18 +1389,18 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[10]), "On");
-        assert_eq!(state_of(&dl, page.cards[11]), "Off");
+        assert_eq!(state_of(&dl, page.cards[11]), "On");
+        assert_eq!(state_of(&dl, page.cards[12]), "Off");
         // A copy that cannot install says so, once, on the update card.
         let note = update.note().unwrap();
         assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
 
-        let at = page.cards[10].center();
+        let at = page.cards[11].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[11].center();
+        let at = page.cards[12].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
         assert!(s.check_updates, "downloading needs checking");
@@ -1303,27 +1412,27 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[12]), "Off");
+        assert_eq!(state_of(&dl, page.cards[13]), "Off");
         assert!(texts(&dl)
             .iter()
             .any(|t| t == "Install updates automatically"));
 
         // On: downloading and checking come with it.
         s.check_updates = false;
-        let at = page.cards[12].center();
+        let at = page.cards[13].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.install_updates && s.download_updates && s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         // Downloading off: installing goes too, checking stays.
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[11].center();
+        let at = page.cards[12].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.download_updates && !s.install_updates && s.check_updates);
         // Checking off takes everything with it.
         s.download_updates = true;
         s.install_updates = true;
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[10].center();
+        let at = page.cards[11].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
     }
@@ -1387,6 +1496,41 @@ mod tests {
     }
 
     #[test]
+    fn the_chart_drawing_card_steps_through_gpu_cpu_and_direct2d() {
+        let update = UpdateView::new("0.2.1", true);
+        let cx = cx(true, &update);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        assert_eq!(s.chart_drawing, ChartDrawing::Gpu, "the GPU unless changed");
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(strings.iter().any(|t| t == "Chart drawing"), "{strings:?}");
+        assert!(strings.iter().any(|t| t == "GPU"), "{strings:?}");
+
+        let card = page.cards[DRAWING_CARD];
+        let [.., minus, plus] = page.steppers;
+        assert!(card.contains(minus.center()) && card.contains(plus.center()));
+        assert_eq!(click(&mut page, minus.center(), &mut s, cx), Reaction::NONE);
+        let r = click(&mut page, plus.center(), &mut s, cx);
+        assert_eq!(s.chart_drawing, ChartDrawing::Cpu);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let _ = click(&mut page, plus.center(), &mut s, cx);
+        assert_eq!(s.chart_drawing, ChartDrawing::Direct2D);
+        assert_eq!(click(&mut page, plus.center(), &mut s, cx), Reaction::NONE);
+        assert!(texts(&paint(&mut page, s, cx))
+            .iter()
+            .any(|t| t == "Direct2D"));
+
+        // Saved by its place; names for the environment override.
+        for d in ChartDrawing::ALL {
+            assert_eq!(ChartDrawing::from_index(d.index()), d);
+        }
+        assert_eq!(ChartDrawing::from_index(9), ChartDrawing::Gpu);
+        assert_eq!(ChartDrawing::parse(" D2D "), Some(ChartDrawing::Direct2D));
+        assert_eq!(ChartDrawing::parse("cpu"), Some(ChartDrawing::Cpu));
+        assert_eq!(ChartDrawing::parse("vulkan"), None);
+    }
+
+    #[test]
     fn the_history_card_steps_the_reach_and_says_what_it_costs() {
         let update = UpdateView::new("0.2.1", true);
         let cx = Context {
@@ -1421,7 +1565,7 @@ mod tests {
             cx,
         );
         assert_eq!(r, Reaction::NONE);
-        let [_, _, _, _, minus, plus] = page.steppers;
+        let [_, _, _, _, minus, plus, ..] = page.steppers;
         assert!(card.contains(minus.center()) && card.contains(plus.center()));
         let r = click(&mut page, plus.center(), &mut s, cx);
         assert_eq!(s.history_minutes, 10);

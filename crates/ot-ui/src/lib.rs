@@ -29,7 +29,7 @@ pub mod view;
 
 pub use nav::Page;
 pub use replay::{RecordingView, ReplayAction, ReplayState, SPEEDS};
-pub use settings::Settings;
+pub use settings::{ChartDrawing, Settings};
 pub use task_manager::{Replacement, TaskManager};
 pub use theme::Theme;
 pub use update::{UpdateAction, UpdateView};

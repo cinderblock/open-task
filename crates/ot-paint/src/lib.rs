@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chart_raster;
 pub mod color;
 pub mod damage;
 pub mod display;
@@ -23,6 +24,7 @@ pub mod geom;
 pub mod icon;
 pub mod text;
 
+pub use chart_raster::ChartRaster;
 pub use color::Color;
 pub use display::{DisplayList, DrawCmd, Layer, Span, TextCmd};
 pub use geom::{Point, Rect, Size};

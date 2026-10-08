@@ -588,8 +588,8 @@ impl UsageChart {
             if self.points.iter().all(|p| p.v[b] <= 0.0) {
                 continue;
             }
-            // Along the band's lower edge oldest to newest, then back along its
-            // upper edge.
+            // The band's lower edge, then its upper, each oldest (leftmost) first;
+            // the points are newest first.
             poly.clear();
             poly.extend(
                 self.points
@@ -606,12 +606,18 @@ impl UsageChart {
                 self.points
                     .iter()
                     .zip(&cum)
+                    .rev()
                     .map(|(p, &c)| Point::new(p.x, self.y(c))),
             );
             let alpha = if dim { DIM_ALPHA } else { 0.9 };
-            dl.fill_polygon(poly.iter().copied(), band_color(theme, b).with_alpha(alpha));
+            let (lower, top) = poly.split_at(upper);
+            dl.band(
+                top.iter().copied(),
+                lower.iter().copied(),
+                band_color(theme, b).with_alpha(alpha),
+            );
             // A hairline of background along the top keeps neighbours apart.
-            dl.polyline(poly[upper..].iter().copied(), theme.bg_solid, 1.0);
+            dl.graph(top.iter().copied(), theme.bg_solid, 1.0);
         }
         self.cum = cum;
         self.poly = poly;
@@ -1010,7 +1016,7 @@ mod tests {
             .cmds()
             .iter()
             .filter_map(|cmd| match *cmd {
-                DrawCmd::FillPolygon { color, .. } => Some(color),
+                DrawCmd::Band { color, .. } => Some(color),
                 _ => None,
             })
             .collect();

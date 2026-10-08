@@ -82,10 +82,14 @@ impl DisplayList {
             DrawCmd::Line {
                 from, to, width, ..
             } => spread(&[from, to], width * 0.5 + FRINGE),
-            DrawCmd::Polyline { points, width, .. } => {
+            DrawCmd::Polyline { points, width, .. } | DrawCmd::Graph { points, width, .. } => {
                 spread(self.points(points), width * 0.5 + FRINGE)
             }
             DrawCmd::FillPolygon { points, .. } => spread(self.points(points), FRINGE),
+            DrawCmd::Band { top, bottom, .. } => union(
+                spread(self.points(top), FRINGE),
+                spread(self.points(bottom), FRINGE),
+            ),
             // Drawn clipped to its rectangle; the caret of a field stays inside it.
             DrawCmd::Text(t) => t.rect.inset(-FRINGE, -FRINGE),
             DrawCmd::Icon { rect, size, .. } => {
@@ -112,6 +116,18 @@ fn same_cmd(a: &DisplayList, ca: &DrawCmd, b: &DisplayList, cb: &DrawCmd) -> boo
                 color: kb,
                 width: wb,
             },
+        )
+        | (
+            DrawCmd::Graph {
+                points: pa,
+                color: ka,
+                width: wa,
+            },
+            DrawCmd::Graph {
+                points: pb,
+                color: kb,
+                width: wb,
+            },
         ) => ka == kb && wa.to_bits() == wb.to_bits() && a.points(pa) == b.points(pb),
         (
             DrawCmd::FillPolygon {
@@ -123,6 +139,18 @@ fn same_cmd(a: &DisplayList, ca: &DrawCmd, b: &DisplayList, cb: &DrawCmd) -> boo
                 color: kb,
             },
         ) => ka == kb && a.points(pa) == b.points(pb),
+        (
+            DrawCmd::Band {
+                top: ta,
+                bottom: ba,
+                color: ka,
+            },
+            DrawCmd::Band {
+                top: tb,
+                bottom: bb,
+                color: kb,
+            },
+        ) => ka == kb && a.points(ta) == b.points(tb) && a.points(ba) == b.points(bb),
         (DrawCmd::Text(ta), DrawCmd::Text(tb)) => {
             // Everything but where the string sits in its arena.
             let tb_at_a = crate::display::TextCmd {
@@ -249,6 +277,38 @@ mod tests {
         let mut out = vec![Rect::ZERO];
         assert!(b.damage_since(&a, &mut out));
         assert_eq!(out, []);
+    }
+
+    #[test]
+    fn a_raised_band_damages_its_old_and_new_area_within_its_clip() {
+        let band = |top: f32| {
+            let mut dl = DisplayList::new();
+            dl.push_clip(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.band(
+                [Point::new(10.0, top), Point::new(50.0, 70.0)],
+                [Point::new(-20.0, 90.0), Point::new(200.0, 90.0)],
+                Color::WHITE,
+            );
+            dl.graph(
+                [Point::new(10.0, top), Point::new(50.0, 70.0)],
+                Color::WHITE,
+                2.0,
+            );
+            dl.pop_clip();
+            dl
+        };
+        let mut out = Vec::new();
+        assert!(band(40.0).damage_since(&band(40.0), &mut out));
+        assert!(out.is_empty(), "the same band and line: no damage");
+        assert!(band(30.0).damage_since(&band(40.0), &mut out));
+        // The band's bottom reaches past the clip both sides, down to its baseline
+        // and fringe; the top is the new line's highest point, less the line's half
+        // width and fringe.
+        let m = 1.0 + FRINGE;
+        assert_eq!(
+            out,
+            [Rect::new(0.0, 30.0 - m, 100.0, 90.0 + FRINGE - (30.0 - m))]
+        );
     }
 
     #[test]

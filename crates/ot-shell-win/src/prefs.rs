@@ -3,7 +3,8 @@
 //!
 //! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each
 //! (`AnimateRows`, `SmoothCharts`, `CheckForUpdates`, `DownloadUpdates`,
-//! `InstallUpdates`, and the numbers `UsageDecayPercent` and `HistoryMinutes`) plus
+//! `InstallUpdates`, and the numbers `UsageDecayPercent`, `HistoryMinutes` and
+//! `ChartDrawing`, 0 GPU, 1 CPU, 2 Direct2D) plus
 //! `Layout`, a `REG_SZ` with the page, arrangement, sort and columns the last
 //! session ended on, per user like every other per-user preference on Windows. A missing key or value means the
 //! default. Nothing here is fatal: a value that cannot be read or written is
@@ -11,7 +12,7 @@
 
 use std::ffi::c_void;
 
-use ot_ui::{Settings, ViewLayout};
+use ot_ui::{ChartDrawing, Settings, ViewLayout};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
@@ -34,6 +35,7 @@ const HIDE_WHEN_MINIMIZED: PCWSTR = w!("HideWhenMinimized");
 const MINIMIZE_ON_USE: PCWSTR = w!("MinimizeOnUse");
 const RESOURCE_PERCENT: PCWSTR = w!("ResourceValuesAsPercent");
 const UPDATE_INTERVAL: PCWSTR = w!("UpdateIntervalMs");
+const CHART_DRAWING: PCWSTR = w!("ChartDrawing");
 const LAYOUT: PCWSTR = w!("Layout");
 
 /// The settings as last saved, defaults for anything never saved.
@@ -50,6 +52,8 @@ pub fn load() -> Settings {
         hide_when_minimized: flag(HIDE_WHEN_MINIMIZED, defaults.hide_when_minimized),
         minimize_on_use: flag(MINIMIZE_ON_USE, defaults.minimize_on_use),
         resource_percent: flag(RESOURCE_PERCENT, defaults.resource_percent),
+        chart_drawing: read_dword(CHART_DRAWING)
+            .map_or(defaults.chart_drawing, ChartDrawing::from_index),
         ..defaults
     };
     let settings = match read_dword(UPDATE_INTERVAL) {
@@ -82,6 +86,7 @@ pub fn save(s: &Settings) {
         (MINIMIZE_ON_USE, Some(u32::from(s.minimize_on_use))),
         (RESOURCE_PERCENT, Some(u32::from(s.resource_percent))),
         (UPDATE_INTERVAL, Some(s.update_interval_ms)),
+        (CHART_DRAWING, Some(s.chart_drawing.index())),
     ];
     let Some(key) = open_for_writing() else {
         return;

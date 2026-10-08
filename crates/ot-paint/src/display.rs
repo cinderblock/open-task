@@ -84,6 +84,22 @@ pub enum DrawCmd {
         points: Span,
         color: Color,
     },
+    /// A chart's filled area: the region between two lines that are functions of
+    /// x, `top` and `bottom` (each indexes [`DisplayList::points`], ascending in x,
+    /// with xs of its own), over the x-range both cover. A chart's wash (`bottom`
+    /// the baseline), a min-max envelope, a stacked band. Backends may draw these
+    /// faster than a general polygon, which is why they are a command of their own.
+    Band {
+        top: Span,
+        bottom: Span,
+        color: Color,
+    },
+    /// A chart's line: through `points` (ascending in x), `width` DIPs wide.
+    Graph {
+        points: Span,
+        color: Color,
+        width: f32,
+    },
     Text(TextCmd),
     /// A symbolic icon, `size` DIPs tall, centered in `rect`.
     Icon {
@@ -205,6 +221,20 @@ impl DisplayList {
                 DrawCmd::FillPolygon { points, color } => DrawCmd::FillPolygon {
                     points: self.push_points(from.points(points).iter().copied()),
                     color,
+                },
+                DrawCmd::Band { top, bottom, color } => DrawCmd::Band {
+                    top: self.push_points(from.points(top).iter().copied()),
+                    bottom: self.push_points(from.points(bottom).iter().copied()),
+                    color,
+                },
+                DrawCmd::Graph {
+                    points,
+                    color,
+                    width,
+                } => DrawCmd::Graph {
+                    points: self.push_points(from.points(points).iter().copied()),
+                    color,
+                    width,
                 },
                 DrawCmd::Text(t) => DrawCmd::Text(TextCmd {
                     text: self.push_str(from.str(t.text)),
@@ -344,6 +374,39 @@ impl DisplayList {
                 points: span,
                 color,
             });
+        }
+    }
+
+    /// Add a chart's filled area between `top` and `bottom`, each ascending in x
+    /// ([`DrawCmd::Band`]). Either with fewer than two points draws nothing.
+    pub fn band<T, B>(&mut self, top: T, bottom: B, color: Color)
+    where
+        T: IntoIterator<Item = Point>,
+        B: IntoIterator<Item = Point>,
+    {
+        let mark = self.points.len();
+        let top = self.push_points(top);
+        let bottom = self.push_points(bottom);
+        if top.len >= 2 && bottom.len >= 2 && color.a > 0.0 {
+            self.cmds.push(DrawCmd::Band { top, bottom, color });
+        } else {
+            self.points.truncate(mark);
+        }
+    }
+
+    /// Add a chart's line through `pts`, ascending in x ([`DrawCmd::Graph`]). Fewer
+    /// than two points draws nothing.
+    pub fn graph<I: IntoIterator<Item = Point>>(&mut self, pts: I, color: Color, width: f32) {
+        let mark = self.points.len();
+        let span = self.push_points(pts);
+        if span.len >= 2 && color.a > 0.0 && width > 0.0 {
+            self.cmds.push(DrawCmd::Graph {
+                points: span,
+                color,
+                width,
+            });
+        } else {
+            self.points.truncate(mark);
         }
     }
 
@@ -576,6 +639,39 @@ mod tests {
             .map(|l| (l.id, l.end - l.start))
             .collect();
         assert_eq!(l, [(7, 1), (9, 2)]);
+    }
+
+    #[test]
+    fn bands_and_graphs_keep_their_points_through_a_splice() {
+        let p = |x: f32, y: f32| Point::new(x, y);
+        let mut kept = DisplayList::new();
+        kept.band(
+            [p(0.0, 1.0), p(2.0, 3.0)],
+            [p(0.0, 9.0), p(2.0, 9.0)],
+            Color::WHITE,
+        );
+        kept.begin_layer(1);
+        kept.graph([p(0.0, 5.0), p(1.0, 6.0)], Color::WHITE, 1.5);
+        kept.end_layer();
+        // Too few points, or nothing to see: no command, and no points left behind.
+        kept.band([p(0.0, 1.0)], [p(0.0, 9.0), p(2.0, 9.0)], Color::WHITE);
+        kept.graph([p(0.0, 5.0), p(1.0, 6.0)], Color::TRANSPARENT, 1.5);
+        assert_eq!(kept.cmds().len(), 2);
+        assert_eq!(kept.points.len(), 6);
+
+        let mut dl = DisplayList::new();
+        dl.splice(&kept, |_, dl| {
+            dl.graph([p(0.0, 7.0), p(1.0, 8.0), p(2.0, 9.0)], Color::WHITE, 1.5);
+        });
+        match dl.cmds() {
+            [DrawCmd::Band { top, bottom, .. }, DrawCmd::Graph { points, width, .. }] => {
+                assert_eq!(dl.points(*top), [p(0.0, 1.0), p(2.0, 3.0)]);
+                assert_eq!(dl.points(*bottom), [p(0.0, 9.0), p(2.0, 9.0)]);
+                assert_eq!(dl.points(*points).len(), 3);
+                assert!((width - 1.5).abs() < f32::EPSILON);
+            }
+            other => panic!("unexpected commands {other:?}"),
+        }
     }
 
     #[test]

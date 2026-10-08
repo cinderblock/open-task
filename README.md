@@ -86,7 +86,11 @@ in from past it (**Scroll charts smoothly** under **Charts** turns this off). A
 frame where only the clock moved repaints just the charts, and only the parts of
 the window that changed are redrawn; behind other windows the charts move at half
 the display's rate, and not at all when the window is minimized or on another
-virtual desktop.
+virtual desktop. **Chart drawing** under **Charts** chooses what draws the charts'
+lines and filled areas: **GPU** (the default), Direct3D shaders that work out each
+pixel's coverage on the graphics card; **CPU**, open-task's own rasterizer for
+chart shapes; or **Direct2D**, Windows' general path renderer, which antialiases on
+the CPU and costs the most once a chart is full. The three look the same.
 The first sample is on screen a quarter of a second after start, drawn across the
 interval it measured. Recent history is drawn sample by sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point
@@ -312,8 +316,8 @@ the numbers in its tooltip; a click brings the window back, and its menu has
 **Always on top** and **Exit**. With **Hide when minimized** on, minimizing hides
 the window and the icon is the way back. **Update speed** (High, Normal, Slow,
 Low: every half second to every four) is beside the fade rate under **Process
-table**; **Space** still pauses. **How far charts reach back** and **Scroll charts
-smoothly** are under **Charts**.
+table**; **Space** still pauses. **How far charts reach back**, **Scroll charts
+smoothly** and **Chart drawing** are under **Charts**.
 
 **Summary** puts every other page's headline numbers on one screen, as TMOG's
 Summary view does, in cards that sit two across when the window is wide and one
@@ -579,7 +583,8 @@ carries it as its version resource too (Properties > Details).
 For performance work, `OT_FRAME_STATS=1` logs every five seconds what the frames
 cost: frames a second by kind (charts only, rows sliding, whole), how many were drawn
 in part and how much of the window, the time to build, diff, draw, copy and present
-a frame, and the process's CPU. `cargo build --profile profiling` is the release build
+a frame, and the process's CPU. `OT_CHARTS=gpu`, `cpu` or `d2d` overrides the **Chart
+drawing** setting, for comparing them. `cargo build --profile profiling` is the release build
 with symbols kept, for a sampling profiler such as WPR or xperf.
 
 Two environment variables help with drawing faults on Windows. With

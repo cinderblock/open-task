@@ -1934,7 +1934,7 @@ pub(crate) mod tests {
         dl.cmds()
             .iter()
             .filter_map(|c| match c {
-                DrawCmd::Polyline { color, .. } => Some(*color),
+                DrawCmd::Graph { color, .. } => Some(*color),
                 _ => None,
             })
             .collect()

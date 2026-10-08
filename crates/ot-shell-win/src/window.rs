@@ -696,7 +696,8 @@ fn seen(hwnd: HWND) -> bool {
 fn repaint(st: &mut State) {
     if st.gfx.is_none() {
         match Gfx::new(st.hwnd, client_size(st.hwnd), st.dpi) {
-            Ok(g) => {
+            Ok(mut g) => {
+                g.set_chart_drawing(st.app.settings().chart_drawing);
                 st.gfx = Some(g);
                 st.app.set_backdrop(st.backdrop);
             }
@@ -947,13 +948,17 @@ fn apply_settings(cell: &RefCell<State>, hwnd: HWND, settings: &Settings) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
-    if let Ok(st) = cell.try_borrow() {
+    if let Ok(mut st) = cell.try_borrow_mut() {
         if let Some(feed) = &st.feed {
             feed.set_interval(Duration::from_millis(u64::from(
                 settings.update_interval_ms,
             )));
         }
+        if let Some(gfx) = st.gfx.as_mut() {
+            gfx.set_chart_drawing(settings.chart_drawing);
+        }
     }
+    invalidate(hwnd);
 }
 
 /// Tell the user something in a message box.

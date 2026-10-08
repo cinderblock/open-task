@@ -340,31 +340,39 @@ impl Plot {
             return;
         }
         let bottom = rect.bottom();
-        let (first, last) = (self.points[0].x, self.points[self.points.len() - 1].x);
+        // Chart shapes go oldest (leftmost) first; the points are newest first.
+        let (oldest, newest) = (self.points[self.points.len() - 1].x, self.points[0].x);
         // The ends lie past the edges while they slide in and out.
         dl.push_clip(rect);
 
         scratch.clear();
-        scratch.extend(self.points.iter().map(|p| Point::new(p.x, self.y(p.mean))));
-        dl.fill_polygon(
-            scratch
+        scratch.extend(
+            self.points
                 .iter()
-                .copied()
-                .chain([Point::new(last, bottom), Point::new(first, bottom)]),
+                .rev()
+                .map(|p| Point::new(p.x, self.y(p.mean))),
+        );
+        dl.band(
+            scratch.iter().copied(),
+            [Point::new(oldest, bottom), Point::new(newest, bottom)],
             style.wash,
         );
 
         if self.points.iter().any(|p| p.max > p.min) {
-            let upper = self.points.iter().map(|p| Point::new(p.x, self.y(p.max)));
+            let upper = self
+                .points
+                .iter()
+                .rev()
+                .map(|p| Point::new(p.x, self.y(p.max)));
             let lower = self
                 .points
                 .iter()
                 .rev()
                 .map(|p| Point::new(p.x, self.y(p.min)));
-            dl.fill_polygon(upper.chain(lower), style.envelope);
+            dl.band(upper, lower, style.envelope);
         }
 
-        dl.polyline(scratch.iter().copied(), style.line, style.width);
+        dl.graph(scratch.iter().copied(), style.line, style.width);
         dl.pop_clip();
     }
 
@@ -536,7 +544,7 @@ mod tests {
         dl.cmds()
             .iter()
             .find_map(|c| match *c {
-                DrawCmd::Polyline { points, .. } => Some(dl.points(points).to_vec()),
+                DrawCmd::Graph { points, .. } => Some(dl.points(points).to_vec()),
                 _ => None,
             })
             .unwrap_or_default()
@@ -546,7 +554,9 @@ mod tests {
         dl.cmds()
             .iter()
             .filter_map(|c| match *c {
-                DrawCmd::FillPolygon { points, .. } => Some(dl.points(points).to_vec()),
+                DrawCmd::Band { top, bottom, .. } => {
+                    Some([dl.points(top), dl.points(bottom)].concat())
+                }
                 _ => None,
             })
             .collect()
@@ -603,9 +613,11 @@ mod tests {
         p.paint(&mut dl, &style(), &AXIS, &mut Vec::new());
         let pts = polyline_points(&dl);
         assert_eq!(pts.len(), 10);
-        assert!((pts[0].y - 25.0).abs() < 1e-3, "50% of 50 DIP tall is y=25");
+        // Oldest first.
+        assert!(pts.windows(2).all(|w| w[0].x < w[1].x));
+        assert!((pts[9].y - 25.0).abs() < 1e-3, "50% of 50 DIP tall is y=25");
         // Gaps shrink with age: log, not linear.
-        assert!(pts[0].x - pts[1].x > pts[8].x - pts[9].x);
+        assert!(pts[9].x - pts[8].x > pts[1].x - pts[0].x);
     }
 
     #[test]
@@ -856,7 +868,7 @@ mod tests {
             .expect("a clip to the plot");
         let line = cmds
             .iter()
-            .position(|c| matches!(c, DrawCmd::Polyline { .. }))
+            .position(|c| matches!(c, DrawCmd::Graph { .. }))
             .unwrap();
         let close = cmds
             .iter()
