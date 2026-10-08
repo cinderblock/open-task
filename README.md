@@ -600,8 +600,10 @@ with symbols kept, for a sampling profiler such as WPR or xperf.
 
 Two environment variables help with drawing faults on Windows. With
 `OT_CHECK_DAMAGE=1` (or a directory path) every frame drawn in part over the last one
-is also drawn whole and the two compared; frames that differ are logged and the first
-twenty dumped as BMPs, with the commands under the difference, in
+is also drawn whole and the two compared, and every frame's buffer is compared with
+the canvas just before it is presented (only what changed is copied to it); frames
+that differ are logged and the first twenty dumped as BMPs, with the commands under
+the difference, in
 `%TEMP%\open-task-damage-check` (or the path given). It costs a full frame and two
 read-backs per frame, so it is for diagnosis only. `OT_WARP=1` draws with Direct3D's
 software rasterizer instead of the GPU, to tell a driver's faults from the app's.

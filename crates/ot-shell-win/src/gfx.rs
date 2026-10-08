@@ -14,11 +14,11 @@ use ot_paint::{
     Span, TextCmd, TextStyle, VAlign,
 };
 use windows::core::{Interface, Result, BOOL, HSTRING};
-use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::Win32::Foundation::{HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
-    D2D_RECT_F, D2D_RECT_U, D2D_SIZE_U,
+    D2D_POINT_2U, D2D_RECT_F, D2D_RECT_U, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
@@ -59,9 +59,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1, DXGI_PRESENT,
+    DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows_numerics::Vector2;
 
@@ -121,6 +121,9 @@ pub struct Gfx {
     damage: Vec<Rect>,
     /// Draw the next frame whole: the canvas is new, or holds something stale.
     redraw_all: bool,
+    /// What the last frame presented changed, in device pixels; `None` for a whole
+    /// frame, or when the buffers hold nothing known (after a resize).
+    shown: Option<Vec<RECT>>,
     /// With `OT_CHECK_DAMAGE` set, every partial frame is also drawn whole and the
     /// two compared ([`Gfx::check_damage`]).
     check: Option<DamageCheck>,
@@ -323,6 +326,7 @@ impl Gfx {
             last: DisplayList::new(),
             damage: Vec::new(),
             redraw_all: true,
+            shown: None,
             check: DamageCheck::from_env(),
             charts: Charts::new(),
             _dcomp: dcomp,
@@ -477,6 +481,7 @@ impl Gfx {
             c.size = (0, 0);
         }
         self.redraw_all = true;
+        self.shown = None;
         Ok(())
     }
 
@@ -524,19 +529,25 @@ impl Gfx {
                 tracing::warn!(error = %e, "damage check failed");
             }
         }
+        // What changed, in whole device pixels, for the copy and the present.
+        let changed = partial.then(|| {
+            damage
+                .iter()
+                .filter_map(|&r| self.device_rect(r))
+                .collect::<Vec<RECT>>()
+        });
         self.damage = damage;
         drawn?;
         let drawn_at = Instant::now();
-        // SAFETY: the canvas and the target are the same size and format; the
-        // canvas's drawing has been flushed by EndDraw.
-        unsafe {
-            if let (Some(target), Some(canvas)) = (&self.target, &self.canvas) {
-                target.CopyFromBitmap(None, canvas, None)?;
+        self.copy_to_buffer(changed.as_deref())?;
+        if self.check.is_some() {
+            if let Err(e) = self.check_buffer() {
+                tracing::warn!(error = %e, "buffer check failed");
             }
         }
         let copied = Instant::now();
-        // SAFETY: the swap chain is valid.
-        unsafe { self.swapchain.Present(sync, DXGI_PRESENT(0)).ok()? };
+        self.present(sync, changed.as_deref())?;
+        self.shown = changed;
         let presented = Instant::now();
         self.last.copy_from(dl);
         self.redraw_all = false;
@@ -556,6 +567,172 @@ impl Gfx {
             rest: presented.elapsed(),
         };
         Ok(())
+    }
+
+    /// `r` (DIPs) as the device pixels it touches, within the window; `None` when
+    /// it touches none.
+    fn device_rect(&self, r: Rect) -> Option<RECT> {
+        let s = self.dpi / 96.0;
+        let (w, h) = (self.size_px.0 as f32, self.size_px.1 as f32);
+        let left = (r.x * s).floor().clamp(0.0, w);
+        let top = (r.y * s).floor().clamp(0.0, h);
+        let right = (r.right() * s).ceil().clamp(0.0, w);
+        let bottom = (r.bottom() * s).ceil().clamp(0.0, h);
+        (right > left && bottom > top).then_some(RECT {
+            left: left as i32,
+            top: top as i32,
+            right: right as i32,
+            bottom: bottom as i32,
+        })
+    }
+
+    /// Bring the swap chain's buffer up to date from the canvas. With two buffers
+    /// flipping, the one being drawn holds the frame before last: it needs what
+    /// changed this frame (`changed`) and last frame ([`Gfx::shown`]). A whole
+    /// frame, or one after a whole frame, copies everything.
+    fn copy_to_buffer(&self, changed: Option<&[RECT]>) -> Result<()> {
+        let (Some(target), Some(canvas)) = (&self.target, &self.canvas) else {
+            return Ok(());
+        };
+        // SAFETY: the canvas and the target are the same size and format; the
+        // canvas's drawing has been flushed by EndDraw; the rects are inside both.
+        unsafe {
+            match (changed, self.shown.as_deref()) {
+                (Some(now), Some(before)) => {
+                    for r in now.iter().chain(before) {
+                        let at = D2D_POINT_2U {
+                            x: r.left as u32,
+                            y: r.top as u32,
+                        };
+                        let src = D2D_RECT_U {
+                            left: r.left as u32,
+                            top: r.top as u32,
+                            right: r.right as u32,
+                            bottom: r.bottom as u32,
+                        };
+                        target.CopyFromBitmap(Some(&raw const at), canvas, Some(&raw const src))?;
+                    }
+                }
+                _ => target.CopyFromBitmap(None, canvas, None)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// With `OT_CHECK_DAMAGE`: the swap chain's buffer, about to be presented, must
+    /// be the canvas exactly, however little of it this frame copied. Logged when
+    /// it is not.
+    fn check_buffer(&mut self) -> Result<()> {
+        let (w, h) = (self.size_px.0.max(1), self.size_px.1.max(1));
+        let (Some(target), Some(canvas)) = (self.target.clone(), self.canvas.clone()) else {
+            return Ok(());
+        };
+        let Some(check) = self.check.as_mut() else {
+            return Ok(());
+        };
+        if check
+            .buffer_read
+            .as_ref()
+            .is_none_or(|(_, size)| *size != (w, h))
+        {
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: self.dpi,
+                dpiY: self.dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                colorContext: ManuallyDrop::new(None),
+            };
+            let size = D2D_SIZE_U {
+                width: w,
+                height: h,
+            };
+            // SAFETY: the properties are a complete local.
+            let read = unsafe { self.dc.CreateBitmap(size, None, 0, &raw const props)? };
+            check.buffer_read = Some((read, (w, h)));
+        }
+        let Some((read, _)) = check.buffer_read.clone() else {
+            return Ok(());
+        };
+        let pixels = |from: &ID2D1Bitmap1| -> Result<Vec<u8>> {
+            let row = (w * 4) as usize;
+            let mut out = vec![0u8; row * h as usize];
+            // SAFETY: the mapped rows are `pitch` apart, each at least `row` bytes.
+            unsafe {
+                read.CopyFromBitmap(None, from, None)?;
+                let mapped = read.Map(D2D1_MAP_OPTIONS_READ)?;
+                for y in 0..h as usize {
+                    let src = mapped.bits.add(y * mapped.pitch as usize);
+                    std::ptr::copy_nonoverlapping(src, out[y * row..].as_mut_ptr(), row);
+                }
+                read.Unmap()?;
+            }
+            Ok(out)
+        };
+        let (shown, kept) = (pixels(&target)?, pixels(&canvas)?);
+        let (mut count, mut x0, mut y0, mut x1, mut y1) = (0usize, u32::MAX, u32::MAX, 0, 0);
+        for (i, (a, b)) in shown.chunks_exact(4).zip(kept.chunks_exact(4)).enumerate() {
+            if a != b {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                count += 1;
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+        check.buffer_frames += 1;
+        if count > 0 {
+            check.buffer_bad += 1;
+            tracing::warn!(
+                frame = self.frame,
+                pixels = count,
+                bbox = ?(x0, y0, x1, y1),
+                bad = check.buffer_bad,
+                of = check.buffer_frames,
+                "the buffer to present differs from the canvas"
+            );
+        } else if check.buffer_frames.is_multiple_of(1000) {
+            tracing::info!(
+                bad = check.buffer_bad,
+                of = check.buffer_frames,
+                "buffer check"
+            );
+        }
+        Ok(())
+    }
+
+    /// Present, telling the compositor which rectangles changed (all of it for a
+    /// whole frame), so it recomposes only those.
+    fn present(&self, sync: u32, changed: Option<&[RECT]>) -> Result<()> {
+        // A frame where nothing moved still presents, to keep the pace with the
+        // display: one pixel, unchanged, is what it claims.
+        let none = [RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        }];
+        let mut rects: Vec<RECT> = match changed {
+            Some([]) => none.to_vec(),
+            Some(r) => r.to_vec(),
+            None => Vec::new(),
+        };
+        let params = DXGI_PRESENT_PARAMETERS {
+            DirtyRectsCount: rects.len() as u32,
+            pDirtyRects: if rects.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                rects.as_mut_ptr()
+            },
+            pScrollRect: std::ptr::null_mut(),
+            pScrollOffset: std::ptr::null_mut(),
+        };
+        // SAFETY: the swap chain is valid; `rects` outlives the call.
+        unsafe {
+            self.swapchain
+                .Present1(sync, DXGI_PRESENT(0), &raw const params)
+                .ok()
+        }
     }
 
     /// How the last frame went.
@@ -1452,6 +1629,11 @@ struct DamageCheck {
     size: (u32, u32),
     /// The whole frame, and two bitmaps the CPU reads the canvas and it through.
     bitmaps: Option<(ID2D1Bitmap1, ID2D1Bitmap1, ID2D1Bitmap1)>,
+    /// A bitmap the CPU reads the swap chain's buffer and the canvas through, and
+    /// the size it was made for ([`Gfx::check_buffer`]).
+    buffer_read: Option<(ID2D1Bitmap1, (u32, u32))>,
+    buffer_frames: u64,
+    buffer_bad: u64,
     frames: u64,
     bad: u64,
     dumped: u32,
@@ -1472,6 +1654,9 @@ impl DamageCheck {
             dir,
             size: (0, 0),
             bitmaps: None,
+            buffer_read: None,
+            buffer_frames: 0,
+            buffer_bad: 0,
             frames: 0,
             bad: 0,
             dumped: 0,
