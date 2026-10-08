@@ -16,6 +16,8 @@
 //! pixels and subtract the raster's origin ([`to_pixels`]). The result is 32-bit
 //! premultiplied BGRA, rows top first, what a GPU bitmap takes as is.
 
+use wide::{f32x4, i32x8, CmpGe, CmpGt, CmpLe};
+
 use crate::color::Color;
 use crate::geom::Point;
 
@@ -32,8 +34,13 @@ pub struct ChartRaster {
     /// Premultiplied BGRA, four bytes a pixel; blended as one little-endian `u32`
     /// (blue in the low byte).
     px: Vec<u8>,
-    /// For each column of the band being filled, the rows it covers whole.
-    inner: Vec<(u32, u32)>,
+    /// For each column of the band being filled, the rows it covers whole: from
+    /// `inner0` up to `inner1`, an empty range for none. Apart, so eight columns
+    /// compare with a row at once.
+    inner0: Vec<i32>,
+    inner1: Vec<i32>,
+    /// A row's columns that it covers whole, a bit each ([`ChartRaster::fill_band`]).
+    bits: Vec<u64>,
     /// The segments of the line being drawn ([`Seg`]).
     segs: Vec<Seg>,
     /// The squared distance of each pixel in a column's run to the line.
@@ -95,35 +102,33 @@ impl ChartRaster {
         let (mut ti, mut bi) = (0, 0);
         let first = x0.floor() as u32;
         let last = (x1.ceil() as u32).min(self.width);
-        let mut lo = [0.0f32; SAMPLES as usize];
-        let mut hi = [0.0f32; SAMPLES as usize];
-        self.inner.clear();
+        let offsets = f32x4::from([0.125, 0.375, 0.625, 0.875]);
+        let (lo_x, hi_x) = (f32x4::splat(x0), f32x4::splat(x1));
+        self.inner0.clear();
+        self.inner1.clear();
         for col in first..last {
-            // The samples inside the band's x-range, with its top and bottom there.
-            let mut n = 0;
-            for k in 0..SAMPLES {
-                let xs = col as f32 + (k as f32 + 0.5) / SAMPLES as f32;
-                if xs < x0 || xs > x1 {
-                    continue;
-                }
-                let t = at(top, &mut ti, xs);
-                let b = at(bottom, &mut bi, xs);
-                lo[n] = t.min(b);
-                hi[n] = t.max(b);
-                n += 1;
-            }
+            // The four samples, as one vector: the band's top and bottom there, a
+            // sample outside its x-range empty (top below bottom, at infinity).
+            let xs = f32x4::splat(col as f32) + offsets;
+            let inside = xs.cmp_ge(lo_x) & xs.cmp_le(hi_x);
+            let n = inside.move_mask().count_ones() as usize;
             if n == 0 {
-                self.inner.push((0, 0));
+                self.inner0.push(0);
+                self.inner1.push(0);
                 continue;
             }
-            let (lo, hi) = (&lo[..n], &hi[..n]);
-            let top_px = lo.iter().copied().fold(f32::INFINITY, f32::min);
-            let bottom_px = hi.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let t = line_at(top, &mut ti, xs);
+            let b = line_at(bottom, &mut bi, xs);
+            let lo = inside.blend(t.min(b), f32x4::splat(f32::INFINITY));
+            let hi = inside.blend(t.max(b), f32x4::splat(f32::NEG_INFINITY));
+            let (lo_a, hi_a) = (lo.to_array(), hi.to_array());
+            let top_px = lo_a.into_iter().fold(f32::INFINITY, f32::min);
+            let bottom_px = hi_a.into_iter().fold(f32::NEG_INFINITY, f32::max);
             let r0 = top_px.floor().max(0.0) as u32;
             let r1 = (bottom_px.ceil().max(0.0) as u32).min(self.height);
             // Rows every sample covers whole: the same coverage all the way down.
-            let inner0 = lo.iter().copied().fold(f32::NEG_INFINITY, f32::max).ceil();
-            let inner1 = hi.iter().copied().fold(f32::INFINITY, f32::min).floor();
+            let inner0 = lo_a.into_iter().fold(f32::NEG_INFINITY, f32::max).ceil();
+            let inner1 = hi_a.into_iter().fold(f32::INFINITY, f32::min).floor();
             // Rows every sample covers whole are filled below, a row at a time;
             // only a column with all its samples inside takes part.
             let (in0, in1) = if n == SAMPLES as usize && inner1 > inner0 {
@@ -135,38 +140,44 @@ impl ChartRaster {
                 (r1, r1)
             };
             for row in (r0..in0).chain(in1.max(in0)..r1) {
-                let (y0, y1) = (row as f32, row as f32 + 1.0);
-                let cov = lo
-                    .iter()
-                    .zip(hi)
-                    .map(|(&l, &h)| (h.min(y1) - l.max(y0)).max(0.0))
-                    .sum::<f32>()
-                    / SAMPLES as f32;
+                // Each sample's overlap with the row, at once; an empty one adds 0.
+                let y0 = f32x4::splat(row as f32);
+                let y1 = y0 + f32x4::ONE;
+                let cov = (hi.min(y1) - lo.max(y0)).max(f32x4::ZERO).reduce_add() / SAMPLES as f32;
                 self.blend(col, row, ink, cov);
             }
-            self.inner.push((in0, in1.max(in0)));
+            self.inner0.push(in0.cast_signed());
+            self.inner1.push(in1.max(in0).cast_signed());
         }
         // The whole rows, as runs along each row: contiguous pixels, one color.
+        // Each row finds its columns eight at a time, as bits, and the runs in
+        // the bits.
         let whole = scaled(ink, 256);
-        let inner = std::mem::take(&mut self.inner);
-        let top_row = inner.iter().map(|r| r.0).min().unwrap_or(0);
-        let bottom_row = inner.iter().map(|r| r.1).max().unwrap_or(0);
-        for row in top_row..bottom_row {
-            let mut c = 0;
-            while c < inner.len() {
-                if !(inner[c].0..inner[c].1).contains(&row) {
-                    c += 1;
-                    continue;
-                }
-                let start = c;
-                while c < inner.len() && (inner[c].0..inner[c].1).contains(&row) {
-                    c += 1;
-                }
-                let at = row as usize * self.width as usize + first as usize + start;
-                self.fill_span(at, c - start, whole);
+        let (inner0, inner1) = (
+            std::mem::take(&mut self.inner0),
+            std::mem::take(&mut self.inner1),
+        );
+        let mut bits = std::mem::take(&mut self.bits);
+        let columns = inner0.len();
+        // The rows some column covers; empty columns cover none.
+        let (mut top_row, mut bottom_row) = (i32::MAX, i32::MIN);
+        for (&a, &b) in inner0.iter().zip(&inner1) {
+            if b > a {
+                top_row = top_row.min(a);
+                bottom_row = bottom_row.max(b);
             }
         }
-        self.inner = inner;
+        for row in top_row..bottom_row.max(top_row) {
+            row_bits(&inner0, &inner1, row, &mut bits);
+            let mut c = 0;
+            while let Some((start, len)) = next_run(&bits, columns, &mut c) {
+                let at = row as usize * self.width as usize + first as usize + start;
+                self.fill_span(at, len, whole);
+            }
+        }
+        self.inner0 = inner0;
+        self.inner1 = inner1;
+        self.bits = bits;
     }
 
     /// Blend `src` over `len` pixels from pixel `at` along a row: byte by byte
@@ -325,25 +336,110 @@ fn over(dst: u32, src: Src) -> u32 {
     out
 }
 
-/// The line through `pts` (ascending in x) at `x`, by linear interpolation; the end
-/// values beyond either end. `cursor` is where the last lookup ended: lookups at
-/// increasing x walk forward from it.
-fn at(pts: &[Point], cursor: &mut usize, x: f32) -> f32 {
-    while *cursor + 1 < pts.len() && pts[*cursor + 1].x < x {
-        *cursor += 1;
-    }
-    let a = pts[*cursor];
-    let Some(&b) = pts.get(*cursor + 1) else {
-        return a.y;
+/// Which columns cover `row` whole (`inner0[c] <= row < inner1[c]`), a bit each
+/// into `bits`, eight columns a comparison.
+fn row_bits(inner0: &[i32], inner1: &[i32], row: i32, bits: &mut Vec<u64>) {
+    bits.clear();
+    bits.resize(inner0.len().div_ceil(64), 0);
+    let at = i32x8::splat(row);
+    let after = i32x8::splat(row + 1);
+    let mut lane = |c: usize, a: [i32; 8], b: [i32; 8]| {
+        // `row + 1 > a` is `a <= row`.
+        let hit = after.cmp_gt(i32x8::from(a)) & i32x8::from(b).cmp_gt(at);
+        bits[c / 64] |= u64::from(hit.move_mask() as u8) << (c % 64);
     };
-    if x <= a.x {
-        return a.y;
+    let mut chunks0 = inner0.chunks_exact(8);
+    let mut chunks1 = inner1.chunks_exact(8);
+    let mut c = 0;
+    for (a, b) in (&mut chunks0).zip(&mut chunks1) {
+        let a: [i32; 8] = a.try_into().unwrap_or([0; 8]);
+        let b: [i32; 8] = b.try_into().unwrap_or([0; 8]);
+        lane(c, a, b);
+        c += 8;
     }
-    let span = b.x - a.x;
-    if span <= f32::EPSILON {
-        return b.y;
+    // The last few, padded with empty columns.
+    let (mut a, mut b) = ([0i32; 8], [0i32; 8]);
+    for (k, (&x, &y)) in chunks0
+        .remainder()
+        .iter()
+        .zip(chunks1.remainder())
+        .enumerate()
+    {
+        a[k] = x;
+        b[k] = y;
     }
-    a.y + (b.y - a.y) * ((x - a.x) / span).min(1.0)
+    if !chunks0.remainder().is_empty() {
+        lane(c, a, b);
+    }
+}
+
+/// The next run of set bits in `bits` (of `columns`) from column `*from`: its
+/// start and length, with `*from` moved past it. Bits past `columns` are clear.
+fn next_run(bits: &[u64], columns: usize, from: &mut usize) -> Option<(usize, usize)> {
+    // The first set bit, skipping clear ones a word at a time.
+    let mut c = *from;
+    loop {
+        if c >= columns {
+            *from = columns;
+            return None;
+        }
+        let word = bits[c / 64] >> (c % 64);
+        if word != 0 {
+            c += word.trailing_zeros() as usize;
+            break;
+        }
+        c = (c / 64 + 1) * 64;
+    }
+    if c >= columns {
+        *from = columns;
+        return None;
+    }
+    let start = c;
+    // The first clear bit after it: the set bits counted a word at a time, carried
+    // into the next word when they reach the end of one.
+    while c < columns {
+        // The bits shifted in from above are clear, so this counts no further than
+        // the word's end; only a count that reaches it carries on.
+        let ones = (!(bits[c / 64] >> (c % 64))).trailing_zeros() as usize;
+        c += ones;
+        if ones == 0 || !c.is_multiple_of(64) {
+            break;
+        }
+    }
+    let end = c.min(columns);
+    *from = end;
+    Some((start, end - start))
+}
+
+/// The line through `pts` (ascending in x) at each of `xs` (ascending), by linear
+/// interpolation; the end values beyond either end. The segment under each x is
+/// found by walking `cursor` forward from where the last lookup ended; the
+/// interpolation is done for all four at once.
+fn line_at(pts: &[Point], cursor: &mut usize, xs: f32x4) -> f32x4 {
+    let (mut ax, mut ay, mut bx, mut by) = ([0.0f32; 4], [0.0f32; 4], [0.0f32; 4], [0.0f32; 4]);
+    for (k, x) in xs.to_array().into_iter().enumerate() {
+        while *cursor + 1 < pts.len() && pts[*cursor + 1].x < x {
+            *cursor += 1;
+        }
+        let a = pts[*cursor];
+        // Past the last point: a segment of no length there, so its end value.
+        let b = pts.get(*cursor + 1).copied().unwrap_or(a);
+        (ax[k], ay[k], bx[k], by[k]) = (a.x, a.y, b.x, b.y);
+    }
+    let (ax, ay, bx, by) = (
+        f32x4::from(ax),
+        f32x4::from(ay),
+        f32x4::from(bx),
+        f32x4::from(by),
+    );
+    let span = bx - ax;
+    let along = ((xs - ax) / span).min(f32x4::ONE);
+    let y = ay + (by - ay) * along;
+    // A step (no width) takes its end; an x at or before the start, the
+    // start. Lanes those cover may hold nonsense from the division; they are not
+    // the ones kept.
+    let y = span.cmp_le(f32x4::splat(f32::EPSILON)).blend(by, y);
+    xs.cmp_le(ax).blend(ay, y)
 }
 
 /// A line segment, with what finding a point's distance to it needs.
@@ -527,6 +623,56 @@ mod tests {
             ms(best_bands),
             ms(best_lines)
         );
+    }
+
+    #[test]
+    fn a_rows_runs_found_by_bits_are_the_runs_found_column_by_column() {
+        // A cheap generator, so the cases are many and the same every time.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut bits = Vec::new();
+        for case in 0..300 {
+            // Widths around the word size and the eight-column steps, and long ones.
+            let columns = [1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 300, 670][case % 12];
+            let (mut inner0, mut inner1) = (Vec::new(), Vec::new());
+            for _ in 0..columns {
+                let a = (next() % 40) as i32;
+                let len = if next() % 4 == 0 {
+                    0
+                } else {
+                    (next() % 30) as i32
+                };
+                inner0.push(a);
+                inner1.push(a + len);
+            }
+            for row in 0..70 {
+                let mut want = Vec::new();
+                let mut c = 0;
+                while c < columns {
+                    if (inner0[c]..inner1[c]).contains(&row) {
+                        let start = c;
+                        while c < columns && (inner0[c]..inner1[c]).contains(&row) {
+                            c += 1;
+                        }
+                        want.push((start, c - start));
+                    } else {
+                        c += 1;
+                    }
+                }
+                row_bits(&inner0, &inner1, row, &mut bits);
+                let mut got = Vec::new();
+                let mut from = 0;
+                while let Some(run) = next_run(&bits, columns, &mut from) {
+                    got.push(run);
+                }
+                assert_eq!(got, want, "case {case}, {columns} columns, row {row}");
+            }
+        }
     }
 
     #[test]

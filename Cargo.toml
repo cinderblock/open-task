@@ -34,6 +34,8 @@ ot-update = { path = "crates/ot-update", version = "0.12.0" }
 arc-swap = "1.7"
 thiserror = "2"
 tracing = "0.1"
+# Safe, portable SIMD (SSE/AVX on x86, NEON on ARM) for the CPU chart rasterizer.
+wide = "0.7"
 # The Flight Recorder's wire format: serde for the derives, postcard for a compact
 # varint encoding, lz4_flex (pure Rust; the frame format and its hash are not needed)
 # to compress each frame.
