@@ -153,7 +153,9 @@ Ranked by its estimated impact:
 - [x] 2026-10-07: chart renderers (`7d7fa5c`, `683221a`), History bands once a
   sample (`e4b3035`), no hidden frames (`947e8cc`), partial presents (`6c1a09e`)
 - [x] 2026-10-07: re-measured on driver 31.0.101.2145
-- [ ] Reported; the user's call on the small remaining items
+- [x] 2026-10-08: reported; released as v0.12.0 at the user's word (`b5d1e78`,
+  tag pushed; Release and CI workflows passed; nine assets published)
+- [ ] The user's call on the small remaining items (open questions 1 and 2)
 
 ## Open questions for the user
 
@@ -166,4 +168,4 @@ Ranked by its estimated impact:
    texture each; skip per-sample work for pages not shown. Worth doing?
    Recommendation: the bounds cache only (simple, safe); the rest is little for
    its risk.
-3. Release these as v0.12.0? (Nothing is pushed.)
+3. ~~Release these as v0.12.0?~~ Released 2026-10-08.

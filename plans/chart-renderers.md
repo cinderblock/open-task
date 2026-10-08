@@ -67,7 +67,7 @@ drawing off that path with two new renderers, compare them, and let the user pic
    screenshots; `OT_CHECK_DAMAGE`.~~
 7. ~~Frame stats for each at full history (6 min runs).~~
 8. ~~CPU rasterizer sped up (`683221a`).~~
-9. **[current]** Report the comparison to the user.
+9. ~~Report the comparison to the user.~~ Released in v0.12.0.
 10. Possible later, if the user wants the CPU path faster still: SIMD by hand for
     the edge pixels and lines, rasterizing only the columns a partial frame
     damages, or sharing the work across threads (wall time only, not CPU).
@@ -111,7 +111,7 @@ drawing off that path with two new renderers, compare them, and let the user pic
 - [x] 2026-10-07: commands, CPU rasterizer, painters, renderer (D2D, CPU, GPU),
   setting, parity test; clippy on three targets, all tests
 - [x] 2026-10-07: measured at full history (two sets); CPU path sped up
-- [ ] Reported to the user
+- [x] 2026-10-08: reported; released in v0.12.0
 
 ## Open questions for the user
 
