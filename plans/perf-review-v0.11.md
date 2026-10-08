@@ -101,6 +101,15 @@ Ranked by its estimated impact:
   PROC_THREAD+LOADER+PROFILE -stackwalk Profile`; analyze with `xperf -a stack
   -butterfly 20 -process open-task` and `target/tmp/butterfly.py`
   (`-event SampledProfile` matched nothing).
+- **Steady-state profile** (History, foreground, 5.5 min in, symbol build,
+  `target/tmp/steady-profile.ps1`): **33.4 % of a core**. Samples: `EndDraw` 73 %;
+  `FillPath`/`RasterizePath` 50–55 % (the bands' and charts' filled paths,
+  antialiased on the CPU); `StrokePath` 15 % (band hairlines, chart lines);
+  `UsageChart::build` 4.8 % (reweights every program over the whole history every
+  frame, `assign_bands`); sampler 3.4 %; `Present` 3.3 %; `BeginPaint` 2.1 %
+  (fixed, `defb530`); text 1.8 %; canvas copy 0.9 %.
+- Minimized: about 2–4 % (per-sample work and one frame a sample, `repaint`
+  draws on `WM_APP_SNAPSHOT` even when not `seen`); Settings page about 1.7 %.
 - The machine is busy (about 39 % total load from Electron/Chrome), so process-CPU
   numbers wander by several points between identical runs; draw times from
   `OT_FRAME_STATS` and profile shares are steadier.
@@ -108,10 +117,17 @@ Ranked by its estimated impact:
 ## Progress log
 
 - [x] 2026-10-07: static review
-- [ ] Baseline measured
+- [x] 2026-10-07: baseline measured (per view, 6-min growth run, steady profile)
+- [x] 2026-10-07: `ValidateRect` paint (`defb530`); diagnostics (`c131cdd`)
 - [ ] Fixes chosen, made, measured
 - [ ] After-driver re-measure
 
 ## Open questions for the user
 
-None yet.
+1. How to take the chart drawing off Direct2D's path rasterizer (about 70 % of the
+   CPU at full history)? Recommendation: our own column rasterizer for chart areas
+   and lines (a chart is a function of x, so exact per-pixel coverage is a short
+   loop per column), uploaded as one bitmap per chart; Direct2D keeps text, grid,
+   everything else. Alternatives: Direct2D tweaks only (aliased fills, fewer
+   points, no band hairlines: perhaps a third off), or a Direct3D shader path
+   (fastest draw, most code).
