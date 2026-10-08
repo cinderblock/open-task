@@ -122,7 +122,7 @@ pub enum ChartDrawing {
 }
 
 impl ChartDrawing {
-    /// In the order the card steps through.
+    /// In the order the card lists them.
     pub const ALL: [Self; 3] = [Self::Gpu, Self::Cpu, Self::Direct2D];
 
     /// The card's name for it.
@@ -156,14 +156,6 @@ impl ChartDrawing {
     #[must_use]
     pub fn from_index(i: u32) -> Self {
         Self::ALL.get(i as usize).copied().unwrap_or_default()
-    }
-
-    /// The next one along (`1`) or back (`-1`), or `None` past either end.
-    fn step(self, by: isize) -> Option<Self> {
-        (self.index() as usize)
-            .checked_add_signed(by)
-            .and_then(|i| Self::ALL.get(i))
-            .copied()
     }
 }
 
@@ -498,7 +490,7 @@ enum Card {
     Speed,
     /// How far back the charts reach: a length with a minus and a plus button.
     History,
-    /// How chart shapes are drawn: GPU, CPU or Direct2D, stepped.
+    /// How chart shapes are drawn: GPU, CPU or Direct2D, side by side to pick from.
     ChartDrawing,
     /// Start a copy as administrator; shown while this one is not.
     RunAsAdministrator,
@@ -544,7 +536,8 @@ impl Card {
     }
 
     /// Whether a click anywhere on the card does something now. The stepper
-    /// cards answer only on their two buttons.
+    /// cards answer only on their two buttons, the chart drawing card only on its
+    /// choices.
     fn clickable(self, cx: Context<'_>) -> bool {
         match self {
             Self::Decay | Self::Speed | Self::History | Self::ChartDrawing => false,
@@ -632,6 +625,8 @@ const STEP_W: f32 = 28.0;
 /// A stepper's minus, value and plus: room between the buttons for the longest
 /// value, "Normal" ("Norma" was all that showed in a switch's width).
 const STEPPER_W: f32 = 2.0 * STEP_W + 60.0;
+/// One choice of the chart drawing card's row: room for "Direct2D".
+const CHOICE_W: f32 = 72.0;
 
 #[derive(Debug, Default)]
 pub(crate) struct SettingsPage {
@@ -641,10 +636,14 @@ pub(crate) struct SettingsPage {
     /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
-    /// The fade card's minus and plus buttons, then the speed card's, the history
-    /// card's and the chart drawing card's, and the one under the pointer.
-    steppers: [Rect; 8],
+    /// The fade card's minus and plus buttons, then the speed card's and the
+    /// history card's, and the one under the pointer.
+    steppers: [Rect; 6],
     hover_step: Option<usize>,
+    /// The chart drawing card's choices, in [`ChartDrawing::ALL`] order, and the
+    /// one under the pointer.
+    drawing: [Rect; ChartDrawing::ALL.len()],
+    hover_drawing: Option<usize>,
     /// Where the sections scroll: the page below its title.
     view: Rect,
     /// How far the sections are scrolled, in DIPs, and how far they can be.
@@ -668,13 +667,35 @@ impl SettingsPage {
     }
 
     /// The stepper button under `p`: 0 and 1 for the fade card's minus and plus,
-    /// 2 and 3 for the speed card's, 4 and 5 for the history card's, 6 and 7 for
-    /// the chart drawing card's.
+    /// 2 and 3 for the speed card's, 4 and 5 for the history card's.
     fn step_at(&self, p: Point) -> Option<usize> {
         if !self.view.contains(p) {
             return None;
         }
         self.steppers.iter().position(|r| r.contains(p))
+    }
+
+    /// The chart drawing choice under `p`, as an index into [`ChartDrawing::ALL`].
+    fn drawing_at(&self, p: Point) -> Option<usize> {
+        if !self.view.contains(p) {
+            return None;
+        }
+        self.drawing.iter().position(|r| r.contains(p))
+    }
+
+    /// The chart drawing choice under `at`: pick it, and ask for it to be saved.
+    /// Nothing when it is already the one picked.
+    fn pick_drawing(&self, at: Point, settings: &mut Settings) -> Reaction {
+        match self.drawing_at(at).map(|i| ChartDrawing::ALL[i]) {
+            Some(d) if d != settings.chart_drawing => {
+                settings.chart_drawing = d;
+                Reaction {
+                    repaint: true,
+                    effect: Some(Effect::SaveSettings(*settings)),
+                }
+            }
+            _ => Reaction::NONE,
+        }
     }
 
     /// A stepper card's minus or plus under `at`: step its setting one along, and
@@ -684,7 +705,6 @@ impl SettingsPage {
             Card::Decay => 0,
             Card::Speed => 2,
             Card::History => 4,
-            Card::ChartDrawing => 6,
             _ => return Reaction::NONE,
         };
         let by = match self.step_at(at) {
@@ -702,10 +722,6 @@ impl SettingsPage {
             Card::History => settings
                 .history_step(by)
                 .map(|v| settings.history_minutes = v),
-            Card::ChartDrawing => settings
-                .chart_drawing
-                .step(by)
-                .map(|v| settings.chart_drawing = v),
             _ => None,
         };
         if stepped.is_none() {
@@ -724,13 +740,16 @@ impl SettingsPage {
             UiEvent::MouseMove(p) => {
                 let hit = self.card_at(p);
                 let step = self.step_at(p);
+                let drawing = self.drawing_at(p);
                 let card = std::mem::replace(&mut self.hover, hit) != hit;
                 let button = std::mem::replace(&mut self.hover_step, step) != step;
-                Reaction::painted(card || button)
+                let choice = std::mem::replace(&mut self.hover_drawing, drawing) != drawing;
+                Reaction::painted(card || button || choice)
             }
             UiEvent::MouseLeave => {
                 let step = self.hover_step.take().is_some();
-                Reaction::painted(self.hover.take().is_some() || step)
+                let choice = self.hover_drawing.take().is_some();
+                Reaction::painted(self.hover.take().is_some() || step || choice)
             }
             UiEvent::MouseDown {
                 at,
@@ -750,9 +769,10 @@ impl SettingsPage {
                 Some(Card::TaskManager) if !cx.task_manager.pending => {
                     Reaction::effect(Effect::ReplaceTaskManager(!cx.task_manager.on()))
                 }
-                Some(card @ (Card::Decay | Card::Speed | Card::History | Card::ChartDrawing)) => {
+                Some(card @ (Card::Decay | Card::Speed | Card::History)) => {
                     self.step(card, at, settings)
                 }
+                Some(Card::ChartDrawing) => self.pick_drawing(at, settings),
                 Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
                 Some(Card::Record) => Reaction::effect(Effect::Record(cx.recording.is_none())),
                 Some(Card::TaskManager) | None => Reaction::NONE,
@@ -773,6 +793,7 @@ impl SettingsPage {
                 self.shift(-moved);
                 self.hover = self.card_at(at);
                 self.hover_step = self.step_at(at);
+                self.hover_drawing = self.drawing_at(at);
                 Reaction::REPAINT
             }
             _ => Reaction::NONE,
@@ -816,8 +837,18 @@ impl SettingsPage {
         let [d0, d1] = pair(self.cards[DECAY_CARD]);
         let [s0, s1] = pair(self.cards[SPEED_CARD]);
         let [h0, h1] = pair(self.cards[HISTORY_CARD]);
-        let [c0, c1] = pair(self.cards[DRAWING_CARD]);
-        self.steppers = [d0, d1, s0, s1, h0, h1, c0, c1];
+        self.steppers = [d0, d1, s0, s1, h0, h1];
+        // The chart drawing card's choices, side by side at the right.
+        let card = self.cards[DRAWING_CARD];
+        let left = card.right() - 16.0 - CHOICE_W * self.drawing.len() as f32;
+        for (i, r) in self.drawing.iter_mut().enumerate() {
+            *r = Rect::new(
+                left + CHOICE_W * i as f32,
+                card.center().y - BUTTON_H * 0.5,
+                CHOICE_W,
+                BUTTON_H,
+            );
+        }
         self.max_scroll = (y - view.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
         self.shift(view.y - self.scroll);
@@ -831,7 +862,7 @@ impl SettingsPage {
         for r in self.cards.iter_mut().filter(|r| r.w > 0.0) {
             r.y += dy;
         }
-        for r in &mut self.steppers {
+        for r in self.steppers.iter_mut().chain(&mut self.drawing) {
             r.y += dy;
         }
     }
@@ -992,22 +1023,18 @@ impl SettingsPage {
                              CPU: the most CPU at full history."
                         }
                     };
+                    // The text stops short of the choices, which are wider than
+                    // the other cards' controls.
+                    let (text, _) =
+                        inner.split_left((self.drawing[0].x - inner.x).clamp(0.0, inner.w));
                     paint_text(dl, text, "Chart drawing", detail, note, theme);
-                    let [.., minus, plus] = self.steppers;
-                    for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
-                        let enabled = settings.chart_drawing.step(by).is_some();
-                        let hover = enabled && self.hover_step == Some(i + 6);
-                        paint_stepper(dl, r, by > 0, enabled, hover, theme);
-                    }
-                    let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
-                    dl.text(
-                        settings.chart_drawing.label(),
-                        value,
-                        theme.cell_num,
-                        theme.text,
-                        HAlign::Center,
-                        VAlign::Middle,
-                        false,
+                    paint_choices(
+                        dl,
+                        &self.drawing,
+                        ChartDrawing::ALL.map(ChartDrawing::label),
+                        settings.chart_drawing.index() as usize,
+                        self.hover_drawing,
+                        theme,
                     );
                 }
                 Card::RunAsAdministrator => {
@@ -1130,6 +1157,48 @@ fn paint_button(dl: &mut DisplayList, r: Rect, label: &str, enabled: bool, theme
         VAlign::Middle,
         true,
     );
+}
+
+/// A row of choices side by side, one of them picked, in the look of the
+/// toolbar's List / Tree / Map / History control: `rects` from the layout,
+/// `labels` in the same order.
+fn paint_choices<const N: usize>(
+    dl: &mut DisplayList,
+    rects: &[Rect; N],
+    labels: [&str; N],
+    picked: usize,
+    hover: Option<usize>,
+    theme: &Theme,
+) {
+    let (Some(first), Some(last)) = (rects.first(), rects.last()) else {
+        return;
+    };
+    let group = Rect::new(first.x, first.y, last.right() - first.x, first.h);
+    dl.fill_round_rect(group, theme.card_radius, theme.input_bg);
+    dl.stroke_round_rect(group, theme.card_radius, theme.surface_border, 1.0);
+    for (i, (&r, label)) in rects.iter().zip(labels).enumerate() {
+        let active = i == picked;
+        let fill = if active {
+            Some(theme.button_active)
+        } else if hover == Some(i) {
+            Some(theme.button_hover)
+        } else {
+            None
+        };
+        if let Some(c) = fill {
+            dl.fill_round_rect(r.inset(2.0, 2.0), theme.card_radius - 1.0, c);
+        }
+        let ink = if active { theme.text } else { theme.text_dim };
+        dl.text(
+            label,
+            r,
+            theme.cell,
+            ink,
+            HAlign::Center,
+            VAlign::Middle,
+            false,
+        );
+    }
 }
 
 /// One of the fade card's buttons: a minus, or a plus, drawn as geometry so it
@@ -1496,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn the_chart_drawing_card_steps_through_gpu_cpu_and_direct2d() {
+    fn the_chart_drawing_card_picks_gpu_cpu_or_direct2d() {
         let update = UpdateView::new("0.2.1", true);
         let cx = cx(true, &update);
         let mut page = SettingsPage::default();
@@ -1506,19 +1575,25 @@ mod tests {
         assert!(strings.iter().any(|t| t == "Chart drawing"), "{strings:?}");
         assert!(strings.iter().any(|t| t == "GPU"), "{strings:?}");
 
-        let card = page.cards[DRAWING_CARD];
-        let [.., minus, plus] = page.steppers;
-        assert!(card.contains(minus.center()) && card.contains(plus.center()));
-        assert_eq!(click(&mut page, minus.center(), &mut s, cx), Reaction::NONE);
-        let r = click(&mut page, plus.center(), &mut s, cx);
-        assert_eq!(s.chart_drawing, ChartDrawing::Cpu);
-        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
-        let _ = click(&mut page, plus.center(), &mut s, cx);
-        assert_eq!(s.chart_drawing, ChartDrawing::Direct2D);
-        assert_eq!(click(&mut page, plus.center(), &mut s, cx), Reaction::NONE);
-        assert!(texts(&paint(&mut page, s, cx))
+        // All three are on the card at once, left to right.
+        assert!(["CPU", "Direct2D"]
             .iter()
-            .any(|t| t == "Direct2D"));
+            .all(|l| strings.iter().any(|t| t == l)));
+        let card = page.cards[DRAWING_CARD];
+        let [gpu, cpu, d2d] = page.drawing;
+        assert!([gpu, cpu, d2d].iter().all(|r| card.contains(r.center())));
+        assert!(gpu.right() <= cpu.x && cpu.right() <= d2d.x);
+
+        // Picking the one already picked does nothing; any other is picked and
+        // saved, in any order.
+        assert_eq!(click(&mut page, gpu.center(), &mut s, cx), Reaction::NONE);
+        let r = click(&mut page, d2d.center(), &mut s, cx);
+        assert_eq!(s.chart_drawing, ChartDrawing::Direct2D);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let _ = click(&mut page, cpu.center(), &mut s, cx);
+        assert_eq!(s.chart_drawing, ChartDrawing::Cpu);
+        let _ = click(&mut page, gpu.center(), &mut s, cx);
+        assert_eq!(s.chart_drawing, ChartDrawing::Gpu);
 
         // Saved by its place; names for the environment override.
         for d in ChartDrawing::ALL {
