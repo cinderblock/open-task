@@ -23,15 +23,21 @@ use crate::theme::Theme;
 
 /// The time axis for a frame: `now_ms` at the right edge (the newest sample when
 /// `None`), and the charts filling their width with whatever history `timeline`
-/// holds back from there, up to `length_ms`, the history setting.
-pub(crate) fn axis_of(timeline: &Timeline, now_ms: Option<i64>, length_ms: i64) -> TimeAxis {
+/// holds back from there, up to `length_ms`, the history setting. The knee is at
+/// `tau_ms`, the knee setting.
+pub(crate) fn axis_of(
+    timeline: &Timeline,
+    now_ms: Option<i64>,
+    length_ms: i64,
+    tau_ms: f32,
+) -> TimeAxis {
     let s = &timeline.cpu_total;
     let now = now_ms.or_else(|| s.latest().map(|n| n.at_unix_ms));
     let reach = match (now, s.oldest_ms()) {
         (Some(now), Some(oldest)) => (now - oldest).clamp(0, length_ms.max(0)),
         _ => 0,
     };
-    TimeAxis::at(now_ms, reach as f32)
+    TimeAxis::at(now_ms, reach as f32, tau_ms)
 }
 
 /// A timeline and the axis a frame charts it on.
@@ -47,7 +53,7 @@ impl Charted<'_> {
     pub fn still(timeline: &Timeline) -> Charted<'_> {
         Charted {
             timeline,
-            axis: axis_of(timeline, None, i64::MAX),
+            axis: axis_of(timeline, None, i64::MAX, TimeAxis::DEFAULT.tau_ms),
         }
     }
 }
@@ -737,13 +743,16 @@ mod tests {
             tl.cpu_total.push(10_000 + i * 1000, 5.0);
         }
         // Still: the newest sample at the edge, everything held in view.
-        let still = axis_of(&tl, None, 3_600_000);
+        let still = axis_of(&tl, None, 3_600_000, TimeAxis::DEFAULT.tau_ms);
         assert_eq!((still.now_ms, still.span_ms), (None, 29_000.0));
         // Running: from the clock, a little behind the newest.
-        let running = axis_of(&tl, Some(37_750), 3_600_000);
+        let running = axis_of(&tl, Some(37_750), 3_600_000, TimeAxis::DEFAULT.tau_ms);
         assert_eq!((running.now_ms, running.span_ms), (Some(37_750), 27_750.0));
         // Never longer than the history setting.
-        assert_eq!(axis_of(&tl, Some(37_750), 20_000).span_ms, 20_000.0);
+        assert_eq!(
+            axis_of(&tl, Some(37_750), 20_000, TimeAxis::DEFAULT.tau_ms).span_ms,
+            20_000.0
+        );
         assert_eq!(newest_gap(&tl.cpu_total), Some((39_000, 1000)));
     }
 }

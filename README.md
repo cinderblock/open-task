@@ -78,9 +78,13 @@ second and the axis grows with the history until it reaches the length set on th
 Settings page: **How far charts reach back**, five minutes to a day, five minutes
 unless changed. Older samples are dropped; the card says how many points a chart
 keeps at that length and about how much memory that is for the charts on this
-machine. With five minutes, the last ten seconds take about two fifths of the width
-and the rest is compressed toward the left end; with an hour, the last minute takes
-half. The charts scroll smoothly with time rather than stepping once a sample: the
+machine. Ages up to the axis's knee spread out evenly and older ones are compressed
+toward the left end. **Where the time axis bends** sets the knee as a number of
+samples, so it follows the update speed: five unless changed, five seconds at the
+Normal speed. With five minutes held, the last ten seconds then take about a quarter
+of the width; with an hour, the last minute takes about two fifths and the last ten
+minutes almost three quarters. More samples give the last minutes more of the width
+and the last seconds less. The charts scroll smoothly with time rather than stepping once a sample: the
 right edge runs a little over a sample behind the newest, so each new sample slides
 in from past it (**Scroll charts smoothly** under **Charts** turns this off). A
 frame where only the clock moved repaints just the charts, and only the parts of
@@ -159,10 +163,15 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   chart get a band and a color each, and the rest are one grey band, "Everything
   else". A program keeps its color for as long as it keeps a band, and a band
   changes hands only when a newcomer is clearly bigger, so the chart does not
-  recolor itself as you watch. The legend beside it names the bands, top to bottom
-  as they are stacked, with each one's value now; point at the chart and it gives
-  the values at that moment instead, and the CPU and memory graphs mark the same
-  moment (and the other way round). Pointing at a band, or its legend row, sets it
+  recolor itself as you watch. Each band's name is written inside it, where the band
+  is thick enough for a line of text, so the chart takes the whole width; a name
+  stays put as the chart scrolls until a clearly better place opens up, and a band
+  too thin anywhere goes unnamed. Point at a band and a readout beside the pointer
+  gives its name and value at that moment; the CPU and memory graphs mark the same
+  moment (and the other way round). **History chart legend** on the Settings page
+  can instead float the legend, with every band's value, over the top corner of the
+  chart the bands leave freer (moving out of the way of a marked moment), or put it
+  in a column beside the chart. Pointing at a band, or its legend row, sets it
   off from the others; a click selects the program's busiest process, right-click
   gives its menu, and the search dims the programs it does not match.
 

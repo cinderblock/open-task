@@ -908,7 +908,7 @@ mod tests {
             Inputs {
                 snap: s,
                 timeline: tl,
-                axis: charts::axis_of(tl, None, i64::MAX),
+                axis: charts::axis_of(tl, None, i64::MAX, TimeAxis::DEFAULT.tau_ms),
                 cycles: &CYCLES,
                 facts: Some(&facts),
             },
@@ -1025,7 +1025,7 @@ mod tests {
             Inputs {
                 snap: &s,
                 timeline: &tl,
-                axis: charts::axis_of(&tl, None, i64::MAX),
+                axis: charts::axis_of(&tl, None, i64::MAX, TimeAxis::DEFAULT.tau_ms),
                 cycles: &CYCLES,
                 facts: None,
             },

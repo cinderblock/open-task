@@ -1123,9 +1123,11 @@ impl App {
     }
 
     /// Make the settings take effect: the row animation, how fast the cycle totals
-    /// fade, and how far back the history reaches.
+    /// fade, how far back the history reaches, and how the History names its
+    /// bands. (The time axis's knee is read as each frame's axis is made.)
     fn apply_settings(&mut self) {
         self.apply_animation();
+        self.history.set_legend(self.settings.chart_legend);
         let decay = self.settings.usage_decay();
         let history_ms = self.settings.history_ms();
         self.usage.set_decay(decay);
@@ -2285,7 +2287,12 @@ impl App {
             Some(p) => &p.timeline,
             None => &self.timeline,
         };
-        let axis = charts::axis_of(timeline, now_ms, self.settings.history_ms());
+        let axis = charts::axis_of(
+            timeline,
+            now_ms,
+            self.settings.history_ms(),
+            self.settings.knee_ms(),
+        );
         if self.only_the_clock_moved() {
             self.last_paint = PaintKind::Tick;
             self.paint_tick(dl, axis);

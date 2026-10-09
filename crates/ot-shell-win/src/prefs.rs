@@ -3,8 +3,9 @@
 //!
 //! Settings live under `HKCU\Software\open-task`, one `REG_DWORD` each
 //! (`AnimateRows`, `SmoothCharts`, `CheckForUpdates`, `DownloadUpdates`,
-//! `InstallUpdates`, and the numbers `UsageDecayPercent`, `HistoryMinutes` and
-//! `ChartDrawing`, 0 GPU, 1 CPU, 2 Direct2D) plus
+//! `InstallUpdates`, and the numbers `UsageDecayPercent`, `HistoryMinutes`,
+//! `ChartKneeSamples`, `ChartDrawing`, 0 GPU, 1 CPU, 2 Direct2D, and
+//! `ChartLegend`, 0 in the bands, 1 floating, 2 beside) plus
 //! `Layout`, a `REG_SZ` with the page, arrangement, sort and columns the last
 //! session ended on, per user like every other per-user preference on Windows. A missing key or value means the
 //! default. Nothing here is fatal: a value that cannot be read or written is
@@ -12,7 +13,7 @@
 
 use std::ffi::c_void;
 
-use ot_ui::{ChartDrawing, Settings, ViewLayout};
+use ot_ui::{ChartDrawing, ChartLegend, Settings, ViewLayout};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
@@ -36,6 +37,8 @@ const MINIMIZE_ON_USE: PCWSTR = w!("MinimizeOnUse");
 const RESOURCE_PERCENT: PCWSTR = w!("ResourceValuesAsPercent");
 const UPDATE_INTERVAL: PCWSTR = w!("UpdateIntervalMs");
 const CHART_DRAWING: PCWSTR = w!("ChartDrawing");
+const CHART_KNEE: PCWSTR = w!("ChartKneeSamples");
+const CHART_LEGEND: PCWSTR = w!("ChartLegend");
 const LAYOUT: PCWSTR = w!("Layout");
 
 /// The settings as last saved, defaults for anything never saved.
@@ -54,10 +57,16 @@ pub fn load() -> Settings {
         resource_percent: flag(RESOURCE_PERCENT, defaults.resource_percent),
         chart_drawing: read_dword(CHART_DRAWING)
             .map_or(defaults.chart_drawing, ChartDrawing::from_index),
+        chart_legend: read_dword(CHART_LEGEND)
+            .map_or(defaults.chart_legend, ChartLegend::from_index),
         ..defaults
     };
     let settings = match read_dword(UPDATE_INTERVAL) {
         Some(ms) => settings.with_interval(ms),
+        None => settings,
+    };
+    let settings = match read_dword(CHART_KNEE) {
+        Some(samples) => settings.with_knee_samples(samples),
         None => settings,
     };
     let settings = match read_dword(USAGE_DECAY) {
@@ -87,6 +96,8 @@ pub fn save(s: &Settings) {
         (RESOURCE_PERCENT, Some(u32::from(s.resource_percent))),
         (UPDATE_INTERVAL, Some(s.update_interval_ms)),
         (CHART_DRAWING, Some(s.chart_drawing.index())),
+        (CHART_KNEE, Some(u32::from(s.chart_knee_samples))),
+        (CHART_LEGEND, Some(s.chart_legend.index())),
     ];
     let Some(key) = open_for_writing() else {
         return;

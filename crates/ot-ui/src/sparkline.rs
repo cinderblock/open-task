@@ -52,11 +52,12 @@ pub struct TimeAxis {
 }
 
 impl TimeAxis {
-    /// One hour, with one second as the knee: the last 10 s take about 29 % of the
-    /// width, the last minute half, the last 10 minutes 78 %.
+    /// One hour, with five seconds as the knee (five samples at the default update
+    /// speed): the last 10 s take about 17 % of the width, the last minute 39 %, the
+    /// last 10 minutes 73 %.
     pub const DEFAULT: Self = Self {
         span_ms: 3_600_000.0,
-        tau_ms: 1_000.0,
+        tau_ms: 5_000.0,
         now_ms: None,
     };
 
@@ -67,12 +68,12 @@ impl TimeAxis {
 
     /// The axis with `now_ms` at the right edge and the history reaching back
     /// `reach_ms` from it at the left, so a chart fills its width: at least
-    /// [`Self::MIN_SPAN_MS`], with the default knee.
+    /// [`Self::MIN_SPAN_MS`], with its knee at `tau_ms`.
     #[must_use]
-    pub fn at(now_ms: Option<i64>, reach_ms: f32) -> Self {
+    pub fn at(now_ms: Option<i64>, reach_ms: f32, tau_ms: f32) -> Self {
         Self {
             span_ms: reach_ms.max(Self::MIN_SPAN_MS),
-            tau_ms: Self::DEFAULT.tau_ms,
+            tau_ms: tau_ms.max(1.0),
             now_ms,
         }
     }
@@ -591,9 +592,14 @@ mod tests {
         assert!(AXIS.x(r, 10.0 * AXIS.span_ms).abs() < 1e-3, "older clamps");
         // The documented proportions of the default axis.
         let from_right = |age: f32| 1.0 - AXIS.x(r, age) / 1000.0;
-        assert!((from_right(10_000.0) - 0.29).abs() < 0.01);
-        assert!((from_right(60_000.0) - 0.50).abs() < 0.01);
-        assert!((from_right(600_000.0) - 0.78).abs() < 0.01);
+        assert!((from_right(10_000.0) - 0.17).abs() < 0.01);
+        assert!((from_right(60_000.0) - 0.39).abs() < 0.01);
+        assert!((from_right(600_000.0) - 0.73).abs() < 0.01);
+        // A wider knee gives the last seconds less and the last minutes more.
+        let wide = TimeAxis::at(None, AXIS.span_ms, 4.0 * AXIS.tau_ms);
+        let share = |a: TimeAxis, from: f32, to: f32| a.fraction(to) - a.fraction(from);
+        assert!(share(wide, 0.0, 10_000.0) < share(AXIS, 0.0, 10_000.0));
+        assert!(share(wide, 60_000.0, 600_000.0) > share(AXIS, 60_000.0, 600_000.0));
         for age in [0.0, 500.0, 7_000.0, 90_000.0, 2_000_000.0] {
             let back = AXIS.age_at(r, AXIS.x(r, age));
             assert!((back - age).abs() <= age * 1e-3 + 1.0, "{age} -> {back}");

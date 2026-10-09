@@ -15,8 +15,20 @@
 //! chart get a band and a color each, and the rest are one grey band. A program
 //! keeps its color for as long as it keeps a band, and bands change hands only when
 //! a newcomer is clearly bigger, so a chart watched live does not recolor itself.
-//! The legend beside it names the bands, top to bottom as they are stacked, with
-//! each one's value now, or at the moment under the pointer.
+//! The bands are named one of three ways ([`ChartLegend`]):
+//!
+//! - **In the bands**: each band's name is written inside it, where it is thick
+//!   enough for a line of text over the label's whole width. The place is the
+//!   stretch where the band is thickest, kept from frame to frame (anchored in
+//!   time, so it scrolls with the band) until another stretch is clearly better.
+//!   A band too thin anywhere goes unnamed. The band under the pointer reads out
+//!   its name and value beside the pointer. The plot takes the whole width.
+//! - **Floating**: the legend, with every band's value now or at the moment under
+//!   the pointer, over a top corner of the plot: the one the bands rise into
+//!   less, and not the one the marked moment is in.
+//! - **Beside**: the same legend in a column of its own right of the plot.
+
+use std::collections::VecDeque;
 
 use ot_core::usage::fade;
 use ot_core::{ProgramId, Usage};
@@ -25,6 +37,7 @@ use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 use crate::charts::{self, Crosshair, AXIS_BAND_H};
 use crate::format;
 use crate::process_rows::contains_ci;
+use crate::settings::ChartLegend;
 use crate::sparkline::{self, TimeAxis, COLUMN_W};
 use crate::theme::Theme;
 
@@ -43,6 +56,25 @@ const LEGEND_ROW_H: f32 = 22.0;
 const SWATCH: f32 = 10.0;
 /// A legend row's share for its value.
 const LEGEND_VALUE_W: f32 = 76.0;
+/// How far a floating legend sits in from the plot's edges.
+const FLOAT_INSET: f32 = 6.0;
+/// A floating legend moves to the other corner only when the bands rise into
+/// that one less than this share of how much they rise into its own.
+const FLOAT_SWITCH: f32 = 0.6;
+/// A band's name inside it: the height it needs clear, the room either side of
+/// the text, and the widest a name is given before it is cut short.
+const LABEL_H: f32 = 14.0;
+const LABEL_PAD: f32 = 4.0;
+const LABEL_MAX_W: f32 = 180.0;
+/// The text is not measured here (the backends do that), so a name's width is
+/// estimated from its length at this share of the font's size a character,
+/// generously for the small UI font; a longer name is cut with an ellipsis.
+const CHAR_EM: f32 = 0.6;
+/// A name stays where it is while that place's clearance is at least this share of
+/// the best place's.
+const LABEL_KEEP: f32 = 0.75;
+/// The band under the pointer's readout: its offset from the pointer.
+const CHIP_OFFSET: f32 = 14.0;
 /// A program needs this share of the chart to be given a band, and half of it to
 /// keep one.
 const BAND_SHARE: f32 = 0.005;
@@ -97,7 +129,34 @@ struct Row {
 struct Pt {
     x: f32,
     age_ms: f32,
+    /// When the column's newest stretch ended: where it is in time, which unlike
+    /// its age does not change as the chart scrolls.
+    end_ms: i64,
     v: [f32; BANDS],
+}
+
+/// A band's name, placed inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Label {
+    rect: Rect,
+    /// The column at its right end, by [`Pt::end_ms`], so the next frame can find
+    /// the same place.
+    anchor_ms: i64,
+}
+
+/// The estimated width of `text` in the small UI font, padded either side.
+fn label_w(text: &str, size: f32) -> f32 {
+    text.chars().count() as f32 * size * CHAR_EM + 2.0 * LABEL_PAD
+}
+
+/// Ink that reads on `fill`: near black on a light color, white on a dark one.
+fn ink_on(fill: Color) -> Color {
+    let luma = 0.2126 * fill.r + 0.7152 * fill.g + 0.0722 * fill.b;
+    if luma > 0.5 {
+        Color::hex(0x1A_1A_1A)
+    } else {
+        Color::hex(0xFF_FF_FF)
+    }
 }
 
 impl Pt {
@@ -126,7 +185,15 @@ pub(crate) struct UsageChart {
     axis: Rect,
     /// The time axis of the last build, shared with the summary charts.
     time: TimeAxis,
+    /// How the bands are named, the setting.
+    style: ChartLegend,
+    /// The legend's place: beside the plot, over it, or empty when the bands are
+    /// named inside themselves.
     legend: Rect,
+    /// A floating legend is in the plot's top right corner rather than its left.
+    float_right: bool,
+    /// Each band's name inside it, where it fits.
+    labels: [Option<Label>; BANDS],
     switch: [Rect; 2],
     /// Each band's legend row; empty for a band that has none.
     rows: [Rect; BANDS],
@@ -144,6 +211,8 @@ pub(crate) struct UsageChart {
     now_ms: i64,
     poly: Vec<Point>,
     cum: Vec<f32>,
+    /// The sliding window's extremes, for placing the names ([`Self::fit`]).
+    window: (VecDeque<usize>, VecDeque<usize>),
     ago: String,
     text: String,
 }
@@ -173,6 +242,14 @@ impl UsageChart {
         self.area
     }
 
+    /// Name the bands this way from the next build on.
+    pub fn set_legend(&mut self, style: ChartLegend) {
+        if self.style != style {
+            self.style = style;
+            self.labels = [None; BANDS];
+        }
+    }
+
     /// Whether the chart marks a moment, its own or another chart's.
     #[must_use]
     pub fn marking(&self) -> bool {
@@ -196,9 +273,15 @@ impl UsageChart {
                 head.h - 4.0,
             );
         }
-        let legend_w = (rect.w * 0.28).clamp(150.0, 240.0).min(body.w * 0.5);
-        let (main, legend) = body.split_left((body.w - legend_w - 8.0).max(0.0));
-        self.legend = legend.split_left(8.0).1;
+        // Only a legend beside the plot takes width from it.
+        let main = if self.style == ChartLegend::Beside {
+            let legend_w = (rect.w * 0.28).clamp(150.0, 240.0).min(body.w * 0.5);
+            let (main, legend) = body.split_left((body.w - legend_w - 8.0).max(0.0));
+            self.legend = legend.split_left(8.0).1;
+            main
+        } else {
+            body
+        };
         let (axis, plot) = main.split_bottom(AXIS_BAND_H);
         self.plot = plot.split_left(GUTTER_W.min(plot.w)).1;
         self.axis = axis.split_left(GUTTER_W.min(axis.w)).1;
@@ -222,8 +305,197 @@ impl UsageChart {
         self.hover_mode = self
             .pointer
             .and_then(|p| self.switch.iter().position(|r| r.contains(p)));
+        // The names inside the bands are placed when painted, in the theme's font.
+        match self.style {
+            ChartLegend::Inline => self.legend = Rect::ZERO,
+            ChartLegend::Floating => self.float_legend(),
+            ChartLegend::Beside => {}
+        }
         self.lay_out_legend();
         self.hover_band = self.pointer.and_then(|p| self.band_at(p));
+    }
+
+    /// Whether the bands are drawn, with what to name: shown when it has a band of
+    /// its own, or for everything else, when anything is in it.
+    fn shown(&self, b: usize) -> bool {
+        if b == OTHER {
+            self.points.iter().any(|p| p.v[OTHER] > 0.0)
+        } else {
+            self.slots[b].is_some()
+        }
+    }
+
+    /// The name band `b` is labeled with.
+    fn band_name<'u>(&self, usage: &'u Usage, b: usize) -> &'u str {
+        self.slots
+            .get(b)
+            .copied()
+            .flatten()
+            .map_or("Everything else", |g| usage.program_name(g))
+    }
+
+    /// Place the floating legend over a top corner of the plot: the one the bands
+    /// rise into less, kept until the other is clearly better, and away from the
+    /// marked moment unless the pointer is on the legend itself.
+    fn float_legend(&mut self) {
+        let plot = self.plot;
+        let rows = (0..BANDS).filter(|&b| self.shown(b)).count();
+        let w = (plot.w * 0.28).clamp(150.0, 220.0).min(plot.w * 0.5);
+        let h = (LEGEND_ROW_H * (rows + 1) as f32 + 4.0).min(plot.h - 2.0 * FLOAT_INSET);
+        if w <= 0.0 || h <= LEGEND_ROW_H {
+            self.legend = Rect::ZERO;
+            return;
+        }
+        let y = plot.y + FLOAT_INSET;
+        let left = Rect::new(plot.x + FLOAT_INSET, y, w, h);
+        let right = Rect::new(plot.right() - FLOAT_INSET - w, y, w, h);
+        // How far the top of the stack rises into a corner, summed across it.
+        let covered = |r: Rect| -> f32 {
+            self.points
+                .iter()
+                .filter(|p| p.x >= r.x && p.x <= r.right())
+                .map(|p| (r.bottom() - self.y(p.sum())).max(0.0))
+                .sum()
+        };
+        let (here, there) = if self.float_right {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let mut flip = covered(there) < covered(here) * FLOAT_SWITCH;
+        let on_legend = self.pointer.is_some_and(|p| here.contains(p));
+        if let Some(c) = self.crosshair.filter(|_| !on_legend) {
+            let x = self.time.x(plot, c.age_ms);
+            let near = |r: Rect| x >= r.x - FLOAT_INSET && x <= r.right() + FLOAT_INSET;
+            if near(here) && !near(there) {
+                flip = true;
+            } else if near(there) {
+                flip = false;
+            }
+        }
+        if flip {
+            self.float_right = !self.float_right;
+        }
+        self.legend = if self.float_right { right } else { left };
+    }
+
+    /// Find each band the place its name fits best: the stretch, as wide as the
+    /// name, over which the band leaves the most height clear. A name keeps last
+    /// frame's place while that is still nearly as good, so names do not hop about
+    /// as the chart scrolls.
+    fn place_labels(&mut self, usage: &Usage, font: f32) {
+        let prev = std::mem::replace(&mut self.labels, [None; BANDS]);
+        let n = self.points.len();
+        if n < 2 || self.scale <= 0.0 || self.plot.is_empty() {
+            return;
+        }
+        let mut cum = std::mem::take(&mut self.cum);
+        let mut window = std::mem::take(&mut self.window);
+        cum.clear();
+        cum.resize(n, 0.0);
+        for (b, prev) in prev.iter().enumerate() {
+            let w = label_w(self.band_name(usage, b), font).min(LABEL_MAX_W);
+            if self.shown(b) && w < self.plot.w {
+                let anchor = prev.map(|l| l.anchor_ms);
+                self.labels[b] = self.fit(b, w, &cum, anchor, &mut window);
+            }
+            for (p, c) in self.points.iter().zip(&mut cum) {
+                *c += p.v[b];
+            }
+        }
+        self.cum = cum;
+        self.window = window;
+    }
+
+    /// Where `band`'s name, `width` wide, fits best, if anywhere: `below` is the
+    /// sum of the bands under it at each column, `anchor` the column it was at last
+    /// frame.
+    ///
+    /// Columns are newest (rightmost) first. For each column as the name's right
+    /// end, the window runs to the first column at or past its left end, which
+    /// bounds the band between them; the clear height is the window's highest lower
+    /// edge less its lowest upper edge, each kept by a monotonic queue so the sweep
+    /// is linear in the columns.
+    fn fit(
+        &self,
+        band: usize,
+        width: f32,
+        below: &[f32],
+        anchor: Option<i64>,
+        window: &mut (VecDeque<usize>, VecDeque<usize>),
+    ) -> Option<Label> {
+        // A place: its clear height, its right end's column, and the band's upper
+        // and lower edges over it, on screen, where y grows downward.
+        type Place = (f32, usize, f32, f32);
+        let (floors, ceils) = window;
+        floors.clear();
+        ceils.clear();
+        let lower = |i: usize| self.y(below[i]);
+        let upper = |i: usize| self.y(below[i] + self.points[i].v[band]);
+        let count = self.points.len();
+        let mut best: Option<Place> = None;
+        let mut kept: Option<Place> = None;
+        let mut next = 0;
+        for i in 0..count {
+            while floors.front().is_some_and(|&j| j < i) {
+                floors.pop_front();
+            }
+            while ceils.front().is_some_and(|&j| j < i) {
+                ceils.pop_front();
+            }
+            let right = self.points[i].x;
+            let left = right - width;
+            if left < self.plot.x {
+                break;
+            }
+            let reached = |next: usize| next > i && self.points[next - 1].x <= left;
+            while next < count && !reached(next) {
+                // `floors` keeps the window's highest lower edge (least y) at its
+                // front, `ceils` its lowest upper edge (greatest y).
+                let y = lower(next);
+                while floors.back().is_some_and(|&j| lower(j) >= y) {
+                    floors.pop_back();
+                }
+                floors.push_back(next);
+                let y = upper(next);
+                while ceils.back().is_some_and(|&j| upper(j) <= y) {
+                    ceils.pop_back();
+                }
+                ceils.push_back(next);
+                next += 1;
+            }
+            // The history does not reach back past the name's left end.
+            if !reached(next) {
+                break;
+            }
+            if right > self.plot.right() {
+                continue;
+            }
+            let (Some(&floor), Some(&ceil)) = (floors.front(), ceils.front()) else {
+                continue;
+            };
+            let (top, bottom) = (upper(ceil), lower(floor));
+            let here = (bottom - top, i, top, bottom);
+            if best.is_none_or(|best| here.0 > best.0) {
+                best = Some(here);
+            }
+            if anchor == Some(self.points[i].end_ms) {
+                kept = Some(here);
+            }
+        }
+        let pick = match (kept, best) {
+            (Some(kept), Some(best)) if kept.0 >= LABEL_H && kept.0 >= best.0 * LABEL_KEEP => kept,
+            (_, best) => best?,
+        };
+        let (clear, i, top, bottom) = pick;
+        (clear >= LABEL_H).then(|| {
+            let p = &self.points[i];
+            let mid = f32::midpoint(top, bottom);
+            Label {
+                rect: Rect::new(p.x - width, mid - LABEL_H * 0.5, width, LABEL_H),
+                anchor_ms: p.end_ms,
+            }
+        })
     }
 
     /// Decide which programs get a band: those that take the most of the chart,
@@ -364,7 +636,12 @@ impl UsageChart {
                 _ => {
                     bin = key;
                     secs = r.secs;
-                    self.points.push(Pt { x, age_ms, v: r.v });
+                    self.points.push(Pt {
+                        x,
+                        age_ms,
+                        end_ms: r.end_ms,
+                        v: r.v,
+                    });
                 }
             }
             // The first stretch past the span carries the bands to the left edge.
@@ -384,17 +661,14 @@ impl UsageChart {
 
     /// The legend's rows, top to bottom as the bands are stacked.
     fn lay_out_legend(&mut self) {
-        let shown = |b: usize| -> bool {
-            if b == OTHER {
-                self.points.iter().any(|p| p.v[OTHER] > 0.0)
-            } else {
-                self.slots[b].is_some()
-            }
-        };
         let mut y = self.legend.y + LEGEND_ROW_H;
         let mut rows = [Rect::ZERO; BANDS];
+        if self.legend.is_empty() {
+            self.rows = rows;
+            return;
+        }
         for b in (0..BANDS).rev() {
-            if shown(b) && y + LEGEND_ROW_H <= self.legend.bottom() {
+            if self.shown(b) && y + LEGEND_ROW_H <= self.legend.bottom() {
                 rows[b] = Rect::new(self.legend.x, y, self.legend.w, LEGEND_ROW_H);
                 y += LEGEND_ROW_H;
             }
@@ -404,8 +678,16 @@ impl UsageChart {
 
     /// The age of the plotted column nearest the pointer, while it is over the plot.
     fn pointed_age(&self) -> Option<f32> {
-        let p = self.pointer.filter(|p| self.plot.contains(*p))?;
+        let p = self
+            .pointer
+            .filter(|p| self.plot.contains(*p) && !self.over_legend(*p))?;
         self.nearest(p.x).map(|i| self.points[i].age_ms)
+    }
+
+    /// Whether `p` is on a legend floating over the plot, which hides what is under
+    /// it from the pointer.
+    fn over_legend(&self, p: Point) -> bool {
+        self.style == ChartLegend::Floating && self.legend.contains(p)
     }
 
     /// The age this chart marks on its own account, for charts that share its axis
@@ -452,7 +734,7 @@ impl UsageChart {
         if let Some(b) = self.rows.iter().position(|r| r.contains(p)) {
             return Some(b);
         }
-        if !self.plot.contains(p) || self.scale <= 0.0 {
+        if !self.plot.contains(p) || self.over_legend(p) || self.scale <= 0.0 {
             return None;
         }
         // Between the two columns around the pointer, as the bands are drawn.
@@ -539,8 +821,103 @@ impl UsageChart {
             *dim = unmatched || self.hover_band.is_some_and(|h| h != b);
         }
         self.paint_bands(dl, dim, theme);
+        if self.style == ChartLegend::Inline {
+            self.place_labels(usage, theme.small.size);
+            self.paint_labels(dl, usage, selected, dim, theme);
+        }
         let marked = self.paint_mark(dl, theme, buf);
-        self.paint_legend(dl, usage, marked, selected, dim, theme, buf);
+        match self.style {
+            ChartLegend::Inline => self.paint_chip(dl, usage, marked, theme, buf),
+            ChartLegend::Floating if !self.legend.is_empty() => {
+                // A backing that keeps the names legible over the bands, and
+                // lets a little of them show through.
+                dl.fill_round_rect(
+                    self.legend,
+                    theme.card_radius,
+                    theme.bg_solid.with_alpha(0.88),
+                );
+                dl.stroke_round_rect(self.legend, theme.card_radius, theme.surface_border, 1.0);
+                self.paint_legend(dl, usage, marked, selected, dim, theme, buf);
+            }
+            ChartLegend::Floating => {}
+            ChartLegend::Beside => self.paint_legend(dl, usage, marked, selected, dim, theme, buf),
+        }
+    }
+
+    /// Each band's name inside it, where it was placed; the selected program's
+    /// outlined, as its legend row would be.
+    fn paint_labels(
+        &self,
+        dl: &mut DisplayList,
+        usage: &Usage,
+        selected: Option<ProgramId>,
+        dim: [bool; BANDS],
+        theme: &Theme,
+    ) {
+        dl.push_clip(self.plot);
+        for (b, label) in self.labels.iter().enumerate() {
+            let Some(label) = label else {
+                continue;
+            };
+            let program = self.slots.get(b).copied().flatten();
+            if program.is_some() && program == selected {
+                dl.stroke_round_rect(label.rect.inset(0.5, 0.5), 3.0, theme.accent, 1.0);
+            }
+            let ink = ink_on(band_color(theme, b));
+            let ink = if dim[b] { ink.with_alpha(0.45) } else { ink };
+            dl.text(
+                self.band_name(usage, b),
+                label.rect.inset(LABEL_PAD, 0.0),
+                theme.small,
+                ink,
+                HAlign::Left,
+                VAlign::Middle,
+                true,
+            );
+        }
+        dl.pop_clip();
+    }
+
+    /// Beside the pointer, the band under it: its color, name and value at the
+    /// marked moment, the readout a legend row would give.
+    fn paint_chip(
+        &self,
+        dl: &mut DisplayList,
+        usage: &Usage,
+        marked: Option<Pt>,
+        theme: &Theme,
+        buf: &mut String,
+    ) {
+        let (Some(band), Some(column), Some(pointer)) = (self.hover_band, marked, self.pointer)
+        else {
+            return;
+        };
+        // The value first: formatting it starts the buffer afresh.
+        self.value(buf, column.v[band]);
+        buf.insert_str(0, "  ");
+        buf.insert_str(0, self.band_name(usage, band));
+        let plot = self.plot;
+        let width = (label_w(buf, theme.small.size) + SWATCH + 6.0).min(plot.w);
+        let height = LEGEND_ROW_H;
+        // Below right of the pointer, or wherever that keeps it in the plot.
+        let mut left = pointer.x + CHIP_OFFSET;
+        if left + width > plot.right() {
+            left = pointer.x - CHIP_OFFSET - width;
+        }
+        let mut top = pointer.y + CHIP_OFFSET;
+        if top + height > plot.bottom() {
+            top = pointer.y - CHIP_OFFSET - height;
+        }
+        let left = left.clamp(plot.x, (plot.right() - width).max(plot.x));
+        let top = top.clamp(plot.y, (plot.bottom() - height).max(plot.y));
+        let chip = Rect::new(left, top, width, height);
+        dl.fill_round_rect(chip, theme.card_radius, theme.bg_solid.with_alpha(0.92));
+        dl.stroke_round_rect(chip, theme.card_radius, theme.surface_border, 1.0);
+        let inner = chip.inset(LABEL_PAD, 0.0);
+        let swatch = Rect::new(inner.x, inner.center().y - SWATCH * 0.5, SWATCH, SWATCH);
+        dl.fill_round_rect(swatch, 2.0, band_color(theme, band));
+        let (_, text) = inner.split_left(SWATCH + 6.0);
+        dl.label(buf, text, theme.small, theme.text);
     }
 
     /// The plot's background: the value grid at quarters, with the scale beside the
@@ -786,8 +1163,7 @@ impl UsageChart {
             let (_, text) = inner.split_left(SWATCH + 6.0);
             let (name, value) = text.split_left((text.w - LEGEND_VALUE_W).max(0.0));
             let ink = if faded { theme.text_dim } else { theme.text };
-            let label = program.map_or("Everything else", |g| usage.program_name(g));
-            dl.label(label, name, theme.small, ink);
+            dl.label(self.band_name(usage, b), name, theme.small, ink);
             buf.clear();
             if let Some(p) = point {
                 self.value(buf, p.v[b]);
@@ -887,6 +1263,7 @@ mod tests {
     fn the_rate_reading_is_cycles_a_second_per_program() {
         let u = session(&["a.exe", "b.exe"], 30, |i, _| if i == 0 { 3 } else { 1 });
         let mut c = UsageChart::default();
+        c.set_legend(ChartLegend::Beside);
         assert_eq!(c.click(Point::new(0.0, 0.0)), None, "nothing built yet");
         let _ = painted(&mut c, &u, "");
         let rate = c.switch[1].center();
@@ -979,6 +1356,7 @@ mod tests {
     fn the_pointer_marks_a_moment_and_picks_a_band() {
         let u = session(&["a.exe", "b.exe"], 60, |i, _| if i == 0 { 3 } else { 1 });
         let mut c = UsageChart::default();
+        c.set_legend(ChartLegend::Beside);
         let _ = painted(&mut c, &u, "");
         let (a, b) = (band(&c, &u, "a.exe"), band(&c, &u, "b.exe"));
         // Ten seconds ago, a third of the way up a's band.
@@ -1031,6 +1409,172 @@ mod tests {
         let (a, b) = (band(&c, &u, "a.exe"), band(&c, &u, "b.exe"));
         assert!(fills.contains(&theme.series[a].with_alpha(DIM_ALPHA)));
         assert!(fills.contains(&theme.series[b].with_alpha(0.9)));
+    }
+
+    /// The y range band `b` covers at column `i`, top first, on screen.
+    fn band_span(c: &UsageChart, b: usize, i: usize) -> (f32, f32) {
+        let below: f32 = c.points[i].v[..b].iter().sum();
+        (c.y(below + c.points[i].v[b]), c.y(below))
+    }
+
+    #[test]
+    fn names_in_the_bands_free_the_width_and_sit_inside_their_bands() {
+        // a is thick throughout; b is thick for its first half, then a sliver.
+        let u = session(&["a.exe", "b.exe", "c.exe"], 120, |i, s| match i {
+            0 => 6,
+            1 if s < 60 => 4,
+            1 => 0,
+            _ => 1,
+        });
+        assert_eq!(
+            UsageChart::default().style,
+            ChartLegend::Inline,
+            "in the bands unless set"
+        );
+        let mut c = UsageChart {
+            mode: ChartMode::Rate,
+            ..Default::default()
+        };
+        let dl = painted(&mut c, &u, "");
+        assert!(
+            (c.plot.right() - RECT.right()).abs() < 1e-3,
+            "the plot takes the width"
+        );
+        assert!(c.rows.iter().all(Rect::is_empty), "no legend rows");
+        let strings = texts(&dl);
+        for name in ["a.exe", "b.exe", "c.exe"] {
+            assert!(strings.iter().any(|s| s == name), "{name}: {strings:?}");
+        }
+        for name in ["a.exe", "b.exe"] {
+            let b = band(&c, &u, name);
+            let l = c.labels[b].expect(name);
+            assert!(c.plot.contains(Point::new(l.rect.x, l.rect.y)));
+            assert!(l.rect.right() <= c.plot.right() + 1e-3);
+            // Inside the band at every column under it.
+            for (i, p) in c.points.iter().enumerate() {
+                if p.x >= l.rect.x && p.x <= l.rect.right() {
+                    let (top, bottom) = band_span(&c, b, i);
+                    assert!(
+                        l.rect.y >= top - 0.5 && l.rect.bottom() <= bottom + 0.5,
+                        "{name}"
+                    );
+                }
+            }
+        }
+        // b's name is where b was thick: over a minute ago.
+        let b = band(&c, &u, "b.exe");
+        let at = c.labels[b].unwrap().rect.right();
+        assert!(c.time.age_at(c.plot, at) > 60_000.0);
+    }
+
+    #[test]
+    fn a_band_too_thin_for_a_line_of_text_goes_unnamed() {
+        let u = session(
+            &["big.exe", "tiny.exe"],
+            60,
+            |i, _| if i == 0 { 100 } else { 1 },
+        );
+        let mut c = UsageChart {
+            mode: ChartMode::Rate,
+            ..Default::default()
+        };
+        let dl = painted(&mut c, &u, "");
+        assert!(c.labels[band(&c, &u, "big.exe")].is_some());
+        assert!(c.labels[band(&c, &u, "tiny.exe")].is_none());
+        assert!(!texts(&dl).iter().any(|s| s == "tiny.exe"));
+    }
+
+    #[test]
+    fn a_name_keeps_its_place_in_time_as_the_chart_scrolls() {
+        let u = session(&["a.exe", "b.exe"], 120, |i, _| if i == 0 { 3 } else { 2 });
+        let newest = u.now_ms();
+        let mut c = UsageChart::default();
+        let mut placed = Vec::new();
+        for step in 0..8 {
+            let axis = TimeAxis::at(Some(newest + step * 125), 120_000.0, 5_000.0);
+            c.build(RECT, &u, None, axis);
+            c.paint(
+                &mut DisplayList::new(),
+                &u,
+                "",
+                None,
+                &Theme::dark(),
+                &mut String::new(),
+            );
+            placed.push(c.labels[band(&c, &u, "a.exe")].unwrap());
+        }
+        assert!(placed.windows(2).all(|w| w[0].anchor_ms == w[1].anchor_ms));
+        assert!(
+            placed[7].rect.x < placed[0].rect.x,
+            "it scrolls with the band"
+        );
+    }
+
+    #[test]
+    fn the_band_under_the_pointer_reads_out_its_name_and_value() {
+        let u = session(&["a.exe", "b.exe"], 60, |i, _| if i == 0 { 3 } else { 1 });
+        let mut c = UsageChart::default();
+        let _ = painted(&mut c, &u, "");
+        let a = band(&c, &u, "a.exe");
+        let x = c.time.x(c.plot, 10_000.0);
+        let (top, bottom) = band_span(&c, a, c.nearest(x).unwrap());
+        assert!(c.set_pointer(Some(Point::new(x, f32::midpoint(top, bottom)))));
+        let dl = painted(&mut c, &u, "");
+        assert_eq!(c.hover_band, Some(a));
+        let strings = texts(&dl);
+        assert!(
+            strings
+                .iter()
+                .any(|s| s.starts_with("a.exe  ") && s.ends_with(" G")),
+            "{strings:?}"
+        );
+    }
+
+    #[test]
+    fn a_floating_legend_sits_over_the_freer_corner_and_out_of_the_marks_way() {
+        // The bands rise high on the old (left) side and stay low on the new.
+        let u = session(&["a.exe", "b.exe"], 300, |i, s| match (i, s) {
+            (0, s) if s < 150 => 8,
+            _ => 1,
+        });
+        let mut c = UsageChart {
+            mode: ChartMode::Rate,
+            style: ChartLegend::Floating,
+            ..Default::default()
+        };
+        // The axis spans the session, as the app's does.
+        let axis = TimeAxis::at(None, 300_000.0, 5_000.0);
+        let paint = |c: &mut UsageChart, outside: Option<f32>| {
+            let mut dl = DisplayList::new();
+            c.build(RECT, &u, outside, axis);
+            c.paint(&mut dl, &u, "", None, &Theme::dark(), &mut String::new());
+            dl
+        };
+        let dl = paint(&mut c, None);
+        assert!(
+            (c.plot.right() - RECT.right()).abs() < 1e-3,
+            "the plot takes the width"
+        );
+        assert!(c.plot.contains(c.legend.center()), "over the plot");
+        assert!(c.float_right, "over the corner the bands leave free");
+        assert!(texts(&dl).iter().any(|s| s == "a.exe"));
+        // Its rows still pick their program; the plot under it is hidden.
+        let b = band(&c, &u, "b.exe");
+        assert_eq!(c.program_at(c.rows[b].center()), u.program("b.exe"));
+        let below = Point::new(c.legend.center().x, c.legend.bottom() - 2.0);
+        assert!(c.over_legend(below));
+        assert!(c.set_pointer(Some(below)));
+        let _ = paint(&mut c, None);
+        assert_eq!(c.hover_age(), None, "the legend is not the plot");
+
+        // Another chart marks a moment under it: it moves to the other corner.
+        assert!(c.set_pointer(None));
+        let age = c.time.age_at(c.plot, c.legend.center().x);
+        let _ = paint(&mut c, Some(age));
+        assert!(!c.float_right);
+        assert!(!c
+            .legend
+            .contains(Point::new(c.time.x(c.plot, age), c.legend.center().y)));
     }
 
     #[test]

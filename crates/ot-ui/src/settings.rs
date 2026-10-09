@@ -28,7 +28,8 @@
 //! how long a total takes to halve at that rate. The speed and history cards step
 //! the same way: how often the system is sampled, and how far back the charts
 //! reach ([`HISTORY_STEPS`]), the history card saying what that commits to in
-//! memory on this machine ([`HistoryCost`]).
+//! memory on this machine ([`HistoryCost`]). The knee card steps where the charts'
+//! log time axis bends ([`KNEE_STEPS`]), in samples so that it follows the speed.
 //!
 //! Below the page's title the sections scroll with the wheel when the window is too
 //! short to show them all.
@@ -54,8 +55,15 @@ pub const DECAY_DEFAULT: u8 = 5;
 /// How far back the charts can reach, in minutes: five minutes to a day.
 pub const HISTORY_STEPS: [u32; 9] = [5, 10, 30, 60, 120, 180, 360, 720, 1440];
 /// The reach unless changed: five minutes, of which the log time axis gives the
-/// last ten seconds about two fifths of the chart.
+/// last ten seconds about a quarter of the chart.
 pub const HISTORY_DEFAULT: u32 = 5;
+
+/// Where the charts' log time axis bends, in samples: ages up to about this many
+/// sampling intervals spread out evenly, older ones compress. More gives the last
+/// minutes more of the width and the last seconds less.
+pub const KNEE_STEPS: [u8; 6] = [1, 2, 3, 5, 10, 20];
+/// The knee unless changed: five samples, five seconds at the default speed.
+pub const KNEE_DEFAULT: u8 = 5;
 
 /// Everything the user can set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +112,51 @@ pub struct Settings {
     pub history_minutes: u32,
     /// How the charts' lines and areas are drawn.
     pub chart_drawing: ChartDrawing,
+    /// Where the charts' log time axis bends, in samples: one of [`KNEE_STEPS`].
+    pub chart_knee_samples: u8,
+    /// How the History chart names its bands.
+    pub chart_legend: ChartLegend,
+}
+
+/// How the History chart names its bands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum ChartLegend {
+    /// Each band's name inside it, where it is thick enough; the band under the
+    /// pointer reads out its value. The chart takes the whole width.
+    #[default]
+    Inline,
+    /// The legend, with every band's value, over a top corner of the chart, on
+    /// the side the bands leave freer.
+    Floating,
+    /// The legend in a column of its own beside the chart.
+    Beside,
+}
+
+impl ChartLegend {
+    /// In the order the card lists them.
+    pub const ALL: [Self; 3] = [Self::Inline, Self::Floating, Self::Beside];
+
+    /// The card's name for it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inline => "In bands",
+            Self::Floating => "Floating",
+            Self::Beside => "Beside",
+        }
+    }
+
+    /// Its number for saving: its place in [`ChartLegend::ALL`].
+    #[must_use]
+    pub fn index(self) -> u32 {
+        Self::ALL.iter().position(|&d| d == self).unwrap_or(0) as u32
+    }
+
+    /// From a saved number; the default for one that is not.
+    #[must_use]
+    pub fn from_index(i: u32) -> Self {
+        Self::ALL.get(i as usize).copied().unwrap_or_default()
+    }
 }
 
 /// How the charts' lines and filled areas are drawn. All three look the same;
@@ -179,6 +232,8 @@ impl Default for Settings {
             update_interval_ms: SPEED_DEFAULT,
             history_minutes: HISTORY_DEFAULT,
             chart_drawing: ChartDrawing::Gpu,
+            chart_knee_samples: KNEE_DEFAULT,
+            chart_legend: ChartLegend::Inline,
         }
     }
 }
@@ -221,6 +276,38 @@ impl Settings {
             update_interval_ms: nearest,
             ..self
         }
+    }
+
+    /// These settings with the knee set to the step nearest `samples`.
+    #[must_use]
+    pub fn with_knee_samples(self, samples: u32) -> Self {
+        let nearest = KNEE_STEPS
+            .into_iter()
+            .min_by_key(|&s| u32::from(s).abs_diff(samples))
+            .unwrap_or(KNEE_DEFAULT);
+        Self {
+            chart_knee_samples: nearest,
+            ..self
+        }
+    }
+
+    /// Where the charts' time axis bends, in milliseconds: the knee's samples at
+    /// the update speed.
+    #[must_use]
+    pub fn knee_ms(self) -> f32 {
+        f32::from(self.chart_knee_samples) * self.update_interval_ms as f32
+    }
+
+    /// The knee one step nearer (`-1`) or further back (`1`), or `None` at the
+    /// end of the steps.
+    fn knee_step(self, by: isize) -> Option<u8> {
+        let at = KNEE_STEPS
+            .iter()
+            .position(|&s| s >= self.chart_knee_samples)
+            .unwrap_or(KNEE_STEPS.len() - 1);
+        at.checked_add_signed(by)
+            .and_then(|i| KNEE_STEPS.get(i))
+            .copied()
     }
 
     /// The interval one step slower (`-1`) or faster (`1`).
@@ -490,6 +577,10 @@ enum Card {
     Speed,
     /// How far back the charts reach: a length with a minus and a plus button.
     History,
+    /// Where the time axis bends: a number of samples, stepped.
+    Knee,
+    /// How the History chart names its bands, side by side to pick from.
+    Legend,
     /// How chart shapes are drawn: GPU, CPU or Direct2D, side by side to pick from.
     ChartDrawing,
     /// Start a copy as administrator; shown while this one is not.
@@ -510,6 +601,8 @@ impl Card {
             | Self::Decay
             | Self::Speed
             | Self::History
+            | Self::Knee
+            | Self::Legend
             | Self::ChartDrawing => true,
         }
     }
@@ -529,6 +622,8 @@ impl Card {
             Self::Decay
             | Self::Speed
             | Self::History
+            | Self::Knee
+            | Self::Legend
             | Self::ChartDrawing
             | Self::RunAsAdministrator
             | Self::Record => None,
@@ -536,11 +631,16 @@ impl Card {
     }
 
     /// Whether a click anywhere on the card does something now. The stepper
-    /// cards answer only on their two buttons, the chart drawing card only on its
+    /// cards answer only on their two buttons, the choice cards only on their
     /// choices.
     fn clickable(self, cx: Context<'_>) -> bool {
         match self {
-            Self::Decay | Self::Speed | Self::History | Self::ChartDrawing => false,
+            Self::Decay
+            | Self::Speed
+            | Self::History
+            | Self::Knee
+            | Self::Legend
+            | Self::ChartDrawing => false,
             Self::Toggle(_) | Self::RunAsAdministrator | Self::Record => true,
             Self::Update => cx.update.action().is_some(),
             Self::TaskManager => !cx.task_manager.pending,
@@ -563,7 +663,9 @@ const SECTIONS: [(&str, &[Card]); 6] = [
         "Charts",
         &[
             Card::History,
+            Card::Knee,
             Card::Toggle(Toggle::SmoothCharts),
+            Card::Legend,
             Card::ChartDrawing,
         ],
     ),
@@ -587,13 +689,15 @@ const SECTIONS: [(&str, &[Card]); 6] = [
     ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
     ("Recording", &[Card::Record]),
 ];
-const CARD_COUNT: usize = 17;
-/// The fade card's place among the cards, the speed card's, the history card's and
-/// the chart drawing card's.
+const CARD_COUNT: usize = 19;
+/// The fade card's place among the cards, the speed card's, the history card's,
+/// the knee card's, the legend card's and the chart drawing card's.
 const DECAY_CARD: usize = 1;
 const SPEED_CARD: usize = 2;
 const HISTORY_CARD: usize = 4;
-const DRAWING_CARD: usize = 6;
+const KNEE_CARD: usize = 5;
+const LEGEND_CARD: usize = 7;
+const DRAWING_CARD: usize = 8;
 
 /// The `i`th card, counting through every section.
 fn card_kind(i: usize) -> Option<Card> {
@@ -636,14 +740,18 @@ pub(crate) struct SettingsPage {
     /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
-    /// The fade card's minus and plus buttons, then the speed card's and the
-    /// history card's, and the one under the pointer.
-    steppers: [Rect; 6],
+    /// The fade card's minus and plus buttons, then the speed card's, the
+    /// history card's and the knee card's, and the one under the pointer.
+    steppers: [Rect; 8],
     hover_step: Option<usize>,
     /// The chart drawing card's choices, in [`ChartDrawing::ALL`] order, and the
     /// one under the pointer.
     drawing: [Rect; ChartDrawing::ALL.len()],
     hover_drawing: Option<usize>,
+    /// The legend card's choices, in [`ChartLegend::ALL`] order, and the one
+    /// under the pointer.
+    legend: [Rect; ChartLegend::ALL.len()],
+    hover_legend: Option<usize>,
     /// Where the sections scroll: the page below its title.
     view: Rect,
     /// How far the sections are scrolled, in DIPs, and how far they can be.
@@ -667,7 +775,8 @@ impl SettingsPage {
     }
 
     /// The stepper button under `p`: 0 and 1 for the fade card's minus and plus,
-    /// 2 and 3 for the speed card's, 4 and 5 for the history card's.
+    /// 2 and 3 for the speed card's, 4 and 5 for the history card's, 6 and 7 for
+    /// the knee card's.
     fn step_at(&self, p: Point) -> Option<usize> {
         if !self.view.contains(p) {
             return None;
@@ -681,6 +790,29 @@ impl SettingsPage {
             return None;
         }
         self.drawing.iter().position(|r| r.contains(p))
+    }
+
+    /// The legend choice under `p`, as an index into [`ChartLegend::ALL`].
+    fn legend_at(&self, p: Point) -> Option<usize> {
+        if !self.view.contains(p) {
+            return None;
+        }
+        self.legend.iter().position(|r| r.contains(p))
+    }
+
+    /// The legend choice under `at`: pick it, and ask for it to be saved. Nothing
+    /// when it is already the one picked.
+    fn pick_legend(&self, at: Point, settings: &mut Settings) -> Reaction {
+        match self.legend_at(at).map(|i| ChartLegend::ALL[i]) {
+            Some(l) if l != settings.chart_legend => {
+                settings.chart_legend = l;
+                Reaction {
+                    repaint: true,
+                    effect: Some(Effect::SaveSettings(*settings)),
+                }
+            }
+            _ => Reaction::NONE,
+        }
     }
 
     /// The chart drawing choice under `at`: pick it, and ask for it to be saved.
@@ -705,6 +837,7 @@ impl SettingsPage {
             Card::Decay => 0,
             Card::Speed => 2,
             Card::History => 4,
+            Card::Knee => 6,
             _ => return Reaction::NONE,
         };
         let by = match self.step_at(at) {
@@ -722,6 +855,9 @@ impl SettingsPage {
             Card::History => settings
                 .history_step(by)
                 .map(|v| settings.history_minutes = v),
+            Card::Knee => settings
+                .knee_step(by)
+                .map(|v| settings.chart_knee_samples = v),
             _ => None,
         };
         if stepped.is_none() {
@@ -741,15 +877,18 @@ impl SettingsPage {
                 let hit = self.card_at(p);
                 let step = self.step_at(p);
                 let drawing = self.drawing_at(p);
+                let legend = self.legend_at(p);
                 let card = std::mem::replace(&mut self.hover, hit) != hit;
                 let button = std::mem::replace(&mut self.hover_step, step) != step;
                 let choice = std::mem::replace(&mut self.hover_drawing, drawing) != drawing;
-                Reaction::painted(card || button || choice)
+                let legend = std::mem::replace(&mut self.hover_legend, legend) != legend;
+                Reaction::painted(card || button || choice || legend)
             }
             UiEvent::MouseLeave => {
                 let step = self.hover_step.take().is_some();
                 let choice = self.hover_drawing.take().is_some();
-                Reaction::painted(self.hover.take().is_some() || step || choice)
+                let legend = self.hover_legend.take().is_some();
+                Reaction::painted(self.hover.take().is_some() || step || choice || legend)
             }
             UiEvent::MouseDown {
                 at,
@@ -769,10 +908,11 @@ impl SettingsPage {
                 Some(Card::TaskManager) if !cx.task_manager.pending => {
                     Reaction::effect(Effect::ReplaceTaskManager(!cx.task_manager.on()))
                 }
-                Some(card @ (Card::Decay | Card::Speed | Card::History)) => {
+                Some(card @ (Card::Decay | Card::Speed | Card::History | Card::Knee)) => {
                     self.step(card, at, settings)
                 }
                 Some(Card::ChartDrawing) => self.pick_drawing(at, settings),
+                Some(Card::Legend) => self.pick_legend(at, settings),
                 Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
                 Some(Card::Record) => Reaction::effect(Effect::Record(cx.recording.is_none())),
                 Some(Card::TaskManager) | None => Reaction::NONE,
@@ -794,6 +934,7 @@ impl SettingsPage {
                 self.hover = self.card_at(at);
                 self.hover_step = self.step_at(at);
                 self.hover_drawing = self.drawing_at(at);
+                self.hover_legend = self.legend_at(at);
                 Reaction::REPAINT
             }
             _ => Reaction::NONE,
@@ -837,18 +978,22 @@ impl SettingsPage {
         let [d0, d1] = pair(self.cards[DECAY_CARD]);
         let [s0, s1] = pair(self.cards[SPEED_CARD]);
         let [h0, h1] = pair(self.cards[HISTORY_CARD]);
-        self.steppers = [d0, d1, s0, s1, h0, h1];
-        // The chart drawing card's choices, side by side at the right.
-        let card = self.cards[DRAWING_CARD];
-        let left = card.right() - 16.0 - CHOICE_W * self.drawing.len() as f32;
-        for (i, r) in self.drawing.iter_mut().enumerate() {
-            *r = Rect::new(
-                left + CHOICE_W * i as f32,
-                card.center().y - BUTTON_H * 0.5,
-                CHOICE_W,
-                BUTTON_H,
-            );
-        }
+        let [k0, k1] = pair(self.cards[KNEE_CARD]);
+        self.steppers = [d0, d1, s0, s1, h0, h1, k0, k1];
+        // The choice cards' choices, side by side at the right.
+        let choices = |card: Rect, rects: &mut [Rect]| {
+            let left = card.right() - 16.0 - CHOICE_W * rects.len() as f32;
+            for (i, r) in rects.iter_mut().enumerate() {
+                *r = Rect::new(
+                    left + CHOICE_W * i as f32,
+                    card.center().y - BUTTON_H * 0.5,
+                    CHOICE_W,
+                    BUTTON_H,
+                );
+            }
+        };
+        choices(self.cards[DRAWING_CARD], &mut self.drawing);
+        choices(self.cards[LEGEND_CARD], &mut self.legend);
         self.max_scroll = (y - view.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
         self.shift(view.y - self.scroll);
@@ -862,7 +1007,12 @@ impl SettingsPage {
         for r in self.cards.iter_mut().filter(|r| r.w > 0.0) {
             r.y += dy;
         }
-        for r in self.steppers.iter_mut().chain(&mut self.drawing) {
+        for r in self
+            .steppers
+            .iter_mut()
+            .chain(&mut self.drawing)
+            .chain(&mut self.legend)
+        {
             r.y += dy;
         }
     }
@@ -1006,6 +1156,62 @@ impl SettingsPage {
                         HAlign::Center,
                         VAlign::Middle,
                         false,
+                    );
+                }
+                Card::Knee => {
+                    let secs = settings.knee_ms() / 1000.0;
+                    let samples = settings.chart_knee_samples;
+                    let what = if samples == 1 { "sample" } else { "samples" };
+                    buf.clear();
+                    let _ = write!(
+                        buf,
+                        "The last {samples} {what} ({secs} s) spread out evenly; older \
+                         history is compressed. More gives the last minutes more room."
+                    );
+                    paint_text(dl, text, "Where the time axis bends", buf, note, theme);
+                    let [.., minus, plus] = self.steppers;
+                    for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
+                        let enabled = settings.knee_step(by).is_some();
+                        let hover = enabled && self.hover_step == Some(i + 6);
+                        paint_stepper(dl, r, by > 0, enabled, hover, theme);
+                    }
+                    buf.clear();
+                    let _ = write!(buf, "{secs} s");
+                    let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
+                    dl.text(
+                        buf,
+                        value,
+                        theme.cell_num,
+                        theme.text,
+                        HAlign::Center,
+                        VAlign::Middle,
+                        false,
+                    );
+                }
+                Card::Legend => {
+                    let detail = match settings.chart_legend {
+                        ChartLegend::Inline => {
+                            "Each program's name inside its band; point at a band for its \
+                             value. The chart takes the whole width."
+                        }
+                        ChartLegend::Floating => {
+                            "Names and values over a top corner of the chart, on the side \
+                             the bands leave freer."
+                        }
+                        ChartLegend::Beside => {
+                            "Names and values in a column of their own beside the chart."
+                        }
+                    };
+                    let (text, _) =
+                        inner.split_left((self.legend[0].x - inner.x).clamp(0.0, inner.w));
+                    paint_text(dl, text, "History chart legend", detail, note, theme);
+                    paint_choices(
+                        dl,
+                        &self.legend,
+                        ChartLegend::ALL.map(ChartLegend::label),
+                        settings.chart_legend.index() as usize,
+                        self.hover_legend,
+                        theme,
                     );
                 }
                 Card::ChartDrawing => {
@@ -1269,7 +1475,7 @@ mod tests {
     use ot_update::{Scope, Status, Version};
 
     /// Tall enough for every card at once; the scrolling test shortens it.
-    const PAGE: Rect = Rect::new(0.0, 0.0, 600.0, 1200.0);
+    const PAGE: Rect = Rect::new(0.0, 0.0, 600.0, 1400.0);
 
     fn texts(dl: &DisplayList) -> Vec<String> {
         dl.cmds()
@@ -1317,7 +1523,7 @@ mod tests {
     }
 
     /// The Task Manager card's place among the cards.
-    const TASK_MANAGER: usize = 14;
+    const TASK_MANAGER: usize = 16;
 
     fn with_task_manager<'a>(update: &'a UpdateView, tm: &'a TaskManager) -> Context<'a> {
         Context {
@@ -1432,7 +1638,7 @@ mod tests {
         ] {
             assert!(strings.iter().any(|t| t == expected), "{expected}");
         }
-        let card = page.cards[10].center();
+        let card = page.cards[12].center();
         let r = click(&mut page, card, &mut s, cx(true, &update));
         assert_eq!(r.effect, Some(Effect::Update(UpdateAction::Check)));
         assert_eq!(s, Settings::default(), "no setting changed");
@@ -1458,18 +1664,18 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[11]), "On");
-        assert_eq!(state_of(&dl, page.cards[12]), "Off");
+        assert_eq!(state_of(&dl, page.cards[13]), "On");
+        assert_eq!(state_of(&dl, page.cards[14]), "Off");
         // A copy that cannot install says so, once, on the update card.
         let note = update.note().unwrap();
         assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
 
-        let at = page.cards[11].center();
+        let at = page.cards[13].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[12].center();
+        let at = page.cards[14].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.download_updates);
         assert!(s.check_updates, "downloading needs checking");
@@ -1481,27 +1687,27 @@ mod tests {
         let mut page = SettingsPage::default();
         let mut s = Settings::default();
         let dl = paint(&mut page, s, cx(true, &update));
-        assert_eq!(state_of(&dl, page.cards[13]), "Off");
+        assert_eq!(state_of(&dl, page.cards[15]), "Off");
         assert!(texts(&dl)
             .iter()
             .any(|t| t == "Install updates automatically"));
 
         // On: downloading and checking come with it.
         s.check_updates = false;
-        let at = page.cards[13].center();
+        let at = page.cards[15].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));
         assert!(s.install_updates && s.download_updates && s.check_updates);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         // Downloading off: installing goes too, checking stays.
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[12].center();
+        let at = page.cards[14].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.download_updates && !s.install_updates && s.check_updates);
         // Checking off takes everything with it.
         s.download_updates = true;
         s.install_updates = true;
         let _ = paint(&mut page, s, cx(true, &update));
-        let at = page.cards[11].center();
+        let at = page.cards[13].center();
         let _ = click(&mut page, at, &mut s, cx(true, &update));
         assert!(!s.check_updates && !s.download_updates && !s.install_updates);
     }
@@ -1606,6 +1812,94 @@ mod tests {
     }
 
     #[test]
+    fn the_knee_card_steps_in_samples_and_follows_the_speed() {
+        let update = UpdateView::new("0.2.1", true);
+        let cx = cx(true, &update);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        assert_eq!(s.chart_knee_samples, 5, "five samples unless changed");
+        assert!(
+            (s.knee_ms() - 5_000.0).abs() < f32::EPSILON,
+            "five seconds at Normal"
+        );
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(
+            strings.iter().any(|t| t == "Where the time axis bends"),
+            "{strings:?}"
+        );
+        assert!(strings.iter().any(|t| t == "5 s"), "{strings:?}");
+
+        // The steppers are on the knee card; plus moves the knee further back.
+        let card = page.cards[KNEE_CARD];
+        let [.., minus, plus] = page.steppers;
+        assert!(card.contains(minus.center()) && card.contains(plus.center()));
+        let r = click(&mut page, plus.center(), &mut s, cx);
+        assert_eq!(s.chart_knee_samples, 10);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let _ = click(&mut page, minus.center(), &mut s, cx);
+        let _ = click(&mut page, minus.center(), &mut s, cx);
+        assert_eq!(s.chart_knee_samples, 3);
+
+        // In samples: a faster speed brings the knee nearer in time.
+        s.update_interval_ms = 500;
+        assert!((s.knee_ms() - 1_500.0).abs() < f32::EPSILON);
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(strings.iter().any(|t| t == "1.5 s"), "{strings:?}");
+
+        // At the ends of the steps, nothing; a stored value snaps to a step.
+        s.chart_knee_samples = KNEE_STEPS[KNEE_STEPS.len() - 1];
+        let _ = paint(&mut page, s, cx);
+        let [.., plus] = page.steppers;
+        assert_eq!(click(&mut page, plus.center(), &mut s, cx), Reaction::NONE);
+        assert_eq!(
+            Settings::default().with_knee_samples(7).chart_knee_samples,
+            5
+        );
+        assert_eq!(
+            Settings::default().with_knee_samples(99).chart_knee_samples,
+            20
+        );
+    }
+
+    #[test]
+    fn the_legend_card_picks_in_bands_floating_or_beside() {
+        let update = UpdateView::new("0.2.1", true);
+        let cx = cx(true, &update);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        assert_eq!(
+            s.chart_legend,
+            ChartLegend::Inline,
+            "in the bands unless changed"
+        );
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(
+            strings.iter().any(|t| t == "History chart legend"),
+            "{strings:?}"
+        );
+        let card = page.cards[LEGEND_CARD];
+        let [inline, floating, beside] = page.legend;
+        assert!([inline, floating, beside]
+            .iter()
+            .all(|r| card.contains(r.center())));
+
+        assert_eq!(
+            click(&mut page, inline.center(), &mut s, cx),
+            Reaction::NONE
+        );
+        let r = click(&mut page, floating.center(), &mut s, cx);
+        assert_eq!(s.chart_legend, ChartLegend::Floating);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let _ = click(&mut page, beside.center(), &mut s, cx);
+        assert_eq!(s.chart_legend, ChartLegend::Beside);
+
+        for l in ChartLegend::ALL {
+            assert_eq!(ChartLegend::from_index(l.index()), l);
+        }
+        assert_eq!(ChartLegend::from_index(9), ChartLegend::Inline);
+    }
+
+    #[test]
     fn the_history_card_steps_the_reach_and_says_what_it_costs() {
         let update = UpdateView::new("0.2.1", true);
         let cx = Context {
@@ -1675,7 +1969,7 @@ mod tests {
         assert!(s.smooth_charts);
         // Under the history card, on even with Windows' animation effects off.
         let dl = paint(&mut page, s, cx(false, &update));
-        let card = page.cards[HISTORY_CARD + 1];
+        let card = page.cards[KNEE_CARD + 1];
         assert_eq!(state_of(&dl, card), "On");
         assert!(texts(&dl).iter().any(|t| t == "Scroll charts smoothly"));
         assert!(
@@ -1686,7 +1980,7 @@ mod tests {
         assert!(!s.smooth_charts);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let dl = paint(&mut page, s, cx(false, &update));
-        assert_eq!(state_of(&dl, page.cards[HISTORY_CARD + 1]), "Off");
+        assert_eq!(state_of(&dl, page.cards[KNEE_CARD + 1]), "Off");
     }
 
     #[test]
