@@ -165,8 +165,10 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   changes hands only when a newcomer is clearly bigger, so the chart does not
   recolor itself as you watch. Each band's name is written inside it, where the band
   is thick enough for a line of text, so the chart takes the whole width; a name
-  stays put as the chart scrolls until a clearly better place opens up, and a band
-  too thin anywhere goes unnamed. Point at a band and a readout beside the pointer
+  scrolls with its band and glides as the band's edges shift under it, and only
+  when a clearly better place opens up (and not within two seconds of its last
+  move) does it fade out where it was and in at the new place. A band too thin
+  anywhere goes unnamed. Point at a band and a readout beside the pointer
   gives its name and value at that moment; the CPU and memory graphs mark the same
   moment (and the other way round). **History chart legend** on the Settings page
   can instead float the legend, with every band's value, over the top corner of the

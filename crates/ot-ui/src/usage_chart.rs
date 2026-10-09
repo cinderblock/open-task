@@ -29,6 +29,7 @@
 //! - **Beside**: the same legend in a column of its own right of the plot.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use ot_core::usage::fade;
 use ot_core::{ProgramId, Usage};
@@ -73,6 +74,15 @@ const CHAR_EM: f32 = 0.6;
 /// A name stays where it is while that place's clearance is at least this share of
 /// the best place's.
 const LABEL_KEEP: f32 = 0.75;
+/// Nor does it move to a better place sooner than this after its last move; only a
+/// place it no longer fits in sends it on sooner.
+const LABEL_DWELL: Duration = Duration::from_secs(2);
+/// A name's small moves (the band's edges shifting under it) are eased, closing
+/// about two thirds of the distance in this many seconds.
+const LABEL_EASE_S: f32 = 0.15;
+/// A name that moves elsewhere fades out where it was while it fades in at its new
+/// place, over this many seconds; one appearing or vanishing fades the same.
+const LABEL_FADE_S: f32 = 0.25;
 /// The band under the pointer's readout: its offset from the pointer.
 const CHIP_OFFSET: f32 = 14.0;
 /// A program needs this share of the chart to be given a band, and half of it to
@@ -135,13 +145,62 @@ struct Pt {
     v: [f32; BANDS],
 }
 
-/// A band's name, placed inside it.
+/// A band's name, as drawn inside it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Label {
-    rect: Rect,
-    /// The column at its right end, by [`Pt::end_ms`], so the next frame can find
-    /// the same place.
+    /// Its right end in time: a column's [`Pt::end_ms`], so it scrolls with the
+    /// band and the next frame can find the same place.
     anchor_ms: i64,
+    width: f32,
+    /// The middle of the text, on screen, easing toward `target_y`.
+    y: f32,
+    target_y: f32,
+    /// How far right of its anchor it is drawn, easing to nothing: what is left of
+    /// a step when its column merged into an older one.
+    dx: f32,
+    /// How opaque, fading in from 0 to 1, or out to 0 once it is leaving.
+    alpha: f32,
+}
+
+impl Label {
+    /// Whether it is still on its way somewhere.
+    fn settling(&self) -> bool {
+        self.alpha < 1.0 || (self.target_y - self.y).abs() > SETTLED || self.dx.abs() > SETTLED
+    }
+
+    /// Ease `y` and `dx` a step of `ease` (the share of the way to go).
+    fn ease(&mut self, ease: f32) {
+        self.y += (self.target_y - self.y) * ease;
+        self.dx -= self.dx * ease;
+        if (self.target_y - self.y).abs() <= SETTLED {
+            self.y = self.target_y;
+        }
+        if self.dx.abs() <= SETTLED {
+            self.dx = 0.0;
+        }
+    }
+}
+
+/// Closer than this, in DIPs, a name is where it is going.
+const SETTLED: f32 = 0.1;
+
+/// A band's name where it is shown, and where it was until it moved, fading out.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Names {
+    shown: Option<Label>,
+    leaving: Option<Label>,
+    /// When `shown` was put where it is.
+    moved_at: Option<Instant>,
+}
+
+/// Where a band's name fits, from [`UsageChart::fit`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Fit {
+    anchor_ms: i64,
+    /// The middle of the height the band leaves clear there.
+    y: f32,
+    /// It is the place the name had: the column that holds its anchor now.
+    kept: bool,
 }
 
 /// The estimated width of `text` in the small UI font, padded either side.
@@ -193,7 +252,11 @@ pub(crate) struct UsageChart {
     /// A floating legend is in the plot's top right corner rather than its left.
     float_right: bool,
     /// Each band's name inside it, where it fits.
-    labels: [Option<Label>; BANDS],
+    labels: [Names; BANDS],
+    /// The moment of the frame being painted ([`Self::set_now`]), and of the last
+    /// one the names were placed in: the names move and fade by the time between.
+    frame_at: Option<Instant>,
+    placed_at: Option<Instant>,
     switch: [Rect; 2],
     /// Each band's legend row; empty for a band that has none.
     rows: [Rect; BANDS],
@@ -246,8 +309,24 @@ impl UsageChart {
     pub fn set_legend(&mut self, style: ChartLegend) {
         if self.style != style {
             self.style = style;
-            self.labels = [None; BANDS];
+            self.labels = [Names::default(); BANDS];
         }
+    }
+
+    /// The moment of the frame about to be painted, which the names move and fade
+    /// by. Without one, they go straight where they are going.
+    pub fn set_now(&mut self, now: Instant) {
+        self.frame_at = Some(now);
+    }
+
+    /// Whether a name is still moving or fading, so another frame is wanted soon.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        self.style == ChartLegend::Inline
+            && self
+                .labels
+                .iter()
+                .any(|n| n.leaving.is_some() || n.shown.is_some_and(|l| l.settling()))
     }
 
     /// Whether the chart marks a moment, its own or another chart's.
@@ -380,25 +459,87 @@ impl UsageChart {
     }
 
     /// Find each band the place its name fits best: the stretch, as wide as the
-    /// name, over which the band leaves the most height clear. A name keeps last
-    /// frame's place while that is still nearly as good, so names do not hop about
-    /// as the chart scrolls.
+    /// name, over which the band leaves the most height clear; and move the names
+    /// there smoothly. A name keeps its place while that is still nearly as good,
+    /// and for a while after it moved, scrolling with the band. The small shifts of
+    /// a kept place (the band's edges moving under it, columns merging as they
+    /// age) are eased; a move to another place fades the name out where it was
+    /// and in where it goes, rather than jumping.
     fn place_labels(&mut self, usage: &Usage, font: f32) {
-        let prev = std::mem::replace(&mut self.labels, [None; BANDS]);
+        // The time since the names were last placed; with no clock, they settle
+        // at once.
+        let now = self.frame_at;
+        let dt = match (self.placed_at, now) {
+            (Some(then), Some(now)) => now.saturating_duration_since(then).as_secs_f32(),
+            _ => f32::INFINITY,
+        };
+        self.placed_at = now;
+        let ease = 1.0 - (-dt / LABEL_EASE_S).exp();
+        let fade = dt / LABEL_FADE_S;
+
         let n = self.points.len();
-        if n < 2 || self.scale <= 0.0 || self.plot.is_empty() {
-            return;
-        }
+        let ready = n >= 2 && self.scale > 0.0 && !self.plot.is_empty();
         let mut cum = std::mem::take(&mut self.cum);
         let mut window = std::mem::take(&mut self.window);
         cum.clear();
         cum.resize(n, 0.0);
-        for (b, prev) in prev.iter().enumerate() {
-            let w = label_w(self.band_name(usage, b), font).min(LABEL_MAX_W);
-            if self.shown(b) && w < self.plot.w {
-                let anchor = prev.map(|l| l.anchor_ms);
-                self.labels[b] = self.fit(b, w, &cum, anchor, &mut window);
+        for b in 0..BANDS {
+            let mut names = self.labels[b];
+            let width = label_w(self.band_name(usage, b), font).min(LABEL_MAX_W);
+            let fit = if ready && self.shown(b) && width < self.plot.w {
+                let may_move = match (names.moved_at, now) {
+                    (Some(then), Some(now)) => now.saturating_duration_since(then) >= LABEL_DWELL,
+                    _ => true,
+                };
+                let anchor = names.shown.map(|l| l.anchor_ms);
+                self.fit(b, width, &cum, anchor, may_move, &mut window)
+            } else {
+                None
+            };
+            match (fit, names.shown.as_mut()) {
+                // Where it was: follow the column that holds it now, without a
+                // step, and the band's clear height.
+                (Some(fit), Some(label)) if fit.kept => {
+                    if fit.anchor_ms != label.anchor_ms {
+                        label.dx += self.anchor_x(label.anchor_ms) - self.anchor_x(fit.anchor_ms);
+                        label.anchor_ms = fit.anchor_ms;
+                    }
+                    label.target_y = fit.y;
+                    label.width = width;
+                }
+                // Somewhere else, or for the first time: fade in there, and out
+                // where it was.
+                (Some(fit), _) => {
+                    if let Some(was) = names.shown.take() {
+                        names.leaving = Some(was);
+                    }
+                    names.shown = Some(Label {
+                        anchor_ms: fit.anchor_ms,
+                        width,
+                        y: fit.y,
+                        target_y: fit.y,
+                        dx: 0.0,
+                        alpha: 0.0,
+                    });
+                    names.moved_at = now;
+                }
+                // Nowhere: fade out where it was.
+                (None, _) => {
+                    if let Some(was) = names.shown.take() {
+                        names.leaving = Some(was);
+                    }
+                }
             }
+            if let Some(label) = &mut names.shown {
+                label.alpha = (label.alpha + fade).min(1.0);
+                label.ease(ease);
+            }
+            if let Some(label) = &mut names.leaving {
+                label.alpha -= fade;
+                label.ease(ease);
+            }
+            names.leaving = names.leaving.filter(|l| l.alpha > 0.0);
+            self.labels[b] = names;
             for (p, c) in self.points.iter().zip(&mut cum) {
                 *c += p.v[b];
             }
@@ -407,9 +548,28 @@ impl UsageChart {
         self.window = window;
     }
 
+    /// The x of a name's right end, anchored at `anchor_ms`, before its offset.
+    fn anchor_x(&self, anchor_ms: i64) -> f32 {
+        self.time
+            .x_unclamped(self.plot, self.time.age(self.now_ms, anchor_ms))
+    }
+
+    /// Where a name is drawn: at its anchor and offset, around its `y`.
+    fn label_rect(&self, label: &Label) -> Rect {
+        let right = self.anchor_x(label.anchor_ms) + label.dx;
+        Rect::new(
+            right - label.width,
+            label.y - LABEL_H * 0.5,
+            label.width,
+            LABEL_H,
+        )
+    }
+
     /// Where `band`'s name, `width` wide, fits best, if anywhere: `below` is the
-    /// sum of the bands under it at each column, `anchor` the column it was at last
-    /// frame.
+    /// sum of the bands under it at each column, `anchor` where its right end was
+    /// last frame. That place is kept, in the column whose stretch of time holds
+    /// the anchor now, while it fits and, if `may_move`, is still nearly as good as
+    /// the best.
     ///
     /// Columns are newest (rightmost) first. For each column as the name's right
     /// end, the window runs to the first column at or past its left end, which
@@ -422,8 +582,9 @@ impl UsageChart {
         width: f32,
         below: &[f32],
         anchor: Option<i64>,
+        may_move: bool,
         window: &mut (VecDeque<usize>, VecDeque<usize>),
-    ) -> Option<Label> {
+    ) -> Option<Fit> {
         // A place: its clear height, its right end's column, and the band's upper
         // and lower edges over it, on screen, where y grows downward.
         type Place = (f32, usize, f32, f32);
@@ -479,22 +640,27 @@ impl UsageChart {
             if best.is_none_or(|best| here.0 > best.0) {
                 best = Some(here);
             }
-            if anchor == Some(self.points[i].end_ms) {
+            // A column holds the stretch of time back to the next older one's end.
+            let holds = |at: i64| {
+                at <= self.points[i].end_ms
+                    && self.points.get(i + 1).is_none_or(|older| at > older.end_ms)
+            };
+            if anchor.is_some_and(holds) {
                 kept = Some(here);
             }
         }
-        let pick = match (kept, best) {
-            (Some(kept), Some(best)) if kept.0 >= LABEL_H && kept.0 >= best.0 * LABEL_KEEP => kept,
-            (_, best) => best?,
+        let keep = |kept: Place, best: Place| {
+            kept.0 >= LABEL_H && (!may_move || kept.0 >= best.0 * LABEL_KEEP)
+        };
+        let (pick, is_kept) = match (kept, best) {
+            (Some(kept), Some(best)) if keep(kept, best) => (kept, true),
+            (_, best) => (best?, false),
         };
         let (clear, i, top, bottom) = pick;
-        (clear >= LABEL_H).then(|| {
-            let p = &self.points[i];
-            let mid = f32::midpoint(top, bottom);
-            Label {
-                rect: Rect::new(p.x - width, mid - LABEL_H * 0.5, width, LABEL_H),
-                anchor_ms: p.end_ms,
-            }
+        (clear >= LABEL_H).then(|| Fit {
+            anchor_ms: self.points[i].end_ms,
+            y: f32::midpoint(top, bottom),
+            kept: is_kept,
         })
     }
 
@@ -855,25 +1021,27 @@ impl UsageChart {
         theme: &Theme,
     ) {
         dl.push_clip(self.plot);
-        for (b, label) in self.labels.iter().enumerate() {
-            let Some(label) = label else {
-                continue;
-            };
+        for (b, names) in self.labels.iter().enumerate() {
             let program = self.slots.get(b).copied().flatten();
-            if program.is_some() && program == selected {
-                dl.stroke_round_rect(label.rect.inset(0.5, 0.5), 3.0, theme.accent, 1.0);
-            }
             let ink = ink_on(band_color(theme, b));
-            let ink = if dim[b] { ink.with_alpha(0.45) } else { ink };
-            dl.text(
-                self.band_name(usage, b),
-                label.rect.inset(LABEL_PAD, 0.0),
-                theme.small,
-                ink,
-                HAlign::Left,
-                VAlign::Middle,
-                true,
-            );
+            let strength = if dim[b] { 0.45 } else { 1.0 };
+            for label in names.leaving.iter().chain(&names.shown) {
+                let rect = self.label_rect(label);
+                let alpha = label.alpha.clamp(0.0, 1.0);
+                if program.is_some() && program == selected {
+                    let outline = theme.accent.with_alpha(theme.accent.a * alpha);
+                    dl.stroke_round_rect(rect.inset(0.5, 0.5), 3.0, outline, 1.0);
+                }
+                dl.text(
+                    self.band_name(usage, b),
+                    rect.inset(LABEL_PAD, 0.0),
+                    theme.small,
+                    ink.with_alpha(strength * alpha),
+                    HAlign::Left,
+                    VAlign::Middle,
+                    true,
+                );
+            }
         }
         dl.pop_clip();
     }
@@ -1447,23 +1615,20 @@ mod tests {
         }
         for name in ["a.exe", "b.exe"] {
             let b = band(&c, &u, name);
-            let l = c.labels[b].expect(name);
-            assert!(c.plot.contains(Point::new(l.rect.x, l.rect.y)));
-            assert!(l.rect.right() <= c.plot.right() + 1e-3);
+            let l = shown(&c, b).expect(name);
+            assert!(c.plot.contains(Point::new(l.x, l.y)));
+            assert!(l.right() <= c.plot.right() + 1e-3);
             // Inside the band at every column under it.
             for (i, p) in c.points.iter().enumerate() {
-                if p.x >= l.rect.x && p.x <= l.rect.right() {
+                if p.x >= l.x && p.x <= l.right() {
                     let (top, bottom) = band_span(&c, b, i);
-                    assert!(
-                        l.rect.y >= top - 0.5 && l.rect.bottom() <= bottom + 0.5,
-                        "{name}"
-                    );
+                    assert!(l.y >= top - 0.5 && l.bottom() <= bottom + 0.5, "{name}");
                 }
             }
         }
         // b's name is where b was thick: over a minute ago.
         let b = band(&c, &u, "b.exe");
-        let at = c.labels[b].unwrap().rect.right();
+        let at = shown(&c, b).unwrap().right();
         assert!(c.time.age_at(c.plot, at) > 60_000.0);
     }
 
@@ -1479,35 +1644,187 @@ mod tests {
             ..Default::default()
         };
         let dl = painted(&mut c, &u, "");
-        assert!(c.labels[band(&c, &u, "big.exe")].is_some());
-        assert!(c.labels[band(&c, &u, "tiny.exe")].is_none());
+        assert!(shown(&c, band(&c, &u, "big.exe")).is_some());
+        assert!(shown(&c, band(&c, &u, "tiny.exe")).is_none());
         assert!(!texts(&dl).iter().any(|s| s == "tiny.exe"));
     }
 
+    /// Where band `b`'s name is drawn, if it has one.
+    fn shown(c: &UsageChart, b: usize) -> Option<Rect> {
+        c.labels[b].shown.map(|l| c.label_rect(&l))
+    }
+
+    /// Build and paint a frame at `at` on `axis`.
+    fn frame(c: &mut UsageChart, u: &Usage, at: Instant, axis: TimeAxis) -> DisplayList {
+        let mut dl = DisplayList::new();
+        c.set_now(at);
+        c.build(RECT, u, None, axis);
+        c.paint(&mut dl, u, "", None, &Theme::dark(), &mut String::new());
+        dl
+    }
+
+    const FRAME: Duration = Duration::from_millis(16);
+
     #[test]
-    fn a_name_keeps_its_place_in_time_as_the_chart_scrolls() {
-        let u = session(&["a.exe", "b.exe"], 120, |i, _| if i == 0 { 3 } else { 2 });
-        let newest = u.now_ms();
+    fn names_glide_with_the_chart_and_never_jump() {
+        // Busy, uneven programs, a sample arriving each second while the chart
+        // scrolls at sixty frames a second: the bands' edges shift under the names
+        // and the best places change.
+        let rate = |i: usize, s: u64| match i {
+            0 => 2 + (s * 7 % 11),
+            1 => 1 + (s * 5 % 7),
+            _ => 3 + (s * 3 % 5),
+        };
+        let names = ["a.exe", "b.exe", "c.exe"];
+        let sessions: Vec<Usage> = (0..30).map(|k| session(&names, 90 + k, rate)).collect();
+        let start = sessions[0].now_ms();
         let mut c = UsageChart::default();
-        let mut placed = Vec::new();
-        for step in 0..8 {
-            let axis = TimeAxis::at(Some(newest + step * 125), 120_000.0, 5_000.0);
-            c.build(RECT, &u, None, axis);
-            c.paint(
-                &mut DisplayList::new(),
-                &u,
-                "",
-                None,
-                &Theme::dark(),
-                &mut String::new(),
-            );
-            placed.push(c.labels[band(&c, &u, "a.exe")].unwrap());
+        let t0 = Instant::now();
+        let mut last: [Option<(Rect, Option<Instant>)>; 3] = [None; 3];
+        let (mut moves, mut steepest) = (0, 0.0f32);
+        for f in 0..(29 * 60u32) {
+            let ms = i64::from(f) * 1000 / 60;
+            let u = &sessions[(f / 60) as usize];
+            let axis = TimeAxis::at(Some(start + ms), 90_000.0, 5_000.0);
+            let _ = frame(&mut c, u, t0 + FRAME * f, axis);
+            for (k, name) in names.iter().enumerate() {
+                let b = band(&c, u, name);
+                let n = c.labels[b];
+                let Some(rect) = shown(&c, b) else {
+                    last[k] = None;
+                    continue;
+                };
+                if let Some((was, moved_at)) = last[k] {
+                    if n.moved_at == moved_at {
+                        let step = (rect.x - was.x).abs().max((rect.y - was.y).abs());
+                        steepest = steepest.max(step);
+                    } else {
+                        // Moved: it starts out faint where it goes, and fades out
+                        // where it was.
+                        moves += 1;
+                        assert!(n.shown.unwrap().alpha < 0.2, "{name}, frame {f}");
+                        assert!(n.leaving.is_some(), "{name}, frame {f}");
+                    }
+                }
+                last[k] = Some((rect, n.moved_at));
+            }
         }
-        assert!(placed.windows(2).all(|w| w[0].anchor_ms == w[1].anchor_ms));
+        assert!(steepest < 4.0, "no frame steps a name far: {steepest}");
+        // At most one move a dwell for each name.
+        let most = 3 * 29 / LABEL_DWELL.as_secs() as usize + 3;
+        assert!(moves <= most, "{moves} moves");
+    }
+
+    #[test]
+    fn a_name_follows_its_column_into_an_older_one_without_a_step() {
+        let u = session(&["a.exe", "b.exe"], 60, |i, _| if i == 0 { 3 } else { 2 });
+        let axis = TimeAxis::at(None, 60_000.0, 5_000.0);
+        let mut c = UsageChart::default();
+        let t0 = Instant::now();
+        let _ = frame(&mut c, &u, t0, axis);
+        let a = band(&c, &u, "a.exe");
+        // As if its column had merged into the next older one: its anchor is now
+        // inside that column's stretch of time rather than at its end.
+        let label = c.labels[a].shown.as_mut().unwrap();
+        let col = c
+            .points
+            .iter()
+            .position(|p| p.end_ms == label.anchor_ms)
+            .unwrap();
+        let older = c.points[col + 1].end_ms;
+        label.anchor_ms = older + (c.points[col].end_ms - older) / 2;
+        let before = shown(&c, a).unwrap();
+        // Drawn where it was, then eased onto the column it is in now.
+        let mut t = t0 + FRAME;
+        let _ = frame(&mut c, &u, t, axis);
+        assert_eq!(c.labels[a].shown.unwrap().anchor_ms, c.points[col].end_ms);
+        // One frame's easing of the way to go, not the whole step.
+        let after = shown(&c, a).unwrap();
+        let gap = c.points[col].x - before.right();
+        let eased = 1.0 - (-FRAME.as_secs_f32() / LABEL_EASE_S).exp();
+        assert!(gap.abs() > 10.0, "a step worth easing: {gap}");
         assert!(
-            placed[7].rect.x < placed[0].rect.x,
-            "it scrolls with the band"
+            (after.x - before.x - gap * eased).abs() < 0.1,
+            "{before:?} -> {after:?}"
         );
+        assert!(c.labels[a].leaving.is_none(), "not a move");
+        for _ in 0..60 {
+            t += FRAME;
+            let _ = frame(&mut c, &u, t, axis);
+        }
+        assert!(!c.animating());
+        let settled = shown(&c, a).unwrap();
+        assert!(
+            (settled.right() - c.points[col].x).abs() < 0.2,
+            "{settled:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_waits_before_moving_then_fades_across() {
+        // b is clearly thickest early on, then a newer stretch is thicker still.
+        let early = session(&["a.exe", "b.exe"], 120, |i, s| match (i, s) {
+            (0, _) => 6,
+            (_, s) if s < 60 => 4,
+            _ => 1,
+        });
+        let late = session(&["a.exe", "b.exe"], 120, |i, s| match (i, s) {
+            (0, _) => 6,
+            (_, s) if s < 60 => 2,
+            _ => 8,
+        });
+        let axis = TimeAxis::at(None, 120_000.0, 5_000.0);
+        let mut c = UsageChart {
+            mode: ChartMode::Rate,
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        let _ = frame(&mut c, &early, t0, axis);
+        let b = band(&c, &early, "b.exe");
+        let first = c.labels[b].shown.unwrap();
+        assert!(
+            (first.alpha - 1.0).abs() < f32::EPSILON,
+            "the first frame shows it"
+        );
+        assert!(!c.animating());
+        let old = |c: &UsageChart| c.time.age(c.now_ms, c.labels[b].shown.unwrap().anchor_ms);
+        assert!(old(&c) > 60_000.0);
+
+        // Within the dwell, the old place still fits, so the name stays.
+        let mut t = t0;
+        for _ in 0..30 {
+            t += FRAME;
+            let _ = frame(&mut c, &late, t, axis);
+        }
+        assert!(old(&c) > 60_000.0, "not yet");
+        assert!(c.labels[b].leaving.is_none());
+
+        // After it, the name moves to the thicker stretch, fading across.
+        let dl = loop {
+            t += FRAME;
+            let dl = frame(&mut c, &late, t, axis);
+            if old(&c) < 60_000.0 {
+                break dl;
+            }
+            assert!(
+                t < t0 + LABEL_DWELL + FRAME * 2,
+                "it moves once the dwell is over"
+            );
+        };
+        assert!(t >= t0 + LABEL_DWELL);
+        let names = c.labels[b];
+        let (shown, leaving) = (names.shown.unwrap(), names.leaving.unwrap());
+        assert!(shown.alpha > 0.0 && shown.alpha < 0.5, "{shown:?}");
+        assert!(leaving.alpha > 0.5 && leaving.alpha < 1.0, "{leaving:?}");
+        assert!(c.animating());
+        let drawn = texts(&dl).iter().filter(|s| *s == "b.exe").count();
+        assert_eq!(drawn, 2, "both, crossing");
+        for _ in 0..40 {
+            t += FRAME;
+            let _ = frame(&mut c, &late, t, axis);
+        }
+        assert!(c.labels[b].leaving.is_none());
+        assert!(!c.animating(), "settled");
     }
 
     #[test]

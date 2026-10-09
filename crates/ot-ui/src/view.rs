@@ -1289,10 +1289,12 @@ impl App {
     }
 
     /// Whether something is moving, so the shell should paint another frame soon:
-    /// rows sliding, or charts on screen scrolling.
+    /// rows sliding, charts on screen scrolling, or the History's names settling.
     #[must_use]
     pub fn animating(&self) -> bool {
-        (self.page == Page::Processes && self.table.animating())
+        let processes = self.page == Page::Processes;
+        (processes && self.table.animating())
+            || (processes && self.history_on() && self.history.animating())
             || (self.page.has_charts() && self.clock.moving())
     }
 
@@ -2272,6 +2274,7 @@ impl App {
     /// repaints just the charts' lines, in a copy of that paint.
     pub fn paint_at(&mut self, dl: &mut DisplayList, now: Instant) {
         self.table.tick(now);
+        self.history.set_now(now);
         // The chart clock learns the pace from the live history, paused or not.
         if let Some((newest, gap)) = charts::newest_gap(&self.timeline.cpu_total) {
             self.clock.arrive(newest, gap, now);

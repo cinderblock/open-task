@@ -51,6 +51,16 @@ The user picked:
 5. [x] Tests, clippy, fmt, README; screenshots checked (dark inline, dark floating,
        light inline, Settings page).
 
+6. [x] Smooth the names (user, after the first pass: "not a fan of the jumps").
+       Each band keeps a shown name and a leaving one. A kept place follows the
+       column whose stretch of time holds its anchor (columns merge as they age)
+       with the step absorbed in an eased `dx`; `y` eases to the clear height's
+       middle (`LABEL_EASE_S` 0.15 s); a move cross-fades (`LABEL_FADE_S`
+       0.25 s) and may not happen within `LABEL_DWELL` (2 s) of the last unless
+       the place no longer fits. `UsageChart::set_now` gets the frame time from
+       `View::paint_at`; `View::animating` includes `history.animating()` so
+       frames keep coming while names settle, even with smooth scrolling off.
+
 ## Findings / gotchas
 
 - Width shares over a 1 h span: τ=1 s gives the last 10 s 29 %, 1–10 min 28 %;
@@ -67,6 +77,11 @@ The user picked:
   `-Click "68,724"` on the rail.
 - `sed -i` in Git Bash rewrote `lib.rs`/`view.rs` to LF; converted back.
 
+- Column merges under a name are rare: bins are aligned in time, so a column's
+  set of samples changes only when the bin size doubles at its age. The jumps
+  seen were mostly new samples moving the best place and the band's edges near
+  "now". Tests feed a sample a second while scrolling at 60 fps.
+
 ## Progress log
 
 - [x] Knee setting, tied to the update speed, default 5 samples
@@ -76,6 +91,8 @@ The user picked:
       band unnamed, name keeps its place while scrolling, hover chip, floating
       corner + crosshair avoidance)
 - [x] README
+- [x] Smoothing: eased moves, cross-faded relocations, dwell; tests for gliding
+      with samples arriving, the wait-then-fade, and following a merged column
 
 ## Open questions for the user
 
