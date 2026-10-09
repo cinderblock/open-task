@@ -61,6 +61,16 @@ The user picked:
        `View::paint_at`; `View::animating` includes `history.animating()` so
        frames keep coming while names settle, even with smooth scrolling off.
 
+7. [x] Glide instead of cross-fade (user: "fade time should be used a lot
+       less... it should move gracefully"). A move re-anchors at once and puts
+       the difference in `dx`, so the name travels from where it is drawn; `dx`
+       and `y` ride a critically damped spring (`LABEL_SPRING` 10 rad/s, ~0.5 s
+       to 95 %, stepped at 4 ms, snapped after a gap over 0.5 s). Fades
+       (`LABEL_FADE_S` 0.2 s) only for a name appearing or left with nowhere to
+       fit; one fading out that fits again comes back rather than a second copy
+       fading in. A kept place holds down to 80 % of the needed height
+       (`LABEL_SLACK`) so a band at the edge of fitting does not flicker.
+
 ## Findings / gotchas
 
 - Width shares over a 1 h span: τ=1 s gives the last 10 s 29 %, 1–10 min 28 %;
@@ -93,6 +103,10 @@ The user picked:
 - [x] README
 - [x] Smoothing: eased moves, cross-faded relocations, dwell; tests for gliding
       with samples arriving, the wait-then-fade, and following a merged column
+- [x] Moves glide on a spring, fades only to appear or vanish; tests: no frame
+      jolts a name with samples arriving and bursts moving the best place, the
+      wait-then-glide, setting off gently onto a merged column, fade out and
+      back in
 
 ## Open questions for the user
 
