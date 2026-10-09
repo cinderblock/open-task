@@ -214,6 +214,16 @@ impl ChartDrawing {
 
 /// The sampling intervals, slowest first, in milliseconds.
 pub const SPEED_STEPS: [u32; 4] = [4000, 2000, 1000, 500];
+
+/// Task Manager's name for a sampling interval in milliseconds.
+const fn speed_name(ms: u32) -> &'static str {
+    match ms {
+        0..=500 => "High",
+        501..=1000 => "Normal",
+        1001..=2000 => "Slow",
+        _ => "Low",
+    }
+}
 pub const SPEED_DEFAULT: u32 = 1000;
 
 impl Default for Settings {
@@ -310,15 +320,13 @@ impl Settings {
             .copied()
     }
 
-    /// The interval one step slower (`-1`) or faster (`1`).
-    fn speed_step(self, by: isize) -> Option<u32> {
-        let at = SPEED_STEPS
+    /// The place in [`SPEED_STEPS`] of the interval: the first step at least as
+    /// fast.
+    fn speed_index(self) -> usize {
+        SPEED_STEPS
             .iter()
             .position(|&s| s <= self.update_interval_ms)
-            .unwrap_or(SPEED_STEPS.len() - 1);
-        at.checked_add_signed(by)
-            .and_then(|i| SPEED_STEPS.get(i))
-            .copied()
+            .unwrap_or(SPEED_STEPS.len() - 1)
     }
 
     /// These settings with the history reach set to the step nearest `minutes`.
@@ -366,12 +374,7 @@ impl Settings {
     /// Task Manager's name for the interval.
     #[must_use]
     pub fn speed_label(self) -> &'static str {
-        match self.update_interval_ms {
-            0..=500 => "High",
-            501..=1000 => "Normal",
-            1001..=2000 => "Slow",
-            _ => "Low",
-        }
+        speed_name(self.update_interval_ms)
     }
 
     /// The fade rate one step slower (`-1`) or faster (`1`), or `None` at the end
@@ -573,7 +576,8 @@ enum Card {
     TaskManager,
     /// How fast the cycle totals fade: a number with a minus and a plus button.
     Decay,
-    /// How often the system is sampled: Task Manager's update speed, stepped.
+    /// How often the system is sampled: Task Manager's update speed, side by
+    /// side to pick from.
     Speed,
     /// How far back the charts reach: a length with a minus and a plus button.
     History,
@@ -740,10 +744,14 @@ pub(crate) struct SettingsPage {
     /// Where each card was placed; [`Rect::ZERO`] for a card not shown.
     cards: [Rect; CARD_COUNT],
     hover: Option<usize>,
-    /// The fade card's minus and plus buttons, then the speed card's, the
-    /// history card's and the knee card's, and the one under the pointer.
-    steppers: [Rect; 8],
+    /// The fade card's minus and plus buttons, then the history card's and the
+    /// knee card's, and the one under the pointer.
+    steppers: [Rect; 6],
     hover_step: Option<usize>,
+    /// The speed card's choices, in [`SPEED_STEPS`] order, and the one under the
+    /// pointer.
+    speed: [Rect; SPEED_STEPS.len()],
+    hover_speed: Option<usize>,
     /// The chart drawing card's choices, in [`ChartDrawing::ALL`] order, and the
     /// one under the pointer.
     drawing: [Rect; ChartDrawing::ALL.len()],
@@ -775,8 +783,7 @@ impl SettingsPage {
     }
 
     /// The stepper button under `p`: 0 and 1 for the fade card's minus and plus,
-    /// 2 and 3 for the speed card's, 4 and 5 for the history card's, 6 and 7 for
-    /// the knee card's.
+    /// 2 and 3 for the history card's, 4 and 5 for the knee card's.
     fn step_at(&self, p: Point) -> Option<usize> {
         if !self.view.contains(p) {
             return None;
@@ -790,6 +797,29 @@ impl SettingsPage {
             return None;
         }
         self.drawing.iter().position(|r| r.contains(p))
+    }
+
+    /// The speed choice under `p`, as an index into [`SPEED_STEPS`].
+    fn speed_at(&self, p: Point) -> Option<usize> {
+        if !self.view.contains(p) {
+            return None;
+        }
+        self.speed.iter().position(|r| r.contains(p))
+    }
+
+    /// The speed choice under `at`: pick it, and ask for it to be saved. Nothing
+    /// when it is already the one picked.
+    fn pick_speed(&self, at: Point, settings: &mut Settings) -> Reaction {
+        match self.speed_at(at) {
+            Some(i) if i != settings.speed_index() => {
+                settings.update_interval_ms = SPEED_STEPS[i];
+                Reaction {
+                    repaint: true,
+                    effect: Some(Effect::SaveSettings(*settings)),
+                }
+            }
+            _ => Reaction::NONE,
+        }
     }
 
     /// The legend choice under `p`, as an index into [`ChartLegend::ALL`].
@@ -835,9 +865,8 @@ impl SettingsPage {
     fn step(&self, card: Card, at: Point, settings: &mut Settings) -> Reaction {
         let first = match card {
             Card::Decay => 0,
-            Card::Speed => 2,
-            Card::History => 4,
-            Card::Knee => 6,
+            Card::History => 2,
+            Card::Knee => 4,
             _ => return Reaction::NONE,
         };
         let by = match self.step_at(at) {
@@ -849,9 +878,6 @@ impl SettingsPage {
             Card::Decay => settings
                 .decay_step(by)
                 .map(|v| settings.usage_decay_percent = v),
-            Card::Speed => settings
-                .speed_step(by)
-                .map(|v| settings.update_interval_ms = v),
             Card::History => settings
                 .history_step(by)
                 .map(|v| settings.history_minutes = v),
@@ -878,17 +904,20 @@ impl SettingsPage {
                 let step = self.step_at(p);
                 let drawing = self.drawing_at(p);
                 let legend = self.legend_at(p);
+                let speed = self.speed_at(p);
                 let card = std::mem::replace(&mut self.hover, hit) != hit;
                 let button = std::mem::replace(&mut self.hover_step, step) != step;
                 let choice = std::mem::replace(&mut self.hover_drawing, drawing) != drawing;
                 let legend = std::mem::replace(&mut self.hover_legend, legend) != legend;
-                Reaction::painted(card || button || choice || legend)
+                let speed = std::mem::replace(&mut self.hover_speed, speed) != speed;
+                Reaction::painted(card || button || choice || legend || speed)
             }
             UiEvent::MouseLeave => {
                 let step = self.hover_step.take().is_some();
                 let choice = self.hover_drawing.take().is_some();
                 let legend = self.hover_legend.take().is_some();
-                Reaction::painted(self.hover.take().is_some() || step || choice || legend)
+                let speed = self.hover_speed.take().is_some();
+                Reaction::painted(self.hover.take().is_some() || step || choice || legend || speed)
             }
             UiEvent::MouseDown {
                 at,
@@ -908,9 +937,10 @@ impl SettingsPage {
                 Some(Card::TaskManager) if !cx.task_manager.pending => {
                     Reaction::effect(Effect::ReplaceTaskManager(!cx.task_manager.on()))
                 }
-                Some(card @ (Card::Decay | Card::Speed | Card::History | Card::Knee)) => {
+                Some(card @ (Card::Decay | Card::History | Card::Knee)) => {
                     self.step(card, at, settings)
                 }
+                Some(Card::Speed) => self.pick_speed(at, settings),
                 Some(Card::ChartDrawing) => self.pick_drawing(at, settings),
                 Some(Card::Legend) => self.pick_legend(at, settings),
                 Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
@@ -935,6 +965,7 @@ impl SettingsPage {
                 self.hover_step = self.step_at(at);
                 self.hover_drawing = self.drawing_at(at);
                 self.hover_legend = self.legend_at(at);
+                self.hover_speed = self.speed_at(at);
                 Reaction::REPAINT
             }
             _ => Reaction::NONE,
@@ -976,10 +1007,9 @@ impl SettingsPage {
             [button(right - STEPPER_W), button(right - STEP_W)]
         };
         let [d0, d1] = pair(self.cards[DECAY_CARD]);
-        let [s0, s1] = pair(self.cards[SPEED_CARD]);
         let [h0, h1] = pair(self.cards[HISTORY_CARD]);
         let [k0, k1] = pair(self.cards[KNEE_CARD]);
-        self.steppers = [d0, d1, s0, s1, h0, h1, k0, k1];
+        self.steppers = [d0, d1, h0, h1, k0, k1];
         // The choice cards' choices, side by side at the right.
         let choices = |card: Rect, rects: &mut [Rect]| {
             let left = card.right() - 16.0 - CHOICE_W * rects.len() as f32;
@@ -994,6 +1024,7 @@ impl SettingsPage {
         };
         choices(self.cards[DRAWING_CARD], &mut self.drawing);
         choices(self.cards[LEGEND_CARD], &mut self.legend);
+        choices(self.cards[SPEED_CARD], &mut self.speed);
         self.max_scroll = (y - view.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
         self.shift(view.y - self.scroll);
@@ -1012,6 +1043,7 @@ impl SettingsPage {
             .iter_mut()
             .chain(&mut self.drawing)
             .chain(&mut self.legend)
+            .chain(&mut self.speed)
         {
             r.y += dy;
         }
@@ -1110,22 +1142,16 @@ impl SettingsPage {
                         f64::from(settings.update_interval_ms) / 1000.0,
                         settings.speed_label().to_ascii_lowercase()
                     );
+                    let (text, _) =
+                        inner.split_left((self.speed[0].x - inner.x).clamp(0.0, inner.w));
                     paint_text(dl, text, "Update speed", buf, note, theme);
-                    let [_, _, minus, plus, ..] = self.steppers;
-                    for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
-                        let enabled = settings.speed_step(by).is_some();
-                        let hover = enabled && self.hover_step == Some(i + 2);
-                        paint_stepper(dl, r, by > 0, enabled, hover, theme);
-                    }
-                    let value = Rect::new(minus.right(), minus.y, plus.x - minus.right(), minus.h);
-                    dl.text(
-                        settings.speed_label(),
-                        value,
-                        theme.cell_num,
-                        theme.text,
-                        HAlign::Center,
-                        VAlign::Middle,
-                        false,
+                    paint_choices(
+                        dl,
+                        &self.speed,
+                        SPEED_STEPS.map(speed_name),
+                        settings.speed_index(),
+                        self.hover_speed,
+                        theme,
                     );
                 }
                 Card::History => {
@@ -1140,10 +1166,10 @@ impl SettingsPage {
                          chart, about {size} for the charts on this machine."
                     );
                     paint_text(dl, text, "How far charts reach back", buf, note, theme);
-                    let [_, _, _, _, minus, plus, ..] = self.steppers;
+                    let [_, _, minus, plus, ..] = self.steppers;
                     for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
                         let enabled = settings.history_step(by).is_some();
-                        let hover = enabled && self.hover_step == Some(i + 4);
+                        let hover = enabled && self.hover_step == Some(i + 2);
                         paint_stepper(dl, r, by > 0, enabled, hover, theme);
                     }
                     settings.history_label(buf);
@@ -1172,7 +1198,7 @@ impl SettingsPage {
                     let [.., minus, plus] = self.steppers;
                     for (i, (r, by)) in [(minus, -1), (plus, 1)].into_iter().enumerate() {
                         let enabled = settings.knee_step(by).is_some();
-                        let hover = enabled && self.hover_step == Some(i + 6);
+                        let hover = enabled && self.hover_step == Some(i + 4);
                         paint_stepper(dl, r, by > 0, enabled, hover, theme);
                     }
                     buf.clear();
@@ -1812,6 +1838,40 @@ mod tests {
     }
 
     #[test]
+    fn the_speed_card_picks_low_slow_normal_or_high() {
+        let update = UpdateView::new("0.2.1", true);
+        let cx = cx(true, &update);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(["Low", "Slow", "Normal", "High"]
+            .iter()
+            .all(|l| strings.iter().any(|t| t == l)));
+        let card = page.cards[SPEED_CARD];
+        let [low, slow, normal, high] = page.speed;
+        assert!([low, slow, normal, high]
+            .iter()
+            .all(|r| card.contains(r.center())));
+        assert!(low.right() <= slow.x && slow.right() <= normal.x && normal.right() <= high.x);
+
+        // Normal unless changed; picking it again does nothing.
+        assert_eq!(s.update_interval_ms, SPEED_DEFAULT);
+        assert_eq!(
+            click(&mut page, normal.center(), &mut s, cx),
+            Reaction::NONE
+        );
+        let r = click(&mut page, high.center(), &mut s, cx);
+        assert_eq!(s.update_interval_ms, 500);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let _ = click(&mut page, low.center(), &mut s, cx);
+        assert_eq!(s.update_interval_ms, 4000);
+        assert!(
+            page.handle(UiEvent::MouseMove(slow.center()), &mut s, cx)
+                .repaint
+        );
+    }
+
+    #[test]
     fn the_knee_card_steps_in_samples_and_follows_the_speed() {
         let update = UpdateView::new("0.2.1", true);
         let cx = cx(true, &update);
@@ -1934,7 +1994,7 @@ mod tests {
             cx,
         );
         assert_eq!(r, Reaction::NONE);
-        let [_, _, _, _, minus, plus, ..] = page.steppers;
+        let [_, _, minus, plus, ..] = page.steppers;
         assert!(card.contains(minus.center()) && card.contains(plus.center()));
         let r = click(&mut page, plus.center(), &mut s, cx);
         assert_eq!(s.history_minutes, 10);
