@@ -1,6 +1,6 @@
 # Chromium process roles: split `chrome.exe` by what each process does
 
-> **Status:** done (level 1) · **Started:** 2026-10-07 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** level 1 done; ETW spike and Electron app names in progress · **Started:** 2026-10-07 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 
 ## Goal
 
@@ -45,6 +45,10 @@ Every child except crashpad carries `--mojo-platform-channel-handle=` and
    not the executable name.
 3. **The main process stays unlabelled**: knowing it is Chromium would need its
    children; "unlabelled" reads as "the main one" next to labelled siblings.
+4. **ETW spike: yes**, if it gets per-site attribution with no plugin or
+   extension (user, 2026-10-07).
+5. **Generic `electron.exe` apps told apart by `--app-path`: yes** (user,
+   2026-10-07).
 
 ## Plan / steps
 
@@ -73,13 +77,25 @@ Every child except crashpad carries `--mojo-platform-channel-handle=` and
   Chrome, Edge WebView2, Discord, Slack, Signal, Logic and `electron.exe` all
   labelled, no other process labelled.
 
+- [ ] 5. ETW spike: does Chrome publish renderer-to-site labels over ETW with no
+  flags or install? (research running in a subagent)
+- [x] 6. Generic `electron.exe`: named by the project folder holding the
+  `node_modules` it runs from, else `--user-data-dir`, else `--app-path`
+  (`chromium::electron_app`, `ProcessStatic::app`). Checked live 2026-10-09: the
+  T3 Code dev build's main process, its Node child and every Chromium child read
+  `electron.exe (t3code ...)`.
+
+## Findings: Electron app names
+
+- `--user-data-dir` is not stable within one app: the T3 Code main process was
+  started with `...\Roaming\t3code` and its children carry `...\t3code-v2` (the
+  app changes it at runtime). The image path is the same for all of them.
+- The app's script child (`electron.exe ...\apps\server\dist\bin.mjs`, run as
+  Node) has no Chromium switches at all; only the image path names it.
+
 ## Open questions for the user
 
-1. Per-domain attribution through Chrome's ETW provider (no install needed) is
-   unexplored: does Chrome publish process-to-site labels to ETW without being
-   started with tracing flags? Worth a look only if the user wants it.
-2. A generic `electron.exe` (dev setups) runs several apps under one name; its
-   renderers' `--app-path=` would tell them apart. Not done.
+None open.
 
 ## Things not to do
 

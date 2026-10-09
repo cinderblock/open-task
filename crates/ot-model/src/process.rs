@@ -76,24 +76,54 @@ impl ProcessStatic {
         self.command_line.as_deref().and_then(crate::chromium::role)
     }
 
-    /// The name to show and to chart the process under: its name, with its role
-    /// when it has one (`chrome.exe (GPU)`).
+    /// For a generic `electron.exe`, which app it is running (`t3code`); `None`
+    /// for anything else. See [`crate::chromium::electron_app`].
+    #[must_use]
+    pub fn app(&self) -> Option<&str> {
+        crate::chromium::electron_app(
+            &self.name,
+            self.image_path.as_deref(),
+            self.command_line.as_deref(),
+        )
+    }
+
+    /// The name to show and to chart the process under: its name, with the app a
+    /// generic `electron.exe` runs and its role when it has them
+    /// (`chrome.exe (GPU)`, `electron.exe (t3code)`,
+    /// `electron.exe (t3code · Renderer)`).
     #[must_use]
     pub fn label(&self) -> Label<'_> {
-        Label(self)
+        Label {
+            name: &self.name,
+            app: self.app(),
+            role: self.role(),
+        }
     }
 }
 
 /// [`ProcessStatic::label`], written without allocating.
 #[derive(Debug, Clone, Copy)]
-pub struct Label<'a>(&'a ProcessStatic);
+pub struct Label<'a> {
+    name: &'a str,
+    app: Option<&'a str>,
+    role: Option<&'a str>,
+}
+
+impl Label<'_> {
+    /// Whether the label is the name alone, as for most processes.
+    #[must_use]
+    pub fn is_name(&self) -> bool {
+        self.app.is_none() && self.role.is_none()
+    }
+}
 
 impl std::fmt::Display for Label<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.name)?;
-        match self.0.role() {
-            Some(role) => write!(f, " ({role})"),
-            None => Ok(()),
+        f.write_str(self.name)?;
+        match (self.app, self.role) {
+            (Some(app), Some(role)) => write!(f, " ({app} \u{b7} {role})"),
+            (Some(one), None) | (None, Some(one)) => write!(f, " ({one})"),
+            (None, None) => Ok(()),
         }
     }
 }

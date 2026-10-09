@@ -9,6 +9,10 @@
 //!
 //! Which site a renderer is serving is not on its command line, so all of a
 //! browser's renderers share the one label.
+//!
+//! A packaged Electron app has an executable of its own (`slack.exe`), but one run
+//! from source runs the generic `electron.exe` from its `node_modules`, so every
+//! app in development has the same name. [`electron_app`] finds which app it is.
 
 /// The role a Chromium child process was started for, for display (`GPU`,
 /// `Renderer`, `Network`), or `None` for the main process and anything that is not
@@ -75,9 +79,134 @@ fn service(sub_type: &str) -> &str {
     }
 }
 
+/// Which app a generic `electron.exe` is running, for a process of that name;
+/// `None` for any other name, or when nothing names the app.
+///
+/// In order of trust:
+/// - the folder holding the `node_modules` the executable runs from
+///   (`...\t3code\node_modules\electron\dist\electron.exe` is `t3code`). It is the
+///   same for the main process, every child, and the scripts the app runs with
+///   Electron as Node, so all of an app's processes agree. A global install
+///   (`npm\node_modules`) names no app and is passed over;
+/// - the last folder of `--user-data-dir=`, which Electron names after the app;
+/// - the last folder of `--app-path=` (a renderer's) that is not a build folder
+///   such as `dist` or `out`.
+#[must_use]
+pub fn electron_app<'a>(
+    name: &str,
+    image_path: Option<&'a str>,
+    command_line: Option<&'a str>,
+) -> Option<&'a str> {
+    if !(name.eq_ignore_ascii_case("electron.exe") || name.eq_ignore_ascii_case("electron")) {
+        return None;
+    }
+    let project = image_path.and_then(|path| {
+        let mut prev: Option<&str> = None;
+        for part in path.split(['\\', '/']) {
+            if part.eq_ignore_ascii_case("node_modules") {
+                return prev.filter(|&p| !global_folder(p));
+            }
+            prev = Some(part);
+        }
+        None
+    });
+    let cl = command_line.unwrap_or("");
+    project
+        .or_else(|| switch(cl, "--user-data-dir=").and_then(|p| folders(p).next()))
+        .or_else(|| switch(cl, "--app-path=").and_then(|p| folders(p).find(|f| !build_folder(f))))
+}
+
+/// A path's folder names, last first, without empty ones.
+fn folders(path: &str) -> impl Iterator<Item = &str> {
+    path.rsplit(['\\', '/']).filter(|f| !f.is_empty())
+}
+
+/// The value of `--name=` on a command line, quoted or not: `--name="C:\a b"`,
+/// `"--name=C:\a b"` or `--name=C:\a`.
+fn switch<'a>(command_line: &'a str, name: &str) -> Option<&'a str> {
+    let at = command_line.find(name)?;
+    let value = &command_line[at + name.len()..];
+    let quoted = command_line[..at].ends_with('"');
+    let (value, end) = match value.strip_prefix('"') {
+        Some(v) => (v, v.find('"')),
+        None if quoted => (value, value.find('"')),
+        None => (value, value.find(char::is_whitespace)),
+    };
+    let value = &value[..end.unwrap_or(value.len())];
+    (!value.is_empty()).then_some(value)
+}
+
+/// A folder `node_modules` sits in that is a package manager's, not an app's:
+/// `npm`, `pnpm\global\5`, `.bun\install\global`.
+fn global_folder(f: &str) -> bool {
+    f.is_empty()
+        || f.starts_with('.')
+        || f.bytes().all(|b| b.is_ascii_digit())
+        || ["npm", "pnpm", "yarn", "global", "install", "lib", "nodejs"]
+            .iter()
+            .any(|g| f.eq_ignore_ascii_case(g))
+}
+
+/// A folder a build writes into, which says nothing about the app.
+fn build_folder(f: &str) -> bool {
+    [
+        "dist",
+        "dist-electron",
+        "out",
+        "build",
+        "app",
+        "app.asar",
+        "resources",
+        "src",
+        "lib",
+        "main",
+        "electron",
+    ]
+    .iter()
+    .any(|b| f.eq_ignore_ascii_case(b))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::role;
+    use super::{electron_app, role};
+
+    #[test]
+    fn an_electron_app_is_named_by_the_project_it_runs_from() {
+        let exe = r"C:\Users\me\git\t3code\node_modules\.pnpm\electron@44.4.2\node_modules\electron\dist\electron.exe";
+        // Every process of it: the main one, a child, a script run as Node.
+        for cl in [
+            r"electron.exe --user-data-dir=C:\Users\me\AppData\Roaming\t3code dist-electron/main.cjs",
+            r#""electron.exe" --type=renderer --user-data-dir="C:\Users\me\AppData\Roaming\t3code-v2""#,
+            r"electron.exe C:\Users\me\git\t3code\apps\server\dist\bin.mjs",
+        ] {
+            assert_eq!(
+                electron_app("electron.exe", Some(exe), Some(cl)),
+                Some("t3code")
+            );
+        }
+        // Not the generic runtime: the name already says which app.
+        assert_eq!(electron_app("slack.exe", Some(exe), None), None);
+    }
+
+    #[test]
+    fn a_global_electron_falls_back_to_the_command_line() {
+        let exe = r"C:\Users\me\AppData\Roaming\npm\node_modules\electron\dist\electron.exe";
+        let udd = r#"electron.exe --type=gpu-process "--user-data-dir=C:\Users\Jo Smith\AppData\Roaming\My App""#;
+        assert_eq!(
+            electron_app("electron.exe", Some(exe), Some(udd)),
+            Some("My App")
+        );
+        let app = r#"electron.exe --type=renderer --app-path="C:\src\notes\dist-electron""#;
+        assert_eq!(
+            electron_app("Electron.exe", Some(exe), Some(app)),
+            Some("notes")
+        );
+        assert_eq!(
+            electron_app("electron.exe", Some(exe), Some("electron.exe .")),
+            None
+        );
+        assert_eq!(electron_app("electron.exe", None, None), None);
+    }
 
     const MOJO: &str = "--field-trial-handle=1916,i,1 --mojo-platform-channel-handle=2012";
 

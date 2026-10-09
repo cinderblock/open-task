@@ -264,6 +264,12 @@ anything built on Chromium, with nothing installed in the browser. Which site a
 renderer is serving is not visible from outside the browser, so the renderers are
 told apart only by PID.
 
+An Electron app run from source runs the generic `electron.exe`, so several apps in
+development would share one name. open-task adds the app's name, taken from the
+project folder whose `node_modules` the executable runs from (or, failing that,
+from `--user-data-dir` or `--app-path`): `electron.exe (t3code)` for the main
+process, `electron.exe (t3code · Renderer)` for a child.
+
 **Inside a process.** In tree mode every process can be opened one level further.
 Under it sit the **services** it hosts (from the service control manager, so a
 `svchost.exe` row reads `svchost.exe (DcomLaunch) · BrokerInfrastructure,

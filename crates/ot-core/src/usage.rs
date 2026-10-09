@@ -528,9 +528,11 @@ fn program_id(
 
 /// A process's label, borrowed when it is just the name, as most are.
 fn label(statics: &ProcessStatic) -> Cow<'_, str> {
-    match statics.role() {
-        None => Cow::Borrowed(&statics.name),
-        Some(_) => Cow::Owned(statics.label().to_string()),
+    let label = statics.label();
+    if label.is_name() {
+        Cow::Borrowed(&statics.name)
+    } else {
+        Cow::Owned(label.to_string())
     }
 }
 
@@ -860,6 +862,24 @@ mod tests {
         assert_eq!(of(renderers), Some(2.0 * G as f32));
         assert_eq!(of(u.program("chrome.exe (GPU)").unwrap()), Some(G as f32));
         assert_eq!(of(u.program("chrome.exe").unwrap()), Some(G as f32));
+    }
+
+    #[test]
+    fn electron_apps_run_from_source_are_charted_apart() {
+        let mut u = Usage::new(0.05);
+        let app = |pid: u32, project: &str, cycles: u64| {
+            let mut p = named(pid, "electron.exe", Some(0), cycles);
+            Arc::make_mut(&mut p.statics).image_path = Some(format!(
+                r"C:\src\{project}\node_modules\electron\dist\electron.exe"
+            ));
+            p
+        };
+        let procs = |c: u64| vec![app(1, "notes", c), app(2, "chat", c)];
+        u.observe(&snap(1000, procs(0)));
+        u.observe(&snap(1001, procs(G)));
+        assert_eq!(u.programs(), 2);
+        assert!(u.program("electron.exe (notes)").is_some());
+        assert!(u.program("electron.exe (chat)").is_some());
     }
 
     #[test]
