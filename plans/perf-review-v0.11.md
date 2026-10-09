@@ -75,7 +75,7 @@ Ranked by its estimated impact:
 5. ~~Report to the user.~~ Released v0.12.0 (2026-10-08).
 6. ~~The user's picks (2026-10-08): leave the bricks; make the CPU chart path
    faster; the bounds cache.~~ Bounds once a frame and the stats fix
-   (`e50c440`); CPU lines (`e875b24`). Not released yet (open question 1).
+   (`e50c440`); CPU lines (`e875b24`); SIMD bands (`12f3ee7`). Released in v0.12.1.
    The other two small items (chart runs straight into the canvas, per-sample
    work for hidden pages) were not asked for and are not done.
 
@@ -159,11 +159,13 @@ Ranked by its estimated impact:
 - [x] 2026-10-07: re-measured on driver 31.0.101.2145
 - [x] 2026-10-08: reported; released as v0.12.0 at the user's word (`b5d1e78`,
   tag pushed; Release and CI workflows passed; nine assets published)
-- [x] 2026-10-08: the user's picks done (`e50c440`, `e875b24`)
+- [x] 2026-10-08: the user's picks done (`e50c440`, `e875b24`, `12f3ee7`)
+- [x] 2026-10-08: released as v0.12.1 at the user's word (`0fbd521`, tag
+  pushed; Release and CI passed; nine assets published)
 
 ## Open questions for the user
 
-1. Release `e50c440`, `e875b24` and `12f3ee7` (SIMD bands) as v0.12.1? (On
-   `master`, not tagged.) Recommendation: yes, once CI on `master` passes.
+1. ~~Release `e50c440`, `e875b24` and `12f3ee7` as v0.12.1?~~ Released
+   2026-10-08 (`0fbd521`).
 2. ~~Earlier questions~~ answered 2026-10-08 (bricks: leave; CPU path: faster;
    bounds cache: do it; v0.12.0: released).

@@ -149,7 +149,7 @@ drawing off that path with two new renderers, compare them, and let the user pic
 - [x] 2026-10-08: reported; released in v0.12.0
 - [x] 2026-10-08: CPU path, round 3: lines vectorized (`e875b24`); dead ends
   recorded; stats draw time fixed (`e50c440`)
-- [x] 2026-10-08: SIMD bands (`12f3ee7`)
+- [x] 2026-10-08: SIMD bands (`12f3ee7`); released in v0.12.1
 
 ## Open questions for the user
 
