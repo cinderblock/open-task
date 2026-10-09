@@ -1,6 +1,6 @@
 # Chromium process roles: split `chrome.exe` by what each process does
 
-> **Status:** level 1 done; ETW spike and Electron app names in progress · **Started:** 2026-10-07 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done: roles, Electron app names; ETW per-site attribution ruled out · **Started:** 2026-10-07 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 
 ## Goal
 
@@ -77,8 +77,8 @@ Every child except crashpad carries `--mojo-platform-channel-handle=` and
   Chrome, Edge WebView2, Discord, Slack, Signal, Logic and `electron.exe` all
   labelled, no other process labelled.
 
-- [ ] 5. ETW spike: does Chrome publish renderer-to-site labels over ETW with no
-  flags or install? (research running in a subagent)
+- [x] 5. ETW spike (2026-10-09): **not feasible** on Chrome stable 154. See
+  "Findings: ETW" below.
 - [x] 6. Generic `electron.exe`: named by the project folder holding the
   `node_modules` it runs from, else `--user-data-dir`, else `--app-path`
   (`chromium::electron_app`, `ProcessStatic::app`). Checked live 2026-10-09: the
@@ -92,6 +92,43 @@ Every child except crashpad carries `--mojo-platform-channel-handle=` and
   app changes it at runtime). The image path is the same for all of them.
 - The app's script child (`electron.exe ...\apps\server\dist\bin.mjs`, run as
   Node) has no Chromium switches at all; only the image path names it.
+
+## Findings: ETW (per-site attribution without an extension)
+
+From Chromium source (main, 2026-10) and a 19.7-minute capture on this machine
+with the Chrome provider at all keywords (1.26M events, none lost):
+
+- Export is on by default, no flag: `kEnableEtwExports` is
+  `FEATURE_ENABLED_BY_DEFAULT` (`components/tracing/common/etw_export_win.cc`),
+  enabled in every process from `services/tracing/public/cpp/trace_startup.cc`.
+  The provider is TraceLogging `Google.Chrome`,
+  `{D2D578D9-2936-45B6-A09F-30E32715F42D}`, exporter
+  `base/trace_event/etw_interceptor_win.cc`. `logman query providers` does not
+  list it; `xperf -a dumper` decodes it. Electron and CEF apps emit under the same
+  GUID and name, so a consumer must classify by PID.
+- Only event names, a track id and debug-annotation arguments are exported. Typed
+  Perfetto arguments and track descriptors are dropped, so Chrome's
+  `process_labels` / site labels **never reach ETW**. Dynamic event names arrive
+  as `FILTERED`; URL arguments are not scrubbed.
+- No navigation or frame-to-site events: zero `NavigationRequest`,
+  `SiteInstance`, `RenderProcessHost`, `site_url`, `process_lock`; every
+  `render_frame_host` field was empty.
+- The one usable mapping: the network service's `CorsURLLoader::CorsURLLoader`
+  carries `url` and `process_id`, the renderer's child id (= its
+  `--renderer-client-id`). But it names subresource URLs (often third-party), only
+  while a page is loading, so idle open tabs are never seen.
+- **Chrome 154 itself went silent** about 6 s into the session (its browser
+  process emitted 5 events at 0.014 s, then nothing). Only Discord's older
+  Chromium kept emitting for the whole capture. Cause unproven: possibly the
+  per-process Perfetto startup session the exporter runs is never adopted.
+- Volume at all keywords: about 1,060 events/s, 266 MB in 20 minutes, nearly all
+  from one Electron renderer. A consumer would enable only `loading|netlog`
+  (`0x40080`).
+
+Verdict: no top-level site per renderer, and nothing for tabs that are idle;
+not worth building. An untried check: a 15 s capture at `0x40080` with a kernel
+process rundown would show whether Chrome's silence came from the volume of
+keywords enabled. Even if it did, the coverage limits above stand.
 
 ## Open questions for the user
 
