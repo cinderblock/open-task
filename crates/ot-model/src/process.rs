@@ -291,7 +291,9 @@ pub struct ProcessSample {
     /// measure of the same thing as `cpu_time`: that is charged a clock tick at a
     /// time, this is counted exactly, so a short burst shows in it.
     pub cycles: u64,
-    /// Private working set: physical memory this process alone is holding.
+    /// Working set: the physical memory this process is holding, pages it shares
+    /// with other processes (DLLs, mapped files) included, so the working sets of
+    /// several processes add up to more than they hold between them.
     pub working_set: Bytes,
     /// Private committed bytes, the closest thing to "how much will I get back".
     pub private_bytes: Bytes,
