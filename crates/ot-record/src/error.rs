@@ -1,6 +1,6 @@
 //! What can go wrong writing or reading a recording.
 
-use crate::format::FORMAT_VERSION;
+use crate::format::{FORMAT_VERSION, OLDEST_VERSION};
 
 /// Why a recording could not be written or read.
 #[derive(Debug, thiserror::Error)]
@@ -11,10 +11,10 @@ pub enum Error {
     /// The file does not start with the recording magic: it is something else.
     #[error("not an open-task recording")]
     NotARecording,
-    /// The file was written by a build with a different format version.
+    /// The file was written in a format version this build does not read.
     #[error(
-        "recording format version {0} is not supported (this build reads version \
-         {FORMAT_VERSION})"
+        "recording format version {0} is not supported (this build reads versions \
+         {OLDEST_VERSION} to {FORMAT_VERSION})"
     )]
     UnsupportedVersion(u16),
     /// The file's structure does not hold together: a record of an unexpected

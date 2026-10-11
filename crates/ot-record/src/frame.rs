@@ -3,6 +3,13 @@
 //!
 //! [`Body`] borrows the snapshot when writing (`Cow::Borrowed`) and owns its parts
 //! when read back, so one definition serves both directions and cannot drift.
+//!
+//! From format version 2 on, the body is followed by an [`Extra`]: what was added
+//! to the samples since version 1, kept apart so that a version 1 body still
+//! decodes as it is (postcard writes a struct as its fields one after another, so
+//! a version 2 payload is the body's bytes and then the extra's).
+
+use ot_model::Bytes;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -146,6 +153,14 @@ enum Row<'a> {
     },
 }
 
+/// What a frame holds beyond its [`Body`], from format version 2 on.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Extra {
+    /// Each process's private working set, in the body's order: for a delta row
+    /// its change from the frame before, for a full row the whole of it.
+    private_working_set: Vec<i64>,
+}
+
 /// A delta row's threads.
 #[derive(Debug, Serialize, Deserialize)]
 enum Threads<'a> {
@@ -175,8 +190,9 @@ pub(crate) fn encode<'a>(
     snap: &'a Snapshot,
     prev: Option<&'a Snapshot>,
     tables: &mut Tables,
-) -> Body<'a> {
+) -> (Body<'a>, Extra) {
     let prev_index = prev.map(by_key);
+    let mut extra = Extra::default();
     let processes = snap
         .processes
         .iter()
@@ -188,6 +204,12 @@ pub(crate) fn encode<'a>(
             let base = prev
                 .zip(prev_index.as_ref())
                 .and_then(|(prev, index)| index.get(&p.key()).map(|&i| (&prev.processes[i], prev)));
+            extra.private_working_set.push(match base {
+                Some((before, _)) => {
+                    delta::d_bytes(p.private_working_set, before.private_working_set)
+                }
+                None => delta::d_bytes(p.private_working_set, Bytes::ZERO),
+            });
             match base {
                 Some((before, prev)) => {
                     let prev_threads = thread_rows(prev, before);
@@ -220,7 +242,7 @@ pub(crate) fn encode<'a>(
             }
         })
         .collect();
-    Body {
+    let body = Body {
         tick: snap.tick,
         taken_at: snap.taken_at,
         interval: snap.interval,
@@ -247,13 +269,16 @@ pub(crate) fn encode<'a>(
         services: tables.services.id_or_empty(&snap.services),
         capabilities: snap.capabilities,
         processes,
-    }
+    };
+    (body, extra)
 }
 
-/// Rebuild a snapshot from `body`, with `prev` the frame before it (required for a
-/// delta frame) and the shared values looked up in `readers`.
+/// Rebuild a snapshot from `body` and, from format version 2 on, its `extra`, with
+/// `prev` the frame before it (required for a delta frame) and the shared values
+/// looked up in `readers`.
 pub(crate) fn decode(
     body: Body<'_>,
+    extra: Option<Extra>,
     prev: Option<&Snapshot>,
     readers: &Readers,
     hardware: &Arc<Hardware>,
@@ -261,8 +286,20 @@ pub(crate) fn decode(
     let base = prev.map(|prev| (prev, by_key(prev)));
     let mut processes = Vec::with_capacity(body.processes.len());
     let mut threads = Vec::new();
-    for row in body.processes {
-        let (mut sample, rows) = decode_row(row, base.as_ref(), readers)?;
+    let private = extra.map(|e| e.private_working_set);
+    if private
+        .as_ref()
+        .is_some_and(|p| p.len() != body.processes.len())
+    {
+        return Err(Error::corrupt(format!(
+            "{} processes with {} private working sets",
+            body.processes.len(),
+            private.as_ref().map_or(0, Vec::len)
+        )));
+    }
+    for (i, row) in body.processes.into_iter().enumerate() {
+        let private = private.as_ref().map(|p| p[i]);
+        let (mut sample, rows) = decode_row(row, private, base.as_ref(), readers)?;
         sample.thread_first = u32::try_from(threads.len())
             .map_err(|_| Error::corrupt("more than four billion thread rows"))?;
         sample.thread_rows = u32::try_from(rows.len())
@@ -318,9 +355,12 @@ pub(crate) fn decode(
 }
 
 /// One row back into a sample with its shared values attached, plus its thread
-/// rows. `base` is the previous frame and its processes by key, for a delta row.
+/// rows. `private` is its private working set from the frame's [`Extra`], none in a
+/// version 1 frame; `base` is the previous frame and its processes by key, for a
+/// delta row.
 fn decode_row(
     row: Row<'_>,
+    private: Option<i64>,
     base: Option<&(&Snapshot, HashMap<ProcessKey, usize>)>,
     readers: &Readers,
 ) -> Result<(ProcessSample, Vec<ThreadSample>), Error> {
@@ -331,13 +371,11 @@ fn decode_row(
             services,
             sample,
             threads,
-        } => (
-            statics,
-            window,
-            services,
-            sample.into_owned(),
-            threads.into_owned(),
-        ),
+        } => {
+            let mut sample = sample.into_owned();
+            sample.private_working_set = delta::a_bytes(Bytes::ZERO, private.unwrap_or(0));
+            (statics, window, services, sample, threads.into_owned())
+        }
         Row::Delta {
             statics,
             window,
@@ -373,13 +411,11 @@ fn decode_row(
                 }
                 Threads::Changed(list) => list.into_owned(),
             };
-            (
-                statics,
-                window,
-                services,
-                delta::apply_process(before, &delta),
-                rows,
-            )
+            let mut sample = delta::apply_process(before, &delta);
+            if let Some(d) = private {
+                sample.private_working_set = delta::a_bytes(before.private_working_set, d);
+            }
+            (statics, window, services, sample, rows)
         }
     };
     sample.statics = readers.statics.get(statics, "process statics")?;

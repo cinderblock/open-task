@@ -202,7 +202,7 @@ fn run_replay_info(path: &str) -> i32 {
     out!(
         "written by  open-task v{}, format {}, {}",
         h.app_version,
-        ot_record::FORMAT_VERSION,
+        rec.version(),
         if rec.had_index() {
             "complete"
         } else {

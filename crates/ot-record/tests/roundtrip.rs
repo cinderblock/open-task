@@ -177,6 +177,9 @@ impl World {
             cpu_time: Duration::from_millis(if busy { n * 100 + i as u64 } else { 7 }),
             cycles: if busy { n * 1_000_000 + i as u64 } else { 42 },
             working_set: Bytes(10_000_000 + i as u64 * 4096 + if busy { n * 4096 } else { 0 }),
+            private_working_set: Bytes(
+                6_000_000 + i as u64 * 4096 + if busy { n * 8192 } else { 0 },
+            ),
             private_bytes: Bytes(5_000_000 + i as u64 * 4096),
             threads: rows as u32,
             handles: 100 + i as u32,

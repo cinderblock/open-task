@@ -11,7 +11,9 @@
 //! enums, bools) are stored as they are.
 //!
 //! Every field of [`ProcessSample`] and [`ThreadSample`] is destructured by name
-//! here, so adding a field to either is a compile error until it is encoded.
+//! here, so adding a field to either is a compile error until it is encoded. The
+//! private working set, added in format version 2, travels in the frame's
+//! [`Extra`](crate::frame::Extra) instead, so that version 1 rows still read.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,11 +85,11 @@ fn a_u32(prev: u32, d: i32) -> u32 {
     prev.wrapping_add(d.cast_unsigned())
 }
 
-fn d_bytes(cur: Bytes, prev: Bytes) -> i64 {
+pub(crate) fn d_bytes(cur: Bytes, prev: Bytes) -> i64 {
     d_u64(cur.0, prev.0)
 }
 
-fn a_bytes(prev: Bytes, d: i64) -> Bytes {
+pub(crate) fn a_bytes(prev: Bytes, d: i64) -> Bytes {
     Bytes(a_u64(prev.0, d))
 }
 
@@ -124,6 +126,8 @@ pub(crate) fn process(cur: &ProcessSample, prev: &ProcessSample) -> ProcessDelta
         cpu_time,
         cycles,
         working_set,
+        // In the frame's `Extra`.
+        private_working_set: _,
         private_bytes,
         disk_read,
         disk_write,
@@ -183,7 +187,7 @@ pub(crate) fn process(cur: &ProcessSample, prev: &ProcessSample) -> ProcessDelta
 }
 
 /// Undo [`process`]. The shared fields and the thread range come back as their
-/// defaults; the caller fills them in.
+/// defaults, and the private working set as it was; the caller fills them in.
 pub(crate) fn apply_process(prev: &ProcessSample, d: &ProcessDelta) -> ProcessSample {
     let ProcessDelta {
         cpu,
@@ -222,6 +226,7 @@ pub(crate) fn apply_process(prev: &ProcessSample, d: &ProcessDelta) -> ProcessSa
         cpu_time: a_duration(prev.cpu_time, *cpu_time),
         cycles: a_u64(prev.cycles, *cycles),
         working_set: a_bytes(prev.working_set, *working_set),
+        private_working_set: prev.private_working_set,
         private_bytes: a_bytes(prev.private_bytes, *private_bytes),
         disk_read: a_bytes(prev.disk_read, *disk_read),
         disk_write: a_bytes(prev.disk_write, *disk_write),

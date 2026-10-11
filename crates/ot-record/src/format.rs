@@ -31,8 +31,15 @@ use crate::Error;
 
 /// The first five bytes of every recording.
 pub const MAGIC: &[u8; 5] = b"OTREC";
-/// The format this build writes and reads.
-pub const FORMAT_VERSION: u16 = 1;
+/// The format this build writes. It reads this one and every one back to
+/// [`OLDEST_VERSION`].
+///
+/// - 1: the first.
+/// - 2: each frame's body is followed by what the samples gained since: the
+///   processes' private working sets ([`crate::frame`]).
+pub const FORMAT_VERSION: u16 = 2;
+/// The oldest format this build reads.
+pub const OLDEST_VERSION: u16 = 1;
 /// The last five bytes of a finished recording.
 pub(crate) const INDEX_MAGIC: &[u8; 5] = b"OTIDX";
 

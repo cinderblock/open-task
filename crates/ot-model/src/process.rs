@@ -295,6 +295,12 @@ pub struct ProcessSample {
     /// with other processes (DLLs, mapped files) included, so the working sets of
     /// several processes add up to more than they hold between them.
     pub working_set: Bytes,
+    /// Private working set: the physical memory this process alone is holding.
+    /// Unlike `working_set` these add up: every process's together is part of the
+    /// memory in use. Not serialized with the rest: a recording carries it beside
+    /// the sample, and one made before it did reads zero.
+    #[serde(skip)]
+    pub private_working_set: Bytes,
     /// Private committed bytes, the closest thing to "how much will I get back".
     pub private_bytes: Bytes,
 

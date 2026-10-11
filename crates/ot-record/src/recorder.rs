@@ -68,6 +68,9 @@ pub struct Recorder {
     keyframe_every: u32,
     stats: RecorderStats,
     finished: bool,
+    /// The format written: [`FORMAT_VERSION`], or an older one in tests of
+    /// reading old files.
+    version: u16,
 }
 
 impl Recorder {
@@ -89,10 +92,21 @@ impl Recorder {
         header: &RecordHeader,
         keyframe_every: u32,
     ) -> Result<Self, Error> {
+        Self::create_as(path, header, keyframe_every, FORMAT_VERSION)
+    }
+
+    /// [`create_with_keyframes`](Recorder::create_with_keyframes), writing format
+    /// `version`: 1 writes frames without their [`frame::Extra`].
+    pub(crate) fn create_as(
+        path: impl AsRef<Path>,
+        header: &RecordHeader,
+        keyframe_every: u32,
+        version: u16,
+    ) -> Result<Self, Error> {
         let file = File::create(path)?;
         let mut out = BufWriter::with_capacity(256 << 10, file);
         out.write_all(MAGIC)?;
-        out.write_all(&FORMAT_VERSION.to_le_bytes())?;
+        out.write_all(&version.to_le_bytes())?;
         let mut pos = format::PREAMBLE_LEN;
         let header_bytes = postcard::to_allocvec(header)?;
         pos += format::write_record(&mut out, Kind::Header, &[&header_bytes])?;
@@ -109,6 +123,7 @@ impl Recorder {
                 ..RecorderStats::default()
             },
             finished: false,
+            version,
         })
     }
 
@@ -132,8 +147,12 @@ impl Recorder {
         let key = self.prev.is_none() || self.since_key >= self.keyframe_every;
         let raw = {
             let prev = if key { None } else { self.prev.as_deref() };
-            let body = frame::encode(snap, prev, &mut self.tables);
-            postcard::to_allocvec(&body)?
+            let (body, extra) = frame::encode(snap, prev, &mut self.tables);
+            if self.version >= 2 {
+                postcard::to_allocvec(&(body, extra))?
+            } else {
+                postcard::to_allocvec(&body)?
+            }
         };
         // Tables first: a frame's ids must already be defined when a reader
         // scanning the file reaches it.
@@ -253,5 +272,95 @@ impl Drop for Recorder {
         // A clean drop finishes the file; an error here has nowhere to go, and the
         // file is still readable by scanning.
         let _ = self.finish_inner();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Error, Recording};
+    use ot_model::hardware::Hardware;
+    use ot_model::process::{ProcessSample, ProcessStatic};
+    use ot_model::{Bytes, Capabilities, ProcessKey, Tick};
+    use std::time::{Duration, SystemTime};
+
+    /// Two frames of two processes whose private working sets are set, the second
+    /// a delta of the first.
+    fn frames() -> Vec<Snapshot> {
+        (0..2u64)
+            .map(|n| Snapshot {
+                tick: Tick(n + 1),
+                taken_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 + n)),
+                interval: Duration::from_secs(1),
+                processes: (1..=2u32)
+                    .map(|pid| ProcessSample {
+                        statics: Arc::new(ProcessStatic {
+                            key: ProcessKey::new(pid, 1),
+                            name: format!("p{pid}.exe"),
+                            ..ProcessStatic::default()
+                        }),
+                        working_set: Bytes(9 << 20),
+                        private_working_set: Bytes((u64::from(pid) + n) << 20),
+                        ..ProcessSample::default()
+                    })
+                    .collect(),
+                ..Snapshot::default()
+            })
+            .collect()
+    }
+
+    fn write(path: &Path, version: u16) {
+        let header = RecordHeader {
+            app_version: "test".to_owned(),
+            hardware: Hardware::default(),
+            capabilities: Capabilities::default(),
+            started: SystemTime::UNIX_EPOCH,
+            interval: Duration::from_secs(1),
+        };
+        let mut rec = Recorder::create_as(path, &header, 8, version).unwrap();
+        for snap in &frames() {
+            rec.write(snap).unwrap();
+        }
+        rec.finish().unwrap();
+    }
+
+    #[test]
+    fn the_private_working_set_is_kept_and_version_1_files_still_read() {
+        let dir = std::env::temp_dir().join("ot-record-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("versions-{}.otrec", std::process::id()));
+        let want = frames();
+
+        write(&path, FORMAT_VERSION);
+        let rec = Recording::open(&path).unwrap();
+        assert_eq!(rec.version(), FORMAT_VERSION);
+        for (i, want) in want.iter().enumerate() {
+            let got = rec.frame(i).unwrap();
+            let private = |s: &Snapshot| -> Vec<Bytes> {
+                s.processes.iter().map(|p| p.private_working_set).collect()
+            };
+            assert_eq!(private(&got), private(want), "frame {i}");
+        }
+
+        // A version 1 file has no private working sets, and everything else.
+        write(&path, 1);
+        let rec = Recording::open(&path).unwrap();
+        assert_eq!(rec.version(), 1);
+        for (i, want) in want.iter().enumerate() {
+            let got = rec.frame(i).unwrap();
+            assert_eq!(got.processes.len(), want.processes.len());
+            for (g, w) in got.processes.iter().zip(&want.processes) {
+                assert_eq!(g.private_working_set, Bytes::ZERO);
+                assert_eq!(g.working_set, w.working_set);
+                assert_eq!(g.statics.name, w.statics.name);
+            }
+        }
+
+        std::fs::write(&path, b"OTREC\x00\x00").unwrap();
+        assert!(matches!(
+            Recording::open(&path),
+            Err(Error::UnsupportedVersion(0))
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 }

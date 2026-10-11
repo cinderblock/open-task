@@ -614,6 +614,7 @@ impl WindowsProbe {
                 cpu_time: Duration::from_nanos(now.cpu_100ns.saturating_mul(100)),
                 cycles: p.CycleTime,
                 working_set: Bytes(p.WorkingSetSize as u64),
+                private_working_set: Bytes(p.WorkingSetPrivateSize.max(0).cast_unsigned()),
                 private_bytes: Bytes(p.PrivatePageCount as u64),
                 disk_read,
                 disk_write,

@@ -404,8 +404,10 @@ window open or with `--headless` (which records its `--passes` passes, then stop
 says what the file cost). `open-task --replay session.otrec --headless` prints the
 frames back the way the live headless mode prints passes, and
 `open-task --replay-info session.otrec` says what a file holds: the version that
-wrote it, the machine, when it started, how many frames over how long and what they
-take. `open-task --replay session.otrec` opens the window on the recording instead
+wrote it and its format, the machine, when it started, how many frames over how long
+and what they take. A file from an older build still opens; one made before the
+processes' private working set was recorded (format 1) shows none in the History's
+memory readings. `open-task --replay session.otrec` opens the window on the recording instead
 of the live machine: every page works as it does live, and a transport bar along
 the bottom has step back, play/pause (**Space**), step forward, a slider over the
 frames (drag to scrub, wheel to step), the time into the recording, and a speed

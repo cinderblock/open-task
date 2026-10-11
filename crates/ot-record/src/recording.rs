@@ -12,7 +12,7 @@ use ot_model::Tick;
 
 use crate::format::{
     self, FrameEntry, Index, Kind, RecordHeader, FORMAT_VERSION, FRAME_PREFIX_LEN, MAGIC,
-    MAX_PAYLOAD, PREAMBLE_LEN, RECORD_HEADER_LEN, TRAILER_LEN,
+    MAX_PAYLOAD, OLDEST_VERSION, PREAMBLE_LEN, RECORD_HEADER_LEN, TRAILER_LEN,
 };
 use crate::frame::{self, Readers};
 use crate::Error;
@@ -40,6 +40,8 @@ pub struct Recording {
     /// The last frame decoded, so sequential reads decode one frame each, and a
     /// delta frame right after it needs no keyframe.
     cache: Mutex<Option<(usize, Arc<Snapshot>)>>,
+    /// The format the file was written in, which says how its frames end.
+    version: u16,
 }
 
 impl Recording {
@@ -62,7 +64,7 @@ impl Recording {
             return Err(Error::NotARecording);
         }
         let version = u16::from_le_bytes([preamble[5], preamble[6]]);
-        if version != FORMAT_VERSION {
+        if !(OLDEST_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(Error::UnsupportedVersion(version));
         }
 
@@ -95,6 +97,7 @@ impl Recording {
             readers,
             had_index,
             cache: Mutex::new(None),
+            version,
         })
     }
 
@@ -108,6 +111,12 @@ impl Recording {
     #[must_use]
     pub fn file_len(&self) -> u64 {
         self.file_len
+    }
+
+    /// The format version the file was written in.
+    #[must_use]
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     #[must_use]
@@ -258,8 +267,13 @@ impl Recording {
             return Err(Error::corrupt(format!("frame {k} is a delta with no base")));
         }
         let raw = format::decompress(body)?;
-        let body: frame::Body<'_> = postcard::from_bytes(&raw)?;
-        frame::decode(body, prev, &self.readers, &self.hardware)
+        let (body, extra) = if self.version >= 2 {
+            let (body, extra) = postcard::from_bytes::<(frame::Body<'_>, frame::Extra)>(&raw)?;
+            (body, Some(extra))
+        } else {
+            (postcard::from_bytes::<frame::Body<'_>>(&raw)?, None)
+        };
+        frame::decode(body, extra, prev, &self.readers, &self.hardware)
     }
 }
 
