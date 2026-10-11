@@ -33,11 +33,20 @@
 //! steps of ten seconds, or wider when the reach is long, so a day is at most 720
 //! steps. Each step lists only the programs that ran in it, so the cost is set by how
 //! many programs are busy, not by how many processes exist.
+//!
+//! Beside the cycles, each step keeps what the chart's other readings need: the CPU
+//! time each program used, the private working set each held, and the machine's
+//! side (its CPU capacity and how much of it was busy, its RAM and how much of it
+//! was in use), so a program's share of the CPU or of memory can be set against the
+//! summary charts. Every quantity is kept as an integral over the step (CPU
+//! milliseconds, byte-milliseconds), so folding steps together is a sum and the
+//! averages come out exact. Memory is listed for every program holding any, which
+//! makes it the larger part of a step.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ot_model::process::ProcessStatic;
 use ot_model::{ProcessKey, Tick};
@@ -100,23 +109,67 @@ pub struct Frame<'a> {
     pub span_ms: i64,
     /// Cycles each program used in it. Programs that used none are not listed.
     pub cycles: &'a [(ProgramId, f32)],
+    /// CPU time each program used in it, in milliseconds. Programs that used none
+    /// are not listed.
+    pub cpu_ms: &'a [(ProgramId, f32)],
+    /// The private working set each program held over it, in byte-milliseconds:
+    /// divided by `span_ms`, its average size. Programs that held none are not
+    /// listed.
+    pub memory: &'a [(ProgramId, f32)],
+    pub machine: Machine,
+}
+
+/// The machine's side of a stretch of the history, each an integral over it like
+/// the programs' numbers: divided by the stretch's length, the average.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Machine {
+    /// CPU time there was to use: the stretch's length times the logical
+    /// processors, in milliseconds. What [`Frame::cpu_ms`] is a share of.
+    pub cpu_capacity_ms: f64,
+    /// Of that, how much the summary CPU chart counts as busy.
+    pub cpu_busy_ms: f64,
+    /// Physical memory installed, and the part the summary memory chart counts as
+    /// in use, in byte-milliseconds.
+    pub ram: f64,
+    pub ram_in_use: f64,
+}
+
+impl Machine {
+    fn add(&mut self, other: Self) {
+        self.cpu_capacity_ms += other.cpu_capacity_ms;
+        self.cpu_busy_ms += other.cpu_busy_ms;
+        self.ram += other.ram;
+        self.ram_in_use += other.ram_in_use;
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Entry {
     statics: Arc<ProcessStatic>,
-    /// Cumulative cycles at the last sample.
+    /// Cumulative cycles and CPU time at the last sample.
     last: u64,
+    last_cpu: Duration,
     total: f64,
     alive: bool,
     program: ProgramId,
 }
 
+/// Each program's numbers for one stretch, sorted by program, without the zeros.
+#[derive(Debug, Clone, Default)]
+struct Lists<L> {
+    cycles: L,
+    cpu_ms: L,
+    memory: L,
+}
+
+type List = Box<[(ProgramId, f32)]>;
+
 #[derive(Debug, Clone)]
 struct Stored {
     end_ms: i64,
     span_ms: i64,
-    cycles: Box<[(ProgramId, f32)]>,
+    lists: Lists<List>,
+    machine: Machine,
 }
 
 impl Stored {
@@ -124,8 +177,15 @@ impl Stored {
         Frame {
             end_ms: self.end_ms,
             span_ms: self.span_ms,
-            cycles: &self.cycles,
+            cycles: &self.lists.cycles,
+            cpu_ms: &self.lists.cpu_ms,
+            memory: &self.lists.memory,
+            machine: self.machine,
         }
+    }
+
+    fn entries(&self) -> usize {
+        self.lists.cycles.len() + self.lists.cpu_ms.len() + self.lists.memory.len()
     }
 }
 
@@ -136,7 +196,44 @@ struct Open {
     index: i64,
     end_ms: i64,
     span_ms: i64,
-    cycles: Vec<(ProgramId, f32)>,
+    lists: Lists<Vec<(ProgramId, f32)>>,
+    machine: Machine,
+}
+
+/// Add `from` into `into`, both sorted by program, keeping it sorted; `scratch` is
+/// spare room for the result.
+fn merge(
+    into: &mut Vec<(ProgramId, f32)>,
+    from: &[(ProgramId, f32)],
+    scratch: &mut Vec<(ProgramId, f32)>,
+) {
+    scratch.clear();
+    scratch.reserve(into.len() + from.len());
+    let (mut a, mut b) = (into.iter().peekable(), from.iter().peekable());
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(&&x), Some(&&y)) if x.0 == y.0 => {
+                a.next();
+                b.next();
+                (x.0, x.1 + y.1)
+            }
+            (Some(&&x), Some(&&y)) if x.0 < y.0 => {
+                a.next();
+                x
+            }
+            (_, Some(&&y)) => {
+                b.next();
+                y
+            }
+            (Some(&&x), None) => {
+                a.next();
+                x
+            }
+            (None, None) => break,
+        };
+        scratch.push(next);
+    }
+    std::mem::swap(into, scratch);
 }
 
 /// Fading per-process cycle totals and the per-program history, fed by snapshots.
@@ -158,8 +255,11 @@ pub struct Usage {
     raw: VecDeque<Stored>,
     coarse: VecDeque<Stored>,
     open: Option<Open>,
-    /// Scratch: this interval's cycles per program.
-    interval: Vec<(ProgramId, f32)>,
+    /// Scratch: this interval's cycles, CPU milliseconds and byte-milliseconds by
+    /// program, then the same as lists; and room for merging lists.
+    by_program: Vec<[f64; 3]>,
+    interval: Lists<Vec<(ProgramId, f32)>>,
+    merged: Vec<(ProgramId, f32)>,
     /// How far back the history reaches, in milliseconds.
     history_ms: i64,
     /// Changes whenever anything here does, and no two `Usage`s share one
@@ -205,7 +305,9 @@ impl Usage {
             raw: VecDeque::new(),
             coarse: VecDeque::new(),
             open: None,
-            interval: Vec::new(),
+            by_program: Vec::new(),
+            interval: Lists::default(),
+            merged: Vec::new(),
             history_ms: DEFAULT_HISTORY_MS,
             revision: next_revision(),
         }
@@ -243,11 +345,12 @@ impl Usage {
     #[must_use]
     pub fn history_bytes(&self) -> usize {
         let entry = size_of::<(ProgramId, f32)>();
-        let stored = |s: &Stored| size_of::<Stored>() + s.cycles.len() * entry;
-        let open = self
-            .open
-            .as_ref()
-            .map_or(0, |o| size_of::<Open>() + o.cycles.capacity() * entry);
+        let stored = |s: &Stored| size_of::<Stored>() + s.entries() * entry;
+        let open = self.open.as_ref().map_or(0, |o| {
+            let l = &o.lists;
+            size_of::<Open>()
+                + (l.cycles.capacity() + l.cpu_ms.capacity() + l.memory.capacity()) * entry
+        });
         self.raw
             .iter()
             .chain(&self.coarse)
@@ -257,14 +360,14 @@ impl Usage {
     }
 
     /// Bytes a frame of this history takes on average, for projecting the cost of
-    /// another reach with [`history_bytes`]. A guess of sixteen programs a frame
-    /// until there are frames to go by.
+    /// another reach with [`history_bytes`]. A guess, until there are frames to go
+    /// by, of sixteen busy programs and a hundred and fifty holding memory.
     #[must_use]
     pub fn frame_bytes(&self) -> usize {
         let frames = self.raw.len() + self.coarse.len();
         self.history_bytes()
             .checked_div(frames)
-            .unwrap_or(size_of::<Stored>() + 16 * size_of::<(ProgramId, f32)>())
+            .unwrap_or(size_of::<Stored>() + (2 * 16 + 150) * size_of::<(ProgramId, f32)>())
     }
 
     /// Share of every total lost each second.
@@ -303,7 +406,8 @@ impl Usage {
             e.alive = false;
             e.total *= keep;
         }
-        self.interval.clear();
+        self.by_program.clear();
+        self.by_program.resize(self.programs.len(), [0.0; 3]);
         for p in &snap.processes {
             // PID 0 is the kernel's idle accounting, not a process.
             if p.key().pid == 0 {
@@ -316,6 +420,7 @@ impl Usage {
                 Entry {
                     statics: Arc::clone(&p.statics),
                     last: p.cycles,
+                    last_cpu: p.cpu_time,
                     total: 0.0,
                     alive: true,
                     program: program_id(programs, ids, &p.statics),
@@ -325,42 +430,84 @@ impl Usage {
             if !Arc::ptr_eq(&e.statics, &p.statics) {
                 e.statics = Arc::clone(&p.statics);
             }
-            let used = if seen_before {
-                p.cycles.saturating_sub(e.last)
-            } else if !first
+            let started_since = !first
                 && p.statics
                     .started_unix_ms
-                    .is_some_and(|s| s >= session_start)
-            {
+                    .is_some_and(|s| s >= session_start);
+            let (used, cpu) = if seen_before {
+                (
+                    p.cycles.saturating_sub(e.last),
+                    p.cpu_time.saturating_sub(e.last_cpu),
+                )
+            } else if started_since {
                 // Started since the last snapshot: everything it has used is new.
-                p.cycles
+                (p.cycles, p.cpu_time)
             } else {
                 // Already running when first seen: what it used before then was
                 // used before anyone was watching.
-                0
+                (0, Duration::ZERO)
             };
             e.last = p.cycles;
+            e.last_cpu = p.cpu_time;
             if used > 0 {
                 e.total += used as f64 * arrived;
-                let program = e.program;
-                match self.interval.iter_mut().find(|(g, _)| *g == program) {
-                    Some((_, c)) => *c += used as f32,
-                    None => self.interval.push((program, used as f32)),
-                }
             }
+            let program = e.program as usize;
+            if program >= self.by_program.len() {
+                self.by_program.resize(program + 1, [0.0; 3]);
+            }
+            let sums = &mut self.by_program[program];
+            sums[0] += used as f64;
+            sums[1] += cpu.as_secs_f64() * 1000.0;
+            sums[2] += p.private_working_set.get() as f64 * span_ms as f64;
         }
-
         self.sum = self.procs.values().map(|e| e.total).sum();
         let floor = GHOST_FLOOR.max(self.sum * GHOST_SHARE);
         self.procs.retain(|_, e| e.alive || e.total >= floor);
 
         if span_ms > 0 {
-            self.push_frame(Stored {
-                end_ms: now,
-                span_ms,
-                cycles: self.interval.as_slice().into(),
-            });
+            self.record(snap, now, span_ms);
         }
+    }
+
+    /// Add the interval that ended at `now`, `span_ms` long, to the history: what
+    /// each program used and held, from the sums [`Self::observe`] made, and the
+    /// machine's side from `snap`.
+    fn record(&mut self, snap: &Snapshot, now: i64, span_ms: i64) {
+        let lists = &mut self.interval;
+        lists.cycles.clear();
+        lists.cpu_ms.clear();
+        lists.memory.clear();
+        for (program, sums) in self.by_program.iter().enumerate() {
+            let program = program as ProgramId;
+            for (list, &v) in [&mut lists.cycles, &mut lists.cpu_ms, &mut lists.memory]
+                .into_iter()
+                .zip(sums)
+            {
+                if v > 0.0 {
+                    list.push((program, v as f32));
+                }
+            }
+        }
+        let span = span_ms as f64;
+        let capacity = span * snap.cpu.cores.len() as f64;
+        let machine = Machine {
+            cpu_capacity_ms: capacity,
+            cpu_busy_ms: capacity * f64::from(snap.cpu.total.get()).clamp(0.0, 100.0) / 100.0,
+            ram: snap.memory.total.get() as f64 * span,
+            ram_in_use: snap.memory.in_use().get() as f64 * span,
+        };
+        let lists = &self.interval;
+        self.push_frame(Stored {
+            end_ms: now,
+            span_ms,
+            lists: Lists {
+                cycles: lists.cycles.as_slice().into(),
+                cpu_ms: lists.cpu_ms.as_slice().into(),
+                memory: lists.memory.as_slice().into(),
+            },
+            machine,
+        });
     }
 
     /// Append a frame to the history, moving what leaves the raw part into the
@@ -386,12 +533,11 @@ impl Usage {
             });
             open.end_ms = old.end_ms;
             open.span_ms += old.span_ms;
-            for &(program, cycles) in &*old.cycles {
-                match open.cycles.iter_mut().find(|(g, _)| *g == program) {
-                    Some((_, c)) => *c += cycles,
-                    None => open.cycles.push((program, cycles)),
-                }
-            }
+            open.machine.add(old.machine);
+            let (into, from) = (&mut open.lists, &old.lists);
+            merge(&mut into.cycles, &from.cycles, &mut self.merged);
+            merge(&mut into.cpu_ms, &from.cpu_ms, &mut self.merged);
+            merge(&mut into.memory, &from.memory, &mut self.merged);
         }
         // Steps that have passed the reach go, the one being filled included.
         if self.open.as_ref().is_some_and(|o| now - o.end_ms > reach) {
@@ -407,7 +553,12 @@ impl Usage {
             self.coarse.push_back(Stored {
                 end_ms: o.end_ms,
                 span_ms: o.span_ms,
-                cycles: o.cycles.into(),
+                lists: Lists {
+                    cycles: o.lists.cycles.into(),
+                    cpu_ms: o.lists.cpu_ms.into(),
+                    memory: o.lists.memory.into(),
+                },
+                machine: o.machine,
             });
         }
     }
@@ -480,7 +631,10 @@ impl Usage {
         let open = self.open.as_ref().map(|o| Frame {
             end_ms: o.end_ms,
             span_ms: o.span_ms,
-            cycles: &o.cycles,
+            cycles: &o.lists.cycles,
+            cpu_ms: &o.lists.cpu_ms,
+            memory: &o.lists.memory,
+            machine: o.machine,
         });
         self.raw
             .iter()
@@ -945,5 +1099,111 @@ mod tests {
         assert!(frames
             .windows(2)
             .all(|w| w[0].end_ms - w[0].span_ms == w[1].end_ms));
+    }
+
+    #[test]
+    fn each_frame_keeps_cpu_time_memory_and_the_machine() {
+        use ot_model::cpu::{CoreKind, LogicalCore};
+        // Two processes of one program and one of another, on four logical
+        // processors with 16 GB, a quarter of it in use.
+        let cores: Vec<LogicalCore> = (0..4)
+            .map(|index| LogicalCore {
+                index,
+                physical: index / 2,
+                kind: CoreKind::default(),
+                usage: Percent(40.0),
+                frequency: None,
+            })
+            .collect();
+        let at = |s: u64, cpu_ms: [u64; 3]| {
+            let mut procs = Vec::new();
+            for (i, (name, ms)) in ["a.exe", "a.exe", "b.exe"]
+                .into_iter()
+                .zip(cpu_ms)
+                .enumerate()
+            {
+                let mut p = named(i as u32 + 1, name, Some(0), 0);
+                p.cpu_time = Duration::from_millis(ms);
+                p.private_working_set = Bytes(100 << 20);
+                procs.push(p);
+            }
+            let mut snap = snap(s, procs);
+            snap.cpu.cores.clone_from(&cores);
+            snap.cpu.total = Percent(40.0);
+            snap.memory.total = Bytes(16 << 30);
+            snap.memory.available = Bytes(12 << 30);
+            snap
+        };
+        let mut u = Usage::new(0.05);
+        u.observe(&at(10, [1000, 2000, 3000]));
+        u.observe(&at(12, [1500, 2500, 3100]));
+        let (a, b) = (u.program("a.exe").unwrap(), u.program("b.exe").unwrap());
+        let frame = u.frames().next().unwrap();
+        assert_eq!(frame.span_ms, 2000);
+        // CPU time used in the interval, not since the processes started.
+        assert_eq!(frame.cpu_ms, [(a, 1000.0), (b, 100.0)]);
+        // The private working sets held, times the interval.
+        assert_eq!(
+            frame.memory,
+            [
+                (a, 2.0 * 100.0 * 1_048_576.0 * 2000.0),
+                (b, 100.0 * 1_048_576.0 * 2000.0)
+            ]
+        );
+        let machine = frame.machine;
+        assert!(close(machine.cpu_capacity_ms, 8000.0));
+        assert!(close(machine.cpu_busy_ms, 3200.0));
+        assert!(close(machine.ram / 2000.0, (16u64 << 30) as f64));
+        assert!(close(machine.ram_in_use / 2000.0, (4u64 << 30) as f64));
+    }
+
+    #[test]
+    fn a_step_sums_its_frames_so_its_averages_are_exact() {
+        // One program whose working set grows by a megabyte a second while it uses
+        // a tenth of a second of CPU a second, for twenty minutes.
+        let mut u = Usage::new(0.05);
+        for s in 0..=1200u64 {
+            let mut p = proc(1, Some(0), s * G);
+            p.cpu_time = Duration::from_millis(100 * s);
+            p.private_working_set = Bytes(s << 20);
+            let mut snap = snap(100_000 + s, vec![p]);
+            snap.memory.total = Bytes(8 << 30);
+            u.observe(&snap);
+        }
+        let step = u
+            .frames()
+            .filter(|f| f.span_ms == STEP_MIN_MS)
+            .last()
+            .unwrap();
+        let secs = step.span_ms as f64 / 1000.0;
+        assert!(close(f64::from(step.cpu_ms[0].1), 100.0 * secs));
+        // The average of ten samples a megabyte apart: the middle of the step.
+        let end_s = (step.end_ms / 1000 - 100_000) as f64;
+        let mean = f64::from(step.memory[0].1) / step.span_ms as f64;
+        assert!(
+            ((mean / 1_048_576.0) - (end_s - 4.5)).abs() < 1e-3,
+            "{mean}"
+        );
+        assert!(close(
+            step.machine.ram / step.span_ms as f64,
+            (8u64 << 30) as f64
+        ));
+    }
+
+    #[test]
+    fn merging_keeps_lists_sorted_and_adds_what_they_share() {
+        let mut into = vec![(1, 1.0), (4, 4.0), (9, 9.0)];
+        let mut scratch = Vec::new();
+        merge(
+            &mut into,
+            &[(0, 0.5), (4, 1.0), (7, 7.0), (10, 1.0)],
+            &mut scratch,
+        );
+        assert_eq!(
+            into,
+            [(0, 0.5), (1, 1.0), (4, 5.0), (7, 7.0), (9, 9.0), (10, 1.0)]
+        );
+        merge(&mut into, &[], &mut scratch);
+        assert_eq!(into.len(), 6);
     }
 }

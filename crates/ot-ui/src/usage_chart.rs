@@ -1,15 +1,26 @@
 //! History: the process table's area drawn as a chart of who has been using the
-//! CPU over the charts' reach, the fourth arrangement beside List, Tree and Map.
+//! CPU, or holding memory, over the charts' reach, the fourth arrangement beside
+//! List, Tree and Map.
 //!
 //! The chart is a stack of bands, one per program (every process of one name
-//! together, see [`ot_core::Usage`]), on the time axis every other chart uses. It
-//! has two readings, switched above it:
+//! together, see [`ot_core::Usage`]), on the time axis every other chart uses. A
+//! switch above it picks CPU or memory, and another the reading:
 //!
-//! - **Fading total**: each band is as thick as the program's cycles used, the
+//! - CPU, **Fading total**: each band is as thick as the program's cycles used, the
 //!   total that fades. This is the number the Cycles column and the Map show, over
 //!   time: a band swells while its program works and sags once it stops.
-//! - **Rate**: each band is as thick as the cycles the program was using a second.
-//!   This is the CPU graph cut up by program; the fading total is this, smoothed.
+//! - CPU, **Rate**: each band is as thick as the cycles the program was using a
+//!   second. The fading total is this, smoothed.
+//! - CPU, **Percent**: each band is the program's share of all the CPU time there
+//!   was, on the summary CPU chart's 0-100 % scale: that chart, cut up by program.
+//! - Memory, **Percent** and **Bytes**: each band is the program's private working
+//!   set, the physical memory its processes alone hold, as a share of the RAM
+//!   installed (on the summary memory chart's scale) or in bytes.
+//!
+//! In the readings that are shares of the machine, and in bytes, a last band, "Not
+//! in a process", tops the stack up to what the summary chart shows: CPU time no
+//! process is charged for, or memory in use that no process holds alone (the
+//! kernel, drivers, pages shared between processes).
 //!
 //! Only so many colors can be told apart, so the programs that take the most of the
 //! chart get a band and a color each, and the rest are one grey band. A program
@@ -31,8 +42,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use ot_core::usage::fade;
+use ot_core::usage::{fade, Frame};
 use ot_core::{ProgramId, Usage};
+use ot_model::Bytes;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
 use crate::charts::{self, Crosshair, AXIS_BAND_H};
@@ -42,15 +54,18 @@ use crate::settings::ChartLegend;
 use crate::sparkline::{self, TimeAxis, COLUMN_W};
 use crate::theme::Theme;
 
-/// Programs with a band of their own, and the bands in all: those and "everything
-/// else", which is the last.
+/// Programs with a band of their own, and the bands in all: those, "everything
+/// else", and on top what the machine's whole is short of their sum.
 const SERIES: usize = 8;
-const BANDS: usize = SERIES + 1;
+const BANDS: usize = SERIES + 2;
 const OTHER: usize = SERIES;
+const REST: usize = SERIES + 1;
 
-/// The row above the chart: the switch and what the chart shows.
+/// The row above the chart: the switches and what the chart shows.
 const HEAD_H: f32 = 26.0;
 const SWITCH_W: f32 = 104.0;
+const RESOURCE_W: f32 = 80.0;
+const SWITCH_GAP: f32 = 8.0;
 /// Room left of the plot for the value scale.
 const GUTTER_W: f32 = 46.0;
 const LEGEND_ROW_H: f32 = 22.0;
@@ -109,8 +124,15 @@ const KEEP: f32 = 0.8;
 /// does not match, or any other than the one pointed at.
 const DIM_ALPHA: f32 = 0.28;
 
+/// In the CPU percent reading, a stretch shorter than this, in seconds, is too few
+/// clock ticks to read a share from and joins the stretch after it.
+const SHORT_S: f32 = 0.25;
+
 /// The color of band `b`.
 fn band_color(theme: &Theme, b: usize) -> Color {
+    if b == REST {
+        return theme.series_rest;
+    }
     theme.series.get(b).copied().unwrap_or(theme.series_other)
 }
 
@@ -122,17 +144,69 @@ pub(crate) enum ChartMode {
     Total,
     /// Cycles used a second.
     Rate,
+    /// CPU time used, as a share of all there was.
+    CpuShare,
+    /// Private working set, as a share of the RAM installed.
+    MemoryShare,
+    /// Private working set, in bytes.
+    MemoryBytes,
 }
 
-const MODES: [(ChartMode, &str); 2] = [
-    (ChartMode::Total, "Fading total"),
-    (ChartMode::Rate, "Rate"),
-];
+/// What the chart is of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resource {
+    Cpu,
+    Memory,
+}
+
+impl ChartMode {
+    fn resource(self) -> Resource {
+        match self {
+            Self::Total | Self::Rate | Self::CpuShare => Resource::Cpu,
+            Self::MemoryShare | Self::MemoryBytes => Resource::Memory,
+        }
+    }
+
+    /// Whether it is a share of the machine, on the summary charts' fixed 0-100 %
+    /// scale.
+    fn share(self) -> bool {
+        matches!(self, Self::CpuShare | Self::MemoryShare)
+    }
+
+    /// Each program's numbers in a frame that this reading is made of.
+    fn of<'f>(self, f: &Frame<'f>) -> &'f [(ProgramId, f32)] {
+        match self {
+            Self::Total | Self::Rate => f.cycles,
+            Self::CpuShare => f.cpu_ms,
+            Self::MemoryShare | Self::MemoryBytes => f.memory,
+        }
+    }
+}
+
+const RESOURCES: [(Resource, &str); 2] = [(Resource::Cpu, "CPU"), (Resource::Memory, "Memory")];
+
+/// The readings of a resource, the first the one it opens on.
+fn modes(resource: Resource) -> &'static [(ChartMode, &'static str)] {
+    match resource {
+        Resource::Cpu => &[
+            (ChartMode::Total, "Fading total"),
+            (ChartMode::Rate, "Rate"),
+            (ChartMode::CpuShare, "Percent"),
+        ],
+        Resource::Memory => &[
+            (ChartMode::MemoryShare, "Percent"),
+            (ChartMode::MemoryBytes, "Bytes"),
+        ],
+    }
+}
+
+/// The most buttons the head row has: the resources and the most readings one has.
+const BUTTONS: usize = RESOURCES.len() + 3;
 
 /// What a click on the chart asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChartHit {
-    /// The switch was pressed; the chart has changed its reading.
+    /// A switch was pressed; the chart has changed its reading.
     Mode,
     /// A band, or its legend row: select this program.
     Program(ProgramId),
@@ -270,8 +344,12 @@ impl Pt {
 #[derive(Debug, Default)]
 pub(crate) struct UsageChart {
     mode: ChartMode,
-    /// The program each colored band belongs to.
+    /// The reading the other resource was left on, to go back to.
+    other_mode: Option<ChartMode>,
+    /// The program each colored band belongs to, and the other resource's, kept so
+    /// that switching back does not recolor the chart.
     slots: [Option<ProgramId>; SERIES],
+    parked: [Option<ProgramId>; SERIES],
     /// Top of the value scale, kept between frames so it does not breathe.
     scale: f32,
     /// Newest first.
@@ -300,7 +378,9 @@ pub(crate) struct UsageChart {
     /// one the names were placed in: the names move and fade by the time between.
     frame_at: Option<Instant>,
     placed_at: Option<Instant>,
-    switch: [Rect; 2],
+    /// The head row's buttons: the resources, then the shown resource's readings;
+    /// the rest empty.
+    switch: [Rect; BUTTONS],
     /// Each band's legend row; empty for a band that has none.
     rows: [Rect; BANDS],
     decay: f64,
@@ -334,6 +414,16 @@ fn nice(v: f32) -> f32 {
         .map(|m| m * p)
         .find(|&s| s >= v)
         .unwrap_or(10.0 * p)
+}
+
+/// [`nice`] for bytes, in the binary unit they are shown in, so the scale reads
+/// 50 GB rather than the 46.6 GB a decimal 50 G would be.
+fn nice_bytes(v: f32) -> f32 {
+    let mut unit = 1.0f32;
+    while v / unit >= 1000.0 && unit < 1024f32.powi(5) {
+        unit *= 1024.0;
+    }
+    nice(v / unit) * unit
 }
 
 impl UsageChart {
@@ -387,13 +477,14 @@ impl UsageChart {
         self.decay = usage.decay();
         let (head, body) = rect.split_top(HEAD_H);
         let (_, body) = body.split_top(4.0);
-        for (i, r) in self.switch.iter_mut().enumerate() {
-            *r = Rect::new(
-                head.x + SWITCH_W * i as f32,
-                head.y + 2.0,
-                SWITCH_W,
-                head.h - 4.0,
-            );
+        self.switch = [Rect::ZERO; BUTTONS];
+        let button = |x: f32, w: f32| Rect::new(x, head.y + 2.0, w, head.h - 4.0);
+        for i in 0..RESOURCES.len() {
+            self.switch[i] = button(head.x + RESOURCE_W * i as f32, RESOURCE_W);
+        }
+        let first = head.x + RESOURCE_W * RESOURCES.len() as f32 + SWITCH_GAP;
+        for i in 0..modes(self.mode.resource()).len() {
+            self.switch[RESOURCES.len() + i] = button(first + SWITCH_W * i as f32, SWITCH_W);
         }
         // Only a legend beside the plot takes width from it.
         let main = if self.style == ChartLegend::Beside {
@@ -424,9 +515,7 @@ impl UsageChart {
         self.crosshair = own
             .or(outside)
             .map(|age| Crosshair::follow(prev, age, time));
-        self.hover_mode = self
-            .pointer
-            .and_then(|p| self.switch.iter().position(|r| r.contains(p)));
+        self.hover_mode = self.pointer.and_then(|p| self.button_at(p));
         // The names inside the bands are placed when painted, in the theme's font.
         match self.style {
             ChartLegend::Inline => self.legend = Rect::ZERO,
@@ -440,8 +529,8 @@ impl UsageChart {
     /// Whether the bands are drawn, with what to name: shown when it has a band of
     /// its own, or for everything else, when anything is in it.
     fn shown(&self, b: usize) -> bool {
-        if b == OTHER {
-            self.points.iter().any(|p| p.v[OTHER] > 0.0)
+        if b >= SERIES {
+            self.points.iter().any(|p| p.v[b] > 0.0)
         } else {
             self.slots[b].is_some()
         }
@@ -449,11 +538,36 @@ impl UsageChart {
 
     /// The name band `b` is labeled with.
     fn band_name<'u>(&self, usage: &'u Usage, b: usize) -> &'u str {
+        if b == REST {
+            return "Not in a process";
+        }
         self.slots
             .get(b)
             .copied()
             .flatten()
             .map_or("Everything else", |g| usage.program_name(g))
+    }
+
+    /// The head row's button under `p`, if any.
+    fn button_at(&self, p: Point) -> Option<usize> {
+        let n = RESOURCES.len() + modes(self.mode.resource()).len();
+        self.switch[..n].iter().position(|r| r.contains(p))
+    }
+
+    /// Change to reading `mode`. Another resource brings back its own bands, and
+    /// the reading this one was left on is remembered for coming back.
+    fn set_mode(&mut self, mode: ChartMode) {
+        if mode == self.mode {
+            return;
+        }
+        if mode.resource() != self.mode.resource() {
+            self.other_mode = Some(self.mode);
+            std::mem::swap(&mut self.slots, &mut self.parked);
+            self.labels = [Names::default(); BANDS];
+        }
+        self.mode = mode;
+        // The readings are in different units.
+        self.scale = 0.0;
     }
 
     /// Place the floating legend over a top corner of the plot: the one the bands
@@ -731,9 +845,9 @@ impl UsageChart {
             // A band's area here: its rate times the width the stretch gets.
             let w = self.time.x(plot, age) - self.time.x(plot, age + f.span_ms as f32);
             let per = w / f.span_ms as f32;
-            for &(g, cycles) in f.cycles {
+            for &(g, v) in self.mode.of(&f) {
                 if let Some(slot) = self.weight.get_mut(g as usize) {
-                    *slot += cycles * per;
+                    *slot += v * per;
                 }
             }
         }
@@ -789,39 +903,66 @@ impl UsageChart {
             if f.span_ms <= 0 {
                 continue;
             }
-            let mut v = [0.0; BANDS];
-            for &(g, cycles) in f.cycles {
+            let span = f.span_ms as f64;
+            let m = f.machine;
+            // What each program's number is multiplied by for the reading, and the
+            // machine's whole in the reading's units, where it has one.
+            let share = |of: f64, whole: f64| {
+                if of > 0.0 {
+                    (100.0 / of, Some(whole * 100.0 / of))
+                } else {
+                    (0.0, None)
+                }
+            };
+            let (per, whole) = match self.mode {
+                ChartMode::Total => (1.0, None),
+                ChartMode::Rate => (1000.0 / span, None),
+                ChartMode::CpuShare => share(m.cpu_capacity_ms, m.cpu_busy_ms),
+                ChartMode::MemoryShare => share(m.ram, m.ram_in_use),
+                ChartMode::MemoryBytes => (1.0 / span, Some(m.ram_in_use / span)),
+            };
+            let mut v = [0.0f64; BANDS];
+            for &(g, x) in self.mode.of(&f) {
                 let band = self
                     .band_of
                     .get(g as usize)
                     .map_or(OTHER, |&b| usize::from(b));
-                v[band] += cycles;
+                v[band] += f64::from(x) * per;
             }
-            self.history.push(Row {
+            if let Some(whole) = whole {
+                v[REST] = (whole - v.iter().sum::<f64>()).max(0.0);
+            }
+            let row = Row {
                 end_ms: f.end_ms,
-                secs: f.span_ms as f32 / 1000.0,
-                v,
-            });
-        }
-        match self.mode {
-            ChartMode::Rate => {
-                for r in &mut self.history {
-                    for v in &mut r.v {
-                        *v /= r.secs;
+                secs: (span / 1000.0) as f32,
+                v: v.map(|v| v as f32),
+            };
+            // CPU time is charged a clock tick (about 16 ms) at a time, so over a
+            // stretch of a few ticks a program's share is mostly rounding; the
+            // first two samples of a session come a few tens of milliseconds
+            // apart. Such a stretch joins the one after it, as their average.
+            if self.mode == ChartMode::CpuShare && row.secs < SHORT_S {
+                if let Some(newer) = self.history.last_mut() {
+                    let secs = newer.secs + row.secs;
+                    for (a, b) in newer.v.iter_mut().zip(row.v) {
+                        *a = (*a * newer.secs + b * row.secs) / secs;
                     }
+                    newer.secs = secs;
+                    continue;
                 }
             }
-            // The same sum the totals are, run over the history oldest first.
-            // Fading is the same for every program, so "everything else" fades as
-            // one.
-            ChartMode::Total => {
-                let mut total = [0.0f64; BANDS];
-                for r in self.history.iter_mut().rev() {
-                    let (kept, arrived) = fade(self.decay, f64::from(r.secs));
-                    for (t, v) in total.iter_mut().zip(&mut r.v) {
-                        *t = *t * kept + f64::from(*v) * arrived;
-                        *v = *t as f32;
-                    }
+            self.history.push(row);
+        }
+        // The fading total: the same sum the totals are, run over the history
+        // oldest first. Fading is the same for every program, so "everything
+        // else" fades as one.
+        if self.mode == ChartMode::Total {
+            let mut total = [0.0f64; BANDS];
+            for r in self.history.iter_mut().rev() {
+                let (kept, arrived) = fade(self.decay, f64::from(r.secs));
+                for (t, v) in total.iter_mut().zip(&mut r.v) {
+                    *t = *t * kept + f64::from(*v) * arrived;
+                    *v = *t as f32;
                 }
             }
         }
@@ -871,9 +1012,17 @@ impl UsageChart {
 
     /// Keep the value scale until the chart outgrows it or shrinks well below it.
     fn rescale(&mut self) {
+        if self.mode.share() {
+            self.scale = 100.0;
+            return;
+        }
         let max = self.points.iter().map(Pt::sum).fold(0.0, f32::max);
         if self.scale <= 0.0 || max > self.scale || max < self.scale * 0.3 {
-            self.scale = nice(max * 1.1);
+            self.scale = if self.mode == ChartMode::MemoryBytes {
+                nice_bytes(max * 1.1)
+            } else {
+                nice(max * 1.1)
+            };
         }
     }
 
@@ -996,21 +1145,33 @@ impl UsageChart {
 
     /// A left click at `p`.
     pub fn click(&mut self, p: Point) -> Option<ChartHit> {
-        if let Some(i) = self.switch.iter().position(|r| r.contains(p)) {
-            if self.mode != MODES[i].0 {
-                self.mode = MODES[i].0;
-                // The two readings are in different units.
-                self.scale = 0.0;
-            }
+        if let Some(i) = self.button_at(p) {
+            let mode = match RESOURCES.get(i) {
+                Some(&(r, _)) if r == self.mode.resource() => self.mode,
+                Some(&(r, _)) => self
+                    .other_mode
+                    .filter(|m| m.resource() == r)
+                    .unwrap_or(modes(r)[0].0),
+                None => modes(self.mode.resource())[i - RESOURCES.len()].0,
+            };
+            self.set_mode(mode);
             return Some(ChartHit::Mode);
         }
         self.program_at(p).map(ChartHit::Program)
     }
 
     fn value(&self, out: &mut String, v: f32) {
-        format::cycles(out, f64::from(v));
-        if self.mode == ChartMode::Rate {
-            out.push_str("/s");
+        match self.mode {
+            ChartMode::Total => format::cycles(out, f64::from(v)),
+            ChartMode::Rate => {
+                format::cycles(out, f64::from(v));
+                out.push_str("/s");
+            }
+            ChartMode::CpuShare | ChartMode::MemoryShare => {
+                format::percent(out, v.max(0.0));
+                out.push('%');
+            }
+            ChartMode::MemoryBytes => format::bytes(out, Bytes(v.max(0.0) as u64)),
         }
     }
 
@@ -1255,22 +1416,85 @@ impl UsageChart {
         marked
     }
 
-    /// The switch, and a line on what the chart shows.
+    /// The switches, and a line on what the chart shows.
     fn paint_head(&self, dl: &mut DisplayList, theme: &Theme, buf: &mut String) {
-        let group = Rect::new(
-            self.switch[0].x,
+        let resource = self.mode.resource();
+        let n = RESOURCES.len();
+        let readings = modes(resource);
+        self.paint_switch(
+            dl,
+            &self.switch[..n],
+            RESOURCES.iter().map(|&(r, label)| (label, r == resource)),
+            0,
+            theme,
+        );
+        let last = &self.switch[n..n + readings.len()];
+        self.paint_switch(
+            dl,
+            last,
+            readings.iter().map(|&(m, label)| (label, m == self.mode)),
+            n,
+            theme,
+        );
+        buf.clear();
+        match self.mode {
+            ChartMode::Total => {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    buf,
+                    "Cycles each program has used, fading {:.0}% a second (halving in {:.0} s). \
+                     Processes of one name are one band.",
+                    self.decay * 100.0,
+                    ot_core::usage::half_life(self.decay)
+                );
+            }
+            ChartMode::Rate => buf.push_str(
+                "Cycles each program was using a second. Processes of one name are one band.",
+            ),
+            ChartMode::CpuShare => buf.push_str(
+                "Each program's share of all the CPU time there was: the CPU chart, cut up by \
+                 program. Time no process is charged for is \"Not in a process\".",
+            ),
+            ChartMode::MemoryShare => buf.push_str(
+                "Each program's private working set, as a share of the RAM installed. Memory \
+                 in use that no process holds alone is \"Not in a process\".",
+            ),
+            ChartMode::MemoryBytes => buf.push_str(
+                "Each program's private working set: the RAM its processes alone hold. Memory \
+                 in use that no process holds alone is \"Not in a process\".",
+            ),
+        }
+        let right = last.last().map_or(self.area.x, Rect::right);
+        let caption = Rect::new(
+            right + theme.pad * 1.5,
             self.switch[0].y,
-            SWITCH_W * MODES.len() as f32,
+            (self.area.right() - right - theme.pad * 1.5).max(0.0),
             self.switch[0].h,
         );
+        dl.label(buf, caption, theme.small, theme.text_dim);
+    }
+
+    /// A group of buttons side by side: `rects`, and for each its label and whether
+    /// it is the one chosen. `first` is the first one's index among all the
+    /// buttons, for the hover.
+    fn paint_switch<'a>(
+        &self,
+        dl: &mut DisplayList,
+        rects: &[Rect],
+        buttons: impl Iterator<Item = (&'a str, bool)>,
+        first: usize,
+        theme: &Theme,
+    ) {
+        let (Some(a), Some(z)) = (rects.first(), rects.last()) else {
+            return;
+        };
+        let group = Rect::new(a.x, a.y, z.right() - a.x, a.h);
         dl.fill_round_rect(group, theme.card_radius, theme.surface);
         dl.stroke_rect(group, theme.surface_border, 1.0);
-        for (i, (mode, label)) in MODES.iter().enumerate() {
-            let r = self.switch[i];
-            let active = *mode == self.mode;
+        for (i, (&r, (label, active))) in rects.iter().zip(buttons).enumerate() {
             let fill = if active {
                 Some(theme.button_active)
-            } else if self.hover_mode == Some(i) {
+            } else if self.hover_mode == Some(first + i) {
                 Some(theme.button_hover)
             } else {
                 None
@@ -1289,29 +1513,6 @@ impl UsageChart {
                 false,
             );
         }
-        buf.clear();
-        match self.mode {
-            ChartMode::Total => {
-                use std::fmt::Write as _;
-                let _ = write!(
-                    buf,
-                    "Cycles each program has used, fading {:.0}% a second (halving in {:.0} s). \
-                     Processes of one name are one band.",
-                    self.decay * 100.0,
-                    ot_core::usage::half_life(self.decay)
-                );
-            }
-            ChartMode::Rate => buf.push_str(
-                "Cycles each program was using a second. Processes of one name are one band.",
-            ),
-        }
-        let caption = Rect::new(
-            group.right() + theme.pad * 1.5,
-            self.switch[0].y,
-            (self.area.right() - group.right() - theme.pad * 1.5).max(0.0),
-            self.switch[0].h,
-        );
-        dl.label(buf, caption, theme.small, theme.text_dim);
     }
 
     /// The legend: the moment it reads and the sum of the bands there, then a row
@@ -1477,6 +1678,15 @@ mod tests {
             assert!((nice(v) - want).abs() < 1e-6, "{v}");
         }
         assert!((nice(3.0e10) / 5.0e10 - 1.0).abs() < 1e-5);
+        let gb = 1024f32.powi(3);
+        for (v, want) in [
+            (30.1 * gb, 50.0 * gb),
+            (6.6 * gb, 10.0 * gb),
+            (900.0, 1000.0),
+            (1500.0, 2048.0),
+        ] {
+            assert!((nice_bytes(v) / want - 1.0).abs() < 1e-5, "{v}");
+        }
     }
 
     #[test]
@@ -1486,7 +1696,7 @@ mod tests {
         c.set_legend(ChartLegend::Beside);
         assert_eq!(c.click(Point::new(0.0, 0.0)), None, "nothing built yet");
         let _ = painted(&mut c, &u, "");
-        let rate = c.switch[1].center();
+        let rate = c.switch[RESOURCES.len() + 1].center();
         assert_eq!(c.click(rate), Some(ChartHit::Mode));
         assert_eq!(c.mode(), ChartMode::Rate);
         let dl = painted(&mut c, &u, "");
@@ -2007,5 +2217,224 @@ mod tests {
         assert!(texts(&dl)
             .iter()
             .any(|s| s == "The history starts with the next sample"));
+    }
+
+    /// A session of `secs` seconds sampled once a second on four logical
+    /// processors and 16 GB: program `i` uses `cpu_ms[i]` of CPU time a second and
+    /// holds `mb[i]` megabytes of private working set; the CPU chart reads `total`
+    /// percent and 6 GB are in use.
+    fn machine_session(names: &[&str], secs: u64, cpu_ms: &[u64], mb: &[u64], total: f32) -> Usage {
+        let mut u = Usage::new(0.05);
+        for s in 0..=secs {
+            let used: Vec<u64> = cpu_ms.iter().map(|ms| ms * s).collect();
+            u.observe(&machine_snapshot(names, s * 1000, &used, mb, total));
+        }
+        u
+    }
+
+    /// One sample of [`machine_session`]'s machine, `at_ms` into the session, where
+    /// program `i` has used `cpu_ms[i]` of CPU time in all.
+    fn machine_snapshot(
+        names: &[&str],
+        at_ms: u64,
+        cpu_ms: &[u64],
+        mb: &[u64],
+        total: f32,
+    ) -> Snapshot {
+        use ot_model::cpu::{CoreKind, LogicalCore};
+        let procs = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut p = proc(i as u32 + 1, None, 0.0);
+                p.statics = Arc::new(ProcessStatic {
+                    name: (*name).to_owned(),
+                    ..(*p.statics).clone()
+                });
+                p.cpu_time = Duration::from_millis(cpu_ms[i]);
+                p.private_working_set = ot_model::Bytes(mb[i] << 20);
+                p
+            })
+            .collect();
+        let mut snap = Snapshot {
+            tick: Tick(at_ms + 1),
+            taken_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_000_000 + at_ms)),
+            interval: Duration::from_secs(1),
+            processes: procs,
+            ..Default::default()
+        };
+        snap.cpu.cores = (0..4)
+            .map(|index| LogicalCore {
+                index,
+                physical: index,
+                kind: CoreKind::default(),
+                usage: ot_model::Percent(total),
+                frequency: None,
+            })
+            .collect();
+        snap.cpu.total = ot_model::Percent(total);
+        snap.memory.total = ot_model::Bytes(16 << 30);
+        snap.memory.available = ot_model::Bytes(10 << 30);
+        snap
+    }
+
+    /// Press the head row's button labeled `label`.
+    fn press(c: &mut UsageChart, dl: &DisplayList, label: &str) {
+        let at = dl
+            .cmds()
+            .iter()
+            .find_map(|cmd| match cmd {
+                DrawCmd::Text(t) if dl.str(t.text) == label && t.rect.y < c.plot.y => {
+                    Some(t.rect.center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {label} button"));
+        assert_eq!(c.click(at), Some(ChartHit::Mode));
+    }
+
+    #[test]
+    fn the_cpu_percent_reading_is_the_cpu_chart_cut_up_by_program() {
+        // a uses 1 s of CPU a second and b 0.6 s, of the 4 s there are: 25 % and
+        // 15 %. The CPU chart reads 42 %, so 2 % is no process's.
+        let u = machine_session(&["a.exe", "b.exe"], 30, &[1000, 600], &[100, 100], 42.0);
+        let mut c = UsageChart::default();
+        c.set_legend(ChartLegend::Beside);
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "Percent");
+        assert_eq!(c.mode(), ChartMode::CpuShare);
+        let dl = painted(&mut c, &u, "");
+        let (a, b) = (band(&c, &u, "a.exe"), band(&c, &u, "b.exe"));
+        for p in &c.points {
+            assert!((p.v[a] - 25.0).abs() < 1e-3, "{}", p.v[a]);
+            assert!((p.v[b] - 15.0).abs() < 1e-3);
+            assert!((p.v[REST] - 2.0).abs() < 1e-3);
+            assert!((p.sum() - 42.0).abs() < 1e-3, "the stack is the CPU chart");
+        }
+        // On the CPU chart's scale, whatever the bands reach.
+        assert_eq!(c.scale, 100.0);
+        let strings = texts(&dl);
+        for want in [
+            "100%",
+            "50%",
+            "25%",
+            "15%",
+            "2.0%",
+            "42%",
+            "Not in a process",
+        ] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
+        assert!(strings
+            .iter()
+            .any(|s| s.starts_with("Each program's share of all the CPU time")));
+    }
+
+    #[test]
+    fn memory_reads_as_a_share_of_the_ram_or_in_bytes() {
+        // 4 GB and 1.5 GB of 16 GB, with 6 GB in use: half a gigabyte is no
+        // process's alone.
+        let u = machine_session(&["a.exe", "b.exe"], 30, &[100, 200], &[4096, 1536], 10.0);
+        let mut c = UsageChart::default();
+        c.set_legend(ChartLegend::Beside);
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "Memory");
+        assert_eq!(c.mode(), ChartMode::MemoryShare, "memory opens on Percent");
+        let dl = painted(&mut c, &u, "");
+        let (a, b) = (band(&c, &u, "a.exe"), band(&c, &u, "b.exe"));
+        let now = c.points[0];
+        assert!((now.v[a] - 25.0).abs() < 1e-3, "{}", now.v[a]);
+        assert!((now.v[b] - 9.375).abs() < 1e-3);
+        assert!((now.v[REST] - 3.125).abs() < 1e-3);
+        assert_eq!(c.scale, 100.0);
+        let strings = texts(&dl);
+        for want in ["25%", "9.4%", "3.1%", "38%"] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
+
+        press(&mut c, &dl, "Bytes");
+        assert_eq!(c.mode(), ChartMode::MemoryBytes);
+        let dl = painted(&mut c, &u, "");
+        let now = c.points[0];
+        let gb = (1u64 << 30) as f32;
+        assert!((now.v[a] / (4.0 * gb) - 1.0).abs() < 1e-5);
+        assert!((now.v[REST] / (0.5 * gb) - 1.0).abs() < 1e-5);
+        // Its own scale: 6 GB in use, a little room, to a round number.
+        assert!((c.scale / (10.0 * gb) - 1.0).abs() < 1e-5, "{}", c.scale);
+        let strings = texts(&dl);
+        for want in ["4.00 GB", "1.50 GB", "512 MB", "6.00 GB"] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
+    }
+
+    #[test]
+    fn each_resource_keeps_its_reading_and_its_bands() {
+        // The more CPU a program uses the less memory it holds: p9 the most CPU,
+        // p0 the most memory.
+        let names: Vec<String> = (0..10).map(|i| format!("p{i}.exe")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let cpu: Vec<u64> = (0..10).map(|i| 10 + 10 * i).collect();
+        let mb: Vec<u64> = (0..10).map(|i| 1000 - 90 * i).collect();
+        let u = machine_session(&names, 30, &cpu, &mb, 50.0);
+        let mut c = UsageChart::default();
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "Percent");
+        let dl = painted(&mut c, &u, "");
+        let cpu_bands = c.slots;
+        // The two smallest CPU users have no band; the two biggest memory holders
+        // are those, and get one in the memory chart.
+        assert!(!cpu_bands.contains(&u.program("p0.exe")));
+        press(&mut c, &dl, "Memory");
+        let dl = painted(&mut c, &u, "");
+        assert!(c.slots.contains(&u.program("p0.exe")));
+        assert!(!c.slots.contains(&u.program("p9.exe")));
+        press(&mut c, &dl, "Bytes");
+        let dl = painted(&mut c, &u, "");
+        // Back to the CPU: its reading and its colors, as they were.
+        press(&mut c, &dl, "CPU");
+        assert_eq!(c.mode(), ChartMode::CpuShare);
+        let dl = painted(&mut c, &u, "");
+        assert_eq!(c.slots, cpu_bands);
+        // And back to memory, on Bytes where it was left.
+        press(&mut c, &dl, "Memory");
+        assert_eq!(c.mode(), ChartMode::MemoryBytes);
+    }
+
+    #[test]
+    fn the_cycle_readings_have_no_band_for_what_no_process_used() {
+        let u = machine_session(&["a.exe"], 10, &[100], &[100], 90.0);
+        let mut c = UsageChart::default();
+        let _ = painted(&mut c, &u, "");
+        assert!(c.points.iter().all(|p| p.v[REST] == 0.0));
+        assert!(!c.shown(REST));
+    }
+
+    #[test]
+    fn a_stretch_too_short_to_read_cpu_time_from_joins_the_next() {
+        // The first two samples 40 ms apart, in which a's CPU time went up by two
+        // clock ticks' worth on each of four threads: 125 ms, more than the 4 x 40
+        // ms there were. Then a steady 25 %.
+        let mut u = Usage::new(0.05);
+        let mut used = 0;
+        for (at, more) in [(0, 0), (40, 125), (1040, 1000), (2040, 1000), (3040, 1000)] {
+            used += more;
+            u.observe(&machine_snapshot(&["a.exe"], at, &[used], &[100], 30.0));
+        }
+        let mut c = UsageChart::default();
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "Percent");
+        let _ = painted(&mut c, &u, "");
+        let a = band(&c, &u, "a.exe");
+        // No column of its own: the oldest is the second the short stretch joined,
+        // (125 + 1000) ms of the 4 x 1040 there were.
+        assert_eq!(c.history.len(), 3);
+        let oldest = c.history.last().unwrap();
+        assert!((oldest.secs - 1.04).abs() < 1e-4);
+        assert!(
+            (oldest.v[a] - 1125.0 / 41.6).abs() < 1e-2,
+            "{}",
+            oldest.v[a]
+        );
+        assert!(c.history[..2].iter().all(|r| (r.v[a] - 25.0).abs() < 1e-3));
     }
 }

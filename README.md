@@ -150,16 +150,26 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   selects it (the ancestry line and the other arrangements keep the selection),
   right-click gives the process menu, and the search dims what does not match. The
   line under the map gives the cycles used by everything together.
-- **History** shows the cycles used over the charts' reach, as a chart: a stack of
-  bands, one per program, on the same time axis as the graphs above it. A program is
+- **History** shows who has been using the CPU, or holding memory, over the charts'
+  reach, as a chart: a stack of bands, one per program, on the same time axis as the
+  graphs above it. A program is
   every process of one name, so the two hundred `rustc.exe` of a build are one band.
   Chromium-based programs (Chrome, Edge, WebView2 and Electron apps such as Slack,
   Discord or VS Code) are split by role, so Chrome's renderers are one band and its
-  GPU process another (see below). The switch above the chart picks what a band's thickness
-  is. **Fading total** is the number the Cycles column shows, over time: a band
-  swells while its program works and sags once it stops. **Rate** is the cycles the
-  program was using each second: the CPU graph cut up by program, of which the
-  fading total is a smoothed copy. The eight programs that take the most of the
+  GPU process another (see below). One switch above the chart picks **CPU** or
+  **Memory**, and the other what a band's thickness is. For the CPU, **Fading
+  total** is the number the Cycles column shows, over time: a band swells while its
+  program works and sags once it stops. **Rate** is the cycles the program was using
+  each second, of which the fading total is a smoothed copy. **Percent** is the
+  program's share of all the CPU time there was, on the CPU graph's 0-100 % scale:
+  the CPU graph cut up by program. For memory, each band is the program's private
+  working set (the RAM its processes alone hold, which unlike the working set adds
+  up across processes), as a share of the RAM installed on the memory graph's scale
+  (**Percent**) or in **Bytes** on a scale of its own. In the Percent and Bytes
+  readings a last band, "Not in a process", tops the stack up to what the graph
+  above shows: CPU time no process is charged for, or memory in use that no process
+  holds alone (the kernel, drivers, pages shared between processes). Each resource
+  keeps its own bands and the reading it was left on. The eight programs that take the most of the
   chart get a band and a color each, and the rest are one grey band, "Everything
   else". A program keeps its color for as long as it keeps a band, and a band
   changes hands only when a newcomer is clearly bigger, so the chart does not

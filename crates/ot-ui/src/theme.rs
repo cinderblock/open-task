@@ -91,6 +91,9 @@ pub struct Theme {
     /// counted under `series_other`.
     pub series: [Color; 8],
     pub series_other: Color,
+    /// What a whole is short of its parts' sum: the CPU time or memory in use that
+    /// no process accounts for. A neutral set apart from `series_other`.
+    pub series_rest: Color,
 }
 
 impl Theme {
@@ -154,6 +157,7 @@ impl Theme {
                 Color::hex(0xE6_67_67),
             ],
             series_other: Color::hex(0x6E_6D_68),
+            series_rest: Color::hex(0x5B_6B_7F),
         }
     }
 
@@ -217,6 +221,7 @@ impl Theme {
                 Color::hex(0xE3_49_48),
             ],
             series_other: Color::hex(0xA9_A7_A0),
+            series_rest: Color::hex(0xA3_B3_C6),
         }
     }
 }
