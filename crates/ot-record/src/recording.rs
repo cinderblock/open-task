@@ -267,13 +267,24 @@ impl Recording {
             return Err(Error::corrupt(format!("frame {k} is a delta with no base")));
         }
         let raw = format::decompress(body)?;
-        let (body, extra) = if self.version >= 2 {
+        let (body, extra, gpu) = if self.version >= 3 {
+            let (body, extra, gpu) =
+                postcard::from_bytes::<(frame::Body<'_>, frame::Extra, frame::GpuExtra)>(&raw)?;
+            (body, Some(extra), Some(gpu))
+        } else if self.version >= 2 {
             let (body, extra) = postcard::from_bytes::<(frame::Body<'_>, frame::Extra)>(&raw)?;
-            (body, Some(extra))
+            (body, Some(extra), None)
         } else {
-            (postcard::from_bytes::<frame::Body<'_>>(&raw)?, None)
+            (postcard::from_bytes::<frame::Body<'_>>(&raw)?, None, None)
         };
-        frame::decode(body, extra, prev, &self.readers, &self.hardware)
+        frame::decode(
+            body,
+            extra,
+            gpu.as_ref(),
+            prev,
+            &self.readers,
+            &self.hardware,
+        )
     }
 }
 

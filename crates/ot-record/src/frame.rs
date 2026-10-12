@@ -7,9 +7,10 @@
 //! From format version 2 on, the body is followed by an [`Extra`]: what was added
 //! to the samples since version 1, kept apart so that a version 1 body still
 //! decodes as it is (postcard writes a struct as its fields one after another, so
-//! a version 2 payload is the body's bytes and then the extra's).
+//! a version 2 payload is the body's bytes and then the extra's). Version 3 adds a
+//! [`GpuExtra`] after the [`Extra`] the same way.
 
-use ot_model::Bytes;
+use ot_model::Percent;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -161,6 +162,50 @@ pub(crate) struct Extra {
     private_working_set: Vec<i64>,
 }
 
+/// What a frame holds beyond its [`Extra`], from format version 3 on: each
+/// process's use of the GPUs, in the body's order, for a delta row as its change
+/// from the frame before and for a full row the whole of it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct GpuExtra {
+    /// `gpu_share`'s bits, exclusive-ORed with the frame before's.
+    share: Vec<u32>,
+    dedicated: Vec<i64>,
+    shared: Vec<i64>,
+}
+
+impl GpuExtra {
+    fn len(&self) -> usize {
+        self.share.len()
+    }
+
+    fn consistent(&self) -> bool {
+        self.dedicated.len() == self.share.len() && self.shared.len() == self.share.len()
+    }
+}
+
+/// What the [`Extra`] and [`GpuExtra`] say of one process, where the frame has
+/// them: changes for a delta row, the whole for a full one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Added {
+    private: Option<i64>,
+    gpu: Option<(u32, i64, i64)>,
+}
+
+impl Added {
+    /// Set what these say on `sample`, as changes from `before` (a default sample
+    /// for a full row). What the frame does not have stays as `sample` has it.
+    fn apply(self, sample: &mut ProcessSample, before: &ProcessSample) {
+        if let Some(d) = self.private {
+            sample.private_working_set = delta::a_bytes(before.private_working_set, d);
+        }
+        if let Some((share, dedicated, shared)) = self.gpu {
+            sample.gpu_share = Percent(f32::from_bits(before.gpu_share.get().to_bits() ^ share));
+            sample.gpu_dedicated = delta::a_bytes(before.gpu_dedicated, dedicated);
+            sample.gpu_shared = delta::a_bytes(before.gpu_shared, shared);
+        }
+    }
+}
+
 /// A delta row's threads.
 #[derive(Debug, Serialize, Deserialize)]
 enum Threads<'a> {
@@ -190,9 +235,11 @@ pub(crate) fn encode<'a>(
     snap: &'a Snapshot,
     prev: Option<&'a Snapshot>,
     tables: &mut Tables,
-) -> (Body<'a>, Extra) {
+) -> (Body<'a>, Extra, GpuExtra) {
     let prev_index = prev.map(by_key);
     let mut extra = Extra::default();
+    let mut gpu = GpuExtra::default();
+    let zero = ProcessSample::default();
     let processes = snap
         .processes
         .iter()
@@ -204,12 +251,17 @@ pub(crate) fn encode<'a>(
             let base = prev
                 .zip(prev_index.as_ref())
                 .and_then(|(prev, index)| index.get(&p.key()).map(|&i| (&prev.processes[i], prev)));
-            extra.private_working_set.push(match base {
-                Some((before, _)) => {
-                    delta::d_bytes(p.private_working_set, before.private_working_set)
-                }
-                None => delta::d_bytes(p.private_working_set, Bytes::ZERO),
-            });
+            let was = base.map_or(&zero, |(before, _)| before);
+            extra.private_working_set.push(delta::d_bytes(
+                p.private_working_set,
+                was.private_working_set,
+            ));
+            gpu.share
+                .push(p.gpu_share.get().to_bits() ^ was.gpu_share.get().to_bits());
+            gpu.dedicated
+                .push(delta::d_bytes(p.gpu_dedicated, was.gpu_dedicated));
+            gpu.shared
+                .push(delta::d_bytes(p.gpu_shared, was.gpu_shared));
             match base {
                 Some((before, prev)) => {
                     let prev_threads = thread_rows(prev, before);
@@ -270,15 +322,16 @@ pub(crate) fn encode<'a>(
         capabilities: snap.capabilities,
         processes,
     };
-    (body, extra)
+    (body, extra, gpu)
 }
 
-/// Rebuild a snapshot from `body` and, from format version 2 on, its `extra`, with
-/// `prev` the frame before it (required for a delta frame) and the shared values
-/// looked up in `readers`.
+/// Rebuild a snapshot from `body` and, from format version 2 on, its `extra`, and
+/// from version 3 its `gpu`, with `prev` the frame before it (required for a delta
+/// frame) and the shared values looked up in `readers`.
 pub(crate) fn decode(
     body: Body<'_>,
     extra: Option<Extra>,
+    gpu: Option<&GpuExtra>,
     prev: Option<&Snapshot>,
     readers: &Readers,
     hardware: &Arc<Hardware>,
@@ -297,9 +350,19 @@ pub(crate) fn decode(
             private.as_ref().map_or(0, Vec::len)
         )));
     }
+    if gpu.is_some_and(|g| !g.consistent() || g.len() != body.processes.len()) {
+        return Err(Error::corrupt(format!(
+            "{} processes with {} GPU rows",
+            body.processes.len(),
+            gpu.map_or(0, GpuExtra::len)
+        )));
+    }
     for (i, row) in body.processes.into_iter().enumerate() {
-        let private = private.as_ref().map(|p| p[i]);
-        let (mut sample, rows) = decode_row(row, private, base.as_ref(), readers)?;
+        let added = Added {
+            private: private.as_ref().map(|p| p[i]),
+            gpu: gpu.map(|g| (g.share[i], g.dedicated[i], g.shared[i])),
+        };
+        let (mut sample, rows) = decode_row(row, added, base.as_ref(), readers)?;
         sample.thread_first = u32::try_from(threads.len())
             .map_err(|_| Error::corrupt("more than four billion thread rows"))?;
         sample.thread_rows = u32::try_from(rows.len())
@@ -355,12 +418,12 @@ pub(crate) fn decode(
 }
 
 /// One row back into a sample with its shared values attached, plus its thread
-/// rows. `private` is its private working set from the frame's [`Extra`], none in a
-/// version 1 frame; `base` is the previous frame and its processes by key, for a
-/// delta row.
+/// rows. `added` is what the frame's [`Extra`] and [`GpuExtra`] say of it, where
+/// the frame's version has them; `base` is the previous frame and its processes by
+/// key, for a delta row.
 fn decode_row(
     row: Row<'_>,
-    private: Option<i64>,
+    added: Added,
     base: Option<&(&Snapshot, HashMap<ProcessKey, usize>)>,
     readers: &Readers,
 ) -> Result<(ProcessSample, Vec<ThreadSample>), Error> {
@@ -373,7 +436,7 @@ fn decode_row(
             threads,
         } => {
             let mut sample = sample.into_owned();
-            sample.private_working_set = delta::a_bytes(Bytes::ZERO, private.unwrap_or(0));
+            added.apply(&mut sample, &ProcessSample::default());
             (statics, window, services, sample, threads.into_owned())
         }
         Row::Delta {
@@ -412,9 +475,7 @@ fn decode_row(
                 Threads::Changed(list) => list.into_owned(),
             };
             let mut sample = delta::apply_process(before, &delta);
-            if let Some(d) = private {
-                sample.private_working_set = delta::a_bytes(before.private_working_set, d);
-            }
+            added.apply(&mut sample, before);
             (statics, window, services, sample, rows)
         }
     };

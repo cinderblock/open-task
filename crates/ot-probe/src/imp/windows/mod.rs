@@ -606,7 +606,7 @@ impl WindowsProbe {
                 )
             };
 
-            let gpu = self.gpu.as_ref().and_then(|g| g.process_gpu(pid));
+            let gpu = self.gpu.as_ref().and_then(|g| g.process(pid));
             out.push(ProcessSample {
                 statics: Arc::clone(&entry.statics),
                 cpu,
@@ -623,7 +623,12 @@ impl WindowsProbe {
                 threads: p.NumberOfThreads,
                 handles: p.HandleCount,
                 power: None,
-                gpu: gpu.as_ref().map(|(share, _)| *share),
+                gpu: gpu
+                    .and_then(|g| g.busiest.as_ref())
+                    .map(|(share, _)| *share),
+                gpu_share: gpu.map_or(Percent::ZERO, |g| g.share),
+                gpu_dedicated: gpu.map_or(Bytes::ZERO, |g| g.dedicated),
+                gpu_shared: gpu.map_or(Bytes::ZERO, |g| g.shared),
                 suspended,
                 efficiency_mode: entry.eco,
                 window: self.windows.window_of(pid),
@@ -643,7 +648,9 @@ impl WindowsProbe {
                     write_bytes: Bytes(p.WriteTransferCount as u64),
                     other_bytes: Bytes(p.OtherTransferCount as u64),
                 },
-                gpu_engine: gpu.map(|(_, label)| label),
+                gpu_engine: gpu
+                    .and_then(|g| g.busiest.as_ref())
+                    .map(|(_, label)| Arc::clone(label)),
                 services: Arc::clone(&entry.services),
                 thread_first,
                 thread_rows,

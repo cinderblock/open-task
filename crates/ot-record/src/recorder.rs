@@ -96,7 +96,8 @@ impl Recorder {
     }
 
     /// [`create_with_keyframes`](Recorder::create_with_keyframes), writing format
-    /// `version`: 1 writes frames without their [`frame::Extra`].
+    /// `version`: 1 writes frames without their [`frame::Extra`], 2 without their
+    /// [`frame::GpuExtra`].
     pub(crate) fn create_as(
         path: impl AsRef<Path>,
         header: &RecordHeader,
@@ -147,8 +148,10 @@ impl Recorder {
         let key = self.prev.is_none() || self.since_key >= self.keyframe_every;
         let raw = {
             let prev = if key { None } else { self.prev.as_deref() };
-            let (body, extra) = frame::encode(snap, prev, &mut self.tables);
-            if self.version >= 2 {
+            let (body, extra, gpu) = frame::encode(snap, prev, &mut self.tables);
+            if self.version >= 3 {
+                postcard::to_allocvec(&(body, extra, gpu))?
+            } else if self.version >= 2 {
                 postcard::to_allocvec(&(body, extra))?
             } else {
                 postcard::to_allocvec(&body)?
@@ -281,11 +284,11 @@ mod tests {
     use crate::{Error, Recording};
     use ot_model::hardware::Hardware;
     use ot_model::process::{ProcessSample, ProcessStatic};
-    use ot_model::{Bytes, Capabilities, ProcessKey, Tick};
+    use ot_model::{Bytes, Capabilities, Percent, ProcessKey, Tick};
     use std::time::{Duration, SystemTime};
 
-    /// Two frames of two processes whose private working sets are set, the second
-    /// a delta of the first.
+    /// Two frames of two processes whose private working sets and GPU use are
+    /// set, the second a delta of the first.
     fn frames() -> Vec<Snapshot> {
         (0..2u64)
             .map(|n| Snapshot {
@@ -301,6 +304,11 @@ mod tests {
                         }),
                         working_set: Bytes(9 << 20),
                         private_working_set: Bytes((u64::from(pid) + n) << 20),
+                        gpu_share: Percent(
+                            f32::from(u8::try_from(pid + 3 * n as u32).unwrap()) * 1.25,
+                        ),
+                        gpu_dedicated: Bytes(u64::from(pid) << 24),
+                        gpu_shared: Bytes((u64::from(pid) + 2 * n) << 22),
                         ..ProcessSample::default()
                     })
                     .collect(),
@@ -325,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn the_private_working_set_is_kept_and_version_1_files_still_read() {
+    fn private_working_sets_and_gpu_use_are_kept_and_older_files_still_read() {
         let dir = std::env::temp_dir().join("ot-record-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("versions-{}.otrec", std::process::id()));
@@ -340,6 +348,27 @@ mod tests {
                 s.processes.iter().map(|p| p.private_working_set).collect()
             };
             assert_eq!(private(&got), private(want), "frame {i}");
+            let gpu = |s: &Snapshot| -> Vec<(Percent, Bytes, Bytes)> {
+                s.processes
+                    .iter()
+                    .map(|p| (p.gpu_share, p.gpu_dedicated, p.gpu_shared))
+                    .collect()
+            };
+            assert_eq!(gpu(&got), gpu(want), "frame {i}");
+        }
+
+        // A version 2 file has the private working sets but no GPU use.
+        write(&path, 2);
+        let rec = Recording::open(&path).unwrap();
+        assert_eq!(rec.version(), 2);
+        for (i, want) in want.iter().enumerate() {
+            let got = rec.frame(i).unwrap();
+            for (g, w) in got.processes.iter().zip(&want.processes) {
+                assert_eq!(g.private_working_set, w.private_working_set, "frame {i}");
+                assert_eq!(g.gpu_share, Percent::ZERO);
+                assert_eq!(g.gpu_dedicated, Bytes::ZERO);
+                assert_eq!(g.gpu_shared, Bytes::ZERO);
+            }
         }
 
         // A version 1 file has no private working sets, and everything else.

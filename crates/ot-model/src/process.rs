@@ -320,8 +320,26 @@ pub struct ProcessSample {
 
     /// Estimated energy attribution, where the platform models it.
     pub power: Option<Watts>,
-    /// GPU utilization attributed to this process.
+    /// GPU utilization attributed to this process: its busiest engine's share of
+    /// the interval, on any adapter, as Task Manager's GPU column has it.
     pub gpu: Option<Percent>,
+    /// What this process adds to the GPU utilization the summary charts show: on
+    /// each hardware GPU, its share of the engine busiest there over the interval,
+    /// summed over the GPUs. Unlike `gpu` these add up: every process's together
+    /// is the GPUs' utilization, give or take time no process is charged for.
+    /// Not serialized with the rest: a recording carries it beside the sample, and
+    /// one made before it did reads zero, as do the next two.
+    #[serde(skip)]
+    pub gpu_share: Percent,
+    /// The GPUs' own memory this process has in use, summed over the hardware
+    /// GPUs. Zero on an integrated GPU, which has none.
+    #[serde(skip)]
+    pub gpu_dedicated: Bytes,
+    /// System memory the GPUs use for this process, summed over the hardware
+    /// GPUs. An allocation several processes share is counted in each, so these
+    /// add up to more than the GPUs report in use.
+    #[serde(skip)]
+    pub gpu_shared: Bytes,
 
     /// True when the process is suspended (UWP lifecycle, `SIGSTOP`, debugger break).
     /// A suspended process at 0% CPU is idle by design, not stuck, and the diagnostics

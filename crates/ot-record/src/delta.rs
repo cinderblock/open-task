@@ -13,7 +13,8 @@
 //! Every field of [`ProcessSample`] and [`ThreadSample`] is destructured by name
 //! here, so adding a field to either is a compile error until it is encoded. The
 //! private working set, added in format version 2, travels in the frame's
-//! [`Extra`](crate::frame::Extra) instead, so that version 1 rows still read.
+//! [`Extra`](crate::frame::Extra) instead, so that version 1 rows still read, and
+//! the GPU numbers added in version 3 in its [`GpuExtra`](crate::frame::GpuExtra).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,6 +138,10 @@ pub(crate) fn process(cur: &ProcessSample, prev: &ProcessSample) -> ProcessDelta
         handles,
         power,
         gpu,
+        // In the frame's `GpuExtra`.
+        gpu_share: _,
+        gpu_dedicated: _,
+        gpu_shared: _,
         suspended,
         efficiency_mode,
         window: _,
@@ -236,6 +241,9 @@ pub(crate) fn apply_process(prev: &ProcessSample, d: &ProcessDelta) -> ProcessSa
         handles: a_u32(prev.handles, *handles),
         power: *power,
         gpu: *gpu,
+        gpu_share: prev.gpu_share,
+        gpu_dedicated: prev.gpu_dedicated,
+        gpu_shared: prev.gpu_shared,
         suspended: *suspended,
         efficiency_mode: *efficiency_mode,
         window: None,

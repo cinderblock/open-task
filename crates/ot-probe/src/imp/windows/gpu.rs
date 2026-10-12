@@ -22,7 +22,8 @@
 //! Cost: one `sample` call took 2.4 to 3.2 ms mean and 3 to 10 ms worst over
 //! three runs of 30 calls on this machine (two adapters in the counters, ~580
 //! engine instances; `gpu_cost` in the tests). Almost all of it is PDH formatting
-//! the engine array. That is under the ~5 ms a pass can afford, so it runs every
+//! the engine array. Reading each process's GPU memory as well left it at 2.3 ms
+//! mean and 3.9 ms worst (2026-10-12). That is under the ~5 ms a pass can afford, so it runs every
 //! pass; if a machine with more processes or adapters pushes it past that,
 //! sampling every other pass is the lever.
 //!
@@ -34,9 +35,13 @@
 //! decides what to show. DXGI objects are created, used and released inside the
 //! read, so nothing COM is held across passes or threads.
 //!
-//! Per-process attribution (`process_gpu`) is the process's busiest engine type on
-//! any adapter over the last pass, labelled `GPU 0 - 3D`, which is what the
-//! Processes table shows.
+//! Per-process attribution ([`GpuProbe::process`]) is, first, the process's busiest
+//! engine type on any adapter over the last pass, labelled `GPU 0 - 3D`, which is
+//! what the Processes table shows. Those do not add up across processes, so beside
+//! it is the process's share of the engine busiest on each hardware adapter, which
+//! does: summed over the processes it is the adapters' utilization. And its memory
+//! from `GPU Process Memory`, one instance per process and adapter, which costs
+//! two more arrays of a few dozen instances a pass.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -139,6 +144,9 @@ struct Query {
     engine: PDH_HCOUNTER,
     dedicated: Option<PDH_HCOUNTER>,
     shared: Option<PDH_HCOUNTER>,
+    /// The same two per process.
+    process_dedicated: Option<PDH_HCOUNTER>,
+    process_shared: Option<PDH_HCOUNTER>,
     /// Scratch for instance arrays, reused every pass.
     items: AlignedBuf,
     /// Whether a failed collection has been logged.
@@ -173,6 +181,8 @@ impl Query {
             engine: PDH_HCOUNTER::default(),
             dedicated: None,
             shared: None,
+            process_dedicated: None,
+            process_shared: None,
             items: AlignedBuf::default(),
             warned: false,
         };
@@ -180,6 +190,8 @@ impl Query {
         q.engine = q.add(w!(r"\GPU Engine(*)\Utilization Percentage"))?;
         q.dedicated = q.add(w!(r"\GPU Adapter Memory(*)\Dedicated Usage"));
         q.shared = q.add(w!(r"\GPU Adapter Memory(*)\Shared Usage"));
+        q.process_dedicated = q.add(w!(r"\GPU Process Memory(*)\Dedicated Usage"));
+        q.process_shared = q.add(w!(r"\GPU Process Memory(*)\Shared Usage"));
         Some(q)
     }
 
@@ -237,8 +249,19 @@ impl Query {
     }
 }
 
-/// Samples every adapter's engines and memory, and remembers which process was
-/// busiest on which engine.
+/// One process's use of the GPUs over the last pass.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ProcessGpu {
+    /// Its busiest engine on any adapter, and that engine's `GPU 0 - 3D` label.
+    pub busiest: Option<(Percent, Arc<str>)>,
+    /// On each hardware adapter, its share of the engine busiest there, summed.
+    pub share: Percent,
+    /// Dedicated and shared GPU memory in use, summed over the hardware adapters.
+    pub dedicated: Bytes,
+    pub shared: Bytes,
+}
+
+/// Samples every adapter's engines and memory, and what each process used of them.
 #[derive(Debug)]
 pub(super) struct GpuProbe {
     query: Query,
@@ -253,8 +276,8 @@ pub(super) struct GpuProbe {
     adapters: Vec<Adapter>,
     /// This pass's per-process, per-adapter, per-engine-type sums.
     by_process: HashMap<(u32, u64, Arc<str>), f64>,
-    /// Each process's busiest engine over the last pass, with its label.
-    busiest: HashMap<u32, (f32, Arc<str>)>,
+    /// Each process's use of the GPUs over the last pass.
+    procs: HashMap<u32, ProcessGpu>,
     /// Scratch for decoding an instance name.
     name: String,
     /// Scratch for an unclassified engine's `Engine N` key.
@@ -272,7 +295,7 @@ impl GpuProbe {
             labels: HashMap::new(),
             adapters: Vec::new(),
             by_process: HashMap::new(),
-            busiest: HashMap::new(),
+            procs: HashMap::new(),
             name: String::new(),
             key: String::new(),
         })
@@ -282,7 +305,7 @@ impl GpuProbe {
     /// the first pass, before the rate counters have an interval.
     pub fn sample(&mut self, out: &mut Vec<GpuSample>) {
         out.clear();
-        self.busiest.clear();
+        self.procs.clear();
         self.by_process.clear();
         for a in &mut self.adapters {
             a.reset();
@@ -293,14 +316,13 @@ impl GpuProbe {
         self.read_memory();
         self.publish(out);
         self.attribute();
+        self.read_process_memory();
     }
 
-    /// The process's busiest engine over the last pass and its label, such as
-    /// `GPU 0 - 3D`; `None` if it used no GPU.
-    pub fn process_gpu(&self, pid: u32) -> Option<(Percent, Arc<str>)> {
-        self.busiest
-            .get(&pid)
-            .map(|(share, label)| (Percent(*share), Arc::clone(label)))
+    /// What the process used of the GPUs over the last pass; `None` if it used
+    /// nothing of them.
+    pub fn process(&self, pid: u32) -> Option<&ProcessGpu> {
+        self.procs.get(&pid)
     }
 
     /// Sum every engine instance into its adapter's engine type and into its
@@ -403,11 +425,22 @@ impl GpuProbe {
         out.sort_by(|a, b| a.info.name.cmp(&b.info.name));
     }
 
-    /// Each process's busiest engine type, with its `GPU 0 - 3D` label.
+    /// Each process's busiest engine type, with its `GPU 0 - 3D` label, and its
+    /// share of each hardware adapter's busiest engine. Runs after [`Self::publish`],
+    /// which leaves each adapter's engines busiest first.
     fn attribute(&mut self) {
         for ((pid, luid, name), share) in &self.by_process {
             let share = (*share as f32).clamp(0.0, 100.0);
-            let busier = self.busiest.get(pid).is_none_or(|(s, _)| share > *s);
+            let p = self.procs.entry(*pid).or_default();
+            let on_busiest = self.adapters.iter().any(|a| {
+                a.luid == *luid
+                    && a.engines.first().is_some_and(|(n, _)| Arc::ptr_eq(n, name))
+                    && self.infos.get(luid).is_some_and(|i| !i.software)
+            });
+            if on_busiest {
+                p.share = Percent(p.share.get() + share);
+            }
+            let busier = p.busiest.as_ref().is_none_or(|(s, _)| share > s.get());
             if !busier {
                 continue;
             }
@@ -420,7 +453,47 @@ impl GpuProbe {
                     .insert((*luid, Arc::clone(name)), Arc::clone(&label));
                 label
             };
-            self.busiest.insert(*pid, (share, label));
+            p.busiest = Some((Percent(share), label));
+        }
+    }
+
+    /// Each process's dedicated and shared memory on the hardware adapters seen
+    /// this pass.
+    fn read_process_memory(&mut self) {
+        for (which, counter) in [self.query.process_dedicated, self.query.process_shared]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(counter) = counter else {
+                continue;
+            };
+            let Some(items) = self.query.array(counter, PDH_FMT_LARGE) else {
+                continue;
+            };
+            for item in items {
+                if !valid(item.FmtValue.CStatus) {
+                    continue;
+                }
+                decode(item.szName, &mut self.name);
+                let Some((pid, luid)) = parse_process(&self.name) else {
+                    continue;
+                };
+                let hardware = self.adapters.iter().any(|a| a.luid == luid)
+                    && self.infos.get(&luid).is_some_and(|i| !i.software);
+                // SAFETY: a LARGE format fills the `largeValue` member.
+                let bytes =
+                    u64::try_from(unsafe { item.FmtValue.Anonymous.largeValue }).unwrap_or(0);
+                if !hardware || bytes == 0 {
+                    continue;
+                }
+                let p = self.procs.entry(pid).or_default();
+                let into = if which == 0 {
+                    &mut p.dedicated
+                } else {
+                    &mut p.shared
+                };
+                *into = Bytes(into.get() + bytes);
+            }
         }
     }
 
@@ -552,6 +625,14 @@ fn parse_adapter(name: &str) -> Option<u64> {
     let (high, rest) = rest.split_once('_')?;
     let low = rest.split_once('_').map_or(rest, |(low, _)| low);
     parse_luid(high, low)
+}
+
+/// `pid_1234_luid_0x00000000_0x0000C8A1_phys_0`, as `GPU Process Memory` names
+/// its instances: the process and the adapter.
+fn parse_process(name: &str) -> Option<(u32, u64)> {
+    let rest = name.strip_prefix("pid_")?;
+    let (pid, rest) = rest.split_once('_')?;
+    Some((pid.parse().ok()?, parse_adapter(rest)?))
 }
 
 /// The two hex halves of an instance name, high part first, as one `u64`: the
@@ -737,6 +818,20 @@ mod tests {
     }
 
     #[test]
+    fn process_memory_instances_parse() {
+        assert_eq!(
+            parse_process("pid_1852_luid_0x00000000_0x00012fcf_phys_0"),
+            Some((1852, 0x12fcf))
+        );
+        assert_eq!(parse_process("luid_0x00000000_0x00012fcf_phys_0"), None);
+        assert_eq!(
+            parse_process("pid_x_luid_0x00000000_0x00012fcf_phys_0"),
+            None
+        );
+        assert_eq!(parse_process("_Total"), None);
+    }
+
+    #[test]
     fn luid_round_trips() {
         for (high, low) in [
             (0, 0xC8A1u32),
@@ -799,12 +894,35 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &out[0].info));
         assert!(out[0].engines.iter().any(|e| Arc::ptr_eq(&e.name, &name)));
         // Every attributed process names a listed adapter.
-        for (pid, (share, label)) in &probe.busiest {
-            assert!(*share > 0.0 && *share <= 100.0, "{pid}: {share} {label}");
-            assert!(label.contains(" - "), "{label}");
-            assert!(probe.process_gpu(*pid).is_some());
+        for (pid, p) in &probe.procs {
+            if let Some((share, label)) = &p.busiest {
+                let share = share.get();
+                assert!(share > 0.0 && share <= 100.0, "{pid}: {share} {label}");
+                assert!(label.contains(" - "), "{label}");
+            }
+            assert!(probe.process(*pid).is_some());
         }
-        assert!(probe.process_gpu(u32::MAX).is_none());
+        assert!(probe.process(u32::MAX).is_none());
+        // The shares of the busiest engines add up to the hardware adapters'
+        // utilization; the busiest engine's sum is clamped at 100, the shares not.
+        let utilization: f32 = out
+            .iter()
+            .filter(|g| !g.info.software)
+            .map(|g| g.utilization.get())
+            .sum();
+        let shares: f32 = probe.procs.values().map(|p| p.share.get()).sum();
+        assert!(
+            shares + 0.01 >= utilization && shares <= utilization + 1.0,
+            "shares {shares} for utilization {utilization}"
+        );
+        // A desktop has a compositor holding GPU memory.
+        assert!(
+            probe
+                .procs
+                .values()
+                .any(|p| p.dedicated.get() + p.shared.get() > 0),
+            "some process holds GPU memory"
+        );
     }
 
     /// What a pass costs here. Ignored because it measures the machine it runs on:
@@ -838,7 +956,7 @@ mod tests {
             "gpu sample  mean {mean:>7.3} ms   worst {worst:>7.3} ms  ({} adapters, {} engine types, {} processes attributed)",
             out.len(),
             instances,
-            probe.busiest.len()
+            probe.procs.len()
         );
         for g in &out {
             println!("{g:#?}");

@@ -37,7 +37,9 @@ pub const MAGIC: &[u8; 5] = b"OTREC";
 /// - 1: the first.
 /// - 2: each frame's body is followed by what the samples gained since: the
 ///   processes' private working sets ([`crate::frame`]).
-pub const FORMAT_VERSION: u16 = 2;
+/// - 3: and after that, the processes' use of the GPUs: their share of the GPUs'
+///   utilization and their dedicated and shared GPU memory.
+pub const FORMAT_VERSION: u16 = 3;
 /// The oldest format this build reads.
 pub const OLDEST_VERSION: u16 = 1;
 /// The last five bytes of a finished recording.
