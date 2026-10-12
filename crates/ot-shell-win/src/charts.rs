@@ -5,7 +5,8 @@
 //! pass, each run it draws is rendered into a bitmap of its own, in device pixels,
 //! by the GPU ([`crate::chart_gpu`]) or the CPU ([`ot_paint::ChartRaster`]); the
 //! pass then draws the bitmap 1:1 where the run's commands were. This module finds
-//! the runs and turns their shapes into pixels both renderers take.
+//! the runs and turns their shapes into pixels both renderers take, and cuts them
+//! into [`Piece`]s for the GPU.
 
 use ot_paint::{ChartRaster, Color, DisplayList, DrawCmd, Point, Rect};
 
@@ -145,6 +146,75 @@ pub struct Shape {
     pub bounds: [f32; 4],
 }
 
+/// How many columns of pixels a [`Piece`] spans. Narrow, so that a piece is not
+/// much taller than its shape is there; wide enough that the pieces stay few (a
+/// full History is a couple of thousand).
+pub const PIECE_W: u32 = 8;
+
+/// A strip of a shape, for the GPU: the pixels of some whole columns that the shape
+/// can touch, and where in its points the searches for those pixels end up.
+///
+/// A shape's bounds are mostly empty: a History band is a thin ribbon across a
+/// plot, its bounding box most of the plot. Drawn as one quad, every pixel of the
+/// box ran the coverage shader, binary searches and all, nine bands and nine
+/// hairlines deep. Cut into pieces only the ribbon's pixels run it, each once, and
+/// each search starts already narrowed to the piece's few points. The coverage is
+/// computed as before, so the pixels come out the same.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Piece {
+    /// `[x0, y0, x1, y1]` in the run's pixels: whole columns, cut to the shape's
+    /// bounds, and the rows the shape can touch in them.
+    pub rect: [f32; 4],
+    /// Index into [`Shapes::shapes`].
+    pub shape: u32,
+    /// For the band's top (the graph's line) and its bottom, the range of answers
+    /// the shader's lower-bound search can give for a pixel of the piece, relative
+    /// to the line's first point: `lo..=hi`.
+    pub a: (u32, u32),
+    pub b: (u32, u32),
+}
+
+/// The index of the first point whose x is at least `x`; `pts.len()` when there is
+/// none. The shader's `lowerBound`.
+fn lower_bound(pts: &[Point], x: f32) -> u32 {
+    pts.partition_point(|p| p.x < x) as u32
+}
+
+/// The line through `pts` at `x`, its end values beyond either end. The shader's
+/// `lineAt`.
+fn line_at(pts: &[Point], x: f32) -> f32 {
+    let i = lower_bound(pts, x) as usize;
+    if i == 0 {
+        return pts[0].y;
+    }
+    let Some(&b) = pts.get(i) else {
+        return pts[pts.len() - 1].y;
+    };
+    let a = pts[i - 1];
+    let span = b.x - a.x;
+    if span <= f32::EPSILON {
+        return b.y;
+    }
+    a.y + (b.y - a.y) * ((x - a.x) / span).min(1.0)
+}
+
+/// The lowest and highest the line through `pts` is over `l..=r`: at its ends, and
+/// at every point between, where a piecewise linear line turns.
+fn extent(pts: &[Point], l: f32, r: f32) -> (f32, f32) {
+    let (a, b) = (line_at(pts, l), line_at(pts, r));
+    let (mut lo, mut hi) = (a.min(b), a.max(b));
+    let first = pts.partition_point(|p| p.x < l);
+    for p in pts[first..].iter().take_while(|p| p.x <= r) {
+        lo = lo.min(p.y);
+        hi = hi.max(p.y);
+    }
+    (lo, hi)
+}
+
+/// Slack, in pixels, on a piece's rows, so that rounding in [`extent`] can never
+/// leave out a row the shader would give a sliver of coverage.
+const ROW_SLACK: f32 = 0.01;
+
 /// The shapes of one or more runs, in each run's own pixels (its top left at 0, 0).
 #[derive(Debug, Default)]
 pub struct Shapes {
@@ -215,6 +285,61 @@ impl Shapes {
 
     fn slice(&self, (start, len): (u32, u32)) -> &[Point] {
         &self.points[start as usize..(start + len) as usize]
+    }
+
+    /// Cut shape `index` into pieces [`PIECE_W`] columns wide onto `out`, or, with
+    /// `whole`, into one piece that is its bounds, its searches over all its points
+    /// (how shapes were drawn before pieces, kept to check them against). A piece
+    /// holds every pixel of its columns that the shape gives any coverage, and no
+    /// pixel is in two pieces of a shape.
+    pub fn pieces(&self, index: usize, whole: bool, out: &mut Vec<Piece>) {
+        let it = &self.shapes[index];
+        let shape = index as u32;
+        let [bx0, by0, bx1, by1] = it.bounds;
+        let (top, bottom) = (self.slice(it.a), self.slice(it.b));
+        let band = it.kind == Kind::Band;
+        if bx1 <= bx0 || by1 <= by0 || top.is_empty() || (band && bottom.is_empty()) {
+            return;
+        }
+        if whole {
+            out.push(Piece {
+                rect: it.bounds,
+                shape,
+                a: (0, top.len() as u32),
+                b: (0, bottom.len() as u32),
+            });
+            return;
+        }
+        // How far from a pixel's center the shape reaches: a line's half width and
+        // the fringe; a band is sampled inside its pixel's column.
+        let reach = if band { 0.0 } else { it.width * 0.5 + 0.5 };
+        let last = bx1.ceil() as u32;
+        let mut c0 = bx0.floor() as u32;
+        while c0 < last {
+            let c1 = (c0 + PIECE_W).min(last);
+            // Every x a pixel of these columns looks at: a band's samples, inside
+            // the columns; a line's segments, within reach of the centers.
+            let (left, right) = (c0 as f32 - reach, c1 as f32 + reach);
+            let (mut lo, mut hi) = extent(top, left, right);
+            let mut range_b = (0, 0);
+            if band {
+                let (blo, bhi) = extent(bottom, left, right);
+                lo = lo.min(blo);
+                hi = hi.max(bhi);
+                range_b = (lower_bound(bottom, left), lower_bound(bottom, right));
+            }
+            let y0 = (lo - reach - ROW_SLACK).floor().max(by0);
+            let y1 = (hi + reach + ROW_SLACK).ceil().min(by1);
+            if y1 > y0 {
+                out.push(Piece {
+                    rect: [(c0 as f32).max(bx0), y0, (c1 as f32).min(bx1), y1],
+                    shape,
+                    a: (lower_bound(top, left), lower_bound(top, right)),
+                    b: range_b,
+                });
+            }
+            c0 = c1;
+        }
     }
 
     /// Draw shapes `range` (from [`Shapes::add_run`]) into `raster`, `w` x `h`.
@@ -349,5 +474,120 @@ mod tests {
         // Inside the band, below the line: white, opaque.
         let i = ((80 * 200 + 100) * 4) as usize;
         assert_eq!(&raster.pixels()[i..i + 4], &[255, 255, 255, 255]);
+    }
+
+    /// Shapes like the History's and the summary charts', and awkward ones: a band
+    /// whose top and bottom have their own xs and ends, steps (two points at one
+    /// x), spikes, lines of several widths, points off the run on either side.
+    fn awkward() -> DisplayList {
+        let mut dl = DisplayList::new();
+        dl.push_clip(Rect::new(0.0, 0.0, 300.0, 200.0));
+        let wave = |i: usize, k: f32| ((i as f32 * 0.37 + k).sin() * (i as f32 * 0.05).cos()).abs();
+        let mut lower: Vec<Point> = (0..=160)
+            .map(|i| p(-10.0 + i as f32 * 2.0, 190.0))
+            .collect();
+        for k in 0..5 {
+            let upper: Vec<Point> = lower
+                .iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    let spike = if i % 23 == 0 { 40.0 } else { 0.0 };
+                    p(q.x, q.y - 4.0 - 25.0 * wave(i, k as f32) - spike)
+                })
+                .collect();
+            dl.band(upper.iter().copied(), lower.iter().copied(), Color::WHITE);
+            dl.graph(upper.iter().copied(), Color::WHITE, 0.5 + k as f32 * 0.6);
+            lower = upper;
+        }
+        // Its own xs, top and bottom, and a step in the top.
+        dl.band(
+            [p(20.3, 50.0), p(80.0, 20.0), p(80.0, 70.0), p(140.7, 30.0)],
+            [p(10.0, 90.0), p(61.1, 95.5), p(150.0, 80.0)],
+            Color::WHITE,
+        );
+        // A steep line, nearly vertical.
+        dl.graph(
+            [p(200.0, 10.0), p(200.4, 180.0), p(203.0, 20.0)],
+            Color::WHITE,
+            1.5,
+        );
+        dl.pop_clip();
+        dl
+    }
+
+    #[test]
+    fn pieces_hold_every_pixel_a_shape_covers_once() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let dl = awkward();
+            let mut runs = Vec::new();
+            find_runs(&dl, scale, (600, 400), &mut runs);
+            let mut shapes = Shapes::default();
+            let range = shapes.add_run(&dl, &runs[0], scale);
+            let (w, h) = (runs[0].px.w, runs[0].px.h);
+            let mut raster = ChartRaster::new();
+            let mut pieces = Vec::new();
+            for i in range.0..range.0 + range.1 {
+                let i = i as usize;
+                pieces.clear();
+                shapes.pieces(i, false, &mut pieces);
+                let mut whole = Vec::new();
+                shapes.pieces(i, true, &mut whole);
+                // The shape alone, with the coverage the shader computes.
+                raster.reset(w, h);
+                shapes.rasterize((i as u32, 1), w, h, &mut raster);
+                let px = raster.pixels();
+                let mut covered = 0usize;
+                let center_in = |r: &[f32; 4], x: u32, y: u32| {
+                    let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    cx >= r[0] && cx < r[2] && cy >= r[1] && cy < r[3]
+                };
+                for y in 0..h {
+                    for x in 0..w {
+                        let n = pieces.iter().filter(|q| center_in(&q.rect, x, y)).count();
+                        assert!(n <= 1, "scale {scale} shape {i}: ({x}, {y}) in {n} pieces");
+                        let alpha = px[((y * w + x) * 4 + 3) as usize];
+                        let in_whole = whole.iter().any(|q| center_in(&q.rect, x, y));
+                        if alpha > 0 && in_whole {
+                            covered += 1;
+                            assert_eq!(
+                                n, 1,
+                                "scale {scale} shape {i}: ({x}, {y}) covered ({alpha}) but in no piece"
+                            );
+                        }
+                        // Nothing the whole quad leaves out is drawn either.
+                        assert!(in_whole || n == 0, "scale {scale} shape {i}: ({x}, {y})");
+                    }
+                }
+                assert!(covered > 0, "scale {scale} shape {i} draws something");
+                // A piece's searches cover where its pixels look.
+                let s = shapes.shapes[i];
+                for q in &pieces {
+                    assert!(q.a.0 <= q.a.1 && q.a.1 <= s.a.1, "{q:?}");
+                    assert!(q.b.0 <= q.b.1 && q.b.1 <= s.b.1, "{q:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pieces_are_much_smaller_than_the_bounds() {
+        let dl = awkward();
+        let mut runs = Vec::new();
+        find_runs(&dl, 1.0, (600, 400), &mut runs);
+        let mut shapes = Shapes::default();
+        let range = shapes.add_run(&dl, &runs[0], 1.0);
+        let area = |pieces: &[Piece]| -> f32 {
+            pieces
+                .iter()
+                .map(|q| (q.rect[2] - q.rect[0]) * (q.rect[3] - q.rect[1]))
+                .sum()
+        };
+        let (mut cut, mut whole) = (Vec::new(), Vec::new());
+        for i in range.0..range.0 + range.1 {
+            shapes.pieces(i as usize, false, &mut cut);
+            shapes.pieces(i as usize, true, &mut whole);
+        }
+        let (cut, whole) = (area(&cut), area(&whole));
+        assert!(cut < whole * 0.4, "pieces {cut} px, bounds {whole} px");
     }
 }

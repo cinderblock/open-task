@@ -1,14 +1,22 @@
 //! Chart shapes on the GPU: Direct3D 11 shaders that compute each pixel's coverage.
 //!
 //! The CPU's part is copying the shapes' points (in each run's pixels,
-//! [`crate::charts::Shapes`]) into one buffer and a record per shape into another;
-//! then, for each run, one instanced draw of a quad per shape into the run's
-//! texture. The pixel shader finds the shape's top and bottom (a band) or nearest
-//! segment (a graph) at its pixel by binary search over the points, which are
-//! ascending in x, and computes the same coverage as
+//! [`crate::charts::Shapes`]) into one buffer, a record per shape into another, and
+//! the shapes cut into [`Piece`]s, strips a few pixels wide and only as tall as the
+//! shape is there, into a third; then, for each run, one instanced draw of a quad
+//! per piece into the run's texture. The pixel shader finds the shape's top and
+//! bottom (a band) or nearest segment (a graph) at its pixel by binary search over
+//! the points, which are ascending in x, narrowed to the piece's points, and
+//! computes the same coverage as
 //! [`ot_paint::ChartRaster`]: four sub-samples across the pixel, exact vertically,
 //! for a band; distance to the line for a graph. Blending is premultiplied
 //! source-over, as Direct2D's.
+//!
+//! The pieces are what keep the GPU's work to the pixels a shape covers. With a
+//! quad per shape, its bounding box, a full History (nine bands and their
+//! hairlines, each box most of the plot) ran the shader over the plot about
+//! eighteen times a frame: half of an integrated GPU's 3D engine at 60 frames a
+//! second, for a chart whose CPU side took under a millisecond.
 //!
 //! The shaders are compiled from source when the renderer starts (`D3DCompile`,
 //! `d3dcompiler_47.dll`, part of Windows since 8.1), which takes a few
@@ -34,13 +42,14 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIEWPORT,
 };
 
-use crate::charts::{Kind, Shapes};
+use crate::charts::{Kind, Piece, Shapes};
 
-/// The shaders. `Shape` must match [`GpuShape`] field for field.
+/// The shaders. `Shape` must match [`GpuShape`] field for field, and `Piece`
+/// [`GpuPiece`].
 const HLSL: &str = r"
 struct Shape {
     float4 color;   // premultiplied
-    float4 rect;    // x0, y0, x1, y1 in the run's pixels
+    float4 rect;    // x0, y0, x1, y1 in the run's pixels (unused: the pieces are)
     uint kind;      // 0 band, 1 graph
     uint aFirst;
     uint aCount;
@@ -49,34 +58,42 @@ struct Shape {
     float width;
     float2 pad;
 };
+struct Piece {
+    float4 rect;    // x0, y0, x1, y1 in the run's pixels
+    uint shape;
+    uint aLo;       // the answers lowerBound can give in the piece, a and b
+    uint aHi;
+    uint bLo;
+    uint bHi;
+    uint3 pad;
+};
 StructuredBuffer<float2> points : register(t0);
 StructuredBuffer<Shape> shapes : register(t1);
+StructuredBuffer<Piece> pieces : register(t2);
 cbuffer Run : register(b0) {
     float2 size;
-    uint firstShape;
+    uint firstPiece;
     uint pad;
 };
 
 struct VOut {
     float4 pos : SV_Position;
-    nointerpolation uint shape : SHAPE;
+    nointerpolation uint piece : PIECE;
 };
 
 VOut vs(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
-    uint i = firstShape + iid;
-    Shape s = shapes[i];
-    float2 c = float2((vid & 1) ? s.rect.z : s.rect.x, (vid & 2) ? s.rect.w : s.rect.y);
+    uint i = firstPiece + iid;
+    Piece p = pieces[i];
+    float2 c = float2((vid & 1) ? p.rect.z : p.rect.x, (vid & 2) ? p.rect.w : p.rect.y);
     VOut o;
     o.pos = float4(c.x / size.x * 2.0 - 1.0, 1.0 - c.y / size.y * 2.0, 0.0, 1.0);
-    o.shape = i;
+    o.piece = i;
     return o;
 }
 
 // The first of points[first .. first + count] whose x is at least `x`, relative to
-// `first`; `count` when there is none.
-uint lowerBound(uint first, uint count, float x) {
-    uint lo = 0;
-    uint hi = count;
+// `first`; `count` when there is none. The answer is known to be in `lo..=hi`.
+uint lowerBound(uint first, uint lo, uint hi, float x) {
     while (lo < hi) {
         uint mid = (lo + hi) / 2;
         if (points[first + mid].x < x) { lo = mid + 1; } else { hi = mid; }
@@ -86,8 +103,8 @@ uint lowerBound(uint first, uint count, float x) {
 
 // The line through the points at `x`, by linear interpolation; the end values
 // beyond either end. As ChartRaster's `at`.
-float lineAt(uint first, uint count, float x) {
-    uint i = lowerBound(first, count, x);
+float lineAt(uint first, uint count, uint lo, uint hi, float x) {
+    uint i = lowerBound(first, lo, hi, x);
     if (i == 0) { return points[first].y; }
     if (i >= count) { return points[first + count - 1].y; }
     float2 a = points[first + i - 1];
@@ -105,7 +122,8 @@ float segmentDistance(float2 p, float2 a, float2 b) {
 }
 
 float4 ps(VOut v) : SV_Target {
-    Shape s = shapes[v.shape];
+    Piece pc = pieces[v.piece];
+    Shape s = shapes[pc.shape];
     float2 px = v.pos.xy;
     float cov = 0.0;
     if (s.kind == 0) {
@@ -116,15 +134,15 @@ float4 ps(VOut v) : SV_Target {
         [unroll] for (uint k = 0; k < 4; k++) {
             float xs = col + (k + 0.5) / 4.0;
             if (xs >= x0 && xs <= x1) {
-                float t = lineAt(s.aFirst, s.aCount, xs);
-                float b = lineAt(s.bFirst, s.bCount, xs);
+                float t = lineAt(s.aFirst, s.aCount, pc.aLo, pc.aHi, xs);
+                float b = lineAt(s.bFirst, s.bCount, pc.bLo, pc.bHi, xs);
                 cov += max(min(max(t, b), row + 1.0) - max(min(t, b), row), 0.0);
             }
         }
         cov /= 4.0;
     } else {
         float reach = s.width * 0.5 + 0.5;
-        uint i = lowerBound(s.aFirst, s.aCount, px.x - reach);
+        uint i = lowerBound(s.aFirst, pc.aLo, pc.aHi, px.x - reach);
         uint j = i == 0 ? 0 : i - 1;
         float d = 1e9;
         for (; j + 1 < s.aCount; j++) {
@@ -154,12 +172,25 @@ pub struct GpuShape {
     pad: [f32; 2],
 }
 
+/// One piece as the shaders read it (`Piece` in [`HLSL`]).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct GpuPiece {
+    rect: [f32; 4],
+    shape: u32,
+    a_lo: u32,
+    a_hi: u32,
+    b_lo: u32,
+    b_hi: u32,
+    pad: [u32; 3],
+}
+
 /// The constant buffer (`Run` in [`HLSL`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct RunConstants {
     size: [f32; 2],
-    first_shape: u32,
+    first_piece: u32,
     pad: u32,
 }
 
@@ -181,7 +212,16 @@ pub struct GpuCharts {
     constants: ID3D11Buffer,
     points: Option<Structured>,
     shapes: Option<Structured>,
+    pieces: Option<Structured>,
     upload: Vec<GpuShape>,
+    /// This frame's pieces, and where each shape's start (one more than there are
+    /// shapes, the last the end).
+    cut: Vec<Piece>,
+    gpu_pieces: Vec<GpuPiece>,
+    starts: Vec<u32>,
+    /// Draw each shape as one quad, its bounds, as before pieces: for checking
+    /// that the pieces draw the same pixels.
+    pub(crate) whole_shapes: bool,
 }
 
 impl std::fmt::Debug for GpuCharts {
@@ -248,13 +288,19 @@ impl GpuCharts {
                 constants: constants.ok_or_else(fail)?,
                 points: None,
                 shapes: None,
+                pieces: None,
                 upload: Vec::new(),
+                cut: Vec::new(),
+                gpu_pieces: Vec::new(),
+                starts: Vec::new(),
+                whole_shapes: false,
             })
         }
     }
 
     /// Hand the shapes of every run this frame draws to the GPU: one copy of the
-    /// points and one of the shape records, before any [`GpuCharts::draw`].
+    /// points, one of the shape records and one of their pieces, before any
+    /// [`GpuCharts::draw`].
     pub fn upload(&mut self, shapes: &Shapes) -> Result<()> {
         self.upload.clear();
         self.upload.extend(shapes.shapes.iter().map(|s| {
@@ -274,16 +320,38 @@ impl GpuCharts {
                 pad: [0.0; 2],
             }
         }));
+        self.cut.clear();
+        self.starts.clear();
+        for i in 0..shapes.shapes.len() {
+            self.starts.push(self.cut.len() as u32);
+            shapes.pieces(i, self.whole_shapes, &mut self.cut);
+        }
+        self.starts.push(self.cut.len() as u32);
+        self.gpu_pieces.clear();
+        self.gpu_pieces.extend(self.cut.iter().map(|p| GpuPiece {
+            rect: p.rect,
+            shape: p.shape,
+            a_lo: p.a.0,
+            a_hi: p.a.1,
+            b_lo: p.b.0,
+            b_hi: p.b.1,
+            pad: [0; 3],
+        }));
         let points: Vec<[f32; 2]> = shapes.points.iter().map(|p| [p.x, p.y]).collect();
         fill(&self.device, &self.ctx, &mut self.points, &points)?;
-        let upload = std::mem::take(&mut self.upload);
-        let r = fill(&self.device, &self.ctx, &mut self.shapes, &upload);
-        self.upload = upload;
-        r
+        fill(&self.device, &self.ctx, &mut self.shapes, &self.upload)?;
+        fill(&self.device, &self.ctx, &mut self.pieces, &self.gpu_pieces)
+    }
+
+    /// The pieces of shapes `range`, as a first piece and a count.
+    fn piece_range(&self, range: (u32, u32)) -> (u32, u32) {
+        let at = |i: u32| self.starts.get(i as usize).copied().unwrap_or(0);
+        let first = at(range.0);
+        (first, at(range.0 + range.1).saturating_sub(first))
     }
 
     /// Draw shapes `range` (from [`Shapes::add_run`], uploaded) into `target`,
-    /// `w` x `h` pixels, cleared first.
+    /// `w` x `h` pixels, cleared first: one quad for each of their pieces.
     pub fn draw(
         &mut self,
         target: &ID3D11RenderTargetView,
@@ -291,9 +359,11 @@ impl GpuCharts {
         h: u32,
         range: (u32, u32),
     ) -> Result<()> {
-        let (Some(points), Some(shapes)) = (&self.points, &self.shapes) else {
+        let (Some(points), Some(shapes), Some(pieces)) = (&self.points, &self.shapes, &self.pieces)
+        else {
             return Ok(());
         };
+        let range = self.piece_range(range);
         // SAFETY: every object is ours and alive; the mapped constant buffer is
         // written within its size and unmapped before the draw.
         unsafe {
@@ -315,7 +385,7 @@ impl GpuCharts {
                 .cast::<RunConstants>()
                 .write_unaligned(RunConstants {
                     size: [w as f32, h as f32],
-                    first_shape: range.0,
+                    first_piece: range.0,
                     pad: 0,
                 });
             ctx.Unmap(&self.constants, 0);
@@ -324,7 +394,11 @@ impl GpuCharts {
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             ctx.VSSetShader(&self.vs, None);
             ctx.PSSetShader(&self.ps, None);
-            let views = [Some(points.view.clone()), Some(shapes.view.clone())];
+            let views = [
+                Some(points.view.clone()),
+                Some(shapes.view.clone()),
+                Some(pieces.view.clone()),
+            ];
             ctx.VSSetShaderResources(0, Some(&views));
             ctx.PSSetShaderResources(0, Some(&views));
             let cbs = [Some(self.constants.clone())];
@@ -351,7 +425,7 @@ impl GpuCharts {
         // SAFETY: unbinding is always valid.
         unsafe {
             self.ctx.OMSetRenderTargets(None, None);
-            let none = [None, None];
+            let none = [None, None, None];
             self.ctx.VSSetShaderResources(0, Some(&none));
             self.ctx.PSSetShaderResources(0, Some(&none));
         }

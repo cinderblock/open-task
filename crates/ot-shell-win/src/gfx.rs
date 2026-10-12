@@ -2032,11 +2032,68 @@ mod tests {
         dl.pop_clip();
     }
 
+    /// The GPU's own time for what `f` submits to `device`, in milliseconds, by
+    /// timestamp queries around it; `None` if the GPU reports the interval
+    /// unreliable (its clock changed).
+    fn gpu_ms(device: &ID3D11Device, f: impl FnOnce()) -> Option<f64> {
+        use std::ffi::c_void;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC, D3D11_QUERY_TIMESTAMP,
+            D3D11_QUERY_TIMESTAMP_DISJOINT,
+        };
+        let query = |kind| {
+            let desc = D3D11_QUERY_DESC {
+                Query: kind,
+                MiscFlags: 0,
+            };
+            let mut q = None;
+            // SAFETY: a complete descriptor and a local out-pointer.
+            unsafe { device.CreateQuery(&raw const desc, Some(&raw mut q)) }.expect("a query");
+            q.expect("a query")
+        };
+        let (disjoint, start, end) = (
+            query(D3D11_QUERY_TIMESTAMP_DISJOINT),
+            query(D3D11_QUERY_TIMESTAMP),
+            query(D3D11_QUERY_TIMESTAMP),
+        );
+        // SAFETY: the queries are ours; each GetData writes at most the size given
+        // into a local of that size. A result not ready yet leaves the local as it
+        // was, so each is polled until it changes from zero.
+        unsafe {
+            let ctx = device.GetImmediateContext().expect("a context");
+            ctx.Begin(&disjoint);
+            ctx.End(&start);
+            f();
+            ctx.End(&end);
+            ctx.End(&disjoint);
+            let mut dj = D3D11_QUERY_DATA_TIMESTAMP_DISJOINT::default();
+            while dj.Frequency == 0 {
+                let _ = ctx.GetData(
+                    &disjoint,
+                    Some((&raw mut dj).cast::<c_void>()),
+                    size_of::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>() as u32,
+                    0,
+                );
+            }
+            let read = |q: &windows::Win32::Graphics::Direct3D11::ID3D11Query| {
+                let mut t = 0u64;
+                while t == 0 {
+                    let _ = ctx.GetData(q, Some((&raw mut t).cast::<c_void>()), 8, 0);
+                }
+                t
+            };
+            let (t0, t1) = (read(&start), read(&end));
+            (!dj.Disjoint.as_bool())
+                .then(|| t1.saturating_sub(t0) as f64 * 1000.0 / dj.Frequency as f64)
+        }
+    }
+
     /// `cargo test -p ot-shell-win --release -- --ignored --nocapture
     /// chart_frame_timing`: the time a full-history History frame takes to draw,
     /// chart preparation (shapes, raster or GPU, upload) and the Direct2D pass
-    /// apart, on this machine's GPU, for each way of drawing charts. The fastest of
-    /// several batches, since a busy machine slows some.
+    /// apart, on this machine's GPU, for each way of drawing charts, and the GPU's
+    /// own time for the frame (for the GPU mode with the shapes in pieces and
+    /// whole). The fastest of several batches, since a busy machine slows some.
     #[test]
     #[ignore = "a timing, not a check"]
     fn chart_frame_timing() {
@@ -2059,28 +2116,119 @@ mod tests {
         }
         .expect("a window");
         let device = create_d3d_device(false).expect("a device");
-        let mut gfx = Gfx::on_device(hwnd, (1164, 721), 96.0, device).expect("graphics");
+        let mut gfx = Gfx::on_device(hwnd, (1164, 721), 96.0, device.clone()).expect("graphics");
         let mut dl = DisplayList::new();
-        for mode in [ChartDrawing::Gpu, ChartDrawing::Cpu, ChartDrawing::Direct2D] {
+        let ways = [
+            (ChartDrawing::Gpu, false),
+            (ChartDrawing::Gpu, true),
+            (ChartDrawing::Cpu, false),
+            (ChartDrawing::Direct2D, false),
+        ];
+        for (mode, whole) in ways {
             gfx.charts.forced = Some(mode);
+            gfx.redraw_all = true;
+            gfx.render(&dl, 0).expect("a frame");
+            if let Some(gpu) = gfx.charts.gpu.as_mut() {
+                gpu.whole_shapes = whole;
+            }
             let (mut best_charts, mut best_draw) = (Duration::MAX, Duration::MAX);
+            let mut best_gpu = f64::MAX;
             for batch in 0..8 {
                 let (mut charts, mut draw) = (Duration::ZERO, Duration::ZERO);
+                let mut on_gpu = 0.0;
                 for f in 0..20 {
                     history_frame(&mut dl, (batch * 20 + f) as f32 * 0.37);
-                    gfx.render(&dl, 0).expect("a frame");
+                    let t = gpu_ms(&device, || {
+                        gfx.render(&dl, 0).expect("a frame");
+                    });
+                    on_gpu += t.unwrap_or(f64::NAN);
                     charts += gfx.stats.charts;
                     draw += gfx.stats.draw;
                 }
                 best_charts = best_charts.min(charts / 20);
                 best_draw = best_draw.min(draw / 20);
+                if on_gpu.is_finite() {
+                    best_gpu = best_gpu.min(on_gpu / 20.0);
+                }
             }
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            let shapes = if whole { " (whole shapes)" } else { "" };
             eprintln!(
-                "{mode:?}: charts {:.3} ms, draw {:.3} ms",
+                "{mode:?}{shapes}: charts {:.3} ms, draw {:.3} ms, GPU {best_gpu:.3} ms",
                 ms(best_charts),
                 ms(best_draw)
             );
+        }
+        // SAFETY: created above.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn shapes_in_pieces_draw_exactly_what_whole_shapes_draw() {
+        // SAFETY: a hidden popup of a system class, destroyed below.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("chart pieces"),
+                WS_POPUP,
+                0,
+                0,
+                1164,
+                721,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a window");
+        let mut dl = DisplayList::new();
+        // WARP everywhere, CI included; this machine's GPU too where there is one.
+        for warp in [true, false] {
+            let Ok(device) = create_d3d_device(warp) else {
+                continue;
+            };
+            for dpi in [96.0, 120.0, 144.0] {
+                let size = ((1164.0 * dpi / 96.0) as u32, (721.0 * dpi / 96.0) as u32);
+                let mut gfx = Gfx::on_device(hwnd, size, dpi, device.clone()).expect("graphics");
+                gfx.charts.forced = Some(ChartDrawing::Gpu);
+                for frame in 0..3 {
+                    match frame {
+                        0 => charts_frame(&mut dl),
+                        f => history_frame(&mut dl, f as f32 * 0.43),
+                    }
+                    let mut frames = Vec::new();
+                    for whole in [true, false] {
+                        gfx.redraw_all = true;
+                        gfx.render(&dl, 0).expect("a frame");
+                        if let Some(gpu) = gfx.charts.gpu.as_mut() {
+                            gpu.whole_shapes = whole;
+                        }
+                        gfx.redraw_all = true;
+                        gfx.render(&dl, 0).expect("a frame");
+                        assert_eq!(gfx.charts.mode(), ChartDrawing::Gpu, "no fallback");
+                        frames.push(gfx.canvas_pixels());
+                    }
+                    let differ = frames[0]
+                        .chunks_exact(4)
+                        .zip(frames[1].chunks_exact(4))
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    assert_eq!(
+                        differ, 0,
+                        "warp {warp}, dpi {dpi}, frame {frame}: {differ} pixels differ"
+                    );
+                    assert!(
+                        frames[1]
+                            .chunks_exact(4)
+                            .any(|p| p != frames[1][..4].as_ref()),
+                        "something was drawn"
+                    );
+                }
+            }
         }
         // SAFETY: created above.
         unsafe {
