@@ -4,6 +4,8 @@ Problems noticed while working on something else, left for a thread of their own
 
 ## The History view keeps the GPU busy
 
+in progress — master, GPU-breakdown thread (`plans/history-gpu-cost.md`)
+
 Seen 2026-10-12 on an Intel UHD (integrated) machine, debug build of `a6166dc`
 plus the GPU History work: with the window on the History view (the default CPU
 reading, nothing touched), open-task's share of the GPU's 3D engine read 30.3,
