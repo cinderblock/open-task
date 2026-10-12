@@ -35,13 +35,15 @@
 //! many programs are busy, not by how many processes exist.
 //!
 //! Beside the cycles, each step keeps what the chart's other readings need: the CPU
-//! time each program used, the private working set each held, and the machine's
+//! time each program used, the private working set each held, its share of the
+//! GPUs' time and the dedicated and shared GPU memory it held, and the machine's
 //! side (its CPU capacity and how much of it was busy, its RAM and how much of it
-//! was in use), so a program's share of the CPU or of memory can be set against the
-//! summary charts. Every quantity is kept as an integral over the step (CPU
-//! milliseconds, byte-milliseconds), so folding steps together is a sum and the
-//! averages come out exact. Memory is listed for every program holding any, which
-//! makes it the larger part of a step.
+//! was in use, its GPUs' time and how much of it was busy, and their dedicated
+//! memory in use), so a program's share can be set against the summary charts.
+//! Every quantity is kept as an integral over the step (CPU milliseconds,
+//! byte-milliseconds), so folding steps together is a sum and the averages come
+//! out exact. Memory is listed for every program holding any, which makes it the
+//! larger part of a step.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -100,6 +102,16 @@ pub struct ProcessUsage<'a> {
     pub program: ProgramId,
 }
 
+/// Which of a stretch's per-program lists: an index into its lists, in the order
+/// [`Frame`] has them.
+const CYCLES: usize = 0;
+const CPU_MS: usize = 1;
+const MEMORY: usize = 2;
+const GPU_MS: usize = 3;
+const GPU_DEDICATED: usize = 4;
+const GPU_SHARED: usize = 5;
+const KINDS: usize = 6;
+
 /// One stretch of the usage history.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Frame<'a> {
@@ -116,7 +128,36 @@ pub struct Frame<'a> {
     /// divided by `span_ms`, its average size. Programs that held none are not
     /// listed.
     pub memory: &'a [(ProgramId, f32)],
+    /// GPU time each program used in it, in milliseconds: its share of the engine
+    /// busiest on each hardware GPU, summed over the GPUs, times the stretch.
+    /// Programs that used none are not listed.
+    pub gpu_ms: &'a [(ProgramId, f32)],
+    /// The dedicated and the shared GPU memory each program held over it, in
+    /// byte-milliseconds. Programs that held none are not listed.
+    pub gpu_dedicated: &'a [(ProgramId, f32)],
+    pub gpu_shared: &'a [(ProgramId, f32)],
     pub machine: Machine,
+}
+
+impl<'a> Frame<'a> {
+    fn new<L: std::ops::Deref<Target = [(ProgramId, f32)]>>(
+        end_ms: i64,
+        span_ms: i64,
+        lists: &'a Lists<L>,
+        machine: Machine,
+    ) -> Self {
+        Frame {
+            end_ms,
+            span_ms,
+            cycles: &lists[CYCLES],
+            cpu_ms: &lists[CPU_MS],
+            memory: &lists[MEMORY],
+            gpu_ms: &lists[GPU_MS],
+            gpu_dedicated: &lists[GPU_DEDICATED],
+            gpu_shared: &lists[GPU_SHARED],
+            machine,
+        }
+    }
 }
 
 /// The machine's side of a stretch of the history, each an integral over it like
@@ -132,6 +173,13 @@ pub struct Machine {
     /// in use, in byte-milliseconds.
     pub ram: f64,
     pub ram_in_use: f64,
+    /// GPU time there was to use: the stretch's length times the hardware GPUs,
+    /// in milliseconds. What [`Frame::gpu_ms`] is a share of.
+    pub gpu_capacity_ms: f64,
+    /// Of that, how much the GPUs' utilization counts as busy.
+    pub gpu_busy_ms: f64,
+    /// The hardware GPUs' dedicated memory in use, in byte-milliseconds.
+    pub gpu_dedicated_in_use: f64,
 }
 
 impl Machine {
@@ -140,6 +188,9 @@ impl Machine {
         self.cpu_busy_ms += other.cpu_busy_ms;
         self.ram += other.ram;
         self.ram_in_use += other.ram_in_use;
+        self.gpu_capacity_ms += other.gpu_capacity_ms;
+        self.gpu_busy_ms += other.gpu_busy_ms;
+        self.gpu_dedicated_in_use += other.gpu_dedicated_in_use;
     }
 }
 
@@ -154,13 +205,9 @@ struct Entry {
     program: ProgramId,
 }
 
-/// Each program's numbers for one stretch, sorted by program, without the zeros.
-#[derive(Debug, Clone, Default)]
-struct Lists<L> {
-    cycles: L,
-    cpu_ms: L,
-    memory: L,
-}
+/// Each program's numbers for one stretch, a list for each of [`CYCLES`] to
+/// [`GPU_SHARED`], sorted by program, without the zeros.
+type Lists<L> = [L; KINDS];
 
 type List = Box<[(ProgramId, f32)]>;
 
@@ -174,18 +221,11 @@ struct Stored {
 
 impl Stored {
     fn frame(&self) -> Frame<'_> {
-        Frame {
-            end_ms: self.end_ms,
-            span_ms: self.span_ms,
-            cycles: &self.lists.cycles,
-            cpu_ms: &self.lists.cpu_ms,
-            memory: &self.lists.memory,
-            machine: self.machine,
-        }
+        Frame::new(self.end_ms, self.span_ms, &self.lists, self.machine)
     }
 
     fn entries(&self) -> usize {
-        self.lists.cycles.len() + self.lists.cpu_ms.len() + self.lists.memory.len()
+        self.lists.iter().map(|l| l.len()).sum()
     }
 }
 
@@ -255,9 +295,9 @@ pub struct Usage {
     raw: VecDeque<Stored>,
     coarse: VecDeque<Stored>,
     open: Option<Open>,
-    /// Scratch: this interval's cycles, CPU milliseconds and byte-milliseconds by
-    /// program, then the same as lists; and room for merging lists.
-    by_program: Vec<[f64; 3]>,
+    /// Scratch: this interval's numbers by program, one of each kind of list,
+    /// then the same as lists; and room for merging lists.
+    by_program: Vec<[f64; KINDS]>,
     interval: Lists<Vec<(ProgramId, f32)>>,
     merged: Vec<(ProgramId, f32)>,
     /// How far back the history reaches, in milliseconds.
@@ -347,9 +387,7 @@ impl Usage {
         let entry = size_of::<(ProgramId, f32)>();
         let stored = |s: &Stored| size_of::<Stored>() + s.entries() * entry;
         let open = self.open.as_ref().map_or(0, |o| {
-            let l = &o.lists;
-            size_of::<Open>()
-                + (l.cycles.capacity() + l.cpu_ms.capacity() + l.memory.capacity()) * entry
+            size_of::<Open>() + o.lists.iter().map(Vec::capacity).sum::<usize>() * entry
         });
         self.raw
             .iter()
@@ -361,13 +399,14 @@ impl Usage {
 
     /// Bytes a frame of this history takes on average, for projecting the cost of
     /// another reach with [`history_bytes`]. A guess, until there are frames to go
-    /// by, of sixteen busy programs and a hundred and fifty holding memory.
+    /// by, of sixteen busy programs, a hundred and fifty holding memory, ten using
+    /// the GPU and forty holding GPU memory of each kind.
     #[must_use]
     pub fn frame_bytes(&self) -> usize {
         let frames = self.raw.len() + self.coarse.len();
-        self.history_bytes()
-            .checked_div(frames)
-            .unwrap_or(size_of::<Stored>() + (2 * 16 + 150) * size_of::<(ProgramId, f32)>())
+        self.history_bytes().checked_div(frames).unwrap_or(
+            size_of::<Stored>() + (2 * 16 + 150 + 10 + 2 * 40) * size_of::<(ProgramId, f32)>(),
+        )
     }
 
     /// Share of every total lost each second.
@@ -407,7 +446,7 @@ impl Usage {
             e.total *= keep;
         }
         self.by_program.clear();
-        self.by_program.resize(self.programs.len(), [0.0; 3]);
+        self.by_program.resize(self.programs.len(), [0.0; KINDS]);
         for p in &snap.processes {
             // PID 0 is the kernel's idle accounting, not a process.
             if p.key().pid == 0 {
@@ -454,12 +493,16 @@ impl Usage {
             }
             let program = e.program as usize;
             if program >= self.by_program.len() {
-                self.by_program.resize(program + 1, [0.0; 3]);
+                self.by_program.resize(program + 1, [0.0; KINDS]);
             }
             let sums = &mut self.by_program[program];
-            sums[0] += used as f64;
-            sums[1] += cpu.as_secs_f64() * 1000.0;
-            sums[2] += p.private_working_set.get() as f64 * span_ms as f64;
+            let span = span_ms as f64;
+            sums[CYCLES] += used as f64;
+            sums[CPU_MS] += cpu.as_secs_f64() * 1000.0;
+            sums[MEMORY] += p.private_working_set.get() as f64 * span;
+            sums[GPU_MS] += f64::from(p.gpu_share.get()) / 100.0 * span;
+            sums[GPU_DEDICATED] += p.gpu_dedicated.get() as f64 * span;
+            sums[GPU_SHARED] += p.gpu_shared.get() as f64 * span;
         }
         self.sum = self.procs.values().map(|e| e.total).sum();
         let floor = GHOST_FLOOR.max(self.sum * GHOST_SHARE);
@@ -475,15 +518,12 @@ impl Usage {
     /// machine's side from `snap`.
     fn record(&mut self, snap: &Snapshot, now: i64, span_ms: i64) {
         let lists = &mut self.interval;
-        lists.cycles.clear();
-        lists.cpu_ms.clear();
-        lists.memory.clear();
+        for list in lists.iter_mut() {
+            list.clear();
+        }
         for (program, sums) in self.by_program.iter().enumerate() {
             let program = program as ProgramId;
-            for (list, &v) in [&mut lists.cycles, &mut lists.cpu_ms, &mut lists.memory]
-                .into_iter()
-                .zip(sums)
-            {
+            for (list, &v) in lists.iter_mut().zip(sums) {
                 if v > 0.0 {
                     list.push((program, v as f32));
                 }
@@ -491,21 +531,26 @@ impl Usage {
         }
         let span = span_ms as f64;
         let capacity = span * snap.cpu.cores.len() as f64;
+        // Software adapters (the basic render driver) are left out, as the
+        // Performance page leaves them out, and as the probe leaves them out of
+        // each process's share.
+        let gpus = || snap.gpus.iter().filter(|g| !g.info.software);
         let machine = Machine {
             cpu_capacity_ms: capacity,
             cpu_busy_ms: capacity * f64::from(snap.cpu.total.get()).clamp(0.0, 100.0) / 100.0,
             ram: snap.memory.total.get() as f64 * span,
             ram_in_use: snap.memory.in_use().get() as f64 * span,
+            gpu_capacity_ms: span * gpus().count() as f64,
+            gpu_busy_ms: gpus()
+                .map(|g| span * f64::from(g.utilization.get()).clamp(0.0, 100.0) / 100.0)
+                .sum(),
+            gpu_dedicated_in_use: gpus().map(|g| g.dedicated_used.get() as f64 * span).sum(),
         };
-        let lists = &self.interval;
+        let lists = self.interval.each_ref().map(|l| l.as_slice().into());
         self.push_frame(Stored {
             end_ms: now,
             span_ms,
-            lists: Lists {
-                cycles: lists.cycles.as_slice().into(),
-                cpu_ms: lists.cpu_ms.as_slice().into(),
-                memory: lists.memory.as_slice().into(),
-            },
+            lists,
             machine,
         });
     }
@@ -534,10 +579,9 @@ impl Usage {
             open.end_ms = old.end_ms;
             open.span_ms += old.span_ms;
             open.machine.add(old.machine);
-            let (into, from) = (&mut open.lists, &old.lists);
-            merge(&mut into.cycles, &from.cycles, &mut self.merged);
-            merge(&mut into.cpu_ms, &from.cpu_ms, &mut self.merged);
-            merge(&mut into.memory, &from.memory, &mut self.merged);
+            for (into, from) in open.lists.iter_mut().zip(&old.lists) {
+                merge(into, from, &mut self.merged);
+            }
         }
         // Steps that have passed the reach go, the one being filled included.
         if self.open.as_ref().is_some_and(|o| now - o.end_ms > reach) {
@@ -553,11 +597,7 @@ impl Usage {
             self.coarse.push_back(Stored {
                 end_ms: o.end_ms,
                 span_ms: o.span_ms,
-                lists: Lists {
-                    cycles: o.lists.cycles.into(),
-                    cpu_ms: o.lists.cpu_ms.into(),
-                    memory: o.lists.memory.into(),
-                },
+                lists: o.lists.map(Into::into),
                 machine: o.machine,
             });
         }
@@ -628,14 +668,10 @@ impl Usage {
     /// The history, newest first: every sample of the last ten minutes, then steps
     /// for the rest of the reach. No stretch is covered twice.
     pub fn frames(&self) -> impl Iterator<Item = Frame<'_>> + '_ {
-        let open = self.open.as_ref().map(|o| Frame {
-            end_ms: o.end_ms,
-            span_ms: o.span_ms,
-            cycles: &o.lists.cycles,
-            cpu_ms: &o.lists.cpu_ms,
-            memory: &o.lists.memory,
-            machine: o.machine,
-        });
+        let open = self
+            .open
+            .as_ref()
+            .map(|o| Frame::new(o.end_ms, o.span_ms, &o.lists, o.machine));
         self.raw
             .iter()
             .rev()
@@ -1155,6 +1191,71 @@ mod tests {
         assert!(close(machine.cpu_busy_ms, 3200.0));
         assert!(close(machine.ram / 2000.0, (16u64 << 30) as f64));
         assert!(close(machine.ram_in_use / 2000.0, (4u64 << 30) as f64));
+    }
+
+    #[test]
+    fn each_frame_keeps_gpu_use_and_the_hardware_gpus() {
+        use ot_model::gpu::{GpuInfo, GpuSample};
+        let gpu = |id: u64, software: bool, utilization: f32, dedicated_mb: u64| GpuSample {
+            info: Arc::new(GpuInfo {
+                id,
+                software,
+                ..GpuInfo::default()
+            }),
+            utilization: Percent(utilization),
+            engines: Vec::new(),
+            dedicated_used: Bytes(dedicated_mb << 20),
+            shared_used: Bytes::ZERO,
+        };
+        // Two programs on two GPUs, one at 60 % and one at 20 %, and the basic
+        // render driver, which counts for nothing.
+        let at = |s: u64| {
+            let mut procs = Vec::new();
+            for (i, (name, share, dedicated, shared)) in [
+                ("game.exe", 50.0, 900u64, 30u64),
+                ("dwm.exe", 25.0, 100, 70),
+                ("idle.exe", 0.0, 0, 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut p = named(i as u32 + 1, name, Some(0), 0);
+                p.gpu_share = Percent(share);
+                p.gpu_dedicated = Bytes(dedicated << 20);
+                p.gpu_shared = Bytes(shared << 20);
+                procs.push(p);
+            }
+            let mut snap = snap(s, procs);
+            snap.gpus = vec![
+                gpu(1, false, 60.0, 1200),
+                gpu(2, false, 20.0, 0),
+                gpu(3, true, 90.0, 0),
+            ];
+            snap
+        };
+        let mut u = Usage::new(0.05);
+        u.observe(&at(10));
+        u.observe(&at(12));
+        let (game, dwm) = (
+            u.program("game.exe").unwrap(),
+            u.program("dwm.exe").unwrap(),
+        );
+        let frame = u.frames().next().unwrap();
+        let mb_ms = |mb: f32| mb * 1_048_576.0 * 2000.0;
+        assert_eq!(frame.gpu_ms, [(game, 1000.0), (dwm, 500.0)]);
+        assert_eq!(
+            frame.gpu_dedicated,
+            [(game, mb_ms(900.0)), (dwm, mb_ms(100.0))]
+        );
+        assert_eq!(frame.gpu_shared, [(game, mb_ms(30.0)), (dwm, mb_ms(70.0))]);
+        let m = frame.machine;
+        // Two hardware GPUs' worth of time, 80 % of one of them busy.
+        assert!(close(m.gpu_capacity_ms, 4000.0));
+        assert!(close(m.gpu_busy_ms, 1600.0));
+        assert!(close(
+            m.gpu_dedicated_in_use / 2000.0,
+            (1200u64 << 20) as f64
+        ));
     }
 
     #[test]

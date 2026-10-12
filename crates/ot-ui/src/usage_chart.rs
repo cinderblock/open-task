@@ -16,11 +16,19 @@
 //! - Memory, **Percent** and **Bytes**: each band is the program's private working
 //!   set, the physical memory its processes alone hold, as a share of the RAM
 //!   installed (on the summary memory chart's scale) or in bytes.
+//! - GPU, **Percent**: each band is the program's share of the GPU's busiest
+//!   engine, on the GPU chart's 0-100 % scale: that chart, cut up by program.
+//!   Several GPUs count as the CPU's cores do, so two with one busy read 50 %.
+//! - GPU, **Dedicated** and **Shared**: each band is the GPU memory the program's
+//!   processes have in use, on the GPU (none on an integrated one) or in system
+//!   memory, in bytes.
 //!
 //! In the readings that are shares of the machine, and in bytes, a last band, "Not
-//! in a process", tops the stack up to what the summary chart shows: CPU time no
-//! process is charged for, or memory in use that no process holds alone (the
-//! kernel, drivers, pages shared between processes).
+//! in a process", tops the stack up to what the summary chart shows: CPU or GPU
+//! time no process is charged for, or memory in use that no process holds alone
+//! (the kernel, drivers, pages shared between processes). Not in Shared: there an
+//! allocation several processes share counts in each, so the programs together
+//! can pass what the GPU has in use and the stack is not a part of a whole.
 //!
 //! Only so many colors can be told apart, so the programs that take the most of the
 //! chart get a band and a color each, and the rest are one grey band. A program
@@ -150,6 +158,12 @@ pub(crate) enum ChartMode {
     MemoryShare,
     /// Private working set, in bytes.
     MemoryBytes,
+    /// GPU time used, as a share of all there was.
+    GpuShare,
+    /// Dedicated GPU memory, in bytes.
+    GpuDedicated,
+    /// Shared GPU memory, in bytes.
+    GpuShared,
 }
 
 /// What the chart is of.
@@ -157,6 +171,14 @@ pub(crate) enum ChartMode {
 pub(crate) enum Resource {
     Cpu,
     Memory,
+    Gpu,
+}
+
+impl Resource {
+    /// Its place in [`RESOURCES`].
+    fn index(self) -> usize {
+        self as usize
+    }
 }
 
 impl ChartMode {
@@ -164,13 +186,22 @@ impl ChartMode {
         match self {
             Self::Total | Self::Rate | Self::CpuShare => Resource::Cpu,
             Self::MemoryShare | Self::MemoryBytes => Resource::Memory,
+            Self::GpuShare | Self::GpuDedicated | Self::GpuShared => Resource::Gpu,
         }
     }
 
     /// Whether it is a share of the machine, on the summary charts' fixed 0-100 %
     /// scale.
     fn share(self) -> bool {
-        matches!(self, Self::CpuShare | Self::MemoryShare)
+        matches!(self, Self::CpuShare | Self::MemoryShare | Self::GpuShare)
+    }
+
+    /// Whether it is in bytes.
+    fn bytes(self) -> bool {
+        matches!(
+            self,
+            Self::MemoryBytes | Self::GpuDedicated | Self::GpuShared
+        )
     }
 
     /// Each program's numbers in a frame that this reading is made of.
@@ -179,11 +210,19 @@ impl ChartMode {
             Self::Total | Self::Rate => f.cycles,
             Self::CpuShare => f.cpu_ms,
             Self::MemoryShare | Self::MemoryBytes => f.memory,
+            Self::GpuShare => f.gpu_ms,
+            Self::GpuDedicated => f.gpu_dedicated,
+            Self::GpuShared => f.gpu_shared,
         }
     }
 }
 
-const RESOURCES: [(Resource, &str); 2] = [(Resource::Cpu, "CPU"), (Resource::Memory, "Memory")];
+/// In the order of [`Resource::index`].
+const RESOURCES: [(Resource, &str); 3] = [
+    (Resource::Cpu, "CPU"),
+    (Resource::Memory, "Memory"),
+    (Resource::Gpu, "GPU"),
+];
 
 /// The readings of a resource, the first the one it opens on.
 fn modes(resource: Resource) -> &'static [(ChartMode, &'static str)] {
@@ -196,6 +235,11 @@ fn modes(resource: Resource) -> &'static [(ChartMode, &'static str)] {
         Resource::Memory => &[
             (ChartMode::MemoryShare, "Percent"),
             (ChartMode::MemoryBytes, "Bytes"),
+        ],
+        Resource::Gpu => &[
+            (ChartMode::GpuShare, "Percent"),
+            (ChartMode::GpuDedicated, "Dedicated"),
+            (ChartMode::GpuShared, "Shared"),
         ],
     }
 }
@@ -344,12 +388,12 @@ impl Pt {
 #[derive(Debug, Default)]
 pub(crate) struct UsageChart {
     mode: ChartMode,
-    /// The reading the other resource was left on, to go back to.
-    other_mode: Option<ChartMode>,
-    /// The program each colored band belongs to, and the other resource's, kept so
-    /// that switching back does not recolor the chart.
+    /// The reading each resource was left on, to go back to.
+    left_on: [Option<ChartMode>; RESOURCES.len()],
+    /// The program each colored band belongs to, and each other resource's, kept
+    /// so that switching back does not recolor the chart.
     slots: [Option<ProgramId>; SERIES],
-    parked: [Option<ProgramId>; SERIES],
+    parked: [[Option<ProgramId>; SERIES]; RESOURCES.len()],
     /// Top of the value scale, kept between frames so it does not breathe.
     scale: f32,
     /// Newest first.
@@ -560,9 +604,11 @@ impl UsageChart {
         if mode == self.mode {
             return;
         }
-        if mode.resource() != self.mode.resource() {
-            self.other_mode = Some(self.mode);
-            std::mem::swap(&mut self.slots, &mut self.parked);
+        let (from, to) = (self.mode.resource().index(), mode.resource().index());
+        if from != to {
+            self.left_on[from] = Some(self.mode);
+            self.parked[from] = std::mem::take(&mut self.parked[to]);
+            std::mem::swap(&mut self.slots, &mut self.parked[from]);
             self.labels = [Names::default(); BANDS];
         }
         self.mode = mode;
@@ -920,6 +966,11 @@ impl UsageChart {
                 ChartMode::CpuShare => share(m.cpu_capacity_ms, m.cpu_busy_ms),
                 ChartMode::MemoryShare => share(m.ram, m.ram_in_use),
                 ChartMode::MemoryBytes => (1.0 / span, Some(m.ram_in_use / span)),
+                ChartMode::GpuShare => share(m.gpu_capacity_ms, m.gpu_busy_ms),
+                ChartMode::GpuDedicated => (1.0 / span, Some(m.gpu_dedicated_in_use / span)),
+                // Shared allocations count in every process using them, so there
+                // is no whole the programs are parts of.
+                ChartMode::GpuShared => (1.0 / span, None),
             };
             let mut v = [0.0f64; BANDS];
             for &(g, x) in self.mode.of(&f) {
@@ -1018,8 +1069,9 @@ impl UsageChart {
         }
         let max = self.points.iter().map(Pt::sum).fold(0.0, f32::max);
         if self.scale <= 0.0 || max > self.scale || max < self.scale * 0.3 {
-            self.scale = if self.mode == ChartMode::MemoryBytes {
-                nice_bytes(max * 1.1)
+            // At least a megabyte, so an empty chart's axis does not read 0.5 B.
+            self.scale = if self.mode.bytes() {
+                nice_bytes((max * 1.1).max(1_048_576.0))
             } else {
                 nice(max * 1.1)
             };
@@ -1148,10 +1200,7 @@ impl UsageChart {
         if let Some(i) = self.button_at(p) {
             let mode = match RESOURCES.get(i) {
                 Some(&(r, _)) if r == self.mode.resource() => self.mode,
-                Some(&(r, _)) => self
-                    .other_mode
-                    .filter(|m| m.resource() == r)
-                    .unwrap_or(modes(r)[0].0),
+                Some(&(r, _)) => self.left_on[r.index()].unwrap_or(modes(r)[0].0),
                 None => modes(self.mode.resource())[i - RESOURCES.len()].0,
             };
             self.set_mode(mode);
@@ -1167,11 +1216,13 @@ impl UsageChart {
                 format::cycles(out, f64::from(v));
                 out.push_str("/s");
             }
-            ChartMode::CpuShare | ChartMode::MemoryShare => {
+            ChartMode::CpuShare | ChartMode::MemoryShare | ChartMode::GpuShare => {
                 format::percent(out, v.max(0.0));
                 out.push('%');
             }
-            ChartMode::MemoryBytes => format::bytes(out, Bytes(v.max(0.0) as u64)),
+            ChartMode::MemoryBytes | ChartMode::GpuDedicated | ChartMode::GpuShared => {
+                format::bytes(out, Bytes(v.max(0.0) as u64));
+            }
         }
     }
 
@@ -1330,12 +1381,35 @@ impl UsageChart {
         }
     }
 
+    /// What the plot says when the reading has nothing to show over the reach.
+    fn empty_note(&self) -> &'static str {
+        match self.mode {
+            ChartMode::GpuDedicated => {
+                "No program has dedicated GPU memory in use. An integrated GPU has none of its own."
+            }
+            ChartMode::GpuShare | ChartMode::GpuShared => "No program has used a GPU in this time",
+            _ => "Nothing used in this time",
+        }
+    }
+
     /// The bands, stacked from the first up, "everything else" on top.
     fn paint_bands(&mut self, dl: &mut DisplayList, dim: [bool; BANDS], theme: &Theme) {
         let plot = self.plot;
         if self.points.len() < 2 {
             dl.text(
                 "The history starts with the next sample",
+                plot,
+                theme.cell,
+                theme.text_dim,
+                HAlign::Center,
+                VAlign::Middle,
+                true,
+            );
+            return;
+        }
+        if self.points.iter().all(|p| p.sum() <= 0.0) {
+            dl.text(
+                self.empty_note(),
                 plot,
                 theme.cell,
                 theme.text_dim,
@@ -1462,6 +1536,19 @@ impl UsageChart {
             ChartMode::MemoryBytes => buf.push_str(
                 "Each program's private working set: the RAM its processes alone hold. Memory \
                  in use that no process holds alone is \"Not in a process\".",
+            ),
+            ChartMode::GpuShare => buf.push_str(
+                "Each program's share of the GPU's busiest engine: the GPU chart, cut up by \
+                 program; several GPUs count as CPU cores do. Engine time no process is charged \
+                 for is \"Not in a process\".",
+            ),
+            ChartMode::GpuDedicated => buf.push_str(
+                "The GPU's own memory each program has in use; an integrated GPU has none. \
+                 Dedicated memory in use that no process is charged for is \"Not in a process\".",
+            ),
+            ChartMode::GpuShared => buf.push_str(
+                "System memory the GPU uses for each program. Memory several programs share \
+                 counts in each, so together they can pass what the GPU has in use.",
             ),
         }
         let right = last.last().map_or(self.area.x, Rect::right);
@@ -2398,6 +2485,145 @@ mod tests {
         // And back to memory, on Bytes where it was left.
         press(&mut c, &dl, "Memory");
         assert_eq!(c.mode(), ChartMode::MemoryBytes);
+    }
+
+    /// [`machine_session`]'s machine with two GPUs, at 60 % and 20 % with 1.2 GB
+    /// of dedicated memory in use between them, and the basic render driver, busy
+    /// but no GPU. a uses half of the first GPU's busiest engine, 900 MB dedicated
+    /// and 30 MB shared; b a quarter, 100 MB and 70 MB.
+    fn gpu_session(secs: u64) -> Usage {
+        use ot_model::gpu::{GpuInfo, GpuSample};
+        let gpu = |id: u64, software: bool, load: f32, mb: u64| GpuSample {
+            info: Arc::new(GpuInfo {
+                id,
+                software,
+                ..GpuInfo::default()
+            }),
+            utilization: ot_model::Percent(load),
+            engines: Vec::new(),
+            dedicated_used: ot_model::Bytes(mb << 20),
+            shared_used: ot_model::Bytes::ZERO,
+        };
+        let mut u = Usage::new(0.05);
+        for s in 0..=secs {
+            let mut snap = machine_snapshot(&["a.exe", "b.exe"], s * 1000, &[0, 0], &[1, 1], 10.0);
+            for (p, (share, dedicated, shared)) in snap
+                .processes
+                .iter_mut()
+                .zip([(50.0, 900u64, 30u64), (25.0, 100, 70)])
+            {
+                p.gpu_share = ot_model::Percent(share);
+                p.gpu_dedicated = ot_model::Bytes(dedicated << 20);
+                p.gpu_shared = ot_model::Bytes(shared << 20);
+            }
+            snap.gpus = vec![
+                gpu(1, false, 60.0, 1200),
+                gpu(2, false, 20.0, 0),
+                gpu(3, true, 90.0, 0),
+            ];
+            u.observe(&snap);
+        }
+        u
+    }
+
+    #[test]
+    fn the_gpu_reads_as_a_share_of_its_time_and_in_memory_of_each_kind() {
+        let u = gpu_session(30);
+        let mut c = UsageChart::default();
+        c.set_legend(ChartLegend::Beside);
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "GPU");
+        assert_eq!(c.mode(), ChartMode::GpuShare, "the GPU opens on Percent");
+        let dl = painted(&mut c, &u, "");
+        let (a, b) = (band(&c, &u, "a.exe"), band(&c, &u, "b.exe"));
+        // Two GPUs' time, as two cores' would be: a 25 %, b 12.5 %, and of the
+        // 40 % busy, 2.5 % no process's. The basic render driver counts for nothing.
+        for p in &c.points {
+            assert!((p.v[a] - 25.0).abs() < 1e-3, "{}", p.v[a]);
+            assert!((p.v[b] - 12.5).abs() < 1e-3);
+            assert!((p.v[REST] - 2.5).abs() < 1e-3);
+            assert!((p.sum() - 40.0).abs() < 1e-3, "the stack is the GPUs' load");
+        }
+        assert_eq!(c.scale, 100.0);
+        let strings = texts(&dl);
+        for want in ["25%", "12%", "2.5%", "40%", "Not in a process"] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
+        assert!(strings
+            .iter()
+            .any(|s| s.starts_with("Each program's share of the GPU's busiest engine")));
+
+        press(&mut c, &dl, "Dedicated");
+        assert_eq!(c.mode(), ChartMode::GpuDedicated);
+        let dl = painted(&mut c, &u, "");
+        let mb = (1u64 << 20) as f32;
+        let now = c.points[0];
+        assert!((now.v[a] / (900.0 * mb) - 1.0).abs() < 1e-5);
+        assert!((now.v[b] / (100.0 * mb) - 1.0).abs() < 1e-5);
+        assert!(
+            (now.v[REST] / (200.0 * mb) - 1.0).abs() < 1e-5,
+            "up to the GPUs' 1.2 GB"
+        );
+        assert!(
+            c.scale > 1200.0 * mb,
+            "its own scale, in bytes: {}",
+            c.scale
+        );
+        let strings = texts(&dl);
+        for want in ["900 MB", "100 MB", "200 MB", "1.17 GB"] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
+
+        press(&mut c, &dl, "Shared");
+        assert_eq!(c.mode(), ChartMode::GpuShared);
+        let dl = painted(&mut c, &u, "");
+        let now = c.points[0];
+        assert!((now.v[a] / (30.0 * mb) - 1.0).abs() < 1e-5);
+        assert!((now.v[b] / (70.0 * mb) - 1.0).abs() < 1e-5);
+        // Shared memory counts in every process using it: no whole to top up to.
+        assert!(c.points.iter().all(|p| p.v[REST] == 0.0));
+        assert!(!c.shown(REST));
+
+        // Each of the three resources keeps the reading it was left on.
+        press(&mut c, &dl, "Memory");
+        assert_eq!(c.mode(), ChartMode::MemoryShare);
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "Bytes");
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "CPU");
+        assert_eq!(c.mode(), ChartMode::Total);
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "GPU");
+        assert_eq!(c.mode(), ChartMode::GpuShared);
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "Memory");
+        assert_eq!(c.mode(), ChartMode::MemoryBytes);
+    }
+
+    #[test]
+    fn an_empty_reading_says_why_on_a_scale_of_its_own() {
+        // An integrated GPU: busy, but with no dedicated memory.
+        let mut u = Usage::new(0.05);
+        for s in 0..=10 {
+            let mut snap = machine_snapshot(&["a.exe"], s * 1000, &[0], &[1], 10.0);
+            snap.processes[0].gpu_share = ot_model::Percent(30.0);
+            u.observe(&snap);
+        }
+        let mut c = UsageChart::default();
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "GPU");
+        let dl = painted(&mut c, &u, "");
+        press(&mut c, &dl, "Dedicated");
+        let dl = painted(&mut c, &u, "");
+        let strings = texts(&dl);
+        assert!(
+            strings
+                .iter()
+                .any(|s| s.starts_with("No program has dedicated GPU memory in use")),
+            "{strings:?}"
+        );
+        assert!(strings.iter().any(|s| s == "1.00 MB"), "{strings:?}");
+        assert!(!strings.iter().any(|s| s == "0 B"), "{strings:?}");
     }
 
     #[test]

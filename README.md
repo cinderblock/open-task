@@ -150,14 +150,14 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   selects it (the ancestry line and the other arrangements keep the selection),
   right-click gives the process menu, and the search dims what does not match. The
   line under the map gives the cycles used by everything together.
-- **History** shows who has been using the CPU, or holding memory, over the charts'
-  reach, as a chart: a stack of bands, one per program, on the same time axis as the
+- **History** shows who has been using the CPU or the GPU, or holding memory, over
+  the charts' reach, as a chart: a stack of bands, one per program, on the same time axis as the
   graphs above it. A program is
   every process of one name, so the two hundred `rustc.exe` of a build are one band.
   Chromium-based programs (Chrome, Edge, WebView2 and Electron apps such as Slack,
   Discord or VS Code) are split by role, so Chrome's renderers are one band and its
-  GPU process another (see below). One switch above the chart picks **CPU** or
-  **Memory**, and the other what a band's thickness is. For the CPU, **Fading
+  GPU process another (see below). One switch above the chart picks **CPU**,
+  **Memory** or **GPU**, and the other what a band's thickness is. For the CPU, **Fading
   total** is the number the Cycles column shows, over time: a band swells while its
   program works and sags once it stops. **Rate** is the cycles the program was using
   each second, of which the fading total is a smoothed copy. **Percent** is the
@@ -165,10 +165,19 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   the CPU graph cut up by program. For memory, each band is the program's private
   working set (the RAM its processes alone hold, which unlike the working set adds
   up across processes), as a share of the RAM installed on the memory graph's scale
-  (**Percent**) or in **Bytes** on a scale of its own. In the Percent and Bytes
-  readings a last band, "Not in a process", tops the stack up to what the graph
-  above shows: CPU time no process is charged for, or memory in use that no process
-  holds alone (the kernel, drivers, pages shared between processes). Each resource
+  (**Percent**) or in **Bytes** on a scale of its own. For the GPU, **Percent** is
+  the program's share of the GPU's busiest engine (the engine the GPU graph on the
+  Performance page goes by, since engines run side by side and do not add up), so
+  the stack is that graph cut up by program; a machine with two GPUs counts them as
+  the CPU counts its cores, so one busy and one idle reads 50 %, and the basic render
+  driver is left out. **Dedicated** is the GPU's own memory each program has in use
+  (an integrated GPU has none), and **Shared** the system memory the GPU uses for
+  it, both in bytes. In every Percent and Bytes reading, and in Dedicated, a last
+  band, "Not in a process", tops the stack up to what the graph above shows: CPU or
+  GPU time no process is charged for, or memory in use that no process holds alone
+  (the kernel, drivers, pages shared between processes). Shared has none: memory
+  several programs share counts in each of them (that is how Windows reports it), so
+  the programs together can pass what the GPU has in use. Each resource
   keeps its own bands and the reading it was left on. The eight programs that take the most of the
   chart get a band and a color each, and the rest are one grey band, "Everything
   else". A program keeps its color for as long as it keeps a band, and a band
@@ -417,7 +426,8 @@ frames back the way the live headless mode prints passes, and
 wrote it and its format, the machine, when it started, how many frames over how long
 and what they take. A file from an older build still opens; one made before the
 processes' private working set was recorded (format 1) shows none in the History's
-memory readings. `open-task --replay session.otrec` opens the window on the recording instead
+memory readings, and one made before their GPU use was (formats 1 and 2) none in its
+GPU readings. `open-task --replay session.otrec` opens the window on the recording instead
 of the live machine: every page works as it does live, and a transport bar along
 the bottom has step back, play/pause (**Space**), step forward, a slider over the
 frames (drag to scrub, wheel to step), the time into the recording, and a speed
