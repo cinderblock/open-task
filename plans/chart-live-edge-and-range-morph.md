@@ -1,6 +1,6 @@
 # Charts: the newest sample at the right edge, eased in; ranges where time is compressed
 
-> **Status:** built, awaiting the user's look · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done; released as v0.14.0 (2026-10-13) · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Revises decision 1 of `plans/smooth-chart-scrolling.md` (the clock's lag).
 
 ## Goal
@@ -67,7 +67,7 @@ we morph to a range display instead?"
    windows/linux/macOS, screenshots.
 7. [x] README charts paragraph; commit.
 8. [x] Range readout on hover (`point_value`), tests, README.
-9. [ ] The user looks at it live (a session of several minutes shows step 1 at the
+9. [x] Released as v0.14.0 (`91eb644`, tag pushed); the user to look at it live (a session of several minutes shows step 1 at the
    left; an hour shows the full morph).
 
 ## Findings / gotchas
@@ -92,11 +92,11 @@ we morph to a range display instead?"
 - [x] 2026-10-13: built, tested (214 `ot-ui` tests), clippy on three targets,
   screenshots; committed.
 - [x] 2026-10-13: user chose min–max in the readout; built and committed.
+- [x] 2026-10-13: user: "glide sounds right"; released v0.14.0 (`91eb644`).
 
 ## Open questions for the user
 
-1. "A little smoothing": built as the 150 ms ease of a new sample. Data
-   smoothing (a moving average) not built; awaiting the user's word.
+(none: the user confirmed the 150 ms glide is the smoothing they meant.)
 
 ## Things not to do
 
