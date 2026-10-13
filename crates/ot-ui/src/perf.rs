@@ -114,6 +114,11 @@ struct Slot {
 }
 
 const LIST_W: f32 = 212.0;
+/// A page narrower than this many times its height stacks the device list above
+/// the detail pane, as a grid of tiles, instead of beside it.
+const STACK_ASPECT: f32 = 1.0;
+/// Stacked, the most of the page's height the list takes; more rows scroll.
+const STACK_SHARE: f32 = 0.35;
 const ITEM_H: f32 = 56.0;
 const ITEM_GAP: f32 = 4.0;
 const MINI_W: f32 = 64.0;
@@ -143,6 +148,8 @@ const NET_FLOOR_BITS: f32 = 100_000.0;
 #[derive(Debug, Clone, Copy, Default)]
 struct Frame {
     list: Rect,
+    /// How many tiles wide the list is: one beside the detail, more stacked above.
+    list_cols: usize,
     card: Rect,
     header: Rect,
     caption: Rect,
@@ -153,9 +160,18 @@ struct Frame {
     stats: Rect,
 }
 
-fn layout(page: Rect, device: Device, theme: &Theme) -> Frame {
-    let (list, right) = page.split_left(LIST_W.min(page.w));
-    let (_, card) = right.split_left(theme.gap.min(right.w));
+fn layout(page: Rect, device: Device, entries: usize, theme: &Theme) -> Frame {
+    let (list, list_cols, card) = if page.w < page.h * STACK_ASPECT {
+        let (cols, rows) = list_grid(page.w, entries);
+        let content = rows as f32 * (ITEM_H + ITEM_GAP) - ITEM_GAP;
+        let (list, rest) = page.split_top(content.min(page.h * STACK_SHARE).max(ITEM_H));
+        let (_, card) = rest.split_top(theme.gap.min(rest.h));
+        (list, cols, card)
+    } else {
+        let (list, rest) = page.split_left(LIST_W.min(page.w));
+        let (_, card) = rest.split_left(theme.gap.min(rest.w));
+        (list, 1, card)
+    };
     let inner = card.inset(theme.pad * 2.0, theme.pad);
     let (header, body) = inner.split_top(HEADER_H);
     let (caption, body) = body.split_top(CAPTION_H);
@@ -168,6 +184,7 @@ fn layout(page: Rect, device: Device, theme: &Theme) -> Frame {
     let (_, chart) = body.split_bottom(theme.gap.min(body.h));
     Frame {
         list,
+        list_cols,
         card,
         header,
         caption,
@@ -175,6 +192,16 @@ fn layout(page: Rect, device: Device, theme: &Theme) -> Frame {
         composition,
         stats,
     }
+}
+
+/// Columns and rows for `n` list tiles across `width`: tiles at least [`LIST_W`]
+/// wide, the fewest rows that hold them all, and then the fewest columns that fill
+/// those rows, so the tiles come out as wide as they can.
+fn list_grid(width: f32, n: usize) -> (usize, usize) {
+    let fit = ((width + ITEM_GAP) / (LIST_W + ITEM_GAP)).floor() as usize;
+    let cols = fit.clamp(1, n.max(1));
+    let rows = n.max(1).div_ceil(cols);
+    (n.max(1).div_ceil(rows), rows)
 }
 
 /// A chart area split in two stacked charts with a caption over the lower one:
@@ -302,6 +329,8 @@ pub(crate) struct PerfPage {
     detail: Detail,
     /// The list's viewport, for hit-testing and wheel scrolling.
     list_view: Rect,
+    /// How many tiles wide the list is laid out.
+    list_cols: usize,
     /// How far the list is scrolled, in DIPs.
     list_scroll: f32,
     list_hover: Option<Device>,
@@ -328,6 +357,7 @@ impl Default for PerfPage {
             minis: Vec::new(),
             detail: Detail::default(),
             list_view: Rect::ZERO,
+            list_cols: 1,
             list_scroll: 0.0,
             list_hover: None,
             reveal: false,
@@ -399,8 +429,10 @@ impl PerfPage {
                 self.list_scroll = (self.list_scroll + lines * (ITEM_H + ITEM_GAP)).max(0.0);
                 Reaction::REPAINT
             }
-            UiEvent::Key(Key::Up) => self.step(-1),
-            UiEvent::Key(Key::Down) => self.step(1),
+            UiEvent::Key(Key::Up) => self.step_row(false),
+            UiEvent::Key(Key::Down) => self.step_row(true),
+            UiEvent::Key(Key::Left) if self.list_cols > 1 => self.step(-1),
+            UiEvent::Key(Key::Right) if self.list_cols > 1 => self.step(1),
             UiEvent::Key(Key::Home) => self.step(isize::MIN / 2),
             UiEvent::Key(Key::End) => self.step(isize::MAX / 2),
             _ => Reaction::NONE,
@@ -412,6 +444,29 @@ impl PerfPage {
             return Reaction::NONE;
         };
         let j = i.saturating_add_signed(n).min(self.devices.len() - 1);
+        self.reveal = true;
+        self.select(self.devices[j])
+    }
+
+    /// Move the selection a row up or down the list. In a grid, a row down from
+    /// above a short last row lands on its last tile; past either end, nothing moves.
+    fn step_row(&mut self, down: bool) -> Reaction {
+        let cols = self.list_cols.max(1);
+        let Some(i) = self.devices.iter().position(|&d| d == self.device) else {
+            return Reaction::NONE;
+        };
+        let last = self.devices.len() - 1;
+        let j = if down {
+            if i / cols == last / cols {
+                return Reaction::NONE;
+            }
+            (i + cols).min(last)
+        } else {
+            let Some(j) = i.checked_sub(cols) else {
+                return Reaction::NONE;
+            };
+            j
+        };
         self.reveal = true;
         self.select(self.devices[j])
     }
@@ -458,16 +513,19 @@ impl PerfPage {
         Reaction::painted(std::mem::replace(&mut self.device, d) != d)
     }
 
-    /// Place the list's entries, scrolled, keeping the scroll in range and, after a
-    /// key moved the selection, the selection in view.
-    fn lay_out_list(&mut self, view: Rect) {
+    /// Place the list's entries, `cols` to a row, scrolled, keeping the scroll in
+    /// range and, after a key moved the selection, the selection in view.
+    fn lay_out_list(&mut self, view: Rect, cols: usize) {
         self.list_view = view;
+        self.list_cols = cols.max(1);
+        let cols = self.list_cols;
         let step = ITEM_H + ITEM_GAP;
-        let content = self.devices.len() as f32 * step - ITEM_GAP;
+        let rows = self.devices.len().div_ceil(cols);
+        let content = rows as f32 * step - ITEM_GAP;
         let max_scroll = (content - view.h).max(0.0);
         if std::mem::take(&mut self.reveal) {
             if let Some(i) = self.devices.iter().position(|&d| d == self.device) {
-                let top = i as f32 * step;
+                let top = (i / cols) as f32 * step;
                 if top < self.list_scroll {
                     self.list_scroll = top;
                 } else if top + ITEM_H > self.list_scroll + view.h {
@@ -477,11 +535,17 @@ impl PerfPage {
         }
         self.list_scroll = self.list_scroll.clamp(0.0, max_scroll);
         self.items.clear();
+        let w = (view.w - ITEM_GAP * (cols - 1) as f32) / cols as f32;
         let y0 = view.y - self.list_scroll;
-        self.items.extend(
-            (0..self.devices.len())
-                .map(|i| Rect::new(view.x, y0 + i as f32 * step, view.w, ITEM_H)),
-        );
+        self.items.extend((0..self.devices.len()).map(|i| {
+            let (col, row) = (i % cols, i / cols);
+            Rect::new(
+                view.x + col as f32 * (w + ITEM_GAP),
+                y0 + row as f32 * step,
+                w,
+                ITEM_H,
+            )
+        }));
     }
 
     fn plan(&mut self, line: Line, area: Rect, band_h: f32, max: f32) {
@@ -615,8 +679,8 @@ impl PerfPage {
             self.device = Device::Cpu;
         }
 
-        let f = layout(rect, self.device, theme);
-        self.lay_out_list(f.list);
+        let f = layout(rect, self.device, self.devices.len(), theme);
+        self.lay_out_list(f.list, f.list_cols);
         if self.device != Device::Cpu {
             self.toggle = [Rect::ZERO; 2];
         }
@@ -1897,11 +1961,15 @@ pub(crate) mod tests {
     }
 
     fn paint_with(page: &mut PerfPage, tl: &Timeline, s: &Snapshot) -> DisplayList {
+        paint_in(page, tl, s, Rect::new(0.0, 0.0, 1000.0, 640.0))
+    }
+
+    fn paint_in(page: &mut PerfPage, tl: &Timeline, s: &Snapshot, rect: Rect) -> DisplayList {
         let mut dl = DisplayList::new();
         let mut buf = String::new();
         page.paint(
             &mut dl,
-            Rect::new(0.0, 0.0, 1000.0, 640.0),
+            rect,
             s,
             Charted::still(tl),
             &Theme::dark(),
@@ -2348,6 +2416,56 @@ pub(crate) mod tests {
         });
         let _ = paint_with(&mut page, &tl, &s);
         assert!((page.items[0].y - view.y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_tall_page_stacks_the_list_over_the_detail_as_a_grid() {
+        // CPU, memory, two disks and an adapter: five tiles.
+        let (tl, s) = timeline_with(2, &[disk(0), disk(1)], &[adapter(7, "Ethernet")]);
+        let mut page = PerfPage::default();
+        let _ = paint_in(&mut page, &tl, &s, Rect::new(0.0, 0.0, 600.0, 1000.0));
+        // 600 DIPs hold two 212-DIP tiles; five take three rows of two.
+        assert_eq!(page.list_cols, 2);
+        let view = page.list_view;
+        assert!((view.w - 600.0).abs() < 1e-3, "spans the width: {view:?}");
+        assert!(view.h <= 1000.0 * STACK_SHARE + 1e-3, "{view:?}");
+        let (a, b) = (page.items[0], page.items[1]);
+        assert!((a.y - b.y).abs() < 1e-3 && b.x > a.right(), "{a:?} {b:?}");
+        assert!(page.items[2].y > a.bottom(), "wraps");
+
+        // Down moves a row, Right a tile; Down from above the short last row
+        // lands on its only tile, and nothing moves past the edges.
+        assert!(!page.handle(UiEvent::Key(Key::Up)).repaint);
+        page.handle(UiEvent::Key(Key::Down));
+        assert_eq!(page.device(), Device::Disk(0));
+        page.handle(UiEvent::Key(Key::Right));
+        assert_eq!(page.device(), Device::Disk(1));
+        page.handle(UiEvent::Key(Key::Down));
+        assert_eq!(page.device(), Device::Adapter(7));
+        assert!(!page.handle(UiEvent::Key(Key::Down)).repaint);
+        page.handle(UiEvent::Key(Key::Up));
+        assert_eq!(page.device(), Device::Disk(0));
+        page.handle(UiEvent::Key(Key::Left));
+        assert_eq!(page.device(), Device::Memory);
+
+        // The same page wide keeps the list beside the detail, one column, where
+        // Left and Right are left alone.
+        let _ = paint_in(&mut page, &tl, &s, Rect::new(0.0, 0.0, 1000.0, 640.0));
+        assert_eq!(page.list_cols, 1);
+        assert!((page.list_view.w - LIST_W).abs() < 1e-3);
+        assert!(!page.handle(UiEvent::Key(Key::Right)).repaint);
+        page.handle(UiEvent::Key(Key::Down));
+        assert_eq!(page.device(), Device::Disk(0));
+    }
+
+    #[test]
+    fn list_grids_balance_their_rows() {
+        assert_eq!(list_grid(600.0, 5), (2, 3));
+        // Four fit across, but two rows of three are as few rows and wider.
+        assert_eq!(list_grid(900.0, 5), (3, 2));
+        assert_eq!(list_grid(900.0, 3), (3, 1));
+        assert_eq!(list_grid(100.0, 4), (1, 4), "never under one column");
+        assert_eq!(list_grid(900.0, 0), (1, 1));
     }
 
     #[test]

@@ -33,7 +33,9 @@ the command line override that). Settings are kept per user, in
 `HKCU\Software\open-task`.
 
 **Performance** lists the devices down its left side, each with a small live graph
-and its headline number; Up and Down, or a click, pick one. The CPU pane shows its
+and its headline number; Up and Down, or a click, pick one. In a window taller than
+it is wide, the list moves above the detail as a grid of tiles, where the arrow keys
+move across and down it. The CPU pane shows its
 utilization, either as one graph or as one small graph per logical processor (the
 **Overall / Logical processors** switch; on a processor with performance and
 efficiency cores the two kinds get different colors), then utilization, the current
@@ -615,7 +617,8 @@ command-line modes, or copy it beside `open-task.exe` as `open-task.com`.
 `target/screenshot.png`, and closes it. Handy for checking a rendering change;
 `-AppArgs "--view tree"` captures the tree and `-AppArgs "--page performance"` the
 Performance page. `-Click "x,y"` clicks first, at a point read off an earlier
-screenshot. It only ever captures and closes the
+screenshot, and `-Size "700,1100"` resizes the window first (a tall one, say). It
+only ever captures and closes the
 instance it launched, so an installed copy can keep running.
 
 The logo lives in `assets/logo` as SVG: `open-task.svg` for 48 px and up, and
