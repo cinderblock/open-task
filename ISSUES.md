@@ -2,18 +2,15 @@
 
 Problems noticed while working on something else, left for a thread of their own.
 
-## The History view keeps the GPU busy
+## The build label can name an older commit and miss `-dirty`
 
-in progress — master, GPU-breakdown thread (`plans/history-gpu-cost.md`)
+Seen 2026-10-12: `target\debug\open-task.exe`, built at 17:15 from `master` at
+`db1435a` with uncommitted changes in `crates/ot-shell-win`, showed `45f39be`
+(an earlier commit, no `-dirty`) in the sidebar's version line. An hour earlier
+a build showed `a6166dc-dirty` correctly. In between, a second checkout (a
+temporary linked worktree at `45f39be`, `git worktree add`) was built with its
+own `CARGO_TARGET_DIR`, then removed. `crates/ot-app/build.rs` `watch()`
+decides when the label is worked out again.
 
-Seen 2026-10-12 on an Intel UHD (integrated) machine, debug build of `a6166dc`
-plus the GPU History work: with the window on the History view (the default CPU
-reading, nothing touched), open-task's share of the GPU's 3D engine read 30.3,
-46.5, 48.9 and 33.8 % over four one-second samples of
-`\GPU Engine(pid_<open-task>_*engtype_3d)\Utilization Percentage`. On the List
-view the same samples read 4.7 to 6.9 %. The History's GPU Percent reading shows
-the same thing: open-task.exe is the biggest band, about half the GPU.
-
-Reproduce: `target\debug\open-task.exe --view history`, then watch the counter
-above (or the History chart's GPU / Percent reading). Matters because an idle
-task manager shouldn't take half an integrated GPU; on a laptop that's battery.
+Matters because the label is how a screenshot or a bug report says which build
+it came from.
