@@ -74,8 +74,10 @@ const HEAD_H: f32 = 26.0;
 const SWITCH_W: f32 = 104.0;
 const RESOURCE_W: f32 = 80.0;
 const SWITCH_GAP: f32 = 8.0;
-/// Room left of the plot for the value scale.
-const GUTTER_W: f32 = 46.0;
+/// The value scale's labels, inside the plot at its left edge: how far in from
+/// the edge they sit, and their height.
+const SCALE_INSET: f32 = 4.0;
+const SCALE_H: f32 = 14.0;
 const LEGEND_ROW_H: f32 = 22.0;
 const SWATCH: f32 = 10.0;
 /// A legend row's share for its value.
@@ -539,9 +541,7 @@ impl UsageChart {
         } else {
             body
         };
-        let (axis, plot) = main.split_bottom(AXIS_BAND_H);
-        self.plot = plot.split_left(GUTTER_W.min(plot.w)).1;
-        self.axis = axis.split_left(GUTTER_W.min(axis.w)).1;
+        (self.axis, self.plot) = main.split_bottom(AXIS_BAND_H);
 
         self.now_ms = usage.now_ms();
         let key = (usage.revision(), self.mode, self.plot.w.to_bits());
@@ -1238,7 +1238,7 @@ impl UsageChart {
         buf: &mut String,
     ) {
         self.paint_head(dl, theme, buf);
-        self.paint_grid(dl, theme, buf);
+        self.paint_grid(dl, theme);
         let mut dim = [false; BANDS];
         for (b, dim) in dim.iter_mut().enumerate() {
             let unmatched = !needle.is_empty()
@@ -1255,6 +1255,7 @@ impl UsageChart {
             self.place_labels(usage, theme.small.size);
             self.paint_labels(dl, usage, selected, dim, theme);
         }
+        self.paint_scale(dl, theme, buf);
         let marked = self.paint_mark(dl, theme, buf);
         match self.style {
             ChartLegend::Inline => self.paint_chip(dl, usage, marked, theme, buf),
@@ -1352,9 +1353,9 @@ impl UsageChart {
         dl.label(buf, text, theme.small, theme.text);
     }
 
-    /// The plot's background: the value grid at quarters, with the scale beside the
-    /// top and the middle, and the time grid at the labeled ages.
-    fn paint_grid(&self, dl: &mut DisplayList, theme: &Theme, buf: &mut String) {
+    /// The plot's background: the value grid at quarters and the time grid at the
+    /// labeled ages.
+    fn paint_grid(&self, dl: &mut DisplayList, theme: &Theme) {
         let plot = self.plot;
         dl.fill_rect(plot, theme.surface);
         for q in 1..4 {
@@ -1367,14 +1368,42 @@ impl UsageChart {
                 dl.fill_rect(Rect::new(x, plot.y, 1.0, plot.h), theme.grid);
             }
         }
-        for (f, y) in [(1.0, plot.y), (0.5, plot.y + plot.h * 0.5 - 7.0)] {
+    }
+
+    /// The value scale, inside the plot so it takes none of its width: the top's
+    /// value just under the top, the middle's just over the middle line, each on
+    /// a backing that keeps it legible over the bands. The top's moves right of a
+    /// floating legend in that corner.
+    fn paint_scale(&self, dl: &mut DisplayList, theme: &Theme, buf: &mut String) {
+        let plot = self.plot;
+        let mid = plot.y + (plot.h * 0.5).floor();
+        for (f, y) in [(1.0, plot.y + 1.0), (0.5, mid - SCALE_H)] {
+            if y < plot.y || y + SCALE_H > plot.bottom() {
+                continue;
+            }
+            let mut x = plot.x + SCALE_INSET;
+            let legend = self.legend;
+            if self.style == ChartLegend::Floating
+                && !legend.is_empty()
+                && legend.x < x + SCALE_INSET
+                && y < legend.bottom()
+                && y + SCALE_H > legend.y
+            {
+                x = legend.right() + SCALE_INSET;
+            }
             self.value(buf, self.scale * f);
+            let w = label_w(buf, theme.small.size);
+            if x + w > plot.right() {
+                continue;
+            }
+            let rect = Rect::new(x, y, w, SCALE_H);
+            dl.fill_round_rect(rect, 3.0, theme.bg_solid.with_alpha(0.75));
             dl.text(
                 buf,
-                Rect::new(plot.x - GUTTER_W, y, GUTTER_W - 6.0, 14.0),
+                rect,
                 theme.small,
                 theme.text_dim,
-                HAlign::Right,
+                HAlign::Center,
                 VAlign::Middle,
                 false,
             );
@@ -1806,6 +1835,42 @@ mod tests {
             assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
         }
         assert!(!strings.iter().any(|s| s == "Everything else"));
+    }
+
+    #[test]
+    fn the_value_scale_sits_inside_the_plot_and_beside_a_floating_legend() {
+        let u = session(&["a.exe", "b.exe"], 30, |i, _| if i == 0 { 3 } else { 1 });
+        let scale = |dl: &DisplayList, c: &UsageChart| -> Vec<Rect> {
+            dl.cmds()
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCmd::Text(t) if dl.str(t.text).ends_with("G/s") => Some(t.rect),
+                    _ => None,
+                })
+                .filter(|r| r.x < c.plot.x + c.plot.w * 0.5)
+                .collect()
+        };
+        let mut c = UsageChart::default();
+        c.set_legend(ChartLegend::Inline);
+        let _ = painted(&mut c, &u, "");
+        let rate = c.switch[RESOURCES.len() + 1].center();
+        assert_eq!(c.click(rate), Some(ChartHit::Mode));
+        let dl = painted(&mut c, &u, "");
+        // No gutter: the plot starts at the chart's left edge.
+        assert_eq!(c.plot.x, RECT.x);
+        let rects = scale(&dl, &c);
+        assert_eq!(rects.len(), 2, "the top and the middle");
+        for r in &rects {
+            assert!(r.x >= c.plot.x && r.right() <= c.plot.right(), "{r:?}");
+            assert!(r.y >= c.plot.y && r.bottom() <= c.plot.bottom(), "{r:?}");
+        }
+
+        c.set_legend(ChartLegend::Floating);
+        let dl = painted(&mut c, &u, "");
+        if !c.float_right && !c.legend.is_empty() {
+            let top = scale(&dl, &c).into_iter().find(|r| r.y < c.legend.bottom());
+            assert!(top.is_none_or(|r| r.x >= c.legend.right()), "{top:?}");
+        }
     }
 
     #[test]
