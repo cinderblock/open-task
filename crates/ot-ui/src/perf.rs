@@ -10,6 +10,12 @@
 //! Charts are planned first as [`Slot`]s (which series, where, on what scale), all
 //! built, and only then painted, so the hover can snap to the chart under the
 //! pointer before any chart draws its line.
+//!
+//! A network card that virtual switch ports sit on (Hyper-V `vEthernet` adapters,
+//! one per VLAN say) is listed alone: its ports' traffic is part of its own. Its
+//! pane stacks each port's share of the card's receive and send rates as bands,
+//! with a grey band for the rest (virtual machines, broadcasts), and a legend
+//! that opens a port's own pane; a switch shows the card's total instead.
 
 use std::fmt::Write as _;
 use std::time::UNIX_EPOCH;
@@ -22,9 +28,9 @@ use ot_model::gpu::GpuSample;
 use ot_model::{Bytes, Hertz};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
-use crate::charts::{self, ChartGroup, Charted, ValueFmt, AXIS_BAND_H};
+use crate::charts::{self, ChartGroup, Charted, Crosshair, ValueFmt, AXIS_BAND_H};
 use crate::format;
-use crate::sparkline::{self, PlotPoint, TimeAxis};
+use crate::sparkline::{self, Plot, PlotPoint, SparkStyle, TimeAxis};
 use crate::theme::Theme;
 use crate::view::{Key, MouseButton, Reaction, UiEvent};
 
@@ -86,6 +92,15 @@ impl Line {
             Self::Rx(_) | Self::Tx(_) => charts::bit_rate_value,
         }
     }
+
+    /// The same direction of another adapter's traffic.
+    fn of_adapter(self, id: u64) -> Self {
+        match self {
+            Self::Rx(_) => Self::Rx(id),
+            Self::Tx(_) => Self::Tx(id),
+            other => other,
+        }
+    }
 }
 
 fn series(tl: &Timeline, line: Line) -> Option<&Series> {
@@ -134,6 +149,14 @@ const FACT_H: f32 = 19.0;
 const FACT_LABEL_W: f32 = 128.0;
 /// The CPU graph switch: all processors as one line, or one chart each.
 const TOGGLE: [(&str, f32); 2] = [("Overall", 70.0), ("Logical processors", 128.0)];
+/// A network card's graph switch: its total, or stacked by its switch ports.
+const NET_TOGGLE: [(&str, f32); 2] = [("Total", 52.0), ("By port", 66.0)];
+/// The legend beside a card's stacked charts, one row per port: its width is a
+/// share of the chart area's, within these.
+const PORT_LEGEND_W: (f32, f32) = (200.0, 290.0);
+const PORT_LEGEND_SHARE: f32 = 0.33;
+const PORT_ROW_H: f32 = 20.0;
+const SWATCH: f32 = 10.0;
 const CELL_GAP: f32 = 4.0;
 /// Target width-to-height ratio of a per-processor chart.
 const CELL_ASPECT: f32 = 2.0;
@@ -312,18 +335,55 @@ struct Detail {
     pair_band: Rect,
     /// Full scale of the two-line chart, in its series' units (bytes per second).
     pair_max: f32,
+    /// A network card's traffic stacked by port: the two charts are
+    /// [`PerfPage::stacks`], and this is where their legend goes.
+    stacked: bool,
+    legend: Rect,
 }
+
+/// One of a network card's stacked charts (receive or send): the card's total and
+/// each switch port's share of it, plotted on the card's slot's area and scale.
+#[derive(Debug, Default)]
+struct Stack {
+    /// The card's slot: the shared hover snaps to its chart.
+    slot: usize,
+    /// Under the plot: the time labels, or the readout.
+    band: Rect,
+    total: Plot,
+    /// In [`PerfPage::ports`] order.
+    ports: Vec<Plot>,
+}
+
+/// The layers of a card's two stacked charts; the charts' own are their indexes.
+const STACK_LAYERS: [u32; 2] = [u32::MAX - 2, u32::MAX - 1];
 
 #[derive(Debug)]
 pub(crate) struct PerfPage {
     device: Device,
     /// The CPU detail shows one chart per logical processor.
     per_core: bool,
+    /// A network card's detail stacks its switch ports' traffic, rather than
+    /// showing its total.
+    by_port: bool,
     charts: ChartGroup,
     slots: Vec<Slot>,
     /// This frame's devices in list order, where each was painted, and its first
     /// chart and chart count.
     devices: Vec<Device>,
+    /// Switch ports folded into their network card's entry, as `(port, card)`.
+    folded: Vec<(u64, u64)>,
+    /// The selected card's ports, in list order, and its stacked charts.
+    ports: Vec<u64>,
+    stacks: [Stack; 2],
+    /// The legend's port rows, for hit-testing, and the one under the pointer.
+    legend_rows: Vec<(Rect, u64)>,
+    legend_hover: Option<u64>,
+    /// Reused while painting the stacks: running totals and one band's values per
+    /// column, and a band's outline.
+    cum: Vec<f32>,
+    vals: Vec<f32>,
+    poly: Vec<Point>,
+    scratch: Vec<Point>,
     items: Vec<Rect>,
     minis: Vec<(usize, usize)>,
     detail: Detail,
@@ -349,10 +409,20 @@ impl Default for PerfPage {
         Self {
             device: Device::default(),
             per_core: false,
+            by_port: true,
             charts: ChartGroup::default(),
             axis: TimeAxis::DEFAULT,
             slots: Vec::new(),
             devices: Vec::new(),
+            folded: Vec::new(),
+            ports: Vec::new(),
+            stacks: [Stack::default(), Stack::default()],
+            legend_rows: Vec::new(),
+            legend_hover: None,
+            cum: Vec::new(),
+            vals: Vec::new(),
+            poly: Vec::new(),
+            scratch: Vec::new(),
             items: Vec::new(),
             minis: Vec::new(),
             detail: Detail::default(),
@@ -394,6 +464,11 @@ impl PerfPage {
             let plot = self.charts.plot(self.detail.first).rect();
             let band = self.detail.pair_band;
             sparkline::paint_axis(dl, plot, band, &self.axis, theme.small, theme.text_dim);
+            return;
+        }
+        if let Some(k) = STACK_LAYERS.iter().position(|&l| l as usize == i) {
+            self.build_stack(k, tl);
+            self.paint_stack(k, dl, theme);
             return;
         }
         let Some(slot) = self.slots.get(i) else {
@@ -439,8 +514,21 @@ impl PerfPage {
         }
     }
 
+    /// The list entry that shows `d`: its own, or for a switch port its card's.
+    fn entry_of(&self, d: Device) -> Option<usize> {
+        let d = match d {
+            Device::Adapter(id) => self
+                .folded
+                .iter()
+                .find(|&&(port, _)| port == id)
+                .map_or(d, |&(_, card)| Device::Adapter(card)),
+            d => d,
+        };
+        self.devices.iter().position(|&x| x == d)
+    }
+
     fn step(&mut self, n: isize) -> Reaction {
-        let Some(i) = self.devices.iter().position(|&d| d == self.device) else {
+        let Some(i) = self.entry_of(self.device) else {
             return Reaction::NONE;
         };
         let j = i.saturating_add_signed(n).min(self.devices.len() - 1);
@@ -452,7 +540,7 @@ impl PerfPage {
     /// above a short last row lands on its last tile; past either end, nothing moves.
     fn step_row(&mut self, down: bool) -> Reaction {
         let cols = self.list_cols.max(1);
-        let Some(i) = self.devices.iter().position(|&d| d == self.device) else {
+        let Some(i) = self.entry_of(self.device) else {
             return Reaction::NONE;
         };
         let last = self.devices.len() - 1;
@@ -482,20 +570,29 @@ impl PerfPage {
             .map(|(&d, _)| d)
     }
 
+    /// The graph switch's segment at `p`; the switch is only placed (non-empty)
+    /// while the pane shows it.
     fn toggle_at(&self, p: Point) -> Option<usize> {
-        if self.device != Device::Cpu {
-            return None;
-        }
         self.toggle.iter().position(|r| r.contains(p))
+    }
+
+    /// The port whose legend row is at `p`.
+    fn legend_at(&self, p: Point) -> Option<u64> {
+        self.legend_rows
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|&(_, id)| id)
     }
 
     fn hover(&mut self, at: Option<Point>) -> Reaction {
         let item = at.and_then(|p| self.item_at(p));
         let segment = at.and_then(|p| self.toggle_at(p));
+        let port = at.and_then(|p| self.legend_at(p));
         let crosshair = self.charts.hover(at);
         let item_moved = std::mem::replace(&mut self.list_hover, item) != item;
         let segment_moved = std::mem::replace(&mut self.toggle_hover, segment) != segment;
-        Reaction::painted(item_moved || segment_moved || crosshair)
+        let port_moved = std::mem::replace(&mut self.legend_hover, port) != port;
+        Reaction::painted(item_moved || segment_moved || port_moved || crosshair)
     }
 
     fn click(&mut self, at: Point) -> Reaction {
@@ -504,7 +601,15 @@ impl PerfPage {
         }
         if let Some(i) = self.toggle_at(at) {
             let on = i == 1;
-            return Reaction::painted(std::mem::replace(&mut self.per_core, on) != on);
+            let switch = if self.device == Device::Cpu {
+                &mut self.per_core
+            } else {
+                &mut self.by_port
+            };
+            return Reaction::painted(std::mem::replace(switch, on) != on);
+        }
+        if let Some(id) = self.legend_at(at) {
+            return self.select(Device::Adapter(id));
         }
         Reaction::NONE
     }
@@ -524,7 +629,7 @@ impl PerfPage {
         let content = rows as f32 * step - ITEM_GAP;
         let max_scroll = (content - view.h).max(0.0);
         if std::mem::take(&mut self.reveal) {
-            if let Some(i) = self.devices.iter().position(|&d| d == self.device) {
+            if let Some(i) = self.entry_of(self.device) {
                 let top = (i / cols) as f32 * step;
                 if top < self.list_scroll {
                     self.list_scroll = top;
@@ -612,6 +717,26 @@ impl PerfPage {
                 detail.pair_band = band;
                 detail.pair_max = max;
             }
+            Device::Adapter(id) if self.by_port && !self.ports.is_empty() => {
+                let legend_w = (f.chart.w * PORT_LEGEND_SHARE)
+                    .clamp(PORT_LEGEND_W.0, PORT_LEGEND_W.1)
+                    .min(f.chart.w * 0.5);
+                let (charts, legend) = f.chart.split_left(f.chart.w - legend_w);
+                let (charts, _) = charts.split_left((charts.w - theme.gap).max(0.0));
+                let (upper, caption, lower) = split_pair(charts, theme);
+                for (k, (area, line)) in [(upper, Line::Rx(id)), (lower, Line::Tx(id))]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let max = self.stack_scale(tl, line);
+                    self.stacks[k].slot = self.slots.len();
+                    self.stacks[k].band = area.split_bottom(AXIS_BAND_H).0;
+                    self.plan(line, area, AXIS_BAND_H, max);
+                }
+                detail.second_caption = caption;
+                detail.stacked = true;
+                detail.legend = legend;
+            }
             Device::Adapter(id) => {
                 let (band, plot) = f.chart.split_bottom(AXIS_BAND_H);
                 let max = net_scale(tl, id, self.axis.span_ms);
@@ -663,8 +788,14 @@ impl PerfPage {
         self.devices.extend([Device::Cpu, Device::Memory]);
         self.devices
             .extend(snap.disks.iter().map(|d| Device::Disk(d.info.number)));
-        self.devices
-            .extend(snap.adapters.iter().map(|a| Device::Adapter(a.info.id)));
+        // A switch port is part of its card's entry.
+        self.folded.clear();
+        for a in &snap.adapters {
+            match a.parent_in(&snap.adapters) {
+                Some(card) => self.folded.push((a.info.id, card.info.id)),
+                None => self.devices.push(Device::Adapter(a.info.id)),
+            }
+        }
         // Software adapters (the basic render driver) are not GPUs anyone watches.
         self.devices.extend(
             snap.gpus
@@ -675,15 +806,24 @@ impl PerfPage {
         if snap.battery.is_some() {
             self.devices.push(Device::Battery);
         }
-        if !self.devices.contains(&self.device) {
+        if self.entry_of(self.device).is_none() {
             self.device = Device::Cpu;
+        }
+        self.ports.clear();
+        if let Device::Adapter(id) = self.device {
+            self.ports.extend(
+                self.folded
+                    .iter()
+                    .filter(|&&(_, card)| card == id)
+                    .map(|&(port, _)| port),
+            );
         }
 
         let f = layout(rect, self.device, self.devices.len(), theme);
         self.lay_out_list(f.list, f.list_cols);
-        if self.device != Device::Cpu {
-            self.toggle = [Rect::ZERO; 2];
-        }
+        // The pane places the graph switch and the legend if it has them.
+        self.toggle = [Rect::ZERO; 2];
+        self.legend_rows.clear();
 
         // Plan every chart and build them all before painting any, so the hover can
         // snap to the one under the pointer and every other chart marks that moment.
@@ -706,6 +846,10 @@ impl PerfPage {
         for (i, s) in self.slots.iter().enumerate() {
             let series = series(tl, s.line).unwrap_or(&self.empty);
             self.charts.build(i, s.area, s.band_h, series, s.max);
+        }
+        if self.detail.stacked {
+            self.build_stack(0, tl);
+            self.build_stack(1, tl);
         }
         self.charts.snap();
 
@@ -745,8 +889,18 @@ impl PerfPage {
                     return;
                 };
                 head(dl, &f, &a.info.name, Some(&a.info.adapter), theme);
-                self.paint_pair(dl, first, f.caption, ["Receive", "Send"], theme, buf);
-                paint_adapter_stats(dl, f.stats, a, theme, buf);
+                let caption = if self.ports.is_empty() {
+                    f.caption
+                } else {
+                    let on = usize::from(self.by_port);
+                    self.paint_toggle(dl, f.caption, &NET_TOGGLE, on, theme)
+                };
+                if self.detail.stacked {
+                    self.paint_stacks(dl, caption, snap, theme, buf);
+                } else {
+                    self.paint_pair(dl, first, caption, ["Receive", "Send"], theme, buf);
+                }
+                paint_adapter_stats(dl, f.stats, a, &snap.adapters, theme, buf);
             }
             Device::Gpu(id) => {
                 let Some(g) = snap.gpus.iter().find(|g| g.info.id == id) else {
@@ -800,7 +954,7 @@ impl PerfPage {
             if r.bottom() < self.list_view.y || r.y > self.list_view.bottom() {
                 continue;
             }
-            let fill = if d == self.device {
+            let fill = if self.entry_of(self.device) == Some(i) {
                 Some(theme.button_active)
             } else if self.list_hover == Some(d) {
                 Some(theme.button_hover)
@@ -825,7 +979,26 @@ impl PerfPage {
                 (r.right() - left - theme.pad).max(0.0),
                 r.h - 16.0,
             );
-            let (title, value) = text.split_top(text.h * 0.5);
+            let (mut title, value) = text.split_top(text.h * 0.5);
+            // A card with switch ports folded in says how many.
+            if let Device::Adapter(id) = d {
+                let n = self.folded.iter().filter(|&&(_, card)| card == id).count();
+                if n > 0 {
+                    buf.clear();
+                    let _ = write!(buf, "{n} port{}", if n == 1 { "" } else { "s" });
+                    let (name, count) = title.split_left((title.w - 52.0).max(0.0));
+                    dl.text(
+                        buf,
+                        count,
+                        theme.small,
+                        theme.text_dim,
+                        HAlign::Right,
+                        VAlign::Middle,
+                        true,
+                    );
+                    title = name;
+                }
+            }
             dl.label(title_of(d, snap), title, theme.cell, theme.text);
             summary(d, snap, buf);
             dl.label(buf, value, theme.small, theme.text_dim);
@@ -837,23 +1010,37 @@ impl PerfPage {
         head(dl, f, "CPU", snap.hardware.cpu_name.as_deref(), theme);
 
         // Caption on the left, the graph switch on the right.
-        let group_w: f32 = TOGGLE.iter().map(|t| t.1).sum();
-        let (caption, group) = f.caption.split_left((f.caption.w - group_w).max(0.0));
+        let on = usize::from(self.per_core);
+        let caption = self.paint_toggle(dl, f.caption, &TOGGLE, on, theme);
         let label = if self.per_core {
             "Utilization of each logical processor"
         } else {
             "Utilization"
         };
         dl.label(label, caption, theme.small, theme.text_dim);
+    }
+
+    /// A graph switch of two `segments` at the right of `caption`, segment `on`
+    /// active. Returns the rest of the caption, to its left.
+    fn paint_toggle(
+        &mut self,
+        dl: &mut DisplayList,
+        caption: Rect,
+        segments: &[(&str, f32); 2],
+        on: usize,
+        theme: &Theme,
+    ) -> Rect {
+        let group_w: f32 = segments.iter().map(|t| t.1).sum();
+        let (rest, group) = caption.split_left((caption.w - group_w).max(0.0));
         let group = Rect::new(group.x, group.y + 1.0, group.w, group.h - 2.0);
         dl.fill_round_rect(group, theme.card_radius, theme.surface);
         dl.stroke_rect(group, theme.surface_border, 1.0);
         let mut x = group.x;
-        for (i, (text, w)) in TOGGLE.iter().enumerate() {
+        for (i, (text, w)) in segments.iter().enumerate() {
             let r = Rect::new(x, group.y, *w, group.h);
             self.toggle[i] = r;
             x += w;
-            let active = self.per_core == (i == 1);
+            let active = i == on;
             let fill = if active {
                 Some(theme.button_active)
             } else if self.toggle_hover == Some(i) {
@@ -875,6 +1062,8 @@ impl PerfPage {
                 false,
             );
         }
+        // A gap between the caption's text and the switch.
+        rest.split_left((rest.w - theme.gap).max(0.0)).0
     }
 
     /// One chart per logical processor, colored by core kind, each with its value in
@@ -1015,6 +1204,332 @@ impl PerfPage {
         let x = self.axis.x(plot, c.age_ms);
         sparkline::paint_readout(dl, band, x, c.side, &text, theme.small, theme.text);
     }
+
+    /// The full scale of one of a card's stacked charts (`line` is the card's): its
+    /// busiest moment in the span, or its ports' together where they add up to
+    /// more, as a port talking to a virtual machine on the same switch does without
+    /// crossing the card.
+    fn stack_scale(&self, tl: &Timeline, line: Line) -> f32 {
+        let span = self.axis.span_ms;
+        let ports = self
+            .ports
+            .iter()
+            .filter_map(|&id| series(tl, line.of_adapter(id)));
+        let top = peak(series(tl, line), span).max(summed_peak(ports, span));
+        nice_bits(top * 8.0, NET_FLOOR_BITS) / 8.0
+    }
+
+    /// Place stack `k`'s card total and ports on its slot's plot and scale, on the
+    /// frame's axis.
+    fn build_stack(&mut self, k: usize, tl: &Timeline) {
+        let s = &mut self.stacks[k];
+        let Some(slot) = self.slots.get(s.slot).copied() else {
+            return;
+        };
+        let rect = slot.area.split_bottom(slot.band_h).1;
+        let card = series(tl, slot.line).unwrap_or(&self.empty);
+        s.total.build(card, rect, slot.max, &self.axis);
+        s.ports.resize_with(self.ports.len(), Plot::default);
+        for (plot, &id) in s.ports.iter_mut().zip(&self.ports) {
+            let port = series(tl, slot.line.of_adapter(id)).unwrap_or(&self.empty);
+            plot.build(port, rect, slot.max, &self.axis);
+        }
+    }
+
+    /// Stack `k`'s bands, each port's share of the card's traffic in its color and
+    /// the rest in grey, under a line along the card's total; and its time labels
+    /// unless a moment is marked. A layer of its own, so a frame where only the
+    /// clock moved paints just this again.
+    fn paint_stack(&mut self, k: usize, dl: &mut DisplayList, theme: &Theme) {
+        dl.begin_layer(STACK_LAYERS[k]);
+        let s = &self.stacks[k];
+        let (rect, max) = (s.total.rect(), s.total.max());
+        let card = s.total.points();
+        if card.len() >= 2 && max > 0.0 && !rect.is_empty() {
+            let y = |v: f32| rect.bottom() - (v / max).clamp(0.0, 1.0) * rect.h;
+            // On a running clock the newest column ended a moment ago: the bands
+            // hold its values from there to the edge until the next lands on it.
+            let hold =
+                (self.axis.now_ms.is_some() && card[0].x < rect.right()).then_some(rect.right());
+            let (cum, vals, poly) = (&mut self.cum, &mut self.vals, &mut self.poly);
+            cum.clear();
+            cum.resize(card.len(), 0.0);
+            dl.push_clip(rect);
+            for b in 0..=s.ports.len() {
+                if let Some(port) = s.ports.get(b) {
+                    align(card, port.points(), vals);
+                } else {
+                    // What the ports do not account for.
+                    vals.clear();
+                    vals.extend(card.iter().zip(&*cum).map(|(p, &c)| (p.mean - c).max(0.0)));
+                }
+                if vals.iter().all(|&v| v <= 0.0) {
+                    continue;
+                }
+                // The band's lower edge, then its upper.
+                poly.clear();
+                edge(poly, card, cum, hold, y);
+                for (c, v) in cum.iter_mut().zip(&*vals) {
+                    *c += v;
+                }
+                let upper = poly.len();
+                edge(poly, card, cum, hold, y);
+                let (lower, top) = poly.split_at(upper);
+                let color = port_color(theme, b, s.ports.len()).with_alpha(0.85);
+                dl.band(top.iter().copied(), lower.iter().copied(), color);
+                // A hairline of background along the top keeps neighbours apart.
+                dl.graph(top.iter().copied(), theme.bg_solid, 1.0);
+            }
+            dl.pop_clip();
+        }
+        // The grid, and the card's total along the top of the bands.
+        let style = SparkStyle {
+            line: theme.text.with_alpha(0.7),
+            wash: theme.text.with_alpha(0.0),
+            envelope: theme.text.with_alpha(0.0),
+            grid: theme.grid,
+            crosshair: theme.crosshair,
+            width: 1.0,
+        };
+        s.total.paint(dl, &style, &self.axis, &mut self.scratch);
+        if self.charts.crosshair().is_none() {
+            let small = theme.small;
+            sparkline::paint_axis(dl, rect, s.band, &self.axis, small, theme.text_dim);
+        }
+        dl.end_layer();
+    }
+
+    /// A card's two stacked charts, receive over send, each with its caption and
+    /// full scale and, while a moment is marked, the card's total then; and the
+    /// legend of ports beside them.
+    fn paint_stacks(
+        &mut self,
+        dl: &mut DisplayList,
+        caption: Rect,
+        snap: &Snapshot,
+        theme: &Theme,
+        buf: &mut String,
+    ) {
+        let captions = [caption, self.detail.second_caption];
+        let crosshair = self.charts.crosshair();
+        for (k, (caption, name)) in captions.into_iter().zip(["Receive", "Send"]).enumerate() {
+            let slot = self.slots[self.stacks[k].slot];
+            let fmt = slot.line.value_fmt();
+            let (text, scale) = caption.split_left((caption.w - SCALE_W).max(0.0));
+            dl.label(name, text, theme.small, theme.text_dim);
+            fmt(buf, slot.max);
+            dl.text(
+                buf,
+                scale,
+                theme.small,
+                theme.text_dim,
+                HAlign::Right,
+                VAlign::Middle,
+                true,
+            );
+            self.paint_stack(k, dl, theme);
+            let Some(c) = crosshair else {
+                continue;
+            };
+            let s = &self.stacks[k];
+            let style = charts::style(theme.text, theme);
+            let point = s.total.paint_crosshair(dl, c.age_ms, &style, &self.axis);
+            buf.clear();
+            if let Some(p) = point {
+                fmt(buf, p.mean);
+            }
+            let mut ago = String::with_capacity(16);
+            c.ago(&mut ago);
+            let mut text = String::with_capacity(48);
+            charts::readout(&mut text, buf, &ago, c.side);
+            let x = self.axis.x(s.total.rect(), c.age_ms);
+            sparkline::paint_readout(dl, s.band, x, c.side, &text, theme.small, theme.text);
+        }
+        self.paint_port_legend(dl, snap, crosshair, theme, buf);
+    }
+
+    /// The ports beside the stacked charts, each in its band's color with its
+    /// receive and send rates at the marked moment (or the latest), then the rest
+    /// of the card's traffic. A port's row opens its own pane.
+    fn paint_port_legend(
+        &mut self,
+        dl: &mut DisplayList,
+        snap: &Snapshot,
+        crosshair: Option<Crosshair>,
+        theme: &Theme,
+        buf: &mut String,
+    ) {
+        let area = self.detail.legend;
+        let (head, mut rows) = area.split_top(CAPTION_H.min(area.h));
+        dl.label("Ports", head, theme.small, theme.text_dim);
+        let n = self.ports.len();
+        // Each row's rates, receive then send: a port's, then the card's less its
+        // ports'.
+        let at = |plot: &Plot| -> f32 {
+            crosshair
+                .and_then(|c| plot.at_age(c.age_ms, &self.axis))
+                .map_or(0.0, |p| p.mean)
+        };
+        let latest = |id: u64| -> [f32; 2] {
+            snap.adapters
+                .iter()
+                .find(|a| a.info.id == id)
+                .map_or([0.0; 2], |a| {
+                    [a.rx_per_sec.get() as f32, a.tx_per_sec.get() as f32]
+                })
+        };
+        let mut rates: Vec<[f32; 2]> = (0..n)
+            .map(|b| match crosshair {
+                Some(_) => [at(&self.stacks[0].ports[b]), at(&self.stacks[1].ports[b])],
+                None => latest(self.ports[b]),
+            })
+            .collect();
+        let card = match crosshair {
+            Some(_) => [at(&self.stacks[0].total), at(&self.stacks[1].total)],
+            None => match self.device {
+                Device::Adapter(id) => latest(id),
+                _ => [0.0; 2],
+            },
+        };
+        let ports_sum = rates
+            .iter()
+            .fold([0.0f32; 2], |s, r| [s[0] + r[0], s[1] + r[1]]);
+        rates.push([
+            (card[0] - ports_sum[0]).max(0.0),
+            (card[1] - ports_sum[1]).max(0.0),
+        ]);
+
+        let mut tmp = String::with_capacity(16);
+        for (b, r) in rates.iter().enumerate() {
+            if rows.h < PORT_ROW_H {
+                break;
+            }
+            let (row, rest) = rows.split_top(PORT_ROW_H);
+            rows = rest;
+            let id = self.ports.get(b).copied();
+            let name = match id {
+                Some(id) => snap
+                    .adapters
+                    .iter()
+                    .find(|a| a.info.id == id)
+                    .map_or("", |a| port_name(&a.info.name)),
+                None => "Other",
+            };
+            if let Some(id) = id {
+                self.legend_rows.push((row, id));
+                if self.legend_hover == Some(id) {
+                    dl.fill_round_rect(row, theme.card_radius, theme.button_hover);
+                }
+            }
+            let swatch = Rect::new(row.x + 4.0, row.center().y - SWATCH * 0.5, SWATCH, SWATCH);
+            dl.fill_round_rect(swatch, 2.0, port_color(theme, b, n));
+            let text = Rect::new(
+                swatch.right() + 6.0,
+                row.y,
+                (row.right() - swatch.right() - 10.0).max(0.0),
+                row.h,
+            );
+            buf.clear();
+            charts::bit_rate_value(&mut tmp, r[0]);
+            let _ = write!(buf, "\u{2193} {tmp}  ");
+            charts::bit_rate_value(&mut tmp, r[1]);
+            let _ = write!(buf, "\u{2191} {tmp}");
+            let (label, values) = text.split_left((text.w - 132.0).max(0.0));
+            let quiet = r[0] <= 0.0 && r[1] <= 0.0;
+            let color = if quiet { theme.text_dim } else { theme.text };
+            dl.label(name, label, theme.small, color);
+            dl.text(
+                buf,
+                values,
+                theme.small,
+                theme.text_dim,
+                HAlign::Right,
+                VAlign::Middle,
+                true,
+            );
+        }
+    }
+}
+
+/// The largest sum `series` reach together within the last `span_ms`, adding up
+/// the samples taken at the same moment (each series' buckets end at the same
+/// times when they were sampled together).
+fn summed_peak<'a>(series: impl Iterator<Item = &'a Series>, span_ms: f32) -> f32 {
+    let mut heads: Vec<_> = series.map(|s| s.history().peekable()).collect();
+    let mut newest = None;
+    let mut top = 0.0f32;
+    while let Some(at) = heads
+        .iter_mut()
+        .filter_map(|h| h.peek().map(|b| b.last_ms))
+        .max()
+    {
+        if (*newest.get_or_insert(at) - at) as f32 > span_ms {
+            break;
+        }
+        let mut sum = 0.0;
+        for h in &mut heads {
+            if let Some(b) = h.next_if(|b| b.last_ms == at) {
+                sum += b.max;
+            }
+        }
+        top = top.max(sum);
+    }
+    top
+}
+
+/// `port`'s value in each of `card`'s columns, zero where it has none. Series
+/// sampled together put their columns at the same ages; a port that came up later
+/// has fewer of them.
+fn align(card: &[PlotPoint], port: &[PlotPoint], out: &mut Vec<f32>) {
+    out.clear();
+    let mut j = 0;
+    for c in card {
+        while port.get(j).is_some_and(|p| p.age_ms < c.age_ms - 0.5) {
+            j += 1;
+        }
+        out.push(match port.get(j) {
+            Some(p) if (p.age_ms - c.age_ms).abs() <= 0.5 => {
+                j += 1;
+                p.mean
+            }
+            _ => 0.0,
+        });
+    }
+}
+
+/// One edge of a band, oldest (leftmost) first: the running total `cum` at each of
+/// `card`'s columns (newest first), held flat out to `hold` past the newest.
+fn edge(
+    out: &mut Vec<Point>,
+    card: &[PlotPoint],
+    cum: &[f32],
+    hold: Option<f32>,
+    y: impl Fn(f32) -> f32,
+) {
+    out.extend(
+        card.iter()
+            .zip(cum)
+            .rev()
+            .map(|(p, &c)| Point::new(p.x, y(c))),
+    );
+    if let Some(x) = hold {
+        out.push(Point::new(x, y(cum[0])));
+    }
+}
+
+/// The color of band `b` of a stack of `ports` ports and the rest, which is grey.
+fn port_color(theme: &Theme, b: usize, ports: usize) -> Color {
+    if b >= ports {
+        return theme.series_other;
+    }
+    theme.series.get(b).copied().unwrap_or(theme.series_other)
+}
+
+/// A switch port's name without the `vEthernet (…)` around every Hyper-V port's.
+pub(crate) fn port_name(name: &str) -> &str {
+    name.strip_prefix("vEthernet (")
+        .and_then(|n| n.strip_suffix(')'))
+        .unwrap_or(name)
 }
 
 /// The layer of the time labels under a pair of charts; the charts' own are their
@@ -1578,6 +2093,7 @@ fn paint_adapter_stats(
     dl: &mut DisplayList,
     stats: Rect,
     a: &AdapterSample,
+    adapters: &[AdapterSample],
     theme: &Theme,
     buf: &mut String,
 ) {
@@ -1603,6 +2119,19 @@ fn paint_adapter_stats(
         "Virtual"
     };
     facts.word("Adapter", hardware);
+    // Where its traffic goes: through a card, or this card carries ports'.
+    if let Some(card) = a.parent_in(adapters) {
+        facts.word("Switch port of", &card.info.name);
+    }
+    let (ports, busy) = a.ports_in(adapters).fold((0, 0), |(n, busy), p| {
+        let moving = p.rx_per_sec.get() + p.tx_per_sec.get() > 0;
+        (n + 1, busy + usize::from(moving))
+    });
+    if ports > 0 {
+        facts.text.clear();
+        let _ = write!(facts.text, "{ports} ({busy} active)");
+        facts.line("Switch ports");
+    }
     if let Some(bps) = a.link_bps {
         format::bits(&mut facts.text, bps as f64);
         facts.line("Link speed");
@@ -2369,6 +2898,178 @@ pub(crate) mod tests {
         ] {
             assert!(has(&t, want), "{want} missing from {t:?}");
         }
+    }
+
+    #[test]
+    fn switch_ports_fold_into_their_card_and_stack_on_its_pane() {
+        let (tl, s) = timeline_with(2, &[], &card_with_ports());
+        let mut page = PerfPage::default();
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        assert_eq!(
+            &page.devices[2..],
+            [Device::Adapter(7), Device::Adapter(10)],
+            "the ports are not listed on their own"
+        );
+        assert!(
+            has(&t, "2 ports") && !has(&t, "vEthernet (VLAN-3)"),
+            "{t:?}"
+        );
+
+        page.handle(UiEvent::Key(Key::End));
+        page.handle(UiEvent::Key(Key::Up));
+        assert_eq!(page.device(), Device::Adapter(7));
+        let dl = paint_with(&mut page, &tl, &s);
+        let t = texts(&dl);
+        for want in [
+            "Receive",
+            "Send",
+            "Total",
+            "By port",
+            "Ports",
+            "VLAN-3",
+            "VLAN-7",
+            "Other",
+            // 400 and 200 KB/s of the card's 700: the rest is 100 KB/s.
+            "\u{2193} 3.20 Mbps  \u{2191} 40.0 Kbps",
+            "\u{2193} 1.60 Mbps  \u{2191} 40.0 Kbps",
+            "\u{2193} 800 Kbps  \u{2191} 20.0 Kbps",
+            "Switch ports",
+            "2 (2 active)",
+        ] {
+            assert!(has(&t, want), "{want} missing from {t:?}");
+        }
+        // Each chart: a band per port in its color, then the rest in grey.
+        let theme = Theme::dark();
+        let bands: Vec<Color> = dl
+            .cmds()
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Band { color, .. } if color.a > 0.8 => Some(*color),
+                _ => None,
+            })
+            .collect();
+        let one =
+            [theme.series[0], theme.series[1], theme.series_other].map(|c| c.with_alpha(0.85));
+        assert_eq!(bands, [one, one].concat());
+
+        // A port's legend row opens its pane; the card's entry stays selected in
+        // the list, and the keys move on from there.
+        let (row, _) = page.legend_rows[1];
+        assert!(page.handle(UiEvent::MouseMove(row.center())).repaint);
+        page.handle(UiEvent::MouseDown {
+            at: row.center(),
+            button: MouseButton::Left,
+        });
+        assert_eq!(page.device(), Device::Adapter(9));
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        assert!(has(&t, "Switch port of") && has(&t, "Throughput"), "{t:?}");
+        assert_eq!(page.entry_of(page.device()), Some(2));
+        assert_eq!(page.toggle[0], Rect::ZERO, "a port has no switch");
+        page.handle(UiEvent::Key(Key::Down));
+        assert_eq!(page.device(), Device::Adapter(10));
+
+        // The switch shows the card's total instead.
+        page.handle(UiEvent::Key(Key::Up));
+        let _ = paint_with(&mut page, &tl, &s);
+        page.handle(UiEvent::MouseDown {
+            at: page.toggle[0].center(),
+            button: MouseButton::Left,
+        });
+        let dl = paint_with(&mut page, &tl, &s);
+        assert!(has(&texts(&dl), "Throughput"));
+        let colors = line_colors(&dl);
+        assert_eq!(
+            &colors[colors.len() - 2..],
+            [theme.network, theme.network_send]
+        );
+        assert_eq!(page.legend_rows, []);
+    }
+
+    #[test]
+    fn hovering_a_stack_reads_out_the_card_and_each_port_then() {
+        let (tl, s) = timeline_with(2, &[], &card_with_ports());
+        let mut page = PerfPage {
+            device: Device::Adapter(7),
+            ..PerfPage::default()
+        };
+        let _ = paint_with(&mut page, &tl, &s);
+        let rx = page.stacks[0].total.rect();
+        let at = Point::new(page.charts().axis().x(rx, 3000.0), rx.center().y);
+        assert!(page.handle(UiEvent::MouseMove(at)).repaint);
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        for want in [
+            "5.60 Mbps · \u{2007}3s ago",
+            "100 Kbps · \u{2007}3s ago",
+            "\u{2193} 3.20 Mbps  \u{2191} 40.0 Kbps",
+        ] {
+            assert!(has(&t, want), "{want} missing from {t:?}");
+        }
+    }
+
+    #[test]
+    fn a_stack_is_scaled_to_its_ports_when_they_add_up_to_more_than_the_card() {
+        // The ports talk to virtual machines on the switch, past the card.
+        let mut adapters = card_with_ports();
+        adapters[1].rx_per_sec = Bytes(900_000);
+        adapters[2].rx_per_sec = Bytes(900_000);
+        let (tl, s) = timeline_with(2, &[], &adapters);
+        let mut page = PerfPage {
+            device: Device::Adapter(7),
+            ..PerfPage::default()
+        };
+        let t = texts(&paint_with(&mut page, &tl, &s));
+        // 1.8 MB/s is 14.4 Mbps: the next step is 20.
+        assert!(has(&t, "20.0 Mbps"), "{t:?}");
+        assert!(
+            has(&t, "\u{2193} 0 bps  \u{2191} 20.0 Kbps"),
+            "no rest: {t:?}"
+        );
+    }
+
+    #[test]
+    fn a_port_lines_up_with_the_cards_columns_it_has() {
+        // The card sampled for five seconds, the port only for the last two.
+        let (mut card, mut port) = (
+            Series::new(Retention::raw(10)),
+            Series::new(Retention::raw(10)),
+        );
+        for t in 0..5 {
+            card.push(1000 * t, 9.0);
+            if t >= 3 {
+                port.push(1000 * t, t as f32);
+            }
+        }
+        let area = Rect::new(0.0, 0.0, 300.0, 60.0);
+        let axis = TimeAxis::at(None, 4000.0, TimeAxis::DEFAULT.tau_ms);
+        let (mut a, mut b) = (Plot::default(), Plot::default());
+        a.build(&card, area, 10.0, &axis);
+        b.build(&port, area, 10.0, &axis);
+        let mut out = Vec::new();
+        align(a.points(), b.points(), &mut out);
+        assert_eq!(out, [4.0, 3.0, 0.0, 0.0, 0.0]);
+        assert_eq!(port_name("vEthernet (VLAN-7)"), "VLAN-7");
+        assert_eq!(port_name("Ethernet 2"), "Ethernet 2");
+    }
+
+    /// A card (7) with two switch ports (8, 9), and an adapter on its own (10).
+    fn card_with_ports() -> Vec<AdapterSample> {
+        let port = |id, name: &str, rx| {
+            let mut a = adapter(id, name);
+            a.info = Arc::new(AdapterInfo {
+                parent: Some(7),
+                hardware: false,
+                ..(*a.info).clone()
+            });
+            a.rx_per_sec = Bytes(rx);
+            a.tx_per_sec = Bytes(5_000);
+            a
+        };
+        vec![
+            adapter(7, "Ethernet"),
+            port(8, "vEthernet (VLAN-3)", 400_000),
+            port(9, "vEthernet (VLAN-7)", 200_000),
+            adapter(10, "Tailscale"),
+        ]
     }
 
     #[test]

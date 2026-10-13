@@ -69,7 +69,15 @@ LGPL `IntelMSR` and `AMDFamily17` modules embedded from
 two figures are simply absent, and the log says where to get it. Connections are the ones a person
 would call connections: physical adapters, Hyper-V `vEthernet` ports and VPNs such
 as Tailscale, not the WAN miniports and virtual-switch internals Windows keeps
-underneath. Rate charts scale themselves to the busiest moment they show.
+underneath. A `vEthernet` port on an external virtual switch (one per VLAN, say)
+carries traffic that is part of its network card's, so it is listed under the card,
+not beside it: the card's entry says how many ports it has, and its pane stacks
+each port's share of what it received and sent in a band of its own, the rest
+(virtual machines, broadcasts) in grey, with a legend whose rows open a port's own
+pane. **Total / By port** above the charts flattens them to the card's two lines.
+The link comes from Windows' interface stack, so a port of an internal switch
+(Default Switch, WSL) stays on its own. Rate charts scale themselves to the busiest
+moment they show.
 The list scrolls when there are more devices than fit. Every graph on the page, the
 small ones in the list included, shares one hover line.
 
@@ -380,7 +388,8 @@ held, processes, threads, handles, up time, and package power and temperature wh
 the probe reports them), memory (in use of total with a graph, committed, cached),
 each disk's active time and read and write rates with the busiest one's graph,
 each network connection's traffic with the busiest one's graph (connections at
-rest are left out when there are more than four), each GPU's utilization and
+rest are left out when there are more than four; a card's busy switch ports are
+indented under it), each GPU's utilization and
 dedicated memory, the battery's charge, state, rate and time left, the five
 processes using the most CPU right now and the five with the highest cycle
 totals (a click on one selects it on the Processes page), and how many users are

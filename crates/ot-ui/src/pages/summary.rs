@@ -16,6 +16,7 @@ use std::time::UNIX_EPOCH;
 
 use ot_core::{Retention, Series, Snapshot, Timeline};
 use ot_model::battery::BatteryState;
+use ot_model::device::AdapterSample;
 use ot_model::service::ServiceState;
 use ot_model::system::SystemFacts;
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
@@ -166,9 +167,11 @@ fn chart_of(kind: CardKind, snap: &Snapshot, tl: &Timeline, span_ms: f32) -> Opt
             .iter()
             .max_by(|a, b| a.active.get().total_cmp(&b.active.get()))
             .map(|d| (Line::DiskActive(d.info.number), 100.0)),
+        // A switch port's traffic is part of its card's.
         CardKind::Network => snap
             .adapters
             .iter()
+            .filter(|a| a.parent_in(&snap.adapters).is_none())
             .max_by_key(|a| a.rx_per_sec.get() + a.tx_per_sec.get())
             .map(|a| {
                 let id = a.info.id;
@@ -729,22 +732,37 @@ impl SummaryPage {
                 }
             }
             CardKind::Network => {
-                let leave_quiet_out = snap.adapters.len() > QUIET_ADAPTERS_FROM;
-                for a in &snap.adapters {
-                    let busy = a.rx_per_sec.get() + a.tx_per_sec.get() > 0;
-                    if leave_quiet_out && !busy {
+                // A card's switch ports are part of its traffic: under it, the busy
+                // ones only, rather than beside it.
+                let adapters = &snap.adapters;
+                let busy = |a: &AdapterSample| a.rx_per_sec.get() + a.tx_per_sec.get() > 0;
+                let listed = adapters.iter().filter(|a| a.parent_in(adapters).is_none());
+                let leave_quiet_out = listed.clone().count() > QUIET_ADAPTERS_FROM;
+                let mut name = String::new();
+                for card in listed.clone() {
+                    if leave_quiet_out && !busy(card) {
                         continue;
                     }
-                    charts::bit_rate_value(&mut self.tmp, a.rx_per_sec.get() as f32);
-                    buf.clear();
-                    let _ = write!(buf, "\u{2193} {}  ", self.tmp);
-                    charts::bit_rate_value(&mut self.tmp, a.tx_per_sec.get() as f32);
-                    let _ = write!(buf, "\u{2191} {}", self.tmp);
-                    self.line(&a.info.name, buf);
+                    let ports = card.ports_in(adapters).filter(|p| busy(p));
+                    for a in std::iter::once(card).chain(ports) {
+                        charts::bit_rate_value(&mut self.tmp, a.rx_per_sec.get() as f32);
+                        buf.clear();
+                        let _ = write!(buf, "\u{2193} {}  ", self.tmp);
+                        charts::bit_rate_value(&mut self.tmp, a.tx_per_sec.get() as f32);
+                        let _ = write!(buf, "\u{2191} {}", self.tmp);
+                        name.clear();
+                        if a.info.id == card.info.id {
+                            name.push_str(&a.info.name);
+                        } else {
+                            name.push('\u{2003}');
+                            name.push_str(perf::port_name(&a.info.name));
+                        }
+                        self.line(&name, buf);
+                    }
                 }
                 if self.lines.is_empty() {
                     buf.clear();
-                    let _ = write!(buf, "{} adapters", snap.adapters.len());
+                    let _ = write!(buf, "{} adapters", listed.count());
                     self.line("No traffic", buf);
                 }
             }
@@ -1098,6 +1116,45 @@ mod tests {
         );
         let t = texts(&paint_in(&mut page, WIDE, &tl, &s));
         assert_eq!(t.iter().filter(|s| *s == "Idle").count(), 3, "{t:?}");
+    }
+
+    #[test]
+    fn switch_ports_are_listed_under_their_card_when_busy() {
+        let mut adapters = vec![adapter(7, "Ethernet")];
+        for (id, name, rx) in [
+            (8, "vEthernet (VLAN-3)", 400_000),
+            (9, "vEthernet (VLAN-7)", 0),
+        ] {
+            let mut a = adapter(id, name);
+            a.info = std::sync::Arc::new(ot_model::device::AdapterInfo {
+                parent: Some(7),
+                ..(*a.info).clone()
+            });
+            a.rx_per_sec = ot_model::Bytes(rx);
+            a.tx_per_sec = ot_model::Bytes(0);
+            adapters.push(a);
+        }
+        let (tl, s) = timeline_of(
+            2,
+            &Devices {
+                adapters,
+                ..Devices::default()
+            },
+        );
+        let mut page = SummaryPage::default();
+        let t = texts(&paint_in(&mut page, WIDE, &tl, &s));
+        let at = |want: &str| t.iter().position(|s| s == want);
+        let card = at("Ethernet").expect("the card");
+        assert_eq!(
+            at("\u{2003}VLAN-3"),
+            Some(card + 2),
+            "after the card's rates: {t:?}"
+        );
+        assert_eq!(
+            at("\u{2003}VLAN-7"),
+            None,
+            "an idle port adds nothing: {t:?}"
+        );
     }
 
     #[test]
