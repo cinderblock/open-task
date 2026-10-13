@@ -44,9 +44,14 @@
 //! byte-milliseconds), so folding steps together is a sum and the averages come
 //! out exact. Memory is listed for every program holding any, which makes it the
 //! larger part of a step.
+//!
+//! And it keeps each process's lineage ([`Seen`]): its parent and when it ran, for
+//! every process seen as far back as the history reaches and for every ancestor of
+//! those, gone or not, so that a band of the chart can say which processes made it
+//! up at a moment and what started each of them, all the way to the root.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -194,6 +199,19 @@ impl Machine {
     }
 }
 
+/// What the history remembers of a process it has seen, after it has gone too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seen {
+    /// The parent's identity, as the probe resolved it: absent for a root, and for
+    /// a process whose parent had exited before it was first seen.
+    pub parent: Option<ProcessKey>,
+    /// The program it is charted under, which [`Usage::program_name`] names.
+    pub program: ProgramId,
+    /// The first and the last snapshot it was in, in ms since the Unix epoch.
+    pub first_ms: i64,
+    pub last_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     statics: Arc<ProcessStatic>,
@@ -282,6 +300,10 @@ pub struct Usage {
     /// Share of every total lost each second.
     decay: f64,
     procs: HashMap<ProcessKey, Entry>,
+    /// Every process seen as far back as the history reaches, and their ancestors;
+    /// and when that was last trimmed to the reach.
+    seen: HashMap<ProcessKey, Seen>,
+    trimmed_ms: i64,
     /// Sum of every total, the exited processes' included.
     sum: f64,
     /// Time of the newest snapshot and of the first, in ms since the epoch.
@@ -336,6 +358,8 @@ impl Usage {
         Self {
             decay: clamp_decay(decay),
             procs: HashMap::new(),
+            seen: HashMap::new(),
+            trimmed_ms: 0,
             sum: 0.0,
             now_ms: 0,
             first_ms: None,
@@ -491,6 +515,19 @@ impl Usage {
             if used > 0 {
                 e.total += used as f64 * arrived;
             }
+            self.seen
+                .entry(p.key())
+                .and_modify(|s| {
+                    s.last_ms = now;
+                    // The probe can learn the parent after first sight.
+                    s.parent = p.statics.parent;
+                })
+                .or_insert(Seen {
+                    parent: p.statics.parent,
+                    program: e.program,
+                    first_ms: now,
+                    last_ms: now,
+                });
             let program = e.program as usize;
             if program >= self.by_program.len() {
                 self.by_program.resize(program + 1, [0.0; KINDS]);
@@ -507,6 +544,9 @@ impl Usage {
         self.sum = self.procs.values().map(|e| e.total).sum();
         let floor = GHOST_FLOOR.max(self.sum * GHOST_SHARE);
         self.procs.retain(|_, e| e.alive || e.total >= floor);
+        if now - self.trimmed_ms >= STEP_MIN_MS {
+            self.trim_lineage();
+        }
 
         if span_ms > 0 {
             self.record(snap, now, span_ms);
@@ -592,6 +632,25 @@ impl Usage {
         }
     }
 
+    /// Forget the processes last seen before the history's reach, except those that
+    /// are ancestors of one still remembered, so no chain is cut short.
+    fn trim_lineage(&mut self) {
+        self.trimmed_ms = self.now_ms;
+        let horizon = self.now_ms - self.history_ms;
+        let mut keep = HashSet::with_capacity(self.seen.len());
+        for (&key, s) in &self.seen {
+            if s.last_ms < horizon {
+                continue;
+            }
+            let mut at = Some(key);
+            // Stops at a key already kept: its ancestors are kept too.
+            while let Some(k) = at.filter(|&k| keep.insert(k)) {
+                at = self.seen.get(&k).and_then(|s| s.parent);
+            }
+        }
+        self.seen.retain(|k, _| keep.contains(k));
+    }
+
     fn close_open(&mut self) {
         if let Some(o) = self.open.take() {
             self.coarse.push_back(Stored {
@@ -601,6 +660,36 @@ impl Usage {
                 machine: o.machine,
             });
         }
+    }
+
+    /// The lineage of a process seen as far back as the history reaches, or of an
+    /// ancestor of one.
+    #[must_use]
+    pub fn seen(&self, key: ProcessKey) -> Option<&Seen> {
+        self.seen.get(&key)
+    }
+
+    /// The processes of `program` in any snapshot taken after `after_ms` and no
+    /// later than `until_ms`: those that make up its share of the stretches
+    /// between. In no particular order.
+    pub fn seen_in(
+        &self,
+        program: ProgramId,
+        after_ms: i64,
+        until_ms: i64,
+    ) -> impl Iterator<Item = (ProcessKey, &Seen)> + '_ {
+        self.seen.iter().filter_map(move |(&k, s)| {
+            (s.program == program && s.first_ms <= until_ms && s.last_ms > after_ms)
+                .then_some((k, s))
+        })
+    }
+
+    /// Whether a process was in the newest snapshot.
+    #[must_use]
+    pub fn running(&self, key: ProcessKey) -> bool {
+        self.seen
+            .get(&key)
+            .is_some_and(|s| s.last_ms == self.now_ms)
     }
 
     /// Every process with its fading total, the exited ones included, in no
@@ -1306,5 +1395,80 @@ mod tests {
         );
         merge(&mut into, &[], &mut scratch);
         assert_eq!(into.len(), 6);
+    }
+
+    /// Process `pid` named `name`, a child of `parent`.
+    fn child(pid: u32, parent: Option<u32>, name: &str) -> ProcessSample {
+        let mut p = named(pid, name, Some(0), 0);
+        Arc::make_mut(&mut p.statics).parent = parent.map(|pp| ProcessKey::new(pp, 1));
+        p
+    }
+
+    fn keys<'a>(it: impl Iterator<Item = (ProcessKey, &'a Seen)>) -> Vec<u32> {
+        let mut pids: Vec<u32> = it.map(|(k, _)| k.pid).collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    #[test]
+    fn lineage_outlives_the_processes_and_says_who_was_in_a_stretch() {
+        let mut u = Usage::new(0.05);
+        let shell = || child(1, None, "shell.exe");
+        let runner = || child(2, Some(1), "runner.exe");
+        u.observe(&snap(
+            1000,
+            vec![shell(), runner(), child(3, Some(2), "tool.exe")],
+        ));
+        u.observe(&snap(1001, vec![shell(), child(3, Some(2), "tool.exe")]));
+        u.observe(&snap(1002, vec![shell(), child(4, Some(1), "tool.exe")]));
+        let tool = u.program("tool.exe").unwrap();
+        let s = 1000_i64;
+        assert_eq!(keys(u.seen_in(tool, 999 * s, 1000 * s)), [3]);
+        assert_eq!(
+            keys(u.seen_in(tool, 1000 * s, 1001 * s)),
+            [3],
+            "the stretch ending at 1001"
+        );
+        assert_eq!(keys(u.seen_in(tool, 1001 * s, 1002 * s)), [4]);
+        assert_eq!(keys(u.seen_in(tool, 999 * s, 1002 * s)), [3, 4]);
+        // p3's parent has gone, and is still named, and its parent still known.
+        let p3 = u.seen(ProcessKey::new(3, 1)).unwrap();
+        assert_eq!(p3.parent, Some(ProcessKey::new(2, 1)));
+        let p2 = u.seen(ProcessKey::new(2, 1)).unwrap();
+        assert_eq!(u.program_name(p2.program), "runner.exe");
+        assert_eq!(p2.parent, Some(ProcessKey::new(1, 1)));
+        assert_eq!((p2.first_ms, p2.last_ms), (1000 * s, 1000 * s));
+        assert!(!u.running(ProcessKey::new(2, 1)));
+        assert!(u.running(ProcessKey::new(1, 1)));
+    }
+
+    #[test]
+    fn lineage_is_kept_as_far_back_as_the_history_and_for_every_ancestor() {
+        let mut u = Usage::new(0.05);
+        u.set_history_span(60_000);
+        let shell = || child(1, None, "shell.exe");
+        let worker = || child(3, Some(2), "worker.exe");
+        u.observe(&snap(
+            1000,
+            vec![
+                shell(),
+                child(2, Some(1), "launcher.exe"),
+                worker(),
+                child(5, None, "brief.exe"),
+            ],
+        ));
+        for t in 1001..=1200 {
+            u.observe(&snap(t, vec![shell(), worker()]));
+        }
+        assert!(
+            u.seen(ProcessKey::new(5, 1)).is_none(),
+            "gone past the reach"
+        );
+        let launcher = u
+            .seen(ProcessKey::new(2, 1))
+            .expect("an ancestor of a live process");
+        assert_eq!(launcher.last_ms, 1_000_000);
+        assert!(u.seen(ProcessKey::new(1, 1)).is_some());
+        assert!(u.seen(ProcessKey::new(3, 1)).is_some());
     }
 }

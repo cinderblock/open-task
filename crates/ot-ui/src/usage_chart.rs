@@ -46,13 +46,19 @@
 //!   the pointer, over a top corner of the plot: the one the bands rise into
 //!   less, and not the one the marked moment is in.
 //! - **Beside**: the same legend in a column of its own right of the plot.
+//!
+//! Whatever the legend, the band under the pointer reads out beside it with the
+//! processes that made it up at that moment as a small tree: each under its
+//! parent, and that under its own, up to the root, the ones that have since
+//! exited included. Processes of the band with the same parent fold into one line.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use ot_core::usage::{fade, Frame};
 use ot_core::{ProgramId, Usage};
-use ot_model::Bytes;
+use ot_model::{Bytes, ProcessKey};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
 use crate::charts::{self, Crosshair, AXIS_BAND_H};
@@ -123,6 +129,11 @@ const SPRING_SNAP_S: f32 = 0.5;
 const LABEL_FADE_S: f32 = 0.2;
 /// The band under the pointer's readout: its offset from the pointer.
 const CHIP_OFFSET: f32 = 14.0;
+/// The readout's tree of the band's processes and their ancestors: a line's
+/// height, the indent of a generation, and the most lines it shows.
+const TREE_LINE_H: f32 = 16.0;
+const TREE_INDENT: f32 = 12.0;
+const TREE_MAX_LINES: usize = 24;
 /// A program needs this share of the chart to be given a band, and half of it to
 /// keep one.
 const BAND_SHARE: f32 = 0.005;
@@ -275,7 +286,35 @@ struct Pt {
     /// When the column's newest stretch ended: where it is in time, which unlike
     /// its age does not change as the chart scrolls.
     end_ms: i64,
+    /// When its oldest stretch began: the column covers the snapshots taken after
+    /// this and no later than `end_ms`.
+    after_ms: i64,
     v: [f32; BANDS],
+}
+
+/// One line of the tree the readout draws: a process, or several of the band's
+/// with the same parent folded together.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct TreeLine {
+    /// Generations below the root.
+    depth: usize,
+    text: String,
+    /// How many of the band's processes it stands for; none for an ancestor.
+    members: usize,
+    /// It is the last child of its parent shown, so the rail to it ends here.
+    last: bool,
+    /// The rails passing by on their way to a later sibling: bit `d` set when the
+    /// one between generations `d` and `d + 1` does.
+    rails: u64,
+}
+
+/// The tree for one band at one moment, kept until either changes.
+#[derive(Debug, Default)]
+struct Ancestry {
+    /// The program, the moment (the column's `after_ms` and `end_ms`) and the
+    /// usage's revision it was worked out for.
+    key: Option<(ProgramId, i64, i64, u64)>,
+    lines: Vec<TreeLine>,
 }
 
 /// A band's name, as drawn inside it.
@@ -381,6 +420,12 @@ fn ink_on(fill: Color) -> Color {
     }
 }
 
+impl Row {
+    fn start_ms(&self) -> i64 {
+        self.end_ms - (self.secs * 1000.0).round() as i64
+    }
+}
+
 impl Pt {
     fn sum(&self) -> f32 {
         self.v.iter().sum()
@@ -449,6 +494,7 @@ pub(crate) struct UsageChart {
     window: (VecDeque<usize>, VecDeque<usize>),
     ago: String,
     text: String,
+    ancestry: Ancestry,
 }
 
 /// The smallest of 1, 2 and 5 times a power of ten that is at least `v`.
@@ -472,6 +518,212 @@ fn nice_bytes(v: f32) -> f32 {
         unit *= 1024.0;
     }
     nice(v / unit) * unit
+}
+
+/// The processes of `program` in the snapshots after `after_ms` and to `until_ms`,
+/// with their ancestors as far as they are known, as the lines of a tree read top
+/// to bottom: roots first, each process under its parent. Of a parent's children,
+/// those with more of the program's processes under them come first. The
+/// program's processes that have no children shown fold into one line under their
+/// parent, `30 × chrome.exe (Renderer)`. A process that has exited says so.
+fn ancestry(
+    usage: &Usage,
+    program: ProgramId,
+    after_ms: i64,
+    until_ms: i64,
+    out: &mut Vec<TreeLine>,
+) {
+    out.clear();
+    let members: HashSet<ProcessKey> = usage
+        .seen_in(program, after_ms, until_ms)
+        .map(|(k, _)| k)
+        .collect();
+    // Each process's children in the tree; the roots under `None`.
+    let mut children: HashMap<Option<ProcessKey>, Vec<ProcessKey>> = HashMap::new();
+    let mut placed = HashSet::new();
+    for &key in &members {
+        let mut k = key;
+        while placed.insert(k) {
+            // A parent the history does not know (the idle process) is no parent.
+            let parent = usage
+                .seen(k)
+                .and_then(|s| s.parent)
+                .filter(|&p| usage.seen(p).is_some());
+            children.entry(parent).or_default().push(k);
+            match parent {
+                Some(p) => k = p,
+                None => break,
+            }
+        }
+    }
+    let mut weight = HashMap::with_capacity(placed.len());
+    for &k in &placed {
+        subtree_members(k, &members, &children, &mut weight);
+    }
+    let tree = Tree {
+        usage,
+        members: &members,
+        children: &children,
+        weight: &weight,
+    };
+    tree.emit(None, 0, 0, out);
+}
+
+/// How many of the band's processes are in the subtree under `k`, `k` included.
+fn subtree_members(
+    k: ProcessKey,
+    members: &HashSet<ProcessKey>,
+    children: &HashMap<Option<ProcessKey>, Vec<ProcessKey>>,
+    memo: &mut HashMap<ProcessKey, usize>,
+) -> usize {
+    if let Some(&n) = memo.get(&k) {
+        return n;
+    }
+    // Marked before the children are visited, so even a loop would end.
+    memo.insert(k, 0);
+    let below: usize = children.get(&Some(k)).map_or(0, |c| {
+        c.iter()
+            .map(|&c| subtree_members(c, members, children, memo))
+            .sum()
+    });
+    let n = usize::from(members.contains(&k)) + below;
+    memo.insert(k, n);
+    n
+}
+
+/// What [`ancestry`] lays out.
+struct Tree<'a> {
+    usage: &'a Usage,
+    members: &'a HashSet<ProcessKey>,
+    children: &'a HashMap<Option<ProcessKey>, Vec<ProcessKey>>,
+    weight: &'a HashMap<ProcessKey, usize>,
+}
+
+impl Tree<'_> {
+    fn name(&self, k: ProcessKey) -> &str {
+        self.usage
+            .seen(k)
+            .map_or("", |s| self.usage.program_name(s.program))
+    }
+
+    fn weight(&self, k: ProcessKey) -> usize {
+        self.weight.get(&k).copied().unwrap_or(0)
+    }
+
+    /// The lines for the children of `parent`, at `depth`, and everything under
+    /// them. `rails` are the rails passing by them.
+    fn emit(&self, parent: Option<ProcessKey>, depth: usize, rails: u64, out: &mut Vec<TreeLine>) {
+        let Some(kids) = self.children.get(&parent) else {
+            return;
+        };
+        let leaf =
+            |k: ProcessKey| self.members.contains(&k) && !self.children.contains_key(&Some(k));
+        let mut folded: Vec<ProcessKey> = kids.iter().copied().filter(|&k| leaf(k)).collect();
+        let mut others: Vec<ProcessKey> = kids.iter().copied().filter(|&k| !leaf(k)).collect();
+        // A fold of one is just that process.
+        if folded.len() == 1 {
+            others.append(&mut folded);
+        }
+        others.sort_by(|&a, &b| {
+            self.weight(b)
+                .cmp(&self.weight(a))
+                .then_with(|| self.name(a).cmp(self.name(b)))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+        // The fold goes among the others by how many it stands for, first among
+        // equals.
+        let at = others.partition_point(|&k| self.weight(k) > folded.len());
+        let mut items: Vec<Option<ProcessKey>> = others.into_iter().map(Some).collect();
+        if !folded.is_empty() {
+            items.insert(at, None);
+        }
+        let n = items.len();
+        for (i, item) in items.into_iter().enumerate() {
+            let last = i + 1 == n;
+            let mut text = String::new();
+            let members = match item {
+                None => {
+                    let gone = folded.iter().filter(|&&k| !self.usage.running(k)).count();
+                    let _ = write!(text, "{} × {}", folded.len(), self.name(folded[0]));
+                    match gone {
+                        0 => {}
+                        g if g == folded.len() => text.push_str(" · exited"),
+                        g => {
+                            let _ = write!(text, " · {g} exited");
+                        }
+                    }
+                    folded.len()
+                }
+                Some(k) => {
+                    let _ = write!(text, "{} · {}", self.name(k), k.pid);
+                    if !self.usage.running(k) {
+                        text.push_str(" · exited");
+                    }
+                    usize::from(self.members.contains(&k))
+                }
+            };
+            out.push(TreeLine {
+                depth,
+                text,
+                members,
+                last,
+                rails,
+            });
+            if let Some(k) = item {
+                // Below a child with later siblings, the rail to them passes by.
+                let below = if depth > 0 && depth <= 64 && !last {
+                    rails | 1 << (depth - 1)
+                } else {
+                    rails
+                };
+                self.emit(Some(k), depth + 1, below, out);
+            }
+        }
+    }
+}
+
+/// The readout's tree in `rect`, a line under another from its top, with the
+/// rails from each parent to its children; then `more`, if some did not fit.
+fn paint_tree(
+    dl: &mut DisplayList,
+    rect: Rect,
+    lines: &[TreeLine],
+    more: Option<&str>,
+    theme: &Theme,
+) {
+    let guide = theme.text_dim.with_alpha(0.45);
+    // The rail from generation `d` down to `d + 1` runs under the first
+    // character of generation `d`'s names.
+    let rail_x = |d: usize| (rect.x + d as f32 * TREE_INDENT + 3.0).floor();
+    for (i, l) in lines.iter().enumerate() {
+        let y = rect.y + i as f32 * TREE_LINE_H;
+        let mid = (y + TREE_LINE_H * 0.5).floor();
+        let tx = rect.x + l.depth as f32 * TREE_INDENT;
+        if l.depth > 0 {
+            for d in 0..(l.depth - 1).min(64) {
+                if l.rails >> d & 1 == 1 {
+                    dl.fill_rect(Rect::new(rail_x(d), y, 1.0, TREE_LINE_H), guide);
+                }
+            }
+            let x = rail_x(l.depth - 1);
+            let down = if l.last { mid + 1.0 - y } else { TREE_LINE_H };
+            dl.fill_rect(Rect::new(x, y, 1.0, down), guide);
+            dl.fill_rect(Rect::new(x, mid, (tx - 2.0 - x).max(1.0), 1.0), guide);
+        }
+        let text = Rect::new(tx, y, (rect.right() - tx).max(0.0), TREE_LINE_H);
+        // The band's own processes read as text, their ancestors dimmer.
+        let color = if l.members > 0 {
+            theme.text
+        } else {
+            theme.text_dim
+        };
+        dl.label(&l.text, text, theme.small, color);
+    }
+    if let Some(more) = more {
+        let y = rect.y + lines.len() as f32 * TREE_LINE_H;
+        let text = Rect::new(rect.x, y, rect.w, TREE_LINE_H);
+        dl.label(more, text, theme.small, theme.text_dim);
+    }
 }
 
 impl UsageChart {
@@ -1044,6 +1296,7 @@ impl UsageChart {
                         *a = (*a * secs + b * r.secs) / n;
                     }
                     secs = n;
+                    p.after_ms = r.start_ms();
                 }
                 _ => {
                     bin = key;
@@ -1052,6 +1305,7 @@ impl UsageChart {
                         x,
                         age_ms,
                         end_ms: r.end_ms,
+                        after_ms: r.start_ms(),
                         v: r.v,
                     });
                 }
@@ -1192,6 +1446,18 @@ impl UsageChart {
         None
     }
 
+    /// The stretch of time the column nearest `p` covers, while `p` is over the
+    /// plot: snapshots taken after the first and no later than the second, in ms
+    /// since the Unix epoch.
+    #[must_use]
+    pub fn moment_at(&self, p: Point) -> Option<(i64, i64)> {
+        if !self.plot.contains(p) || self.over_legend(p) {
+            return None;
+        }
+        self.nearest(p.x)
+            .map(|i| (self.points[i].after_ms, self.points[i].end_ms))
+    }
+
     /// The program whose band, or legend row, is under `p`.
     #[must_use]
     pub fn program_at(&self, p: Point) -> Option<ProgramId> {
@@ -1270,7 +1536,6 @@ impl UsageChart {
         self.paint_scale(dl, theme, buf);
         let marked = self.paint_mark(dl, theme, buf);
         match self.style {
-            ChartLegend::Inline => self.paint_chip(dl, usage, marked, theme, buf),
             ChartLegend::Floating if !self.legend.is_empty() => {
                 // A backing that keeps the names legible over the bands, and
                 // lets a little of them show through.
@@ -1282,9 +1547,10 @@ impl UsageChart {
                 dl.stroke_round_rect(self.legend, theme.card_radius, theme.surface_border, 1.0);
                 self.paint_legend(dl, usage, marked, selected, dim, theme, buf);
             }
-            ChartLegend::Floating => {}
             ChartLegend::Beside => self.paint_legend(dl, usage, marked, selected, dim, theme, buf),
+            ChartLegend::Inline | ChartLegend::Floating => {}
         }
+        self.paint_chip(dl, usage, marked, theme, buf);
     }
 
     /// Each band's name inside it, where it was placed; the selected program's
@@ -1324,9 +1590,10 @@ impl UsageChart {
     }
 
     /// Beside the pointer, the band under it: its color, name and value at the
-    /// marked moment, the readout a legend row would give.
+    /// marked moment, the readout a legend row would give, and under that the
+    /// tree of its processes then and their ancestors.
     fn paint_chip(
-        &self,
+        &mut self,
         dl: &mut DisplayList,
         usage: &Usage,
         marked: Option<Pt>,
@@ -1337,32 +1604,91 @@ impl UsageChart {
         else {
             return;
         };
+        // Everything else, and what is in no process, are many programs or none.
+        if let Some(program) = self.slots.get(band).copied().flatten() {
+            let key = (program, column.after_ms, column.end_ms, usage.revision());
+            if self.ancestry.key != Some(key) {
+                self.ancestry.key = Some(key);
+                ancestry(
+                    usage,
+                    program,
+                    column.after_ms,
+                    column.end_ms,
+                    &mut self.ancestry.lines,
+                );
+            }
+        } else {
+            self.ancestry.key = None;
+            self.ancestry.lines.clear();
+        }
         // The value first: formatting it starts the buffer afresh.
         self.value(buf, column.v[band]);
         buf.insert_str(0, "  ");
         buf.insert_str(0, self.band_name(usage, band));
-        let plot = self.plot;
-        let width = (label_w(buf, theme.small.size) + SWATCH + 6.0).min(plot.w);
-        let height = LEGEND_ROW_H;
-        // Below right of the pointer, or wherever that keeps it in the plot.
+        let area = self.area;
+        let lines = &self.ancestry.lines;
+        // As many lines as fit, up to a limit; the last place then says how many
+        // of the band's processes did not.
+        let room = ((area.h - LEGEND_ROW_H - LABEL_PAD) / TREE_LINE_H).max(0.0) as usize;
+        let cap = room.min(TREE_MAX_LINES);
+        let (shown, more) = if lines.len() > cap {
+            let shown = cap.saturating_sub(1);
+            let hidden: usize = lines[shown..].iter().map(|l| l.members).sum();
+            (&lines[..shown], Some(hidden))
+        } else {
+            (&lines[..], None)
+        };
+        let more = more.map(|n| match n {
+            0 => "\u{2026}".to_owned(),
+            1 => "\u{2026} and 1 more process".to_owned(),
+            n => format!("\u{2026} and {n} more processes"),
+        });
+        let size = theme.small.size;
+        let tree_w = shown
+            .iter()
+            .map(|l| l.depth as f32 * TREE_INDENT + label_w(&l.text, size))
+            .chain(more.as_deref().map(|m| label_w(m, size)))
+            .fold(0.0, f32::max);
+        let width = (label_w(buf, size) + SWATCH + 6.0)
+            .max(tree_w + LABEL_PAD)
+            .min(area.w);
+        let rows = shown.len() + usize::from(more.is_some());
+        let height = if rows == 0 {
+            LEGEND_ROW_H
+        } else {
+            LEGEND_ROW_H + rows as f32 * TREE_LINE_H + LABEL_PAD
+        };
+        // Below right of the pointer, or wherever that keeps it in the chart.
         let mut left = pointer.x + CHIP_OFFSET;
-        if left + width > plot.right() {
+        if left + width > area.right() {
             left = pointer.x - CHIP_OFFSET - width;
         }
         let mut top = pointer.y + CHIP_OFFSET;
-        if top + height > plot.bottom() {
+        if top + height > area.bottom() {
             top = pointer.y - CHIP_OFFSET - height;
         }
-        let left = left.clamp(plot.x, (plot.right() - width).max(plot.x));
-        let top = top.clamp(plot.y, (plot.bottom() - height).max(plot.y));
+        let left = left.clamp(area.x, (area.right() - width).max(area.x));
+        let top = top.clamp(area.y, (area.bottom() - height).max(area.y));
         let chip = Rect::new(left, top, width, height);
         dl.fill_round_rect(chip, theme.card_radius, theme.bg_solid.with_alpha(0.92));
         dl.stroke_round_rect(chip, theme.card_radius, theme.surface_border, 1.0);
-        let inner = chip.inset(LABEL_PAD, 0.0);
+        let (head, body) = chip.split_top(LEGEND_ROW_H);
+        let inner = head.inset(LABEL_PAD, 0.0);
         let swatch = Rect::new(inner.x, inner.center().y - SWATCH * 0.5, SWATCH, SWATCH);
         dl.fill_round_rect(swatch, 2.0, band_color(theme, band));
         let (_, text) = inner.split_left(SWATCH + 6.0);
         dl.label(buf, text, theme.small, theme.text);
+        if rows > 0 {
+            dl.push_clip(chip);
+            paint_tree(
+                dl,
+                body.inset(LABEL_PAD, 0.0),
+                shown,
+                more.as_deref(),
+                theme,
+            );
+            dl.pop_clip();
+        }
     }
 
     /// The plot's background: the value grid at quarters and the time grid at the
@@ -2754,5 +3080,116 @@ mod tests {
             oldest.v[a]
         );
         assert!(c.history[..2].iter().all(|r| (r.v[a] - 25.0).abs() < 1e-3));
+    }
+
+    /// A session of `secs` seconds where each second's processes are `at(s)`:
+    /// `(pid, parent, name)`, each using a G cycles a second.
+    fn family_session(
+        secs: u64,
+        at: impl Fn(u64) -> Vec<(u32, Option<u32>, &'static str)>,
+    ) -> Usage {
+        let mut u = Usage::new(0.05);
+        for s in 0..=secs {
+            let procs = at(s)
+                .into_iter()
+                .map(|(pid, parent, name)| {
+                    let mut p = proc(pid, parent, 0.0);
+                    p.statics = Arc::new(ProcessStatic {
+                        name: name.to_owned(),
+                        ..(*p.statics).clone()
+                    });
+                    p.cycles = 100 * G + s * G;
+                    p
+                })
+                .collect();
+            u.observe(&Snapshot {
+                tick: Tick(s + 1),
+                taken_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1000 + s)),
+                interval: Duration::from_secs(1),
+                processes: procs,
+                ..Default::default()
+            });
+        }
+        u
+    }
+
+    /// A shell that started a launcher (which has since exited) that started three
+    /// workers (one has exited), and one worker itself; and a service with a worker
+    /// of its own.
+    fn workers(s: u64) -> Vec<(u32, Option<u32>, &'static str)> {
+        let mut v = vec![
+            (1, None, "shell.exe"),
+            (6, Some(2), "w.exe"),
+            (7, Some(2), "w.exe"),
+            (8, Some(1), "w.exe"),
+            (9, None, "svc.exe"),
+            (10, Some(9), "w.exe"),
+        ];
+        if s < 20 {
+            v.extend([(2, Some(1), "launcher.exe"), (5, Some(2), "w.exe")]);
+        }
+        v
+    }
+
+    fn line(depth: usize, text: &str, members: usize, last: bool, rails: u64) -> TreeLine {
+        TreeLine {
+            depth,
+            text: text.to_owned(),
+            members,
+            last,
+            rails,
+        }
+    }
+
+    #[test]
+    fn a_bands_processes_read_as_a_tree_up_to_their_roots_the_exited_included() {
+        let u = family_session(30, workers);
+        let w = u.program("w.exe").unwrap();
+        let mut lines = Vec::new();
+        // A moment when all four of the launcher's family ran.
+        ancestry(&u, w, 1_009_000, 1_010_000, &mut lines);
+        assert_eq!(
+            lines,
+            [
+                line(0, "shell.exe · 1", 0, false, 0),
+                line(1, "launcher.exe · 2 · exited", 0, false, 0),
+                line(2, "3 × w.exe · 1 exited", 3, true, 1),
+                line(1, "w.exe · 8", 1, true, 0),
+                line(0, "svc.exe · 9", 0, true, 0),
+                line(1, "w.exe · 10", 1, true, 0),
+            ]
+        );
+        // Now: the launcher's exited worker is not in the band, and the launcher
+        // is still named as its workers' parent.
+        ancestry(&u, w, 1_029_000, 1_030_000, &mut lines);
+        assert_eq!(lines[2], line(2, "2 × w.exe", 2, true, 1));
+        assert_eq!(lines[1].text, "launcher.exe · 2 · exited");
+    }
+
+    #[test]
+    fn pointing_at_a_band_reads_out_its_processes_ancestry() {
+        let usage = family_session(30, workers);
+        let program = usage.program("w.exe");
+        for style in [ChartLegend::Inline, ChartLegend::Beside] {
+            let mut chart = UsageChart::default();
+            chart.set_legend(style);
+            painted(&mut chart, &usage, "");
+            let plot = chart.plot;
+            let x = plot.right() - plot.w * 0.25;
+            let at = (0..plot.h as i32)
+                .step_by(2)
+                .map(|i| Point::new(x, plot.y + i as f32))
+                .find(|&p| chart.program_at(p) == program)
+                .expect("w.exe has a band");
+            chart.set_pointer(Some(at));
+            let texts = texts(&painted(&mut chart, &usage, ""));
+            for want in ["shell.exe · 1", "launcher.exe · 2 · exited", "svc.exe · 9"] {
+                assert!(
+                    texts.iter().any(|t| t == want),
+                    "{style:?} {want}: {texts:?}"
+                );
+            }
+            assert!(chart.moment_at(at).is_some());
+        }
     }
 }

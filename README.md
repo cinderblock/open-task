@@ -171,7 +171,8 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   process is right now. A process that has exited stays, dimmed and marked, until
   its total has faded. Pointing at a tile names it and gives its cycles; a click
   selects it (the ancestry line and the other arrangements keep the selection),
-  right-click gives the process menu, and the search dims what does not match. The
+  right-click gives the process menu (which starts with **Show in List** and **Show
+  in Tree**, to go to the process there), and the search dims what does not match. The
   line under the map gives the cycles used by everything together.
 - **History** shows who has been using the CPU or the GPU, or holding memory, over
   the charts' reach, as a chart: a stack of bands, one per program, on the same time axis as the
@@ -211,13 +212,23 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   clearly better place opens up (and not within two seconds of its last move) it
   slides over there. Names fade only as they first appear, or when their band
   becomes too thin for them anywhere, and a band that thin goes unnamed. Point at a band and a readout beside the pointer
-  gives its name and value at that moment; the CPU and memory graphs mark the same
-  moment (and the other way round). **History chart legend** on the Settings page
+  gives its name and value at that moment, and under them, as a small tree, the
+  processes that made up the band then, each under its parent and that under its
+  own, up to the root: `explorer.exe › pwsh.exe › cargo.exe › 12 × rustc.exe`.
+  Processes that have exited since are still named, marked "exited"; the History
+  remembers every process, and every ancestor of one, for as long as the chart
+  reaches back. Processes of the band with the same parent fold into one line. A
+  parent that exited before open-task saw it (a launcher that lived for a moment)
+  is not known, and its child reads as a root. The CPU and memory graphs mark the
+  same moment (and the other way round). **History chart legend** on the Settings page
   can instead float the legend, with every band's value, over the top corner of the
   chart the bands leave freer (moving out of the way of a marked moment), or put it
   in a column beside the chart. Pointing at a band, or its legend row, sets it
-  off from the others; a click selects the program's busiest process, right-click
-  gives its menu, and the search dims the programs it does not match.
+  off from the others; a click selects the program's busiest process still running
+  (of those in the band at the moment pointed at, if any of them still runs),
+  right-click gives its menu, which starts with **Show in List** and **Show in
+  Tree** to go to that process there, and the search dims the programs it does not
+  match.
 
 In List, Tree and History, a thin **usage strip** between the graphs and the table
 keeps the Map's answer in view: the Map folded flat into two rows. The top-level

@@ -39,4 +39,4 @@ pub use snapshot::Snapshot;
 pub use timeline::{
     AdapterSeries, Bucket, DiskSeries, History, Resolution, Retention, Sample, Series, Timeline,
 };
-pub use usage::{Frame, ProcessUsage, ProgramId, Usage};
+pub use usage::{Frame, ProcessUsage, ProgramId, Seen, Usage};

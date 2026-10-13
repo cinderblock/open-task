@@ -6,6 +6,7 @@
 //! should happen; the shell decides how it looks on the platform.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
@@ -151,6 +152,9 @@ pub enum MenuAction {
     ResetColumns,
     /// Select the row's process on the Processes page (from another page).
     GoToProcess,
+    /// Show the selected process in the list or the tree, from the Map or the
+    /// History.
+    ShowIn(ViewMode),
     ServiceStart,
     ServiceStop,
     ServiceRestart,
@@ -1769,7 +1773,10 @@ impl App {
                     self.table.selected = None;
                     Reaction::REPAINT
                 }
-                Some(ChartHit::Program(program)) => Reaction::painted(self.select_program(program)),
+                Some(ChartHit::Program(program)) => {
+                    let moment = self.history.moment_at(at);
+                    Reaction::painted(self.select_program(program, moment))
+                }
                 None => Reaction::NONE,
             };
         }
@@ -1793,16 +1800,31 @@ impl App {
     }
 
     /// Select the process of `program` that has used the most cycles, among those
-    /// still running. Returns whether the selection changed.
-    fn select_program(&mut self, program: ProgramId) -> bool {
+    /// still running: of those that were running at `moment` (a stretch of the
+    /// History, [`UsageChart::moment_at`]) if any still are. Returns whether the
+    /// selection changed.
+    fn select_program(&mut self, program: ProgramId, moment: Option<(i64, i64)>) -> bool {
         let usage = match &self.paused {
             Some(p) => &p.usage,
             None => &self.usage,
         };
+        let then: HashSet<ProcessKey> = moment
+            .map(|(after, until)| {
+                usage
+                    .seen_in(program, after, until)
+                    .map(|(k, _)| k)
+                    .collect()
+            })
+            .unwrap_or_default();
         let busiest = usage
             .iter()
             .filter(|(_, u)| u.program == program && u.alive)
-            .max_by(|a, b| a.1.used.total_cmp(&b.1.used))
+            // Those of the moment first, then by cycles.
+            .max_by(|a, b| {
+                then.contains(&a.0)
+                    .cmp(&then.contains(&b.0))
+                    .then(a.1.used.total_cmp(&b.1.used))
+            })
             .map(|(key, _)| process_rows::row_id(key));
         match busiest {
             Some(id) => self.table.selected.replace(id) != Some(id),
@@ -1837,10 +1859,11 @@ impl App {
             return false;
         }
         if self.history_on() {
+            let moment = self.history.moment_at(at);
             return self
                 .history
                 .program_at(at)
-                .is_some_and(|program| self.select_program(program));
+                .is_some_and(|program| self.select_program(program, moment));
         }
         let rows = rows_of!(self, self.table.tree());
         match self.table.hit(at, &self.theme) {
@@ -1963,8 +1986,14 @@ impl App {
         }
         let anchor = if let Some(p) = at {
             self.select_at(p);
+            // In the History, only a band with a process still running has one to
+            // act on, which the selection now is.
             let over_process = self.map.key_at(p).is_some_and(|(_, alive)| alive)
-                || (self.history_on() && self.history.program_at(p).is_some())
+                || (self.history_on()
+                    && self
+                        .history
+                        .program_at(p)
+                        .is_some_and(|g| self.selected_program() == Some(g)))
                 || (!self.table_off()
                     && matches!(
                         self.table.hit(p, &self.theme),
@@ -1994,6 +2023,25 @@ impl App {
         let Some(row) = self.selected_process() else {
             return Reaction::NONE;
         };
+        let mut entries = Vec::new();
+        // The Map and the History take the table's place; from them, the way back
+        // to the process in it.
+        if self.table_off() {
+            entries.extend([
+                MenuEntry::item(MenuAction::ShowIn(ViewMode::List), "Show in List", true),
+                MenuEntry::item(MenuAction::ShowIn(ViewMode::Tree), "Show in Tree", true),
+                MenuEntry::Separator,
+            ]);
+        }
+        self.process_menu(row, &mut entries);
+        Reaction::effect(Effect::Menu {
+            at: anchor,
+            entries,
+        })
+    }
+
+    /// The process menu's entries for the process in snapshot row `row`.
+    fn process_menu(&self, row: usize, entries: &mut Vec<MenuEntry>) {
         let p = &self.snap.processes[row];
         let can_sample =
             self.snap.capabilities.cpu_sampling && p.key().pid > 4 && self.sampling.is_none();
@@ -2011,7 +2059,7 @@ impl App {
                 )
             })
             .collect();
-        let entries = vec![
+        entries.extend([
             MenuEntry::item(MenuAction::EndTask, "End task", real),
             MenuEntry::item(
                 MenuAction::EndTree,
@@ -2046,11 +2094,7 @@ impl App {
             MenuEntry::item(MenuAction::CreateDump, "Create dump file", real),
             MenuEntry::item(MenuAction::WaitChain, "Analyze wait chain", real),
             MenuEntry::item(MenuAction::SampleCpu, "Sample CPU for 5 s", can_sample),
-        ];
-        Reaction::effect(Effect::Menu {
-            at: anchor,
-            entries,
-        })
+        ]);
     }
 
     /// The selected row's visible cells, tab-separated, for the clipboard.
@@ -2096,6 +2140,10 @@ impl App {
         };
         let p = &self.snap.processes[row];
         match action {
+            MenuAction::ShowIn(mode) => {
+                self.set_view(mode);
+                Reaction::REPAINT
+            }
             MenuAction::SampleCpu => {
                 if !self.snap.capabilities.cpu_sampling || self.sampling.is_some() {
                     return Reaction::NONE;
@@ -4540,11 +4588,9 @@ mod tests {
         assert!(painted_strings(&mut app).iter().any(|s| s == "14.6 G"));
     }
 
-    #[test]
-    fn the_history_charts_programs_and_shares_the_selection_and_the_hover() {
-        let mut app = App::default();
-        busy_minute(&mut app);
-        // A few more seconds, so there is a history to draw.
+    /// [`busy_minute`], and a few more seconds, so there is a history to draw.
+    fn busy_history(app: &mut App) {
+        busy_minute(app);
         for tick in 3..=12u64 {
             let mut procs = family().processes.clone();
             for p in &mut procs {
@@ -4558,7 +4604,13 @@ mod tests {
             }
             app.set_snapshot(snapshot(tick, procs));
         }
-        ready(&mut app);
+        ready(app);
+    }
+
+    #[test]
+    fn the_history_charts_programs_and_shares_the_selection_and_the_hover() {
+        let mut app = App::default();
+        busy_history(&mut app);
         assert_eq!(ViewMode::parse("History"), ViewMode::History);
         let segment = app.toolbar.segments[3].center();
         app.handle(UiEvent::MouseDown {
@@ -4631,8 +4683,12 @@ mod tests {
         }
 
         // Pointing at the chart marks the same moment in the summary charts.
+        // And reads out the band's processes, under their ancestors.
         assert!(app.handle(UiEvent::MouseMove(at)).repaint);
-        painted_strings(&mut app);
+        let strings = painted_strings(&mut app);
+        for want in ["p4.exe · 4", "p10.exe · 10", "p11.exe · 11"] {
+            assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
+        }
         let age = app.history.hover_age().expect("over the plot");
         assert_eq!(app.charts.hover_age(), Some(age));
         app.handle(UiEvent::MouseLeave);
@@ -4644,5 +4700,70 @@ mod tests {
         assert_eq!(app.view(), ViewMode::List);
         assert_eq!(app.table.selected, Some(id(11)));
         assert!(painted_strings(&mut app).iter().any(|s| s == "PID"));
+    }
+
+    #[test]
+    fn the_history_and_the_map_menu_shows_the_process_in_the_list_or_the_tree() {
+        let mut app = App::default();
+        busy_history(&mut app);
+        let item = |e: &MenuEntry| match e {
+            MenuEntry::Item { action, label, .. } => Some((*action, label.to_string())),
+            _ => None,
+        };
+        for (view, show) in [
+            (ViewMode::History, ViewMode::Tree),
+            (ViewMode::Map, ViewMode::List),
+        ] {
+            app.set_view(view);
+            painted_strings(&mut app);
+            app.table.selected = Some(id(11));
+            let r = app.handle(UiEvent::ContextMenu { at: None });
+            let entries = match (view, r.effect) {
+                (_, Some(Effect::Menu { entries, .. })) => entries,
+                // The History has no place of its own for the keyboard's menu.
+                (ViewMode::History, None) => {
+                    let p11 = app.usage.program("p11.exe").unwrap();
+                    let at = (0..700)
+                        .step_by(4)
+                        .flat_map(|y| (150..500).step_by(4).map(move |x| (x, y)))
+                        .map(|(x, y)| Point::new(x as f32, y as f32))
+                        .find(|&p| app.history.program_at(p) == Some(p11))
+                        .expect("p11 has a band");
+                    match app.handle(UiEvent::ContextMenu { at: Some(at) }).effect {
+                        Some(Effect::Menu { entries, .. }) => entries,
+                        e => panic!("{e:?}"),
+                    }
+                }
+                (_, e) => panic!("{view:?}: {e:?}"),
+            };
+            let first: Vec<_> = entries.iter().take(2).filter_map(item).collect();
+            assert_eq!(
+                first,
+                [
+                    (
+                        MenuAction::ShowIn(ViewMode::List),
+                        "Show in List".to_owned()
+                    ),
+                    (
+                        MenuAction::ShowIn(ViewMode::Tree),
+                        "Show in Tree".to_owned()
+                    ),
+                ],
+                "{view:?}"
+            );
+            assert_eq!(app.table.selected, Some(id(11)));
+            cmd(&mut app, Command::Menu(MenuAction::ShowIn(show)));
+            assert_eq!(app.view(), show);
+            assert_eq!(app.table.selected, Some(id(11)), "{view:?}");
+        }
+        // The table's own menu has no need of them.
+        let r = app.handle(UiEvent::ContextMenu { at: None });
+        let Some(Effect::Menu { entries, .. }) = r.effect else {
+            panic!("{r:?}");
+        };
+        assert!(!entries
+            .iter()
+            .filter_map(item)
+            .any(|(a, _)| matches!(a, MenuAction::ShowIn(_))));
     }
 }
