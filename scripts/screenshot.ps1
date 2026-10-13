@@ -1,6 +1,6 @@
 # Launch the app, wait for its window, screenshot it, and kill it.
 # Dev-time visual smoke test. Usage: pwsh -File scripts/screenshot.ps1 [-Exe path] [-Out path]
-#   [-Click "x,y;x,y"] [-Keys "End;Up"] [-Wheel -20] [-AfterClickMs 3000]
+#   [-Size "W,H"] [-Click "x,y;x,y"] [-Keys "End;Up"] [-Wheel -20] [-AfterClickMs 3000]
 param(
     [string]$Exe = "target\debug\open-task.exe",
     [string]$Out = "target\screenshot.png",
@@ -8,6 +8,9 @@ param(
     [int]$SettleMs = 2500,
     # Extra command-line arguments for the app, as one string, e.g. "--theme light".
     [string]$AppArgs = "",
+    # Resize the window to "W,H" physical pixels once it appears, e.g. "700,1100"
+    # for a tall window. Empty leaves the size the app chose.
+    [string]$Size = "",
     # Left clicks before the shot, "x,y" separated by ";", in the coordinates of the
     # screenshot itself (so a point can be read off an earlier shot).
     [string]$Click = "",
@@ -34,6 +37,7 @@ public static class Native {
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
     public delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
@@ -75,6 +79,11 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if ($h -eq [IntPtr]::Zero) { throw "window did not appear within $WaitMs ms" }
+    if ($Size -ne "") {
+        $w, $hh = $Size -split "," | ForEach-Object { [int]$_ }
+        # SWP_NOMOVE (2) | SWP_NOZORDER (4) | SWP_NOACTIVATE (0x10).
+        [Native]::SetWindowPos($h, [IntPtr]::Zero, 0, 0, $w, $hh, 0x16) | Out-Null
+    }
     Start-Sleep -Milliseconds $SettleMs
     $rw = [Native+RECT]::new()
     [Native]::GetWindowRect($h, [ref]$rw) | Out-Null
