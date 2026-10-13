@@ -1,6 +1,6 @@
 # Network: fold virtual switch ports into their network card, stacked
 
-> **Status:** active · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done (`05ce365`, `58de653`) · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Related: `plans/performance-view.md` (the page's design; its finding on which
 > interfaces count as connections).
 
@@ -47,15 +47,14 @@ programs. Each port keeps its own page.
 
 ## Plan / steps
 
-1. Probe + model: `AdapterInfo::parent: Option<u64>`; stack-table walk in
-   discovery; natural name order (`VLAN-3` before `VLAN-11`). Test. ← current
-2. Recorder: format version 4 (adapter tables gain `parent`); read 1–3 through a
-   legacy struct. Roundtrip + old-version tests.
-3. Performance page: fold ports out of the list (selection of a port highlights its
-   card); card page stacked charts + legend + switch; port page names its card.
-   Tests.
-4. Summary card and console print: ports under their card, card counted once.
-5. README; screenshot check; commit per step.
+1. ~~Probe + model: `AdapterInfo::parent: Option<u64>`; stack-table walk in
+   discovery; natural name order (`VLAN-3` before `VLAN-11`).~~ `05ce365`
+2. ~~Recorder: format version 4; read 1–3 through `AdapterInfoV3`.~~ `05ce365`
+3. ~~Performance page: fold ports into the card's entry; stacked charts + legend
+   + Total / By port switch; port page names its card.~~ `58de653`
+4. ~~Summary card and console print: ports under their card.~~ `05ce365`, `58de653`
+5. ~~README; screenshot check.~~ Done (dark and light, card and port panes,
+   Summary).
 
 ## Findings / gotchas
 
@@ -72,15 +71,26 @@ programs. Each port keeps its own page.
   columns line up across ports; the stack can sum plots column by column.
 - Adding a field to `AdapterInfo` changes the recorder's table layout (postcard
   writes fields in order, records are `Vec<(id, value)>`): needs a format bump.
+- The stacked charts are not `ChartGroup` charts: the card's slot sits in the
+  group only so the shared hover snaps to it; the bands are drawn from `Plot`s the
+  page keeps (`Stack`), in layers `STACK_LAYERS` that `repaint_chart` rebuilds on
+  clock-only frames. Easing of a new sample (`TimeAxis::settle`, added alongside by
+  the chart-live-edge thread) happens in `Plot::build`, so ports and total ease
+  together.
+- Live on this machine nearly all traffic is the untagged `VLAN-vSwitch` port; the
+  tagged VLANs are a few Kbps. "Other" was ~22 Kbps against ~4.5 Mbps.
+- Known limits, not worked on: more than eight ports share the grey of "Other"
+  (the theme has eight series colors); the VLAN *id* is not shown (only Hyper-V
+  WMI has it; names usually carry it).
 
 ## Progress log
 
 - [x] Topology and counters checked on this machine; design chosen
-- [ ] Probe + model
-- [ ] Recorder v4
-- [ ] Performance page
-- [ ] Summary + console
-- [ ] README, screenshot, commits
+- [x] Probe + model (`05ce365`)
+- [x] Recorder v4 (`05ce365`)
+- [x] Performance page (`58de653`)
+- [x] Summary + console (`05ce365`, `58de653`)
+- [x] README, screenshots, commits
 
 ## Open questions for the user
 
@@ -92,3 +102,4 @@ programs. Each port keeps its own page.
   and is slow; the stack table already has it.
 - Don't change network settings on this machine to test (see the
   `hyperv-tagged-vnic` skill); read-only queries only.
+- Don't `sed -i` source files here: Git Bash's sed writes LF and the repo is CRLF.
