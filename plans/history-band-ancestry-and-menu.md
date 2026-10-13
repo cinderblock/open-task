@@ -1,6 +1,6 @@
 # History chart: a band's ancestry on hover, and "Show in List / Tree" on right-click
 
-> **Status:** active · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done, not released · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 
 ## Goal
 
@@ -42,9 +42,12 @@ graph should give options, including to jump to that process in the list/tree vi
    Tree** at the top (switch arrangement, select, reveal). The process picked for a
    band is the busiest still-running process of those in the band at the pointed
    moment, else the program's busiest running process (click uses the same rule).
-5. **Limitation accepted:** a process whose parent exited before open-task first
-   saw it has no parent link (the probe only resolves live parents), so its chain
-   starts at that process.
+5. **A parent that exited before open-task saw it** (user, 2026-10-13: "do it"):
+   `ProcessStatic::parent_pid` keeps the PID the system reported, resolved or not
+   (recording format 5; formats 1-4 read with none, through `ProcessStaticV4`).
+   `Seen::lost_parent` carries it where `parent` is absent (not the idle
+   process's 0), and the tree shows `PID n · exited before open-task saw it` as
+   the root above such processes, grouping children of the same dead PID.
 
 ## Plan / steps
 
@@ -56,8 +59,8 @@ graph should give options, including to jump to that process in the list/tree vi
    moment-aware `select_program`, `process_menu` split out. Tests.~~
 4. ~~README (Map and History paragraphs).~~
 5. ~~Checks; app check; commit.~~
-6. **[current]** Waiting on the user: open question 1 (parents that exited before
-   open-task saw them).
+6. ~~Parents that exited before open-task saw them: format 5 `parent_pid`,
+   `Seen::lost_parent`, `Node::Lost` in the tree. Tests; checks; app check.~~
 
 ## Findings / gotchas
 
@@ -67,7 +70,13 @@ graph should give options, including to jump to that process in the list/tree vi
   keeps a parent it can resolve against the live table at first sight
   (`resolve_parents` in `ot-probe/src/imp/windows/mod.rs`), and at 1 Hz a launcher
   that lives milliseconds is never seen. Common in practice: `cmd /c start`,
-  `userinit.exe` → `explorer.exe`. See open question 1.
+  `userinit.exe` → `explorer.exe`. Fixed by decision 5; checked in the app: two
+  spinners from two `cmd /c start` read `PID 9508 · exited before open-task saw
+  it` and `PID 17632 · …`, matching the cmd PIDs `Win32_Process` reported.
+- The drive script must pass `--page processes`: the app restores the last page
+  from the shared preferences, and the user's own instance had left Settings.
+  Focus restore still fails now and then (`SetForegroundWindow` from a background
+  process is not always allowed).
 - Every `ProcessStatic` constructor in the workspace uses `..Default`, so a new
   field compiles everywhere; the cost of one is the recording format (postcard is
   positional: a version 5 with a v4 statics reader, as `AdapterInfoV3` was done).
@@ -96,11 +105,14 @@ graph should give options, including to jump to that process in the list/tree vi
       Linux and macOS; rustfmt on own files. App checked (screenshots in
       `target/ancestry/`).
 - [x] Committed.
-- [ ] Open question 1.
+- [x] Open question 1 answered "do it"; built (format 5, lost parent in the
+      tree), tests (record v4 read-back, `lost_parent`, the tree's PID root),
+      checks on three targets, app check, README (History and Recording).
 
 ## Open questions for the user
 
-1. **Show a parent that exited before open-task saw it?** Today such a process
+1. **Answered 2026-10-13: "do it"**, built as decision 5. The question was:
+   **Show a parent that exited before open-task saw it?** Today such a process
    reads as a root. Windows still reports the parent's PID (not its name, which
    is gone with it). Option: add `ProcessStatic::parent_pid` (what the OS
    reported, resolved or not), bump the recording format to 5 with a v4 reader,
