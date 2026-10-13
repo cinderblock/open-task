@@ -10,7 +10,8 @@
 //! message), input, resize, or DPI change, plus the frames of a row slide after a
 //! re-sort (150 ms, paced by the display). Idle cost is zero frames per second.
 //!
-//! The user's settings are read from and written to the registry by `prefs`. The
+//! The user's settings are read from and written to the registry by `prefs`, and
+//! where the window was on each monitor layout by `placement`. The
 //! updater (`ot_update`) runs on its own threads and posts its progress back; the
 //! installer it starts closes the window through Restart Manager (`WM_ENDSESSION`).
 //!
@@ -40,6 +41,8 @@ mod icons;
 mod instance;
 #[cfg(windows)]
 pub mod launcher;
+#[cfg(windows)]
+mod placement;
 #[cfg(windows)]
 mod prefs;
 #[cfg(windows)]

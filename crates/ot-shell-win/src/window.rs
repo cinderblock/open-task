@@ -55,18 +55,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG,
     SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWDEFAULT, SW_SHOWNORMAL, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP, WM_APP, WM_CHAR,
-    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
-    WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP, WM_APP, WM_CHAR, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON,
+    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::actions::{self, ActionOutcome};
 use crate::frame_stats::FrameLog;
 use crate::gfx::Gfx;
 use crate::icons;
+use crate::placement;
 use crate::task_manager::{self, Elevated};
 use crate::tray::Tray;
 use crate::{instance, prefs, run_dialog};
@@ -315,6 +316,9 @@ pub fn run(
         )
         .map_err(win("CreateWindowExW"))?
     };
+    // Where it was left on these monitors, before the DPI and size are read below
+    // and before the state is attached (see `placement::restore`).
+    let maximized = placement::restore(hwnd);
     let raise_message = instance::raise_message();
     instance::accept_raise(hwnd, raise_message);
 
@@ -434,7 +438,7 @@ pub fn run(
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
         let _ = SetWindowTextW(hwnd, &HSTRING::from(window_title(elevated, false)));
-        let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
+        placement::show(hwnd, maximized);
         SetTimer(Some(hwnd), TIMER_UPDATE, FIRST_CHECK_MS, None);
     }
     // SAFETY: the state was just stored; the window is up.
@@ -1484,6 +1488,14 @@ fn handle_message(st: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             Outcome::Done(LRESULT(0))
         }
         WM_CLOSE => close(st),
+        // The end of a move or resize by the user. Saving here as well as on close
+        // keeps the place through a crash, and keeps a monitor layout's place
+        // from being overwritten by where Windows moves the window when the
+        // layout changes.
+        WM_EXITSIZEMOVE => {
+            placement::save(hwnd);
+            Outcome::Default
+        }
         WM_TIMER if wparam.0 == TIMER_UPDATE => {
             // After the first tick, look hourly; the updater decides whether a day
             // has passed since the last check.
@@ -1997,6 +2009,7 @@ fn set_task_manager_pending(st: &mut State, pending: bool) {
 fn close(st: &mut State) -> Outcome {
     // Where things stand, for the next start.
     prefs::save_layout(&st.app.view_layout());
+    placement::save(st.hwnd);
     st.tray = None;
     if st.closing != Closing::No {
         return Outcome::Default;

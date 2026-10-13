@@ -29,7 +29,9 @@ flips that. **Ctrl+Tab** and **Ctrl+Shift+Tab** step through the pages, and
 **Ctrl+1** to **Ctrl+9** jump to one. Typing (or **Ctrl+F**) on any page goes to
 that page's search. **Ctrl+N** opens **Run new task**. The page, arrangement, sort
 and columns you leave open come back at the next start (`--page` and `--view` on
-the command line override that). Settings are kept per user, in
+the command line override that). The window opens where you last left it,
+remembered separately for each arrangement of monitors, so a laptop docked and
+undocked keeps a place for each. Settings are kept per user, in
 `HKCU\Software\open-task`.
 
 **Performance** lists the devices down its left side, each with a small live graph
