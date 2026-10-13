@@ -87,8 +87,13 @@ Normal speed. With five minutes held, the last ten seconds then take about a qua
 of the width; with an hour, the last minute takes about two fifths and the last ten
 minutes almost three quarters. More samples give the last minutes more of the width
 and the last seconds less. The charts scroll smoothly with time rather than stepping once a sample: the
-right edge runs a little over a sample behind the newest, so each new sample slides
-in from past it (**Scroll charts smoothly** under **Charts** turns this off). A
+right edge is now, so each new sample lands on it, its value easing in from the one
+before over 150 ms, and slides left from there while the line holds its value out
+to the edge until the next (**Scroll charts smoothly** under **Charts** turns this
+off). Where the axis is compressed enough that a point stands for several samples,
+the line gives way to their range: a step per doubling, the mean line fading and the
+min-max band behind it strengthening, so the oldest stretch reads as how far the
+value swung rather than one line through it. A
 frame where only the clock moved repaints just the charts, and only the parts of
 the window that changed are redrawn; behind other windows the charts move at half
 the display's rate, and not at all when the window is minimized or on another

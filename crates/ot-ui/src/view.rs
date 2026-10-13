@@ -2295,7 +2295,12 @@ impl App {
             now_ms,
             self.settings.history_ms(),
             self.settings.knee_ms(),
-        );
+        )
+        .settled(if now_ms.is_some() {
+            self.clock.settle()
+        } else {
+            1.0
+        });
         if self.only_the_clock_moved() {
             self.last_paint = PaintKind::Tick;
             self.paint_tick(dl, axis);
@@ -3831,19 +3836,23 @@ mod tests {
         let mut dl = DisplayList::new();
         app.paint_at(&mut dl, t0);
         let newest = app.timeline.cpu_total.latest().unwrap().at_unix_ms;
-        // The newest sample at the right edge at once; nothing moves until the
-        // next one arrives, so the shell has no frames to paint.
+        // The newest sample at the right edge at once, and the charts scroll on
+        // from there, frame by frame.
         assert_eq!(app.charts.axis().now_ms, Some(newest));
-        assert!(!app.animating());
-        // The next sample: the charts scroll on, frame by frame, easing back to
-        // trail the newest so the samples after it enter past the edge.
-        assert!(app.set_snapshot(history_sample(21)));
-        let ms = Duration::from_millis;
-        app.paint_at(&mut dl, t0 + ms(1000));
-        let a = app.charts.axis().now_ms.unwrap();
-        assert!((newest..newest + 1000).contains(&a), "{a}");
         assert!(app.animating(), "the shell keeps the frames coming");
-        app.paint_at(&mut dl, t0 + ms(1016));
+        let ms = Duration::from_millis;
+        // No next sample: the charts stop half an interval after it was due.
+        app.paint_at(&mut dl, t0 + ms(3000));
+        assert!(!app.animating());
+        // The next sample lands on the edge, its value easing in.
+        assert!(app.set_snapshot(history_sample(21)));
+        app.paint_at(&mut dl, t0 + ms(3016));
+        let a = app.charts.axis().now_ms.unwrap();
+        let next = app.timeline.cpu_total.latest().unwrap().at_unix_ms;
+        assert!(a <= next + 1500, "{a} {next}");
+        assert!(app.charts.axis().settle < 1.0);
+        assert!(app.animating());
+        app.paint_at(&mut dl, t0 + ms(3032));
         assert!(app.charts.axis().now_ms.unwrap() > a);
 
         // Paused: the charts hold still at the newest sample they had.

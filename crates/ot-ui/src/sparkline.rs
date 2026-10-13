@@ -8,17 +8,21 @@
 //!
 //! The right edge is a moment on a clock ([`TimeAxis::now_ms`]) that the view runs
 //! smoothly between samples, so the charts scroll rather than step: a new sample
-//! enters from just past the right edge, the oldest leaves past the left one, and
-//! [`Plot::paint`] clips both. Samples that share a column are grouped by bins
-//! anchored in time, not on screen ([`TimeAxis::bin`]), so a summarized stretch
-//! keeps its members as it scrolls and the compressed end does not shimmer.
+//! lands on the right edge, its value easing in from the one before
+//! ([`TimeAxis::settle`]), and slides left from there while the line holds its
+//! value out to the edge; the oldest leaves past the left edge, clipped. Samples
+//! that share a column are grouped by bins anchored in time, not on screen
+//! ([`TimeAxis::bin`]), so a summarized stretch keeps its members as it scrolls and
+//! the compressed end does not shimmer.
 //!
 //! Drawing is split in two so several charts can share one hover. [`Plot::build`]
 //! places a series' history into columns one DIP wide, keeping each column's
 //! minimum, maximum and mean; [`Plot::paint`] draws that as a mean line over a
 //! light wash, with a min-max envelope wherever a column summarizes several
 //! samples, so a spike twenty minutes ago still shows at the compressed end. The
-//! view snaps the pointer to the nearest column of the chart under it and marks
+//! more samples a column summarizes, the more the mean line gives way to that
+//! range ([`range_step`]), so the compressed end reads as a band of what happened
+//! rather than one line through it. The view snaps the pointer to the nearest column of the chart under it and marks
 //! that same age in every chart with [`Plot::paint_crosshair`].
 
 use ot_core::Series;
@@ -49,6 +53,9 @@ pub struct TimeAxis {
     /// ages are measured from. `None` puts each series' newest sample there, for a
     /// chart that only moves when a sample arrives.
     pub now_ms: Option<i64>,
+    /// How far each series' newest sample has eased in from the one before it,
+    /// `0.0` (just arrived, drawn at the value before) to `1.0` (in place).
+    pub settle: f32,
 }
 
 impl TimeAxis {
@@ -59,6 +66,7 @@ impl TimeAxis {
         span_ms: 3_600_000.0,
         tau_ms: 5_000.0,
         now_ms: None,
+        settle: 1.0,
     };
 
     /// The shortest span a chart shows, only so that a log axis over no time at
@@ -75,6 +83,16 @@ impl TimeAxis {
             span_ms: reach_ms.max(Self::MIN_SPAN_MS),
             tau_ms: tau_ms.max(1.0),
             now_ms,
+            settle: 1.0,
+        }
+    }
+
+    /// This axis with the newest samples eased in `settle` of the way.
+    #[must_use]
+    pub fn settled(self, settle: f32) -> Self {
+        Self {
+            settle: settle.clamp(0.0, 1.0),
+            ..self
         }
     }
 
@@ -187,6 +205,11 @@ pub struct PlotPoint {
     /// Raw samples behind the point. More than one means `min` and `max` bound a
     /// range the line only shows the mean of.
     pub count: u32,
+    /// How far the line has given way to a range here: the [`range_step`] of the
+    /// busiest column from here to the newest, so it only grows toward the left
+    /// and the line fades once rather than flickering where a column now and then
+    /// catches two samples.
+    pub step: usize,
 }
 
 /// A series placed on a time axis, ready to paint and to hit-test. Kept by the view
@@ -237,12 +260,25 @@ impl Plot {
                         min: b.min,
                         max: b.max,
                         count: b.count,
+                        step: 0,
                     });
                 }
             }
             // Anything older than the first point past the span is off the chart.
             if past {
                 break;
+            }
+        }
+        let mut step = 0;
+        for p in &mut self.points {
+            step = step.max(range_step(p.count));
+            p.step = step;
+        }
+        // The newest sample eases in from the value before it.
+        if let [newest, before, ..] = &mut self.points[..] {
+            if axis.settle < 1.0 && newest.count == 1 {
+                let v = before.mean + (newest.mean - before.mean) * axis.settle;
+                (newest.mean, newest.min, newest.max) = (v, v, v);
             }
         }
     }
@@ -342,8 +378,10 @@ impl Plot {
         }
         let bottom = rect.bottom();
         // Chart shapes go oldest (leftmost) first; the points are newest first.
-        let (oldest, newest) = (self.points[self.points.len() - 1].x, self.points[0].x);
-        // The ends lie past the edges while they slide in and out.
+        let n = self.points.len();
+        let oldest = self.points[n - 1].x;
+        // The oldest leaves past the left edge while it slides out, and a sample
+        // that came a little early lands just past the right one.
         dl.push_clip(rect);
 
         scratch.clear();
@@ -353,27 +391,47 @@ impl Plot {
                 .rev()
                 .map(|p| Point::new(p.x, self.y(p.mean))),
         );
+        // On a running clock the newest sample is a moment old: the line holds
+        // its value from there to the edge until the next one lands on it.
+        let head = scratch[n - 1];
+        if axis.now_ms.is_some() && head.x < rect.right() {
+            scratch.push(Point::new(rect.right(), head.y));
+        }
+        let newest = scratch[scratch.len() - 1].x;
         dl.band(
             scratch.iter().copied(),
             [Point::new(oldest, bottom), Point::new(newest, bottom)],
             style.wash,
         );
 
-        if self.points.iter().any(|p| p.max > p.min) {
-            let upper = self
-                .points
-                .iter()
-                .rev()
-                .map(|p| Point::new(p.x, self.y(p.max)));
-            let lower = self
-                .points
-                .iter()
-                .rev()
-                .map(|p| Point::new(p.x, self.y(p.min)));
-            dl.band(upper, lower, style.envelope);
+        // Runs of segments that summarize about as many samples, oldest first; a
+        // segment takes the step of its older end. Each run is a line and an
+        // envelope of its own, so toward the compressed end the line fades and the
+        // range strengthens, step by step.
+        let segment = |k: usize| self.points[n - 1 - k].step;
+        let mut start = 0;
+        while start < n - 1 {
+            let step = segment(start);
+            let mut end = start + 1;
+            while end < n - 1 && segment(end) == step {
+                end += 1;
+            }
+            // Points `start..=end`, oldest first; the newest run takes the hold.
+            if step > 0 {
+                let run = self.points[n - 1 - end..n - start].iter().rev();
+                let upper = run.clone().map(|p| Point::new(p.x, self.y(p.max)));
+                let lower = run.map(|p| Point::new(p.x, self.y(p.min)));
+                let a = (style.envelope.a * RANGE_ENVELOPE[step]).min(1.0);
+                dl.band(upper, lower, style.envelope.with_alpha(a));
+            }
+            let last = if end == n - 1 { scratch.len() } else { end + 1 };
+            dl.graph(
+                scratch[start..last].iter().copied(),
+                style.line.with_alpha(style.line.a * RANGE_LINE[step]),
+                style.width,
+            );
+            start = end;
         }
-
-        dl.graph(scratch.iter().copied(), style.line, style.width);
         dl.pop_clip();
     }
 
@@ -401,6 +459,19 @@ impl Plot {
 
 /// Radius of the hover marker on the line.
 const DOT_R: f32 = 4.0;
+
+/// How far a column of `count` samples has given way from a line to a range:
+/// `0` for a single sample, then a step per doubling, up to `4` (16 or more).
+#[must_use]
+pub fn range_step(count: u32) -> usize {
+    (count.max(1).ilog2() as usize).min(RANGE_LINE.len() - 1)
+}
+
+/// The mean line's opacity at each [`range_step`], as a share of its color's.
+const RANGE_LINE: [f32; 5] = [1.0, 0.75, 0.55, 0.4, 0.3];
+/// The min-max envelope's opacity at each [`range_step`], as a multiple of its
+/// color's.
+const RANGE_ENVELOPE: [f32; 5] = [1.0, 1.4, 1.8, 2.2, 2.6];
 
 /// A one-DIP vertical line at `x` across `rect`, on whole DIPs so it stays crisp.
 fn hairline(x: f32, rect: Rect) -> Rect {
@@ -541,14 +612,25 @@ mod tests {
 
     const AXIS: TimeAxis = TimeAxis::DEFAULT;
 
-    fn polyline_points(dl: &DisplayList) -> Vec<Point> {
+    /// Every line drawn, oldest first, with its color.
+    fn graphs(dl: &DisplayList) -> Vec<(Color, Vec<Point>)> {
         dl.cmds()
             .iter()
-            .find_map(|c| match *c {
-                DrawCmd::Graph { points, .. } => Some(dl.points(points).to_vec()),
+            .filter_map(|c| match *c {
+                DrawCmd::Graph { points, color, .. } => Some((color, dl.points(points).to_vec())),
                 _ => None,
             })
-            .unwrap_or_default()
+            .collect()
+    }
+
+    /// The points of the line, its runs joined, oldest first.
+    fn polyline_points(dl: &DisplayList) -> Vec<Point> {
+        let mut out: Vec<Point> = Vec::new();
+        for (_, pts) in graphs(dl) {
+            let skip = usize::from(out.last() == pts.first());
+            out.extend(&pts[skip..]);
+        }
+        out
     }
 
     fn polygons(dl: &DisplayList) -> Vec<Vec<Point>> {
@@ -660,15 +742,80 @@ mod tests {
         let mut dl = DisplayList::new();
         p.paint(&mut dl, &style(), &AXIS, &mut Vec::new());
         let polys = polygons(&dl);
-        assert_eq!(polys.len(), 2, "wash and envelope");
+        assert!(polys.len() >= 2, "wash and envelope");
         assert!(
-            polys[1].iter().any(|q| q.y.abs() < 1e-3),
+            polys[1..].iter().flatten().any(|q| q.y.abs() < 1e-3),
             "the envelope reaches the top at the spike"
         );
         assert!(
             polyline_points(&dl).iter().all(|q| q.y > 20.0),
             "the mean line does not"
         );
+
+        // Toward the compressed end the line gives way to the range, step by
+        // step: fainter lines, stronger envelopes, the newest at full strength.
+        let lines = graphs(&dl);
+        let alphas: Vec<f32> = lines.iter().map(|(c, _)| c.a).collect();
+        assert!(alphas.len() > 2, "{alphas:?}");
+        assert!(
+            alphas.windows(2).all(|w| w[0] <= w[1]),
+            "fading toward the left: {alphas:?}"
+        );
+        assert!((alphas[alphas.len() - 1] - 1.0).abs() < 1e-6);
+        assert!(alphas[0] < 0.5, "{alphas:?}");
+        // The runs meet: each starts where the one before it ended.
+        assert!(lines.windows(2).all(|w| w[0].1.last() == w[1].1.first()));
+    }
+
+    #[test]
+    fn a_line_turns_to_a_range_a_step_per_doubling() {
+        let steps: Vec<usize> = [0, 1, 2, 3, 4, 7, 8, 15, 16, 1000]
+            .into_iter()
+            .map(range_step)
+            .collect();
+        assert_eq!(steps, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]);
+    }
+
+    #[test]
+    fn on_a_running_clock_the_line_holds_its_newest_value_to_the_edge() {
+        // Samples to 9 s; the clock 400 ms on.
+        let s = per_second(Retention::raw(100), (0..10).map(|i| i as f32 * 10.0));
+        let rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let axis = running(9_400, 9_400.0);
+        let mut p = Plot::default();
+        p.build(&s, rect, 100.0, &axis);
+        assert!(p.points()[0].x < rect.right(), "the newest is 400 ms old");
+        let mut dl = DisplayList::new();
+        p.paint(&mut dl, &style(), &axis, &mut Vec::new());
+        let pts = polyline_points(&dl);
+        let (head, edge) = (pts[pts.len() - 2], pts[pts.len() - 1]);
+        assert!((edge.x - rect.right()).abs() < 1e-3);
+        assert!((edge.y - head.y).abs() < 1e-3 && (head.y - 10.0).abs() < 1e-3);
+        // The hold is drawn, not pointed at.
+        assert_eq!(p.nearest_x(rect.right()).unwrap().age_ms, 400.0);
+
+        // Still, the newest sample is the edge: nothing to hold.
+        let p = plot(&s, rect, 100.0);
+        let mut dl = DisplayList::new();
+        p.paint(&mut dl, &style(), &AXIS, &mut Vec::new());
+        assert_eq!(polyline_points(&dl).len(), 10);
+    }
+
+    #[test]
+    fn a_new_sample_eases_in_from_the_one_before() {
+        let s = per_second(Retention::raw(100), [10.0, 10.0, 10.0, 90.0]);
+        let rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let value = |settle: f32| {
+            let mut p = Plot::default();
+            p.build(&s, rect, 100.0, &running(3_000, 3_000.0).settled(settle));
+            p.points()[0].mean
+        };
+        assert!(
+            (value(0.0) - 10.0).abs() < 1e-3,
+            "drawn at the value before"
+        );
+        assert!((value(0.5) - 50.0).abs() < 1e-3);
+        assert!((value(1.0) - 90.0).abs() < 1e-3, "in place");
     }
 
     #[test]

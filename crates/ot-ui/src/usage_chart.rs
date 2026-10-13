@@ -1059,6 +1059,16 @@ impl UsageChart {
                 break;
             }
         }
+        // The newest stretch eases in from the one before it, as the line charts'
+        // newest samples do.
+        if let [newest, before, ..] = &mut self.points[..] {
+            let s = self.time.settle;
+            if s < 1.0 {
+                for (n, b) in newest.v.iter_mut().zip(before.v) {
+                    *n = b + (*n - b) * s;
+                }
+            }
+        }
     }
 
     /// Keep the value scale until the chart outgrows it or shrinks well below it.
@@ -1454,6 +1464,10 @@ impl UsageChart {
         let mut poly = std::mem::take(&mut self.poly);
         cum.clear();
         cum.resize(self.points.len(), 0.0);
+        // On a running clock the newest stretch ended a moment ago: the bands hold
+        // its values from there to the edge until the next one lands on it.
+        let hold =
+            (self.time.now_ms.is_some() && self.points[0].x < plot.right()).then_some(plot.right());
         for (b, &dim) in dim.iter().enumerate() {
             if self.points.iter().all(|p| p.v[b] <= 0.0) {
                 continue;
@@ -1468,6 +1482,9 @@ impl UsageChart {
                     .rev()
                     .map(|(p, &c)| Point::new(p.x, self.y(c))),
             );
+            if let Some(x) = hold {
+                poly.push(Point::new(x, self.y(cum[0])));
+            }
             for (p, c) in self.points.iter().zip(&mut cum) {
                 *c += p.v[b];
             }
@@ -1479,6 +1496,9 @@ impl UsageChart {
                     .rev()
                     .map(|(p, &c)| Point::new(p.x, self.y(c))),
             );
+            if let Some(x) = hold {
+                poly.push(Point::new(x, self.y(cum[0])));
+            }
             let alpha = if dim { DIM_ALPHA } else { 0.9 };
             let (lower, top) = poly.split_at(upper);
             dl.band(
