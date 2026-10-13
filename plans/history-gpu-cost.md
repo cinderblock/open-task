@@ -64,20 +64,19 @@ time axis squeezes the pixels.
 4. [x] Re-measure (timing test and live): History's GPU share now ~10 %, on a par
        with the CPU (11 %) and Direct2D (8 %) modes; List is 5–7 %.
 5. [x] Close the ISSUES.md entry.
-6. [ ] User's call: whether the left-side frame idea or cheaper hairlines
-       (~0.5 ms of the remaining GPU frame) are still wanted. Recommendation: no.
+6. [x] Left-side frame idea and cheaper hairlines: dropped (user, 2026-10-12).
+7. [x] Released in v0.13.1 (`5aea1c6`).
 
 ## Decisions already made (don't re-ask)
 
 - Output must stay visually nearly pixel identical (user).
-- Fewer frames only on the left of the chart, where pixels are small (user), and
-  only if still needed after the renderer fix (mine: measure first).
+- No frame-rate tricks (cached left side, fewer frames there): dropped by the
+  user once the renderer fix brought the GPU share to ~10 %.
 
 ## Open questions for the user
 
-1. With History's GPU share down to ~10 % (from ~40 %), still pursue the cached
-   left side / fewer frames there, or the hairlines? Recommendation: no; what is
-   left is about what every mode costs to draw 60 frames a second.
+None. (Asked whether to still pursue the cached left side / fewer frames there
+or cheaper hairlines; user, 2026-10-12: drop them.)
 
 ## Things not to do
 
