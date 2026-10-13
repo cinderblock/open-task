@@ -66,6 +66,12 @@ pub struct ProcessStatic {
     /// (`Microsoft.WindowsTerminal_1.21.2911.0_x64__8wekyb3d8bbwe`), when the
     /// process runs from a package.
     pub package: Option<String>,
+    /// The parent's PID as the operating system reported it, whether or not it
+    /// resolved to [`Self::parent`]. Where `parent` is absent and this is not, the
+    /// parent had exited before this process was first seen (or its PID had been
+    /// taken by a younger process): it existed, but nothing more is known of it.
+    /// For display only; never resolve a process by it.
+    pub parent_pid: Option<u32>,
 }
 
 impl ProcessStatic {

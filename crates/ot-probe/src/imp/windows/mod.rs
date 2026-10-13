@@ -1070,6 +1070,7 @@ fn build_statics(p: &SystemProcessInformation, key: ProcessKey) -> ProcessStatic
         user: None,
         integrity: Integrity::Unknown,
         started_unix_ms,
+        parent_pid: (parent_pid != key.pid).then_some(parent_pid),
         session_id: p.SessionId,
         architecture: ot_model::process::Architecture::Unknown,
         description: None,

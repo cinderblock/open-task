@@ -9,7 +9,7 @@ use ot_model::snapshot::Snapshot;
 use serde::Serialize;
 
 use crate::format::{self, FrameEntry, Index, Kind, RecordHeader, FORMAT_VERSION, MAGIC};
-use crate::frame::{self, AdapterInfoV3, Tables};
+use crate::frame::{self, AdapterInfoV3, ProcessStaticV4, Tables};
 use crate::Error;
 
 /// How many frames apart keyframes are unless [`Recorder::create_with_keyframes`]
@@ -97,7 +97,8 @@ impl Recorder {
 
     /// [`create_with_keyframes`](Recorder::create_with_keyframes), writing format
     /// `version`: 1 writes frames without their [`frame::Extra`], 2 without their
-    /// [`frame::GpuExtra`], 3 adapters without their parent ([`AdapterInfoV3`]).
+    /// [`frame::GpuExtra`], 3 adapters without their parent ([`AdapterInfoV3`]), 4
+    /// processes without their parent's PID ([`ProcessStaticV4`]).
     pub(crate) fn create_as(
         path: impl AsRef<Path>,
         header: &RecordHeader,
@@ -236,7 +237,18 @@ impl Recorder {
             services,
         } = &mut self.tables;
         let records = [
-            (Kind::Statics, postcard_pending(&statics.take_pending())?),
+            (Kind::Statics, {
+                let pending = statics.take_pending();
+                if self.version >= 5 {
+                    postcard_pending(&pending)?
+                } else {
+                    let old: Vec<_> = pending
+                        .iter()
+                        .map(|(id, p)| (*id, Arc::new(ProcessStaticV4::from(&**p))))
+                        .collect();
+                    postcard_pending(&old)?
+                }
+            }),
             (Kind::Windows, postcard_pending(&windows.take_pending())?),
             (
                 Kind::ProcessServices,
@@ -324,6 +336,7 @@ mod tests {
                         statics: Arc::new(ProcessStatic {
                             key: ProcessKey::new(pid, 1),
                             name: format!("p{pid}.exe"),
+                            parent_pid: Some(pid + 100),
                             ..ProcessStatic::default()
                         }),
                         working_set: Bytes(9 << 20),
@@ -363,6 +376,10 @@ mod tests {
             .collect()
     }
 
+    fn parent_pids(s: &Snapshot) -> Vec<Option<u32>> {
+        s.processes.iter().map(|p| p.statics.parent_pid).collect()
+    }
+
     #[test]
     fn private_working_sets_and_gpu_use_are_kept_and_older_files_still_read() {
         let dir = std::env::temp_dir().join("ot-record-tests");
@@ -387,6 +404,23 @@ mod tests {
                     .collect()
             };
             assert_eq!(gpu(&got), gpu(want), "frame {i}");
+            assert_eq!(parent_pids(&got), [Some(101), Some(102)], "frame {i}");
+        }
+
+        // A version 4 file has everything but the processes' parent PIDs.
+        write(&path, 4);
+        let rec = Recording::open(&path).unwrap();
+        assert_eq!(rec.version(), 4);
+        for (i, want) in want.iter().enumerate() {
+            let got = rec.frame(i).unwrap();
+            assert_eq!(parent_pids(&got), [None, None], "frame {i}");
+            assert_eq!(parents(&got), parents(want), "frame {i}");
+            let names: Vec<_> = got
+                .processes
+                .iter()
+                .map(|p| p.statics.name.clone())
+                .collect();
+            assert_eq!(names, ["p1.exe", "p2.exe"], "frame {i}");
         }
 
         // A version 3 file has everything but the adapters' parents.

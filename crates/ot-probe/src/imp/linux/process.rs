@@ -682,6 +682,7 @@ impl ProcessProbe {
             key,
             // Only the PID for now; `resolve_parents` checks it against the table.
             parent: (stat.ppid != 0).then(|| ProcessKey::new(stat.ppid, 0)),
+            parent_pid: (stat.ppid != 0).then_some(stat.ppid),
             name,
             image_path,
             command_line,

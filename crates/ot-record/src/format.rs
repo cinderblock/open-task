@@ -42,7 +42,10 @@ pub const MAGIC: &[u8; 5] = b"OTREC";
 /// - 4: each adapter's facts end with the adapter it is a part of
 ///   ([`ot_model::device::AdapterInfo::parent`]); older adapter tables read with
 ///   none.
-pub const FORMAT_VERSION: u16 = 4;
+/// - 5: each process's facts end with the parent's PID as the system reported it
+///   ([`ot_model::process::ProcessStatic::parent_pid`]); older statics tables
+///   read with none.
+pub const FORMAT_VERSION: u16 = 5;
 /// The oldest format this build reads.
 pub const OLDEST_VERSION: u16 = 1;
 /// The last five bytes of a finished recording.

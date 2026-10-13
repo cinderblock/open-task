@@ -11,7 +11,7 @@
 //! [`GpuExtra`] after the [`Extra`] the same way.
 //!
 //! A table's values are written whole, so a type that gains a field keeps its old
-//! layout for older files: [`AdapterInfoV3`].
+//! layout for older files: [`AdapterInfoV3`], [`ProcessStaticV4`].
 
 use ot_model::Percent;
 
@@ -26,7 +26,7 @@ use ot_model::device::{AdapterInfo, AdapterSample, DiskInfo, DiskSample, LinkKin
 use ot_model::gpu::{GpuInfo, GpuSample};
 use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
-use ot_model::process::{ProcessSample, ProcessStatic, WindowInfo};
+use ot_model::process::{Architecture, Integrity, ProcessSample, ProcessStatic, WindowInfo};
 use ot_model::service::{ServiceEntry, ServiceInfo};
 use ot_model::session::SessionInfo;
 use ot_model::snapshot::Snapshot;
@@ -109,6 +109,66 @@ impl From<&AdapterInfo> for AdapterInfoV3 {
     }
 }
 
+/// A process's facts as format versions 1 to 4 write them: before
+/// [`ProcessStatic::parent_pid`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ProcessStaticV4 {
+    key: ProcessKey,
+    parent: Option<ProcessKey>,
+    name: String,
+    image_path: Option<String>,
+    command_line: Option<String>,
+    user: Option<String>,
+    integrity: Integrity,
+    started_unix_ms: Option<i64>,
+    session_id: u32,
+    architecture: Architecture,
+    description: Option<String>,
+    company: Option<String>,
+    package: Option<String>,
+}
+
+impl From<ProcessStaticV4> for ProcessStatic {
+    fn from(p: ProcessStaticV4) -> Self {
+        Self {
+            key: p.key,
+            parent: p.parent,
+            name: p.name,
+            image_path: p.image_path,
+            command_line: p.command_line,
+            user: p.user,
+            integrity: p.integrity,
+            started_unix_ms: p.started_unix_ms,
+            session_id: p.session_id,
+            architecture: p.architecture,
+            description: p.description,
+            company: p.company,
+            package: p.package,
+            parent_pid: None,
+        }
+    }
+}
+
+impl From<&ProcessStatic> for ProcessStaticV4 {
+    fn from(p: &ProcessStatic) -> Self {
+        Self {
+            key: p.key,
+            parent: p.parent,
+            name: p.name.clone(),
+            image_path: p.image_path.clone(),
+            command_line: p.command_line.clone(),
+            user: p.user.clone(),
+            integrity: p.integrity,
+            started_unix_ms: p.started_unix_ms,
+            session_id: p.session_id,
+            architecture: p.architecture,
+            description: p.description.clone(),
+            company: p.company.clone(),
+            package: p.package.clone(),
+        }
+    }
+}
+
 /// The reader's tables.
 #[derive(Debug)]
 pub(crate) struct Readers {
@@ -141,7 +201,15 @@ impl Readers {
     /// Add one decompressed table record.
     pub(crate) fn load(&mut self, kind: Kind, raw: &[u8]) -> Result<(), Error> {
         match kind {
-            Kind::Statics => self.statics.insert(postcard::from_bytes(raw)?),
+            Kind::Statics if self.version >= 5 => self.statics.insert(postcard::from_bytes(raw)?),
+            Kind::Statics => {
+                let old: Vec<(u32, ProcessStaticV4)> = postcard::from_bytes(raw)?;
+                self.statics.insert(
+                    old.into_iter()
+                        .map(|(id, p)| (id, Arc::new(ProcessStatic::from(p))))
+                        .collect(),
+                );
+            }
             Kind::Windows => self.windows.insert(postcard::from_bytes(raw)?),
             Kind::ProcessServices => self.process_services.insert(postcard::from_bytes(raw)?),
             Kind::Disks => self.disks.insert(postcard::from_bytes(raw)?),
