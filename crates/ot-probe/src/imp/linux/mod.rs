@@ -5,8 +5,12 @@
 
 mod control;
 mod cpu;
+mod disks;
 mod fs;
+mod net;
+mod power;
 mod process;
+mod volumes;
 
 use std::time::Duration;
 
@@ -31,6 +35,12 @@ pub fn is_elevated() -> bool {
 pub struct LinuxProbe {
     cpu: cpu::CpuProbe,
     processes: process::ProcessProbe,
+    disks: disks::DiskProbe,
+    net: net::NetProbe,
+    volumes: volumes::VolumeProbe,
+    battery: power::BatteryProbe,
+    thermal: Option<power::Thermal>,
+    rapl: Option<power::Rapl>,
     hardware: ot_model::hardware::Hardware,
     buf: Vec<u8>,
 }
@@ -43,13 +53,21 @@ impl LinuxProbe {
     /// this is not Linux.
     pub fn new() -> Result<Self, ProbeError> {
         std::fs::metadata("/proc/stat").map_err(|e| ProbeError::os("reading /proc", e))?;
-        let hardware = cpu::hardware();
+        let thermal = power::Thermal::find();
+        let mut hardware = cpu::hardware();
+        hardware.thermal_sensor = thermal.as_ref().map(power::Thermal::sensor);
         Ok(Self {
             cpu: cpu::CpuProbe::new(),
             processes: process::ProcessProbe::new(
                 hardware.logical_processors,
                 hardware.boot_unix_ms,
             ),
+            disks: disks::DiskProbe::default(),
+            net: net::NetProbe::default(),
+            volumes: volumes::VolumeProbe::default(),
+            battery: power::BatteryProbe::new(),
+            thermal,
+            rapl: power::Rapl::open(),
             hardware,
             buf: Vec::with_capacity(2048),
         })
@@ -109,6 +127,8 @@ impl SystemProbe for LinuxProbe {
             per_process_cpu: true,
             per_process_disk: true,
             core_frequency: self.cpu.has_frequency(),
+            package_power: self.rapl.is_some(),
+            thermals: self.thermal.is_some(),
             hybrid_core_kinds: self.cpu.hybrid(),
             threads: true,
             services: self.processes.has_services(),
@@ -123,7 +143,15 @@ impl SystemProbe for LinuxProbe {
             .sample(&mut out.cpu)
             .map_err(|e| ProbeError::os("reading /proc/stat", e))?;
         self.processes.sample(&mut out.processes, &mut out.threads);
+        out.cpu.package_power = self.rapl.as_mut().and_then(power::Rapl::sample);
+        out.cpu.hotspot_celsius = self.thermal.as_ref().and_then(power::Thermal::read);
         out.memory = self.sample_memory()?;
+        // Disks first, so they are numbered in the kernel's order; the volumes then
+        // tell them where they are mounted, which names them from the next pass.
+        self.disks.sample(&mut out.disks);
+        self.volumes.sample(&mut out.volumes, &mut self.disks);
+        self.net.sample(&mut out.adapters);
+        out.battery = self.battery.sample();
         Ok(())
     }
 }
@@ -183,5 +211,6 @@ mod tests {
         assert!(out.memory.available <= out.memory.total);
         assert!(out.processes.len() > 1);
         assert_ne!(out.threads.len(), 0);
+        assert_ne!(out.volumes.len(), 0);
     }
 }
