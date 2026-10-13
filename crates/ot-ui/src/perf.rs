@@ -1091,13 +1091,18 @@ impl PerfPage {
             let r = self.charts.plot(first + i).rect();
             dl.stroke_rect(r, theme.grid, 1.0);
             if r.h >= 28.0 {
-                let value = if hovering.is_some() {
-                    point.map(|p| p.mean)
-                } else {
-                    core.map(|c| c.usage.get())
+                let shown = match (hovering, point, core) {
+                    (Some(_), Some(p), _) => {
+                        charts::point_value(buf, charts::percent_value, &p);
+                        true
+                    }
+                    (None, _, Some(c)) => {
+                        charts::percent_value(buf, c.usage.get());
+                        true
+                    }
+                    _ => false,
                 };
-                if let Some(v) = value {
-                    charts::percent_value(buf, v);
+                if shown {
                     let corner = Rect::new(r.x + 4.0, r.y + 2.0, r.w - 8.0, 14.0);
                     dl.text(
                         buf,
@@ -1191,7 +1196,7 @@ impl PerfPage {
         let mut values = String::with_capacity(48);
         for (name, p) in names.iter().zip(points) {
             if let Some(p) = p {
-                fmt(buf, p.mean);
+                charts::point_value(buf, fmt, &p);
                 if !values.is_empty() {
                     values.push_str(" \u{b7} ");
                 }
@@ -1336,7 +1341,7 @@ impl PerfPage {
             let point = s.total.paint_crosshair(dl, c.age_ms, &style, &self.axis);
             buf.clear();
             if let Some(p) = point {
-                fmt(buf, p.mean);
+                charts::point_value(buf, fmt, &p);
             }
             let mut ago = String::with_capacity(16);
             c.ago(&mut ago);

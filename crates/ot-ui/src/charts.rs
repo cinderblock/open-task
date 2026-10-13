@@ -473,7 +473,7 @@ impl ChartGroup {
         if !band.is_empty() {
             buf.clear();
             if let Some(p) = &point {
-                value(buf, p.mean);
+                point_value(buf, value, p);
             }
             c.ago(&mut self.ago);
             readout(&mut self.readout, buf, &self.ago, c.side);
@@ -494,6 +494,37 @@ pub(crate) fn style(color: Color, theme: &Theme) -> SparkStyle {
         crosshair: theme.crosshair,
         width: 1.5,
     }
+}
+
+/// What a readout says for `p`, into `out` as a [`ValueFmt`] writes: its value,
+/// or where the point stands for several samples that differ (the chart draws a
+/// range there), the lowest and highest of them, `12–48%`. The unit is written
+/// once when both ends share it.
+pub(crate) fn point_value(out: &mut String, value: ValueFmt, p: &PlotPoint) {
+    if p.count <= 1 || p.max <= p.min {
+        value(out, p.mean);
+        return;
+    }
+    let mut high = String::with_capacity(16);
+    value(&mut high, p.max);
+    out.clear();
+    value(out, p.min);
+    if *out == high {
+        // The same to the digits shown.
+        return;
+    }
+    let shared = unit(&high);
+    if !shared.is_empty() && unit(out) == shared {
+        out.truncate(out.len() - shared.len());
+    }
+    out.push('\u{2013}');
+    out.push_str(&high);
+}
+
+/// A written value's unit: whatever follows its last digit.
+fn unit(s: &str) -> &str {
+    s.rfind(|c: char| c.is_ascii_digit())
+        .map_or("", |i| &s[i + 1..])
 }
 
 pub(crate) fn percent_value(out: &mut String, v: f32) {
@@ -611,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn a_summarized_point_reads_out_one_value() {
+    fn a_summarized_point_reads_out_its_range() {
         // Forty minutes at 1 Hz with a spike 25 minutes ago, where a column
         // summarizes several 10 s buckets.
         let r = Retention {
@@ -646,15 +677,54 @@ mod tests {
         let mut buf = String::new();
         let st = style(theme.cpu, &theme);
         let point = group.paint(0, &mut dl, &st, percent_value, &theme, &mut buf);
-        assert!(point.expect("history reaches back that far").count > 1);
+        let point = point.expect("history reaches back that far");
+        assert!(point.count > 1);
         let mut ago = String::new();
         crosshair.ago(&mut ago);
         assert!(ago.ends_with("m ago") && !ago.contains('s'), "{ago}");
         let texts = texts(&dl);
         assert_eq!(texts.len(), 1, "{texts:?}");
-        assert!(
-            texts[0].starts_with(&format!("{ago} \u{b7} ")) && texts[0].matches('%').count() == 1,
-            "the time next to the line, then one value: {texts:?}"
+        let mut range = String::new();
+        point_value(&mut range, percent_value, &point);
+        assert!(range.contains('\u{2013}'), "{range}");
+        assert_eq!(
+            texts[0],
+            format!("{ago} \u{b7} {range}"),
+            "the time next to the line, then the range"
+        );
+    }
+
+    #[test]
+    fn a_range_reads_low_to_high_with_its_unit_once() {
+        let p = |count, min, mean, max| PlotPoint {
+            x: 0.0,
+            age_ms: 0.0,
+            mean,
+            min,
+            max,
+            count,
+            step: 0,
+        };
+        let read = |v: ValueFmt, q: PlotPoint| {
+            let mut out = String::from("stale");
+            point_value(&mut out, v, &q);
+            out
+        };
+        assert_eq!(read(percent_value, p(1, 30.0, 30.0, 30.0)), "30%");
+        assert_eq!(read(percent_value, p(8, 12.0, 30.0, 48.0)), "12\u{2013}48%");
+        assert_eq!(
+            read(percent_value, p(8, 30.0, 30.0, 30.2)),
+            "30%",
+            "the same shown"
+        );
+        let (mut lo, mut hi) = (String::new(), String::new());
+        bytes_value(&mut lo, 800_000.0);
+        bytes_value(&mut hi, 1_300_000.0);
+        assert_ne!(lo[lo.len() - 2..], hi[hi.len() - 2..], "{lo} {hi}");
+        assert_eq!(
+            read(bytes_value, p(4, 800_000.0, 1e6, 1_300_000.0)),
+            format!("{lo}\u{2013}{hi}"),
+            "different units, both written"
         );
     }
 

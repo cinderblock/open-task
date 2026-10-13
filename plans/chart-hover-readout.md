@@ -36,6 +36,8 @@ The user's feedback on 2026-09-29 about the readout under a hovered chart:
 
 1. **One number.** The readout shows the value under the dot (the column's mean).
    The peak is gone from the text; the min-max envelope still shows spikes.
+   **Revised 2026-10-13** (`plans/chart-live-edge-and-range-morph.md`): where a
+   column summarizes several samples, the readout shows their range, `12–48%`.
 2. **The time sits next to the line**, the value beyond it: `34% · 12s ago|` left
    of the line, `|12s ago · 34%` right of it. With a constant-width time (below),
    the time never moves relative to the line and the value's near edge only moves

@@ -115,7 +115,7 @@ interval it measured. Recent history is drawn sample by sample. Older stretches 
 highest value, so a short spike stays visible after it has been averaged. Point
 at either graph and a hairline marks the same moment in both, with each graph's
 value there and how long ago it was (where a point summarizes several samples, the
-value is their average and the faint band their range). The time sits against the
+value is their range, lowest to highest: `12–48%`). The time sits against the
 line and keeps its width as the pointer moves: `2m 05s ago`, `25m ago`,
 `1h 05m ago`. Seconds drop away from ten minutes and minutes from two hours, and
 come back only once the pointer is well short of those, so a readout resting near

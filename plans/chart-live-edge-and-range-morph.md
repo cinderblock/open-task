@@ -50,6 +50,11 @@ we morph to a range display instead?"
    have one color per command (three renderers).
 6. **History view (usage chart):** the same hold and ease; no range morph (its
    stacked bands have no envelope).
+7. **Readout in a range shows the range** (user, 2026-10-13: "min/max is fine"):
+   where a point summarizes several samples that differ, the hover readout says
+   `12–48%`, the unit once when both ends share it (`charts::point_value`). Used
+   by the chart groups' readouts, the Performance pair and stack readouts and
+   the per-core tiles; the port legend keeps the mean (its rows are sums).
 
 ## Plan / steps
 
@@ -61,7 +66,8 @@ we morph to a range display instead?"
 6. [x] Tests (clock tests rewritten; hold, ease, step tests), fmt, clippy on
    windows/linux/macOS, screenshots.
 7. [x] README charts paragraph; commit.
-8. [ ] The user looks at it live (a session of several minutes shows step 1 at the
+8. [x] Range readout on hover (`point_value`), tests, README.
+9. [ ] The user looks at it live (a session of several minutes shows step 1 at the
    left; an hour shows the full morph).
 
 ## Findings / gotchas
@@ -85,11 +91,12 @@ we morph to a range display instead?"
 - [x] 2026-10-13: code read, plan written.
 - [x] 2026-10-13: built, tested (214 `ot-ui` tests), clippy on three targets,
   screenshots; committed.
+- [x] 2026-10-13: user chose min–max in the readout; built and committed.
 
 ## Open questions for the user
 
-1. Readout in a range region: still one value (the mean), per
-   `plans/chart-hover-readout.md`. Show "min–max" there instead? Not changed.
+1. "A little smoothing": built as the 150 ms ease of a new sample. Data
+   smoothing (a moving average) not built; awaiting the user's word.
 
 ## Things not to do
 
