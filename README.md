@@ -103,7 +103,12 @@ to the edge until the next (**Scroll charts smoothly** under **Charts** turns th
 off). Where the axis is compressed enough that a point stands for several samples,
 the line gives way to their range: a step per doubling, the mean line fading and the
 min-max band behind it strengthening, so the oldest stretch reads as how far the
-value swung rather than one line through it. A
+value swung rather than one line through it. Lines are drawn as smooth curves, not
+straight from sample to sample: a cubic B-spline through the points, with no corners
+and a gentle low-pass that takes the sample-to-sample zigzag out (a lone one-sample
+spike draws at about two thirds of its height; the readout gives the value measured).
+The range band's edges pass through every lowest and highest value, so a spike keeps
+its height there, and the stacked History and port charts use the same curve. A
 frame where only the clock moved repaints just the charts, and only the parts of
 the window that changed are redrawn; behind other windows the charts move at half
 the display's rate, and not at all when the window is minimized or on another

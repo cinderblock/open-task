@@ -326,13 +326,18 @@ impl Plot {
     /// sample every few dozen DIPs).
     #[must_use]
     pub fn at_age(&self, age_ms: f32, axis: &TimeAxis) -> Option<&PlotPoint> {
+        self.index_at_age(age_ms, axis).map(|i| &self.points[i])
+    }
+
+    /// The index of [`Plot::at_age`]'s point.
+    fn index_at_age(&self, age_ms: f32, axis: &TimeAxis) -> Option<usize> {
         let x = axis.x(self.rect, age_ms);
         let i = self.nearest_index(x)?;
         let p = &self.points[i];
         let older = self.points.get(i + 1).map_or(0.0, |q| p.x - q.x);
         let newer = i.checked_sub(1).map_or(0.0, |j| self.points[j].x - p.x);
         let reach = COLUMN_W.max(older.max(newer) * 0.5);
-        ((p.x - x).abs() <= reach).then_some(p)
+        ((p.x - x).abs() <= reach).then_some(i)
     }
 
     fn y(&self, v: f32) -> f32 {
@@ -344,14 +349,16 @@ impl Plot {
         self.rect.bottom() - f * self.rect.h
     }
 
-    /// Grid, wash, envelope and mean line. `scratch` is caller-owned so steady-state
+    /// Grid, wash, envelope and mean line: the line and wash through the smoothed
+    /// curve ([`smooth`]), the envelope's edges through every lowest and highest
+    /// value ([`smooth_through`]), so a spike keeps its height there. `scratch` is caller-owned so steady-state
     /// painting does not allocate.
     pub fn paint(
         &self,
         dl: &mut DisplayList,
         style: &SparkStyle,
         axis: &TimeAxis,
-        scratch: &mut Vec<Point>,
+        scratch: &mut Scratch,
     ) {
         let rect = self.rect;
         if rect.is_empty() {
@@ -379,13 +386,13 @@ impl Plot {
         let bottom = rect.bottom();
         // Chart shapes go oldest (leftmost) first; the points are newest first.
         let n = self.points.len();
-        let oldest = self.points[n - 1].x;
         // The oldest leaves past the left edge while it slides out, and a sample
         // that came a little early lands just past the right one.
         dl.push_clip(rect);
 
-        scratch.clear();
-        scratch.extend(
+        let s = scratch;
+        s.ctrl.clear();
+        s.ctrl.extend(
             self.points
                 .iter()
                 .rev()
@@ -393,21 +400,42 @@ impl Plot {
         );
         // On a running clock the newest sample is a moment old: the line holds
         // its value from there to the edge until the next one lands on it.
-        let head = scratch[n - 1];
+        let head = s.ctrl[n - 1];
         if axis.now_ms.is_some() && head.x < rect.right() {
-            scratch.push(Point::new(rect.right(), head.y));
+            s.ctrl.push(Point::new(rect.right(), head.y));
         }
-        let newest = scratch[scratch.len() - 1].x;
+        smooth(&s.ctrl, &mut s.line, &mut s.knots);
+        let (first, last) = (s.line[0].x, s.line[s.line.len() - 1].x);
         dl.band(
-            scratch.iter().copied(),
-            [Point::new(oldest, bottom), Point::new(newest, bottom)],
+            s.line.iter().copied(),
+            [Point::new(first, bottom), Point::new(last, bottom)],
             style.wash,
         );
+        if self.points.iter().any(|p| p.step > 0) {
+            s.ctrl.clear();
+            s.ctrl.extend(
+                self.points
+                    .iter()
+                    .rev()
+                    .map(|p| Point::new(p.x, self.y(p.max))),
+            );
+            smooth_through(&s.ctrl, &mut s.upper, &mut s.edge_knots);
+            s.ctrl.clear();
+            s.ctrl.extend(
+                self.points
+                    .iter()
+                    .rev()
+                    .map(|p| Point::new(p.x, self.y(p.min))),
+            );
+            smooth_through(&s.ctrl, &mut s.lower, &mut s.edge_knots);
+        }
 
         // Runs of segments that summarize about as many samples, oldest first; a
         // segment takes the step of its older end. Each run is a line and an
         // envelope of its own, so toward the compressed end the line fades and the
-        // range strengthens, step by step.
+        // range strengthens, step by step. A run is the curve from its first
+        // point's knot to its last's; the oldest run takes the curve from its
+        // start, the newest to its end (the hold).
         let segment = |k: usize| self.points[n - 1 - k].step;
         let mut start = 0;
         while start < n - 1 {
@@ -416,23 +444,38 @@ impl Plot {
             while end < n - 1 && segment(end) == step {
                 end += 1;
             }
-            // Points `start..=end`, oldest first; the newest run takes the hold.
+            let span = |knots: &[usize], len: usize| {
+                let from = if start == 0 { 0 } else { knots[start] };
+                let to = if end == n - 1 { len - 1 } else { knots[end] };
+                from..to + 1
+            };
             if step > 0 {
-                let run = self.points[n - 1 - end..n - start].iter().rev();
-                let upper = run.clone().map(|p| Point::new(p.x, self.y(p.max)));
-                let lower = run.map(|p| Point::new(p.x, self.y(p.min)));
+                let r = span(&s.edge_knots, s.upper.len());
                 let a = (style.envelope.a * RANGE_ENVELOPE[step]).min(1.0);
-                dl.band(upper, lower, style.envelope.with_alpha(a));
+                dl.band(
+                    s.upper[r.clone()].iter().copied(),
+                    s.lower[r].iter().copied(),
+                    style.envelope.with_alpha(a),
+                );
             }
-            let last = if end == n - 1 { scratch.len() } else { end + 1 };
             dl.graph(
-                scratch[start..last].iter().copied(),
+                s.line[span(&s.knots, s.line.len())].iter().copied(),
                 style.line.with_alpha(style.line.a * RANGE_LINE[step]),
                 style.width,
             );
             start = end;
         }
         dl.pop_clip();
+    }
+
+    /// Where the drawn curve passes point `i` (newest first): its knot, a blend
+    /// of it with its neighbours ([`smooth`]), on a running clock with the hold
+    /// after the newest.
+    fn knot_y(&self, i: usize) -> f32 {
+        let y = |j: usize| self.y(self.points[j].mean);
+        let older = y((i + 1).min(self.points.len() - 1));
+        let newer = i.checked_sub(1).map_or(y(i), y);
+        (older + 4.0 * y(i) + newer) / 6.0
     }
 
     /// Mark `age_ms`: a hairline across the plot and a dot on the mean line.
@@ -449,11 +492,175 @@ impl Plot {
         }
         let x = axis.x(self.rect, age_ms);
         dl.fill_rect(hairline(x, self.rect), style.crosshair);
-        let p = *self.at_age(age_ms, axis)?;
+        let at = self.index_at_age(age_ms, axis)?;
+        let p = self.points[at];
         let r = DOT_R;
-        let c = Point::new(x, self.y(p.mean));
+        // On the drawn curve; the readout gives the value measured.
+        let c = Point::new(x, self.knot_y(at));
         dl.fill_round_rect(Rect::new(c.x - r, c.y - r, 2.0 * r, 2.0 * r), r, style.line);
         Some(p)
+    }
+}
+
+/// Buffers [`Plot::paint`] draws through, kept by the caller so steady-state
+/// painting does not allocate.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    /// Control points, for one curve at a time.
+    ctrl: Vec<Point>,
+    /// The mean line's curve, and each point's knot on it.
+    line: Vec<Point>,
+    knots: Vec<usize>,
+    /// The envelope's edges' curves, and each point's knot on them.
+    upper: Vec<Point>,
+    lower: Vec<Point>,
+    edge_knots: Vec<usize>,
+}
+
+impl Scratch {
+    /// The curves of a band's two edges (control points each ascending in x):
+    /// [`Scratch::top`] and [`Scratch::bottom`] until the next call.
+    pub fn band(&mut self, top: &[Point], bottom: &[Point]) {
+        smooth(top, &mut self.upper, &mut self.edge_knots);
+        smooth(bottom, &mut self.lower, &mut self.edge_knots);
+    }
+
+    /// The top edge's curve from the last [`Scratch::band`].
+    #[must_use]
+    pub fn top(&self) -> &[Point] {
+        &self.upper
+    }
+
+    /// The bottom edge's curve from the last [`Scratch::band`].
+    #[must_use]
+    pub fn bottom(&self) -> &[Point] {
+        &self.lower
+    }
+}
+
+/// About how far apart, in DIPs along x, [`smooth`] places a curve's points.
+const SMOOTH_STEP: f32 = 2.0;
+/// The most pieces a span between two control points is drawn in.
+const SMOOTH_MAX_PIECES: f32 = 24.0;
+
+/// The uniform cubic B-spline over `ctrl` (ascending in x), its ends clamped to
+/// the first and last points, as points about [`SMOOTH_STEP`] apart into `out`;
+/// `knots[k]` is the index in `out` of the curve's point for `ctrl[k]`.
+///
+/// The curve has no corners and no jumps in its slope, and passes not through a
+/// point but through its knot, a sixth of each neighbour and four sixths of it:
+/// a gentle low-pass that takes the zigzag of samples taken a second apart out
+/// of the line. It stays within its control points' hull, so it never overshoots
+/// (a CPU line does not dip below zero) and x only ever grows; a lone spike is
+/// drawn at about two thirds of its height. It is linear in the points, so the
+/// curves of stacked edges stay stacked.
+pub fn smooth(ctrl: &[Point], out: &mut Vec<Point>, knots: &mut Vec<usize>) {
+    out.clear();
+    knots.clear();
+    let n = ctrl.len();
+    if n < 2 {
+        out.extend_from_slice(ctrl);
+        knots.extend(0..n);
+        return;
+    }
+    // The control points with the ends tripled, so the curve starts and ends on
+    // them.
+    let q = |j: usize| ctrl[j.saturating_sub(2).min(n - 1)];
+    out.push(ctrl[0]);
+    // Segment `s` is shaped by `q(s)..=q(s + 3)`; it starts at the knot of
+    // `ctrl[s - 1]`.
+    for s in 0..=n {
+        if s > 0 {
+            knots.push(out.len() - 1);
+        }
+        let (p0, p1, p2, p3) = (q(s), q(s + 1), q(s + 2), q(s + 3));
+        let pieces = ((p2.x - p1.x).abs() / SMOOTH_STEP)
+            .ceil()
+            .clamp(1.0, SMOOTH_MAX_PIECES) as u32;
+        for i in 1..=pieces {
+            let t = i as f32 / pieces as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            let u = 1.0 - t;
+            let b0 = u * u * u / 6.0;
+            let b1 = (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0;
+            let b2 = (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0;
+            let b3 = t3 / 6.0;
+            out.push(Point::new(
+                b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x,
+                b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y,
+            ));
+        }
+    }
+    // Exactly on the last point, not a rounding off it: the edge.
+    if let Some(end) = out.last_mut() {
+        *end = ctrl[n - 1];
+    }
+}
+
+/// A smooth curve through every point of `ctrl` (ascending in x), as points
+/// about [`SMOOTH_STEP`] apart into `out`; `knots[k]` is the index in `out` of
+/// `ctrl[k]`.
+///
+/// Piecewise cubic with Fritsch-Carlson slopes: no corners, and monotone between
+/// neighbours, so it never overshoots them. Unlike [`smooth`] it does not
+/// low-pass: it is for the envelope, whose edges say how high and how low the
+/// value went.
+pub fn smooth_through(ctrl: &[Point], out: &mut Vec<Point>, knots: &mut Vec<usize>) {
+    out.clear();
+    knots.clear();
+    let count = ctrl.len();
+    if count < 3 {
+        out.extend_from_slice(ctrl);
+        knots.extend(0..count);
+        return;
+    }
+    let width = |k: usize| ctrl[k + 1].x - ctrl[k].x;
+    let secant = |k: usize| {
+        let w = width(k);
+        if w > 0.0 {
+            (ctrl[k + 1].y - ctrl[k].y) / w
+        } else {
+            0.0
+        }
+    };
+    // The slope at each point: zero at a peak or a trough, else the weighted
+    // harmonic mean of the two sides' (Fritsch and Butland), which keeps each
+    // piece monotone.
+    let slope = |k: usize| {
+        if k == 0 {
+            return secant(0);
+        }
+        if k == count - 1 {
+            return secant(count - 2);
+        }
+        let (before, after) = (secant(k - 1), secant(k));
+        if before * after <= 0.0 {
+            return 0.0;
+        }
+        let (w0, w1) = (width(k - 1), width(k));
+        3.0 * (w0 + w1) / ((2.0 * w1 + w0) / before + (w1 + 2.0 * w0) / after)
+    };
+    out.push(ctrl[0]);
+    knots.push(0);
+    let mut leaving = slope(0);
+    for k in 0..count - 1 {
+        let (from, to, w) = (ctrl[k], ctrl[k + 1], width(k));
+        let arriving = slope(k + 1);
+        let pieces = (w.abs() / SMOOTH_STEP).ceil().clamp(1.0, SMOOTH_MAX_PIECES) as u32;
+        for piece in 1..=pieces {
+            let t = piece as f32 / pieces as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            let y = (2.0 * t3 - 3.0 * t2 + 1.0) * from.y
+                + (t3 - 2.0 * t2 + t) * w * leaving
+                + (-2.0 * t3 + 3.0 * t2) * to.y
+                + (t3 - t2) * w * arriving;
+            out.push(Point::new(from.x + t * w, y));
+        }
+        // Exactly through the point.
+        let last = out.len() - 1;
+        out[last] = to;
+        knots.push(last);
+        leaving = arriving;
     }
 }
 
@@ -698,14 +905,19 @@ mod tests {
         assert!((p.points()[3].age_ms - 3000.0).abs() < 1e-3);
         assert!((p.points()[3].x - AXIS.x(rect, 3000.0)).abs() < 1e-3);
         let mut dl = DisplayList::new();
-        p.paint(&mut dl, &style(), &AXIS, &mut Vec::new());
+        p.paint(&mut dl, &style(), &AXIS, &mut Scratch::default());
         let pts = polyline_points(&dl);
-        assert_eq!(pts.len(), 10);
-        // Oldest first.
+        // Oldest first, from the oldest sample to the newest, on the edge.
         assert!(pts.windows(2).all(|w| w[0].x < w[1].x));
-        assert!((pts[9].y - 25.0).abs() < 1e-3, "50% of 50 DIP tall is y=25");
+        assert_eq!(pts[0], Point::new(p.points()[9].x, 25.0));
+        assert_eq!(pts[pts.len() - 1], Point::new(200.0, 25.0));
+        assert!(
+            pts.iter().all(|q| (q.y - 25.0).abs() < 1e-3),
+            "50% of 50 DIP tall is y=25 all along"
+        );
         // Gaps shrink with age: log, not linear.
-        assert!(pts[9].x - pts[8].x > pts[1].x - pts[0].x);
+        let x = |i: usize| p.points()[i].x;
+        assert!(x(0) - x(1) > x(8) - x(9));
     }
 
     #[test]
@@ -740,7 +952,7 @@ mod tests {
             .expect("the spike's column");
         assert!(hit.count > 1 && hit.mean < 50.0, "summarized, not the line");
         let mut dl = DisplayList::new();
-        p.paint(&mut dl, &style(), &AXIS, &mut Vec::new());
+        p.paint(&mut dl, &style(), &AXIS, &mut Scratch::default());
         let polys = polygons(&dl);
         assert!(polys.len() >= 2, "wash and envelope");
         assert!(
@@ -786,19 +998,105 @@ mod tests {
         p.build(&s, rect, 100.0, &axis);
         assert!(p.points()[0].x < rect.right(), "the newest is 400 ms old");
         let mut dl = DisplayList::new();
-        p.paint(&mut dl, &style(), &axis, &mut Vec::new());
+        p.paint(&mut dl, &style(), &axis, &mut Scratch::default());
         let pts = polyline_points(&dl);
-        let (head, edge) = (pts[pts.len() - 2], pts[pts.len() - 1]);
-        assert!((edge.x - rect.right()).abs() < 1e-3);
-        assert!((edge.y - head.y).abs() < 1e-3 && (head.y - 10.0).abs() < 1e-3);
+        // The curve ends on the edge at the newest value (90% is y=10), and
+        // settles toward it from the newest sample on.
+        assert_eq!(pts[pts.len() - 1], Point::new(rect.right(), 10.0));
+        let held: Vec<f32> = pts
+            .iter()
+            .filter(|q| q.x >= p.points()[0].x)
+            .map(|q| q.y)
+            .collect();
+        assert!(held.len() > 2, "{held:?}");
+        assert!(
+            held.windows(2).all(|w| w[1] <= w[0] + 1e-4) && held[0] < 12.0,
+            "{held:?}"
+        );
         // The hold is drawn, not pointed at.
         assert_eq!(p.nearest_x(rect.right()).unwrap().age_ms, 400.0);
 
-        // Still, the newest sample is the edge: nothing to hold.
+        // Still, the newest sample is the edge, and the curve ends on it.
         let p = plot(&s, rect, 100.0);
         let mut dl = DisplayList::new();
-        p.paint(&mut dl, &style(), &AXIS, &mut Vec::new());
-        assert_eq!(polyline_points(&dl).len(), 10);
+        p.paint(&mut dl, &style(), &AXIS, &mut Scratch::default());
+        let pts = polyline_points(&dl);
+        assert_eq!(pts[pts.len() - 1], Point::new(p.points()[0].x, 10.0));
+    }
+
+    /// Control points `ys` one every `dx` DIPs from x = 0.
+    fn ctrl(dx: f32, ys: &[f32]) -> Vec<Point> {
+        ys.iter()
+            .enumerate()
+            .map(|(i, &y)| Point::new(i as f32 * dx, y))
+            .collect()
+    }
+
+    #[test]
+    fn the_curve_is_smooth_takes_out_the_zigzag_and_never_overshoots() {
+        // A sample-to-sample zigzag, as aliasing draws it.
+        let zig: Vec<f32> = (0..12)
+            .map(|i| if i % 2 == 0 { 0.0 } else { 100.0 })
+            .collect();
+        let pts = ctrl(20.0, &zig);
+        let (mut out, mut knots) = (Vec::new(), Vec::new());
+        smooth(&pts, &mut out, &mut knots);
+        assert_eq!(knots.len(), pts.len());
+        assert_eq!(
+            (out[0], out[out.len() - 1]),
+            (pts[0], pts[11]),
+            "clamped ends"
+        );
+        assert!(out.windows(2).all(|w| w[0].x < w[1].x), "x only grows");
+        assert!(
+            out.iter().all(|q| (0.0..=100.0).contains(&q.y)),
+            "no overshoot"
+        );
+        // Away from the ends, a sixth-four sixths-a sixth blend at each knot: the
+        // zigzag is down to a third of its swing.
+        for k in 2..10 {
+            let want = if k % 2 == 0 {
+                100.0 / 6.0 * 2.0
+            } else {
+                100.0 / 6.0 * 4.0
+            };
+            assert!(
+                (out[knots[k]].y - want).abs() < 1e-3,
+                "{k}: {:?}",
+                out[knots[k]]
+            );
+        }
+        // No corners: the slope turns by little from one piece to the next.
+        let slopes: Vec<f32> = out
+            .windows(2)
+            .map(|w| (w[1].y - w[0].y) / (w[1].x - w[0].x))
+            .collect();
+        let turn = slopes
+            .windows(2)
+            .skip(12)
+            .take(slopes.len() - 24)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(turn < 1.5, "a corner: the slope turns by {turn}");
+    }
+
+    #[test]
+    fn the_envelope_curve_passes_through_every_extreme_without_overshoot() {
+        let ys = [10.0, 10.0, 90.0, 20.0, 25.0, 25.0, 60.0];
+        let pts = ctrl(10.0, &ys);
+        let (mut out, mut knots) = (Vec::new(), Vec::new());
+        smooth_through(&pts, &mut out, &mut knots);
+        for (k, p) in pts.iter().enumerate() {
+            assert_eq!(out[knots[k]], *p, "through point {k}");
+        }
+        // Between neighbours it stays between them: the spike keeps its height
+        // and nothing bulges past it.
+        for k in 0..pts.len() - 1 {
+            let (lo, hi) = (ys[k].min(ys[k + 1]), ys[k].max(ys[k + 1]));
+            for q in &out[knots[k]..=knots[k + 1]] {
+                assert!((lo - 1e-3..=hi + 1e-3).contains(&q.y), "{k}: {q:?}");
+            }
+        }
     }
 
     #[test]
@@ -826,7 +1124,7 @@ mod tests {
             &mut dl,
             &style(),
             &AXIS,
-            &mut Vec::new(),
+            &mut Scratch::default(),
         );
         assert!(dl
             .cmds()
@@ -1013,7 +1311,7 @@ mod tests {
         assert!(p.nearest_x(rect.right()).unwrap().x <= rect.right());
         // Drawn inside a clip, so neither end spills out of the chart.
         let mut dl = DisplayList::new();
-        p.paint(&mut dl, &style(), &axis, &mut Vec::new());
+        p.paint(&mut dl, &style(), &axis, &mut Scratch::default());
         let cmds = dl.cmds();
         let open = cmds
             .iter()

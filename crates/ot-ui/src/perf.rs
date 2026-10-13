@@ -383,7 +383,7 @@ pub(crate) struct PerfPage {
     cum: Vec<f32>,
     vals: Vec<f32>,
     poly: Vec<Point>,
-    scratch: Vec<Point>,
+    scratch: sparkline::Scratch,
     items: Vec<Rect>,
     minis: Vec<(usize, usize)>,
     detail: Detail,
@@ -422,7 +422,7 @@ impl Default for PerfPage {
             cum: Vec::new(),
             vals: Vec::new(),
             poly: Vec::new(),
-            scratch: Vec::new(),
+            scratch: sparkline::Scratch::default(),
             items: Vec::new(),
             minis: Vec::new(),
             detail: Detail::default(),
@@ -1257,6 +1257,7 @@ impl PerfPage {
             let hold =
                 (self.axis.now_ms.is_some() && card[0].x < rect.right()).then_some(rect.right());
             let (cum, vals, poly) = (&mut self.cum, &mut self.vals, &mut self.poly);
+            let curves = &mut self.scratch;
             cum.clear();
             cum.resize(card.len(), 0.0);
             dl.push_clip(rect);
@@ -1281,9 +1282,15 @@ impl PerfPage {
                 edge(poly, card, cum, hold, y);
                 let (lower, top) = poly.split_at(upper);
                 let color = port_color(theme, b, s.ports.len()).with_alpha(0.85);
-                dl.band(top.iter().copied(), lower.iter().copied(), color);
+                // Through the same curve as the lines.
+                curves.band(top, lower);
+                dl.band(
+                    curves.top().iter().copied(),
+                    curves.bottom().iter().copied(),
+                    color,
+                );
                 // A hairline of background along the top keeps neighbours apart.
-                dl.graph(top.iter().copied(), theme.bg_solid, 1.0);
+                dl.graph(curves.top().iter().copied(), theme.bg_solid, 1.0);
             }
             dl.pop_clip();
         }

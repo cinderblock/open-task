@@ -291,7 +291,7 @@ pub(crate) struct ChartGroup {
     /// An age a chart outside the group asks this group to mark too, while the
     /// pointer is over that chart rather than one of these.
     outside: Option<f32>,
-    scratch: Vec<Point>,
+    scratch: sparkline::Scratch,
     ago: String,
     readout: String,
 }

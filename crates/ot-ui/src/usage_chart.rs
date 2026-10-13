@@ -443,6 +443,8 @@ pub(crate) struct UsageChart {
     now_ms: i64,
     poly: Vec<Point>,
     cum: Vec<f32>,
+    /// The bands' edges as drawn, smoothed.
+    curves: sparkline::Scratch,
     /// The sliding window's extremes, for placing the names ([`Self::fit`]).
     window: (VecDeque<usize>, VecDeque<usize>),
     ago: String,
@@ -1501,13 +1503,15 @@ impl UsageChart {
             }
             let alpha = if dim { DIM_ALPHA } else { 0.9 };
             let (lower, top) = poly.split_at(upper);
+            // Through the same curve as the line charts.
+            self.curves.band(top, lower);
             dl.band(
-                top.iter().copied(),
-                lower.iter().copied(),
+                self.curves.top().iter().copied(),
+                self.curves.bottom().iter().copied(),
                 band_color(theme, b).with_alpha(alpha),
             );
             // A hairline of background along the top keeps neighbours apart.
-            dl.graph(top.iter().copied(), theme.bg_solid, 1.0);
+            dl.graph(self.curves.top().iter().copied(), theme.bg_solid, 1.0);
         }
         self.cum = cum;
         self.poly = poly;
