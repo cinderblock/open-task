@@ -209,6 +209,7 @@ dependencies = [
 name = "ot-probe"
 version = "0.15.1"
 dependencies = [
+ "libc",
  "ot-model",
  "thiserror",
  "tracing",

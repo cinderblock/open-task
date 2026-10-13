@@ -1,6 +1,6 @@
 [package]
 name = "ot-probe"
-description = "Platform sampling backends for open-task. Windows is real; Linux and macOS are stubs."
+description = "Platform sampling backends for open-task. Windows and Linux are real; macOS is a stub."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,11 @@ authors.workspace = true
 ot-model.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Syscalls the Linux probe needs beyond reading /proc and /sys: statvfs,
+# getifaddrs, pidfd_open, sched_*affinity, setpriority.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
