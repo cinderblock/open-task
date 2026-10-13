@@ -229,19 +229,20 @@ fn thread_state(state: u8) -> (ThreadState, WaitReason) {
 /// users resolve too) and remembered.
 #[derive(Debug, Default)]
 struct Users {
-    names: HashMap<u32, Option<String>>,
+    names: HashMap<u32, String>,
 }
 
 impl Users {
-    fn name(&mut self, uid: u32) -> Option<String> {
+    fn name(&mut self, uid: u32) -> String {
         self.names
             .entry(uid)
-            .or_insert_with(|| lookup_user(uid))
+            .or_insert_with(|| user_name(uid))
             .clone()
     }
 }
 
-fn lookup_user(uid: u32) -> Option<String> {
+/// The name of user `uid`, or the number when it has none.
+pub(super) fn user_name(uid: u32) -> String {
     let mut buf = vec![0u8; 1024];
     loop {
         // SAFETY: zeroed `passwd` is a valid out-parameter; every pointer passed is
@@ -262,11 +263,11 @@ fn lookup_user(uid: u32) -> Option<String> {
             continue;
         }
         if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
-            return Some(uid.to_string());
+            return uid.to_string();
         }
         // SAFETY: on success `pw_name` points at a NUL-terminated string in `buf`.
         let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
-        return Some(name.to_string_lossy().into_owned());
+        return name.to_string_lossy().into_owned();
     }
 }
 
@@ -684,7 +685,7 @@ impl ProcessProbe {
             name,
             image_path,
             command_line,
-            user: status.euid.and_then(|uid| self.users.name(uid)),
+            user: status.euid.map(|uid| self.users.name(uid)),
             integrity,
             started_unix_ms: self.started_unix_ms(stat.starttime),
             session_id,

@@ -7,9 +7,11 @@ mod control;
 mod cpu;
 mod disks;
 mod fs;
+mod inventory;
 mod net;
 mod power;
 mod process;
+mod sessions;
 mod volumes;
 
 use std::time::Duration;
@@ -41,6 +43,7 @@ pub struct LinuxProbe {
     battery: power::BatteryProbe,
     thermal: Option<power::Thermal>,
     rapl: Option<power::Rapl>,
+    sessions: sessions::SessionProbe,
     hardware: ot_model::hardware::Hardware,
     buf: Vec<u8>,
 }
@@ -68,6 +71,7 @@ impl LinuxProbe {
             battery: power::BatteryProbe::new(),
             thermal,
             rapl: power::Rapl::open(),
+            sessions: sessions::SessionProbe::new(),
             hardware,
             buf: Vec::with_capacity(2048),
         })
@@ -132,6 +136,7 @@ impl SystemProbe for LinuxProbe {
             hybrid_core_kinds: self.cpu.hybrid(),
             threads: true,
             services: self.processes.has_services(),
+            sessions: self.sessions.available(),
             elevated: is_elevated(),
             ..Capabilities::default()
         }
@@ -152,6 +157,7 @@ impl SystemProbe for LinuxProbe {
         self.volumes.sample(&mut out.volumes, &mut self.disks);
         self.net.sample(&mut out.adapters);
         out.battery = self.battery.sample();
+        self.sessions.sample(&mut out.sessions);
         Ok(())
     }
 }
