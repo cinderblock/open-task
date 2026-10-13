@@ -915,12 +915,16 @@ mod tests {
             shares + 0.01 >= utilization && shares <= utilization + 1.0,
             "shares {shares} for utilization {utilization}"
         );
-        // A desktop has a compositor holding GPU memory.
+        // A desktop with a hardware GPU has a compositor holding GPU memory. CI's
+        // runners have only the basic render driver, a software adapter, whose
+        // memory is left out.
+        let hardware = out.iter().any(|g| !g.info.software);
         assert!(
-            probe
-                .procs
-                .values()
-                .any(|p| p.dedicated.get() + p.shared.get() > 0),
+            !hardware
+                || probe
+                    .procs
+                    .values()
+                    .any(|p| p.dedicated.get() + p.shared.get() > 0),
             "some process holds GPU memory"
         );
     }
