@@ -1,6 +1,6 @@
 # Charts: a smooth curve through the samples
 
-> **Status:** built and committed · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
+> **Status:** done; released as v0.15.1 (2026-10-13) · **Started:** 2026-10-13 · **Repo:** `C:\Users\camer\git\Personal Projects\open-task` (branch `master`)
 > Follows `plans/chart-live-edge-and-range-morph.md` (released in v0.14.0).
 
 ## Goal
@@ -52,7 +52,8 @@ low-passed a little.
 3. [x] Hover dot on the curve (`Plot::knot_y`).
 4. [x] `usage_chart::paint_bands`, `perf::paint_stack` through the curve.
 5. [x] Tests (222 `ot-ui`), clippy (three targets), fmt, renders, README, commit.
-6. [ ] Release when the user asks (v0.14.0 is out without it).
+6. [x] Released as v0.15.1 (`a536a6a`). v0.15.0, cut by another session minutes
+   earlier, missed it.
 
 ## Findings / gotchas
 
@@ -67,11 +68,11 @@ low-passed a little.
 
 - [x] 2026-10-13: plan written.
 - [x] 2026-10-13: built, checked, committed.
+- [x] 2026-10-13: released v0.15.1 (9 assets, release and CI green).
 
 ## Open questions for the user
 
-1. A setting to turn the smoothing off (exact sample-to-sample lines)? Not built
-   unless asked.
+(none: the user went ahead to release without asking for an off switch.)
 
 ## Things not to do
 
