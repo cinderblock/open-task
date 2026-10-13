@@ -74,8 +74,8 @@ const HEAD_H: f32 = 26.0;
 const SWITCH_W: f32 = 104.0;
 const RESOURCE_W: f32 = 80.0;
 const SWITCH_GAP: f32 = 8.0;
-/// The value scale's labels, inside the plot at its left edge: how far in from
-/// the edge they sit, and their height.
+/// The value scale's labels, inside the plot at its right edge, beside now: how
+/// far in from the edge they sit, and their height.
 const SCALE_INSET: f32 = 4.0;
 const SCALE_H: f32 = 14.0;
 const LEGEND_ROW_H: f32 = 22.0;
@@ -1370,10 +1370,11 @@ impl UsageChart {
         }
     }
 
-    /// The value scale, inside the plot so it takes none of its width: the top's
-    /// value just under the top, the middle's just over the middle line, each on
-    /// a backing that keeps it legible over the bands. The top's moves right of a
-    /// floating legend in that corner.
+    /// The value scale, inside the plot so it takes none of its width, and on the
+    /// right, beside now, the value read against it most: the top's value just
+    /// under the top, the middle's just over the middle line, each on a backing
+    /// that keeps it legible over the bands. The top's moves left of a floating
+    /// legend in that corner.
     fn paint_scale(&self, dl: &mut DisplayList, theme: &Theme, buf: &mut String) {
         let plot = self.plot;
         let mid = plot.y + (plot.h * 0.5).floor();
@@ -1381,22 +1382,22 @@ impl UsageChart {
             if y < plot.y || y + SCALE_H > plot.bottom() {
                 continue;
             }
-            let mut x = plot.x + SCALE_INSET;
+            self.value(buf, self.scale * f);
+            let w = label_w(buf, theme.small.size);
+            let mut right = plot.right() - SCALE_INSET;
             let legend = self.legend;
             if self.style == ChartLegend::Floating
                 && !legend.is_empty()
-                && legend.x < x + SCALE_INSET
+                && legend.right() > right - w - SCALE_INSET
                 && y < legend.bottom()
                 && y + SCALE_H > legend.y
             {
-                x = legend.right() + SCALE_INSET;
+                right = legend.x - SCALE_INSET;
             }
-            self.value(buf, self.scale * f);
-            let w = label_w(buf, theme.small.size);
-            if x + w > plot.right() {
+            if right - w < plot.x {
                 continue;
             }
-            let rect = Rect::new(x, y, w, SCALE_H);
+            let rect = Rect::new(right - w, y, w, SCALE_H);
             dl.fill_round_rect(rect, 3.0, theme.bg_solid.with_alpha(0.75));
             dl.text(
                 buf,
@@ -1773,6 +1774,18 @@ mod tests {
         dl
     }
 
+    /// Where the value scale's labels are: the rate texts outside any legend.
+    fn scale_rects(dl: &DisplayList, c: &UsageChart) -> Vec<Rect> {
+        dl.cmds()
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::Text(t) if dl.str(t.text).ends_with("G/s") => Some(t.rect),
+                _ => None,
+            })
+            .filter(|r| !c.legend.contains(r.center()))
+            .collect()
+    }
+
     fn texts(dl: &DisplayList) -> Vec<String> {
         dl.cmds()
             .iter()
@@ -1838,18 +1851,8 @@ mod tests {
     }
 
     #[test]
-    fn the_value_scale_sits_inside_the_plot_and_beside_a_floating_legend() {
+    fn the_value_scale_sits_inside_the_plot_on_the_right() {
         let u = session(&["a.exe", "b.exe"], 30, |i, _| if i == 0 { 3 } else { 1 });
-        let scale = |dl: &DisplayList, c: &UsageChart| -> Vec<Rect> {
-            dl.cmds()
-                .iter()
-                .filter_map(|cmd| match cmd {
-                    DrawCmd::Text(t) if dl.str(t.text).ends_with("G/s") => Some(t.rect),
-                    _ => None,
-                })
-                .filter(|r| r.x < c.plot.x + c.plot.w * 0.5)
-                .collect()
-        };
         let mut c = UsageChart::default();
         c.set_legend(ChartLegend::Inline);
         let _ = painted(&mut c, &u, "");
@@ -1858,18 +1861,12 @@ mod tests {
         let dl = painted(&mut c, &u, "");
         // No gutter: the plot starts at the chart's left edge.
         assert_eq!(c.plot.x, RECT.x);
-        let rects = scale(&dl, &c);
+        let rects = scale_rects(&dl, &c);
         assert_eq!(rects.len(), 2, "the top and the middle");
         for r in &rects {
+            assert!(r.x >= c.plot.x + c.plot.w * 0.5, "on the right: {r:?}");
             assert!(r.x >= c.plot.x && r.right() <= c.plot.right(), "{r:?}");
             assert!(r.y >= c.plot.y && r.bottom() <= c.plot.bottom(), "{r:?}");
-        }
-
-        c.set_legend(ChartLegend::Floating);
-        let dl = painted(&mut c, &u, "");
-        if !c.float_right && !c.legend.is_empty() {
-            let top = scale(&dl, &c).into_iter().find(|r| r.y < c.legend.bottom());
-            assert!(top.is_none_or(|r| r.x >= c.legend.right()), "{top:?}");
         }
     }
 
@@ -2340,6 +2337,12 @@ mod tests {
         );
         assert!(c.plot.contains(c.legend.center()), "over the plot");
         assert!(c.float_right, "over the corner the bands leave free");
+        // The value scale's top steps left of it.
+        let top = scale_rects(&dl, &c)
+            .into_iter()
+            .find(|r| r.y < c.legend.bottom())
+            .expect("the top's value");
+        assert!(top.right() <= c.legend.x, "{top:?} {:?}", c.legend);
         assert!(texts(&dl).iter().any(|s| s == "a.exe"));
         // Its rows still pick their program; the plot under it is hidden.
         let b = band(&c, &u, "b.exe");
