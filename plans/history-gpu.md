@@ -50,7 +50,8 @@ The user asked (2026-10-12): the History chart recently gained memory by program
   empty.
 - The GPU Percent reading showed open-task itself at ~50 % of the iGPU's 3D engine
   on the History view (5–7 % on List), confirmed with raw PDH. Pre-existing, not
-  from this work: logged in `ISSUES.md`.
+  from this work: logged in `ISSUES.md`, then fixed in the GPU chart renderer
+  (`db1435a`, `c8ec759`; `plans/history-gpu-cost.md`): now ~10 %.
 - The Bash tool can't take Python heredocs with triple quotes; edit scripts live in
   `%TEMP%\ot-edit\` (`edit.py` helper keeps CRLF). Run them without `-I`, or the
   helper import fails.
