@@ -218,8 +218,10 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   Processes that have exited since are still named, marked "exited"; the History
   remembers every process, and every ancestor of one, for as long as the chart
   reaches back. Processes of the band with the same parent fold into one line. A
-  parent that exited before open-task saw it (a launcher that lived for a moment)
-  is not known, and its child reads as a root. The CPU and memory graphs mark the
+  parent that exited before open-task saw it (a launcher that lived for a moment,
+  such as `cmd /c start`) is all but unknown: its name went with it, so it reads
+  `PID 13356 · exited before open-task saw it`, by the PID its children were
+  given for it. The CPU and memory graphs mark the
   same moment (and the other way round). **History chart legend** on the Settings page
   can instead float the legend, with every band's value, over the top corner of the
   chart the bands leave freer (moving out of the way of a marked moment), or put it
@@ -462,8 +464,9 @@ wrote it and its format, the machine, when it started, how many frames over how 
 and what they take. A file from an older build still opens; one made before the
 processes' private working set was recorded (format 1) shows none in the History's
 memory readings, one made before their GPU use was (formats 1 and 2) none in its
-GPU readings, and one made before network adapters knew their switch ports (formats
-1 to 3) lists every port beside its card. `open-task --replay session.otrec` opens the window on the recording instead
+GPU readings, one made before network adapters knew their switch ports (formats
+1 to 3) lists every port beside its card, and one made before a process kept its
+parent's PID (formats 1 to 4) cannot name a parent that exited before it was seen. `open-task --replay session.otrec` opens the window on the recording instead
 of the live machine: every page works as it does live, and a transport bar along
 the bottom has step back, play/pause (**Space**), step forward, a slider over the
 frames (drag to scrub, wheel to step), the time into the recording, and a speed

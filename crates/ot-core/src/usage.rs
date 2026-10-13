@@ -205,6 +205,9 @@ pub struct Seen {
     /// The parent's identity, as the probe resolved it: absent for a root, and for
     /// a process whose parent had exited before it was first seen.
     pub parent: Option<ProcessKey>,
+    /// Where `parent` is absent: the PID the system gave for a parent that had
+    /// exited before this process was first seen, all that is known of it.
+    pub lost_parent: Option<u32>,
     /// The program it is charted under, which [`Usage::program_name`] names.
     pub program: ProgramId,
     /// The first and the last snapshot it was in, in ms since the Unix epoch.
@@ -521,9 +524,11 @@ impl Usage {
                     s.last_ms = now;
                     // The probe can learn the parent after first sight.
                     s.parent = p.statics.parent;
+                    s.lost_parent = lost_parent(&p.statics);
                 })
                 .or_insert(Seen {
                     parent: p.statics.parent,
+                    lost_parent: lost_parent(&p.statics),
                     program: e.program,
                     first_ms: now,
                     last_ms: now,
@@ -803,6 +808,15 @@ fn program_id(
     programs.push(label.clone().into_owned());
     ids.insert(label.into_owned(), id);
     id
+}
+
+/// The PID of a parent the probe could not find: one the system reported (not the
+/// idle process's 0) that did not resolve.
+fn lost_parent(statics: &ProcessStatic) -> Option<u32> {
+    match statics.parent {
+        Some(_) => None,
+        None => statics.parent_pid.filter(|&pid| pid != 0),
+    }
 }
 
 /// A process's label, borrowed when it is just the name, as most are.
@@ -1440,6 +1454,20 @@ mod tests {
         assert_eq!((p2.first_ms, p2.last_ms), (1000 * s, 1000 * s));
         assert!(!u.running(ProcessKey::new(2, 1)));
         assert!(u.running(ProcessKey::new(1, 1)));
+        assert_eq!(p2.lost_parent, None, "its parent was found");
+    }
+
+    #[test]
+    fn a_parent_gone_before_first_sight_is_remembered_by_its_pid() {
+        let mut u = Usage::new(0.05);
+        let mut orphan = child(7, None, "orphan.exe");
+        Arc::make_mut(&mut orphan.statics).parent_pid = Some(4242);
+        let mut root = child(4, None, "System");
+        Arc::make_mut(&mut root.statics).parent_pid = Some(0);
+        u.observe(&snap(1000, vec![orphan, root]));
+        let seen = |pid| u.seen(ProcessKey::new(pid, 1)).unwrap().lost_parent;
+        assert_eq!(seen(7), Some(4242));
+        assert_eq!(seen(4), None, "the idle process is no parent");
     }
 
     #[test]

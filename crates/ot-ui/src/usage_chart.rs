@@ -525,7 +525,9 @@ fn nice_bytes(v: f32) -> f32 {
 /// to bottom: roots first, each process under its parent. Of a parent's children,
 /// those with more of the program's processes under them come first. The
 /// program's processes that have no children shown fold into one line under their
-/// parent, `30 × chrome.exe (Renderer)`. A process that has exited says so.
+/// parent, `30 × chrome.exe (Renderer)`. A process that has exited says so. A
+/// parent that had exited before open-task saw it is named by the PID the system
+/// gave for it, all that is known of it.
 fn ancestry(
     usage: &Usage,
     program: ProgramId,
@@ -538,27 +540,33 @@ fn ancestry(
         .seen_in(program, after_ms, until_ms)
         .map(|(k, _)| k)
         .collect();
-    // Each process's children in the tree; the roots under `None`.
-    let mut children: HashMap<Option<ProcessKey>, Vec<ProcessKey>> = HashMap::new();
+    // Each node's children in the tree; the roots under `None`.
+    let mut children: HashMap<Option<Node>, Vec<Node>> = HashMap::new();
     let mut placed = HashSet::new();
     for &key in &members {
-        let mut k = key;
-        while placed.insert(k) {
-            // A parent the history does not know (the idle process) is no parent.
-            let parent = usage
-                .seen(k)
-                .and_then(|s| s.parent)
-                .filter(|&p| usage.seen(p).is_some());
-            children.entry(parent).or_default().push(k);
+        let mut node = Node::Process(key);
+        while placed.insert(node) {
+            let parent = match node {
+                Node::Process(k) => usage.seen(k).and_then(|s| {
+                    match s.parent {
+                        // A parent the history does not know (the idle process) is
+                        // no parent.
+                        Some(p) => usage.seen(p).is_some().then_some(Node::Process(p)),
+                        None => s.lost_parent.map(Node::Lost),
+                    }
+                }),
+                Node::Lost(_) => None,
+            };
+            children.entry(parent).or_default().push(node);
             match parent {
-                Some(p) => k = p,
+                Some(p) => node = p,
                 None => break,
             }
         }
     }
     let mut weight = HashMap::with_capacity(placed.len());
-    for &k in &placed {
-        subtree_members(k, &members, &children, &mut weight);
+    for &n in &placed {
+        subtree_members(n, &members, &children, &mut weight);
     }
     let tree = Tree {
         usage,
@@ -569,57 +577,82 @@ fn ancestry(
     tree.emit(None, 0, 0, out);
 }
 
-/// How many of the band's processes are in the subtree under `k`, `k` included.
+/// A place in the readout's tree: a process the history knows, or a parent known
+/// only by the PID its child reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Node {
+    Process(ProcessKey),
+    Lost(u32),
+}
+
+impl Node {
+    fn pid(self) -> u32 {
+        match self {
+            Self::Process(k) => k.pid,
+            Self::Lost(pid) => pid,
+        }
+    }
+}
+
+/// How many of the band's processes are in the subtree under `n`, `n` included.
 fn subtree_members(
-    k: ProcessKey,
+    n: Node,
     members: &HashSet<ProcessKey>,
-    children: &HashMap<Option<ProcessKey>, Vec<ProcessKey>>,
-    memo: &mut HashMap<ProcessKey, usize>,
+    children: &HashMap<Option<Node>, Vec<Node>>,
+    memo: &mut HashMap<Node, usize>,
 ) -> usize {
-    if let Some(&n) = memo.get(&k) {
-        return n;
+    if let Some(&w) = memo.get(&n) {
+        return w;
     }
     // Marked before the children are visited, so even a loop would end.
-    memo.insert(k, 0);
-    let below: usize = children.get(&Some(k)).map_or(0, |c| {
+    memo.insert(n, 0);
+    let below: usize = children.get(&Some(n)).map_or(0, |c| {
         c.iter()
             .map(|&c| subtree_members(c, members, children, memo))
             .sum()
     });
-    let n = usize::from(members.contains(&k)) + below;
-    memo.insert(k, n);
-    n
+    let own = matches!(n, Node::Process(k) if members.contains(&k));
+    let w = usize::from(own) + below;
+    memo.insert(n, w);
+    w
 }
 
 /// What [`ancestry`] lays out.
 struct Tree<'a> {
     usage: &'a Usage,
     members: &'a HashSet<ProcessKey>,
-    children: &'a HashMap<Option<ProcessKey>, Vec<ProcessKey>>,
-    weight: &'a HashMap<ProcessKey, usize>,
+    children: &'a HashMap<Option<Node>, Vec<Node>>,
+    weight: &'a HashMap<Node, usize>,
 }
 
 impl Tree<'_> {
-    fn name(&self, k: ProcessKey) -> &str {
-        self.usage
-            .seen(k)
-            .map_or("", |s| self.usage.program_name(s.program))
+    fn name(&self, n: Node) -> &str {
+        match n {
+            Node::Process(k) => self
+                .usage
+                .seen(k)
+                .map_or("", |s| self.usage.program_name(s.program)),
+            Node::Lost(_) => "",
+        }
     }
 
-    fn weight(&self, k: ProcessKey) -> usize {
-        self.weight.get(&k).copied().unwrap_or(0)
+    fn weight(&self, n: Node) -> usize {
+        self.weight.get(&n).copied().unwrap_or(0)
+    }
+
+    fn member(&self, n: Node) -> bool {
+        matches!(n, Node::Process(k) if self.members.contains(&k))
     }
 
     /// The lines for the children of `parent`, at `depth`, and everything under
     /// them. `rails` are the rails passing by them.
-    fn emit(&self, parent: Option<ProcessKey>, depth: usize, rails: u64, out: &mut Vec<TreeLine>) {
+    fn emit(&self, parent: Option<Node>, depth: usize, rails: u64, out: &mut Vec<TreeLine>) {
         let Some(kids) = self.children.get(&parent) else {
             return;
         };
-        let leaf =
-            |k: ProcessKey| self.members.contains(&k) && !self.children.contains_key(&Some(k));
-        let mut folded: Vec<ProcessKey> = kids.iter().copied().filter(|&k| leaf(k)).collect();
-        let mut others: Vec<ProcessKey> = kids.iter().copied().filter(|&k| !leaf(k)).collect();
+        let leaf = |n: Node| self.member(n) && !self.children.contains_key(&Some(n));
+        let mut folded: Vec<Node> = kids.iter().copied().filter(|&n| leaf(n)).collect();
+        let mut others: Vec<Node> = kids.iter().copied().filter(|&n| !leaf(n)).collect();
         // A fold of one is just that process.
         if folded.len() == 1 {
             others.append(&mut folded);
@@ -628,12 +661,12 @@ impl Tree<'_> {
             self.weight(b)
                 .cmp(&self.weight(a))
                 .then_with(|| self.name(a).cmp(self.name(b)))
-                .then_with(|| a.pid.cmp(&b.pid))
+                .then_with(|| a.pid().cmp(&b.pid()))
         });
         // The fold goes among the others by how many it stands for, first among
         // equals.
-        let at = others.partition_point(|&k| self.weight(k) > folded.len());
-        let mut items: Vec<Option<ProcessKey>> = others.into_iter().map(Some).collect();
+        let at = others.partition_point(|&n| self.weight(n) > folded.len());
+        let mut items: Vec<Option<Node>> = others.into_iter().map(Some).collect();
         if !folded.is_empty() {
             items.insert(at, None);
         }
@@ -643,7 +676,10 @@ impl Tree<'_> {
             let mut text = String::new();
             let members = match item {
                 None => {
-                    let gone = folded.iter().filter(|&&k| !self.usage.running(k)).count();
+                    let gone = folded
+                        .iter()
+                        .filter(|&&n| matches!(n, Node::Process(k) if !self.usage.running(k)))
+                        .count();
                     let _ = write!(text, "{} × {}", folded.len(), self.name(folded[0]));
                     match gone {
                         0 => {}
@@ -654,12 +690,16 @@ impl Tree<'_> {
                     }
                     folded.len()
                 }
-                Some(k) => {
-                    let _ = write!(text, "{} · {}", self.name(k), k.pid);
+                Some(Node::Process(k)) => {
+                    let _ = write!(text, "{} · {}", self.name(Node::Process(k)), k.pid);
                     if !self.usage.running(k) {
                         text.push_str(" · exited");
                     }
                     usize::from(self.members.contains(&k))
+                }
+                Some(Node::Lost(pid)) => {
+                    let _ = write!(text, "PID {pid} · exited before open-task saw it");
+                    0
                 }
             };
             out.push(TreeLine {
@@ -669,14 +709,14 @@ impl Tree<'_> {
                 last,
                 rails,
             });
-            if let Some(k) = item {
+            if let Some(node) = item {
                 // Below a child with later siblings, the rail to them passes by.
                 let below = if depth > 0 && depth <= 64 && !last {
                     rails | 1 << (depth - 1)
                 } else {
                     rails
                 };
-                self.emit(Some(k), depth + 1, below, out);
+                self.emit(Some(node), depth + 1, below, out);
             }
         }
     }
@@ -3083,7 +3123,9 @@ mod tests {
     }
 
     /// A session of `secs` seconds where each second's processes are `at(s)`:
-    /// `(pid, parent, name)`, each using a G cycles a second.
+    /// `(pid, parent, name)`, each using a G cycles a second. A parent from
+    /// [`LOST`] on is one that had exited before the session saw it: the child
+    /// has only its PID.
     fn family_session(
         secs: u64,
         at: impl Fn(u64) -> Vec<(u32, Option<u32>, &'static str)>,
@@ -3093,9 +3135,11 @@ mod tests {
             let procs = at(s)
                 .into_iter()
                 .map(|(pid, parent, name)| {
-                    let mut p = proc(pid, parent, 0.0);
+                    let lost = parent.filter(|&pp| pp >= LOST);
+                    let mut p = proc(pid, parent.filter(|_| lost.is_none()), 0.0);
                     p.statics = Arc::new(ProcessStatic {
                         name: name.to_owned(),
+                        parent_pid: parent,
                         ..(*p.statics).clone()
                     });
                     p.cycles = 100 * G + s * G;
@@ -3164,6 +3208,30 @@ mod tests {
         ancestry(&u, w, 1_029_000, 1_030_000, &mut lines);
         assert_eq!(lines[2], line(2, "2 × w.exe", 2, true, 1));
         assert_eq!(lines[1].text, "launcher.exe · 2 · exited");
+    }
+
+    const LOST: u32 = 9000;
+
+    #[test]
+    fn a_parent_that_exited_unseen_is_named_by_its_pid() {
+        let usage = family_session(5, |_| {
+            vec![
+                (1, Some(LOST + 1), "w.exe"),
+                (2, Some(LOST + 1), "w.exe"),
+                (3, None, "w.exe"),
+            ]
+        });
+        let program = usage.program("w.exe").unwrap();
+        let mut lines = Vec::new();
+        ancestry(&usage, program, 1_003_000, 1_005_000, &mut lines);
+        assert_eq!(
+            lines,
+            [
+                line(0, "PID 9001 · exited before open-task saw it", 0, false, 0),
+                line(1, "2 × w.exe", 2, true, 0),
+                line(0, "w.exe · 3", 1, true, 0),
+            ]
+        );
     }
 
     #[test]
