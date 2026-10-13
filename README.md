@@ -14,8 +14,9 @@ window with eight pages: live CPU and memory graphs over a sortable process tabl
 (a flat list, a process tree, a map or a history of who has been using the CPU),
 Performance (CPU, memory, each disk, each network connection, each GPU and the
 battery), Users, Services, Startup apps, Connections, Installed apps and System.
-Everything is drawn with Direct2D over a Mica backdrop. Linux and macOS compile, run
-headless, and measure nothing yet. What is still missing is listed under
+Everything is drawn with Direct2D over a Mica backdrop. Linux measures the machine
+but has no window yet, so it runs headless (see [Linux](#linux)); macOS compiles,
+runs headless, and measures nothing yet. What is still missing is listed under
 [Not yet](#not-yet).
 
 ## Using it
@@ -494,6 +495,37 @@ thinks it was forgotten:
 - TMOG's **Benchmarks**.
 - **Start with Windows**, an installer task rather than an app feature.
 
+## Linux
+
+Linux has a full sampling backend but no window yet, so `open-task` runs headless
+there: it prints a few passes of live state and exits (`--passes N` for more), and
+`--record <file>` captures a session that the Windows app can replay with
+`--replay <file>`.
+
+Everything comes from `/proc` and `/sys`, with no daemon and no kernel module:
+
+- CPU load per logical processor, clocks, topology, caches, and P- and E-cores on
+  Intel hybrids.
+- Memory in Task Manager's terms: available, cached, committed, swap, dirty and
+  writeback pages as "modified", unreclaimable kernel slab as "non-paged pool".
+- Every process and thread: CPU, resident, private and peak memory, disk I/O, open
+  file descriptors, priority (from nice), owner, command line, and the systemd
+  service it belongs to.
+- Physical disks (active time, throughput, response time), volumes, network
+  adapters and the battery.
+- The CPU's temperature (`coretemp`, or `k10temp`'s Tctl), and its package power
+  from RAPL, which most kernels let only root read.
+- Logon sessions from systemd-logind, and open connections with their processes.
+
+As an ordinary user, the kernel hides another user's disk I/O, file descriptors
+and sockets, so those processes show none and their connections no owner; run it
+with `sudo` to see everything.
+
+Not on Linux yet: the window, GPUs, CPU sampling (`--sample`), the full list of
+services, and installed apps.
+
+The binaries need glibc 2.34 or later: Ubuntu 22.04, Debian 12, RHEL 9 and newer.
+
 ## Why not a webview
 
 A task manager's whole job is telling you what is wasting your RAM and CPU. A webview
@@ -508,7 +540,7 @@ class: tens of megabytes, not hundreds.
 | Crate | Role |
 | --- | --- |
 | `ot-model` | Pure data types. No I/O, no platform code. |
-| `ot-probe` | Platform sampling. Windows is real; Linux and macOS are stubs. |
+| `ot-probe` | Platform sampling. Windows and Linux are real; macOS is a stub. |
 | `ot-core` | Sampling thread, multi-resolution history, lock-free snapshot publication. |
 | `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
 | `ot-ui` | UI-agnostic view models: theme, the pages, navigation rail, virtualized table with a column chooser, charts. |
@@ -547,8 +579,8 @@ The installer and the binaries are not code-signed yet, so SmartScreen asks you 
 confirm the first run.
 
 The bare binaries for every platform are on the same release as `.zip` / `.tar.gz`
-with a `SHA256SUMS` file. Linux and macOS have no installer because there is nothing
-to install yet beyond the headless probe stub.
+with a `SHA256SUMS` file. Linux and macOS have no installer: Linux runs headless
+(see [Linux](#linux)) and macOS measures nothing yet.
 
 On Windows, `open-task.exe` comes with `open-task.com` beside it. The `.exe` is a
 windowed program, and shells do not wait for those, so a command-line mode typed at
@@ -616,8 +648,8 @@ page.
 instead and exits (the processor and its caches, the top processes by CPU with
 their CPU time, cycles and owning user, the busiest
 service hosts with the services they run, and the hottest threads with the service
-each works for); that is the only mode on Linux and macOS for now, where it exits
-with code 3 ("no probe on this platform yet"). `--headless --sample <pid>
+each works for); that is the only mode on Linux and macOS for now, and on macOS it
+exits with code 3 ("no probe on this platform yet"). `--headless --sample <pid>
 [--seconds N]` takes one CPU sample of a process and prints it (see "Sample CPU"
 above; needs an elevated terminal).
 

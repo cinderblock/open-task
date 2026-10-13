@@ -93,28 +93,63 @@ memory that cannot be reclaimed â€” where a driver leak shows),
 
 Later (not this pass; listed so they are not forgotten):
 
-- Full service list (systemd over D-Bus, or `systemctl list-units` output).
-- Startup entries (`~/.config/autostart`, `/etc/xdg/autostart`, user units).
+- Full service list and start/stop (systemd over D-Bus).
+- Enabling/disabling startup entries (XDG autostart is read-only for now), and
+  user systemd units as startup entries.
 - Installed apps (dpkg status, rpm, flatpak, snap).
+- Memory modules and installed memory as root: the Windows SMBIOS parser
+  (`imp/windows/smbios.rs`) could read `/sys/firmware/dmi/tables/DMI` if moved
+  out of the Windows module.
+- Session sign-out / disconnect (logind over D-Bus).
 - GPU (amdgpu `gpu_busy_percent`, i915/xe via PMU, NVIDIA via NVML).
 - CPU sampling (`perf_event_open`).
 - A Linux GUI shell.
 
 ## Findings / gotchas
 
-- (none yet)
+- **logind's session files say "This is private data. Do not parse."** The
+  supported reader is `sd-login` in libsystemd. It is `dlopen`ed at run time
+  (`libsystemd.so.0`), so the binary still starts without systemd and lists no
+  sessions there.
+- **Per-process CPU is in clock ticks (USER_HZ = 100)**, so a 1 s pass resolves
+  1%. `/proc/<pid>/task/*/schedstat` has nanoseconds but only per thread (dead
+  threads' time is lost), and reading it doubles the thread reads. top and htop
+  use ticks too. Left as ticks.
+- **Cost:** 2–6 ms a pass for ~30 processes in WSL; **~21 ms for 532 processes
+  and ~800 threads** (release build), about 2% of one core at the 1 s interval.
+  Most of it is `status` + `io` + the `fd` directory per process and a `stat`
+  per thread. Fine for now; if it needs to drop, read `io` and the `fd` count
+  every few passes, and skip unchanged single-threaded processes.
+- **WSL has no DMI, hwmon, RAPL, cpufreq or battery**, so those paths are unit
+  tested against fake sysfs directories (battery) or only exercised in CI on
+  real hardware. Hyper-V virtual disks report `rotational=1`, so WSL's disks read
+  "HDD"; that is what the kernel says.
+- Disks must be sampled before volumes in a pass, or they are numbered in the
+  order volumes find them (sdb, sdd, sda, sdc) rather than the kernel's.
+- Priority and affinity are per thread on Linux, and the syscalls take a thread
+  id, not a pidfd. The process is verified through its pidfd first, then each
+  thread in its `task` directory is set; a thread exiting meanwhile is skipped.
+- A recording made on Linux (`--record`) replays and reads (`--replay-info`) on
+  Windows: checked 2026-10-13.
+- The binary's own `cargo` in WSL writes intermediates to `~/.cargo/build`
+  (a `build-dir` in the WSL user's cargo config), not `CARGO_TARGET_DIR`; the
+  binaries still land in `CARGO_TARGET_DIR`.
 
 ## Progress log
 
-- [ ] 1. Skeleton
-- [ ] 2. CPU / memory / processes / threads / hardware
-- [ ] 3. Devices
-- [ ] 4. Control, inventory, sessions
-- [ ] 5. CI, docs, release
+- [x] 1. Skeleton — `73e6d18`
+- [x] 2. CPU / memory / processes / threads / hardware — `73e6d18`
+- [x] 3. Devices — `fcef473`
+- [x] 4. Control, inventory, sessions — `16f81ed`
+- [x] 5a. CI smoke step requires exit 0 on Linux; README, crate docs
+- [ ] 5b. Push and release (waiting on the user)
 
 ## Open questions for the user
 
-- (none yet)
+1. Push to `origin/master` and cut a release (v0.16.0) so the published Linux
+   binaries measure? Recommended: yes. The working tree also holds another
+   thread's uncommitted `ot-core`/`ot-ui` work, which a release commit must not
+   sweep in.
 
 ## Things not to do
 

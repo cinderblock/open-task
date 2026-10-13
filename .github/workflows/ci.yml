@@ -64,7 +64,8 @@ jobs:
         # --headless is mandatory here: without it the Windows build opens its window
         # and runs the message loop until the job times out. The step-level timeout is
         # the portable guard (macOS has no GNU `timeout`). Exit 3 means "no probe on
-        # this platform yet", which is expected on the stubs.
+        # this platform yet", which is expected only on macOS, still a stub; Windows
+        # and Linux must measure.
         timeout-minutes: 2
         shell: bash
         run: |
@@ -73,5 +74,6 @@ jobs:
           cargo run --target ${{ matrix.target }} -- --headless --passes 2
           code=$?
           set -e
-          if [ "$code" = "0" ] || [ "$code" = "3" ]; then exit 0; fi
+          if [ "$code" = "0" ]; then exit 0; fi
+          if [ "$code" = "3" ] && [[ "${{ matrix.target }}" == *apple* ]]; then exit 0; fi
           echo "unexpected exit code $code"; exit "$code"

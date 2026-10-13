@@ -9,7 +9,7 @@
 //! | Platform | Status |
 //! | --- | --- |
 //! | Windows | implemented against `NtQuerySystemInformation` |
-//! | Linux | stub; returns [`ProbeError::Unsupported`] |
+//! | Linux | implemented against `/proc` and `/sys` |
 //! | macOS | stub; returns [`ProbeError::Unsupported`] |
 
 use std::path::{Path, PathBuf};

@@ -1,7 +1,7 @@
 //! Placeholder backend for platforms without an implementation yet.
 //!
-//! Compiles everywhere so the workspace, CI matrix and UI can be exercised on Linux
-//! and macOS before their real probes exist. Every call reports
+//! Compiles everywhere so the workspace, CI matrix and UI can be exercised on macOS
+//! (and any other target) before its real probe exists. Every call reports
 //! [`ProbeError::Unsupported`] rather than fabricating data.
 
 use std::time::Duration;
