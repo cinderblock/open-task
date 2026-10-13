@@ -9,7 +9,7 @@ use ot_model::snapshot::Snapshot;
 use serde::Serialize;
 
 use crate::format::{self, FrameEntry, Index, Kind, RecordHeader, FORMAT_VERSION, MAGIC};
-use crate::frame::{self, Tables};
+use crate::frame::{self, AdapterInfoV3, Tables};
 use crate::Error;
 
 /// How many frames apart keyframes are unless [`Recorder::create_with_keyframes`]
@@ -97,7 +97,7 @@ impl Recorder {
 
     /// [`create_with_keyframes`](Recorder::create_with_keyframes), writing format
     /// `version`: 1 writes frames without their [`frame::Extra`], 2 without their
-    /// [`frame::GpuExtra`].
+    /// [`frame::GpuExtra`], 3 adapters without their parent ([`AdapterInfoV3`]).
     pub(crate) fn create_as(
         path: impl AsRef<Path>,
         header: &RecordHeader,
@@ -243,7 +243,18 @@ impl Recorder {
                 postcard_pending(&process_services.take_pending())?,
             ),
             (Kind::Disks, postcard_pending(&disks.take_pending())?),
-            (Kind::Adapters, postcard_pending(&adapters.take_pending())?),
+            (Kind::Adapters, {
+                let pending = adapters.take_pending();
+                if self.version >= 4 {
+                    postcard_pending(&pending)?
+                } else {
+                    let old: Vec<_> = pending
+                        .iter()
+                        .map(|(id, a)| (*id, Arc::new(AdapterInfoV3::from(&**a))))
+                        .collect();
+                    postcard_pending(&old)?
+                }
+            }),
             (Kind::Gpus, postcard_pending(&gpus.take_pending())?),
             (Kind::Services, postcard_pending(&services.take_pending())?),
         ];
@@ -282,16 +293,29 @@ impl Drop for Recorder {
 mod tests {
     use super::*;
     use crate::{Error, Recording};
+    use ot_model::device::{AdapterInfo, AdapterSample};
     use ot_model::hardware::Hardware;
     use ot_model::process::{ProcessSample, ProcessStatic};
     use ot_model::{Bytes, Capabilities, Percent, ProcessKey, Tick};
     use std::time::{Duration, SystemTime};
 
     /// Two frames of two processes whose private working sets and GPU use are
-    /// set, the second a delta of the first.
+    /// set, the second a delta of the first, and a switch port of a network card.
     fn frames() -> Vec<Snapshot> {
+        let adapter = |id, parent| AdapterSample {
+            info: Arc::new(AdapterInfo {
+                id,
+                name: format!("adapter {id}"),
+                parent,
+                ..AdapterInfo::default()
+            }),
+            rx_per_sec: Bytes(id * 1000),
+            tx_per_sec: Bytes(id),
+            link_bps: None,
+        };
         (0..2u64)
             .map(|n| Snapshot {
+                adapters: vec![adapter(1, None), adapter(2, Some(1))],
                 tick: Tick(n + 1),
                 taken_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 + n)),
                 interval: Duration::from_secs(1),
@@ -332,6 +356,13 @@ mod tests {
         rec.finish().unwrap();
     }
 
+    fn parents(s: &Snapshot) -> Vec<(String, Option<u64>)> {
+        s.adapters
+            .iter()
+            .map(|a| (a.info.name.clone(), a.info.parent))
+            .collect()
+    }
+
     #[test]
     fn private_working_sets_and_gpu_use_are_kept_and_older_files_still_read() {
         let dir = std::env::temp_dir().join("ot-record-tests");
@@ -344,6 +375,7 @@ mod tests {
         assert_eq!(rec.version(), FORMAT_VERSION);
         for (i, want) in want.iter().enumerate() {
             let got = rec.frame(i).unwrap();
+            assert_eq!(parents(&got), parents(want), "frame {i}");
             let private = |s: &Snapshot| -> Vec<Bytes> {
                 s.processes.iter().map(|p| p.private_working_set).collect()
             };
@@ -355,6 +387,25 @@ mod tests {
                     .collect()
             };
             assert_eq!(gpu(&got), gpu(want), "frame {i}");
+        }
+
+        // A version 3 file has everything but the adapters' parents.
+        write(&path, 3);
+        let rec = Recording::open(&path).unwrap();
+        assert_eq!(rec.version(), 3);
+        for (i, want) in want.iter().enumerate() {
+            let got = rec.frame(i).unwrap();
+            assert_eq!(
+                parents(&got),
+                [
+                    ("adapter 1".to_owned(), None),
+                    ("adapter 2".to_owned(), None)
+                ],
+                "frame {i}"
+            );
+            let gpu: Vec<_> = got.processes.iter().map(|p| p.gpu_dedicated).collect();
+            let gpu_want: Vec<_> = want.processes.iter().map(|p| p.gpu_dedicated).collect();
+            assert_eq!(gpu, gpu_want, "frame {i}");
         }
 
         // A version 2 file has the private working sets but no GPU use.

@@ -709,16 +709,21 @@ fn print_devices(snap: &ot_core::Snapshot) {
                 .unwrap_or_default(),
         );
     }
-    for a in &snap.adapters {
-        out!(
-            "  {:<28} rx {:>8}/s  tx {:>8}/s  {:?}{}  {}",
-            a.info.name,
-            human(a.rx_per_sec),
-            human(a.tx_per_sec),
-            a.info.kind,
-            if a.info.hardware { "" } else { " (virtual)" },
-            a.info.adapter,
-        );
+    // Each card, then the switch ports whose traffic is part of its, indented.
+    let adapters = &snap.adapters;
+    for a in adapters.iter().filter(|a| a.parent_in(adapters).is_none()) {
+        for (indent, a) in std::iter::once(("", a)).chain(a.ports_in(adapters).map(|p| ("  ", p))) {
+            out!(
+                "  {indent}{:<w$} rx {:>8}/s  tx {:>8}/s  {:?}{}  {}",
+                a.info.name,
+                human(a.rx_per_sec),
+                human(a.tx_per_sec),
+                a.info.kind,
+                if a.info.hardware { "" } else { " (virtual)" },
+                a.info.adapter,
+                w = 28 - indent.len(),
+            );
+        }
     }
 }
 

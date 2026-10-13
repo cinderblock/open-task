@@ -9,6 +9,9 @@
 //! decodes as it is (postcard writes a struct as its fields one after another, so
 //! a version 2 payload is the body's bytes and then the extra's). Version 3 adds a
 //! [`GpuExtra`] after the [`Extra`] the same way.
+//!
+//! A table's values are written whole, so a type that gains a field keeps its old
+//! layout for older files: [`AdapterInfoV3`].
 
 use ot_model::Percent;
 
@@ -19,7 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use ot_model::battery::BatterySample;
 use ot_model::cpu::CpuSample;
-use ot_model::device::{AdapterInfo, AdapterSample, DiskInfo, DiskSample, VolumeSample};
+use ot_model::device::{AdapterInfo, AdapterSample, DiskInfo, DiskSample, LinkKind, VolumeSample};
 use ot_model::gpu::{GpuInfo, GpuSample};
 use ot_model::hardware::Hardware;
 use ot_model::memory::MemorySample;
@@ -61,6 +64,51 @@ impl Tables {
     }
 }
 
+/// An adapter's facts as format versions 1 to 3 write them: before
+/// [`AdapterInfo::parent`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AdapterInfoV3 {
+    id: u64,
+    name: String,
+    adapter: String,
+    kind: LinkKind,
+    hardware: bool,
+    addresses: Vec<std::net::IpAddr>,
+    dns_suffix: Option<String>,
+    mac: Option<String>,
+}
+
+impl From<AdapterInfoV3> for AdapterInfo {
+    fn from(a: AdapterInfoV3) -> Self {
+        Self {
+            id: a.id,
+            name: a.name,
+            adapter: a.adapter,
+            kind: a.kind,
+            hardware: a.hardware,
+            addresses: a.addresses,
+            dns_suffix: a.dns_suffix,
+            mac: a.mac,
+            parent: None,
+        }
+    }
+}
+
+impl From<&AdapterInfo> for AdapterInfoV3 {
+    fn from(a: &AdapterInfo) -> Self {
+        Self {
+            id: a.id,
+            name: a.name.clone(),
+            adapter: a.adapter.clone(),
+            kind: a.kind,
+            hardware: a.hardware,
+            addresses: a.addresses.clone(),
+            dns_suffix: a.dns_suffix.clone(),
+            mac: a.mac.clone(),
+        }
+    }
+}
+
 /// The reader's tables.
 #[derive(Debug)]
 pub(crate) struct Readers {
@@ -71,10 +119,13 @@ pub(crate) struct Readers {
     pub adapters: table::Reader<AdapterInfo>,
     pub gpus: table::Reader<GpuInfo>,
     pub services: table::Reader<[ServiceEntry]>,
+    /// The file's format version, which decides how some tables decode.
+    version: u16,
 }
 
-impl Default for Readers {
-    fn default() -> Self {
+impl Readers {
+    /// Empty tables for a file of format `version`.
+    pub(crate) fn new(version: u16) -> Self {
         Self {
             statics: table::Reader::default(),
             windows: table::Reader::default(),
@@ -83,11 +134,10 @@ impl Default for Readers {
             adapters: table::Reader::default(),
             gpus: table::Reader::default(),
             services: table::Reader::with_empty(),
+            version,
         }
     }
-}
 
-impl Readers {
     /// Add one decompressed table record.
     pub(crate) fn load(&mut self, kind: Kind, raw: &[u8]) -> Result<(), Error> {
         match kind {
@@ -95,7 +145,17 @@ impl Readers {
             Kind::Windows => self.windows.insert(postcard::from_bytes(raw)?),
             Kind::ProcessServices => self.process_services.insert(postcard::from_bytes(raw)?),
             Kind::Disks => self.disks.insert(postcard::from_bytes(raw)?),
-            Kind::Adapters => self.adapters.insert(postcard::from_bytes(raw)?),
+            Kind::Adapters if self.version >= 4 => {
+                self.adapters.insert(postcard::from_bytes(raw)?);
+            }
+            Kind::Adapters => {
+                let old: Vec<(u32, AdapterInfoV3)> = postcard::from_bytes(raw)?;
+                self.adapters.insert(
+                    old.into_iter()
+                        .map(|(id, a)| (id, Arc::new(AdapterInfo::from(a))))
+                        .collect(),
+                );
+            }
             Kind::Gpus => self.gpus.insert(postcard::from_bytes(raw)?),
             Kind::Services => self.services.insert(postcard::from_bytes(raw)?),
             _ => return Err(Error::corrupt(format!("{kind:?} is not a table record"))),

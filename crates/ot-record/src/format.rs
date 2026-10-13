@@ -39,7 +39,10 @@ pub const MAGIC: &[u8; 5] = b"OTREC";
 ///   processes' private working sets ([`crate::frame`]).
 /// - 3: and after that, the processes' use of the GPUs: their share of the GPUs'
 ///   utilization and their dedicated and shared GPU memory.
-pub const FORMAT_VERSION: u16 = 3;
+/// - 4: each adapter's facts end with the adapter it is a part of
+///   ([`ot_model::device::AdapterInfo::parent`]); older adapter tables read with
+///   none.
+pub const FORMAT_VERSION: u16 = 4;
 /// The oldest format this build reads.
 pub const OLDEST_VERSION: u16 = 1;
 /// The last five bytes of a finished recording.

@@ -428,8 +428,9 @@ frames back the way the live headless mode prints passes, and
 wrote it and its format, the machine, when it started, how many frames over how long
 and what they take. A file from an older build still opens; one made before the
 processes' private working set was recorded (format 1) shows none in the History's
-memory readings, and one made before their GPU use was (formats 1 and 2) none in its
-GPU readings. `open-task --replay session.otrec` opens the window on the recording instead
+memory readings, one made before their GPU use was (formats 1 and 2) none in its
+GPU readings, and one made before network adapters knew their switch ports (formats
+1 to 3) lists every port beside its card. `open-task --replay session.otrec` opens the window on the recording instead
 of the live machine: every page works as it does live, and a transport bar along
 the bottom has step back, play/pause (**Space**), step forward, a slider over the
 frames (drag to scrub, wheel to step), the time into the recording, and a speed

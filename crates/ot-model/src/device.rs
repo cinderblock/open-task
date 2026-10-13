@@ -75,6 +75,28 @@ pub struct AdapterInfo {
     pub dns_suffix: Option<String>,
     /// The hardware address, formatted `00-11-22-33-44-55`.
     pub mac: Option<String>,
+    /// The listed adapter this one's traffic also crosses, by id: for a Hyper-V
+    /// `vEthernet` port on an external virtual switch, the network card the switch
+    /// is bound to. Its traffic is part of the parent's, not in addition to it.
+    pub parent: Option<u64>,
+}
+
+impl AdapterSample {
+    /// The adapter `self` is a part of, when that is listed in `adapters` too.
+    #[must_use]
+    pub fn parent_in<'a>(&self, adapters: &'a [AdapterSample]) -> Option<&'a AdapterSample> {
+        let id = self.info.parent?;
+        adapters.iter().find(|a| a.info.id == id)
+    }
+
+    /// The adapters in `adapters` that are parts of `self`, in their order.
+    pub fn ports_in<'a>(
+        &self,
+        adapters: &'a [AdapterSample],
+    ) -> impl Iterator<Item = &'a AdapterSample> {
+        let id = self.info.id;
+        adapters.iter().filter(move |a| a.info.parent == Some(id))
+    }
 }
 
 /// A mounted volume (a drive letter, or a mount point), for the disk panes and

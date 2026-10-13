@@ -123,6 +123,7 @@ impl World {
                 addresses: vec!["192.168.1.2".parse().unwrap(), "fe80::1".parse().unwrap()],
                 dns_suffix: None,
                 mac: Some("00-11-22-33-44-55".to_owned()),
+                parent: Some(3),
             }),
             gpu: Arc::new(GpuInfo {
                 id: 1,

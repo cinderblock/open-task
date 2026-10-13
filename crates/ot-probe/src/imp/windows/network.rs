@@ -23,7 +23,15 @@
 //! adapters look the same in every other field and have none. A physical adapter
 //! is kept even without one, because an external virtual switch takes over its IP
 //! binding while all the traffic still crosses it.
+//!
+//! Discovery also reads the interface stack (`GetIfStackTable`) to link each
+//! listed interface to the nearest listed one below it: a `vEthernet` port of an
+//! external virtual switch sits, through filter shadows and the switch's own
+//! adapter, on the network card the switch is bound to, and its traffic is part of
+//! that card's ([`AdapterInfo::parent`]). A port of an internal switch has nothing
+//! listed below it.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -32,13 +40,13 @@ use std::time::{Duration, Instant};
 
 use ot_model::device::{AdapterInfo, AdapterSample, LinkKind};
 use ot_model::Bytes;
-use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetAdaptersAddresses, GetIfEntry2, GetIfTable2Ex,
+    FreeMibTable, GetAdaptersAddresses, GetIfEntry2, GetIfStackTable, GetIfTable2Ex,
     MibIfTableNormalWithoutStatistics, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
     GAA_FLAG_SKIP_MULTICAST, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_PPP,
-    IF_TYPE_PROP_VIRTUAL, IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
-    MIB_IF_TABLE2,
+    IF_TYPE_PROP_VIRTUAL, IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADAPTER_ADDRESSES_LH,
+    MIB_IFSTACK_ROW, MIB_IFSTACK_TABLE, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::Networking::WinSock::{
@@ -68,6 +76,18 @@ struct Facts {
     dns_suffix: Option<String>,
     /// `AA-BB-CC-DD-EE-FF`, as Windows writes it.
     mac: Option<String>,
+}
+
+/// An interface discovery decided to list, before its facts are attached.
+#[derive(Debug)]
+struct Found {
+    id: u64,
+    /// The interface index, which the interface stack is written in.
+    index: u32,
+    name: String,
+    adapter: String,
+    kind: LinkKind,
+    hardware: bool,
 }
 
 #[derive(Debug, Default)]
@@ -154,7 +174,9 @@ impl NetProbe {
                 (*table).NumEntries as usize,
             )
         };
-        let previous = std::mem::take(&mut self.listed);
+        // Which interfaces to list, before their facts are shared out: the parent
+        // links need the whole set.
+        let mut found = Vec::new();
         for row in rows {
             let Some(kind) = kind_of(row) else {
                 continue;
@@ -166,8 +188,31 @@ impl NetProbe {
             if !hardware && !addressed {
                 continue;
             }
-            let name = wide(&row.Alias);
-            let adapter = wide(&row.Description);
+            found.push(Found {
+                id,
+                index: row.InterfaceIndex,
+                name: wide(&row.Alias),
+                adapter: wide(&row.Description),
+                kind,
+                hardware,
+            });
+        }
+        // SAFETY: allocated by GetIfTable2Ex, freed exactly once, not used after.
+        unsafe { FreeMibTable(table.cast()) };
+
+        let listed_at: HashMap<u32, u64> = found.iter().map(|f| (f.index, f.id)).collect();
+        let below = stack_below();
+        let previous = std::mem::take(&mut self.listed);
+        for f in found {
+            let parent = parent_of(f.index, &below, &listed_at);
+            let Found {
+                id,
+                name,
+                adapter,
+                kind,
+                hardware,
+                ..
+            } = f;
             let f = facts.remove(&id).unwrap_or_default();
             // Keep the same Arc when nothing changed, so samples keep pointing at one
             // allocation per adapter.
@@ -180,6 +225,7 @@ impl NetProbe {
                         && i.addresses == f.addresses
                         && i.dns_suffix == f.dns_suffix
                         && i.mac == f.mac
+                        && i.parent == parent
                 })
                 .cloned()
                 .unwrap_or_else(|| {
@@ -192,17 +238,16 @@ impl NetProbe {
                         addresses: f.addresses,
                         dns_suffix: f.dns_suffix,
                         mac: f.mac,
+                        parent,
                     })
                 });
             self.listed.push(info);
         }
-        // SAFETY: allocated by GetIfTable2Ex, freed exactly once, not used after.
-        unsafe { FreeMibTable(table.cast()) };
 
         self.listed.sort_by(|a, b| {
             b.hardware
                 .cmp(&a.hardware)
-                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| natural_cmp(&a.name, &b.name))
         });
         let listed = &self.listed;
         self.prev.retain(|id, _| listed.iter().any(|i| i.id == *id));
@@ -326,6 +371,93 @@ fn ip_of(sa: &SOCKET_ADDRESS) -> Option<IpAddr> {
     None
 }
 
+/// The interface stack: for each interface index, the interfaces directly below it.
+/// Empty if the system will not say.
+fn stack_below() -> HashMap<u32, Vec<u32>> {
+    let mut below: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut table: *mut MIB_IFSTACK_TABLE = std::ptr::null_mut();
+    // SAFETY: `table` is a valid out-pointer; freed with FreeMibTable below.
+    if unsafe { GetIfStackTable(&raw mut table) } != NO_ERROR || table.is_null() {
+        return below;
+    }
+    // SAFETY: the call succeeded: `NumEntries` rows follow the header.
+    let rows = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const (*table).Table).cast::<MIB_IFSTACK_ROW>(),
+            (*table).NumEntries as usize,
+        )
+    };
+    for row in rows {
+        // Index 0 stands for "nothing": the top or the bottom of a stack.
+        if row.HigherLayerInterfaceIndex != 0 && row.LowerLayerInterfaceIndex != 0 {
+            below
+                .entry(row.HigherLayerInterfaceIndex)
+                .or_default()
+                .push(row.LowerLayerInterfaceIndex);
+        }
+    }
+    // SAFETY: allocated by GetIfStackTable, freed exactly once, not used after.
+    unsafe { FreeMibTable(table.cast()) };
+    below
+}
+
+/// The nearest listed interface below `index` in the stack, by id: what a Hyper-V
+/// port's traffic crosses on its way out. The walk passes through what is not
+/// listed (filter drivers' shadows, the virtual switch's own adapter), and
+/// `listed` maps listed interfaces' indexes to their ids.
+fn parent_of(
+    index: u32,
+    below: &HashMap<u32, Vec<u32>>,
+    listed: &HashMap<u32, u64>,
+) -> Option<u64> {
+    // A stack is a handful of layers; the cap only guards against a cycle.
+    let mut todo: Vec<(u32, u8)> = below.get(&index)?.iter().map(|&i| (i, 1)).collect();
+    while let Some((at, depth)) = todo.pop() {
+        if at == index {
+            continue;
+        }
+        if let Some(&id) = listed.get(&at) {
+            return Some(id);
+        }
+        if depth < 16 {
+            if let Some(next) = below.get(&at) {
+                todo.extend(next.iter().map(|&i| (i, depth + 1)));
+            }
+        }
+    }
+    None
+}
+
+/// Names in the order people read them: runs of digits by their value, so
+/// `VLAN-3` comes before `VLAN-11`.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut a, mut b) = (a, b);
+    loop {
+        let (Some(ca), Some(cb)) = (a.chars().next(), b.chars().next()) else {
+            return a.len().cmp(&b.len());
+        };
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let ea = a.find(|c: char| !c.is_ascii_digit()).unwrap_or(a.len());
+            let eb = b.find(|c: char| !c.is_ascii_digit()).unwrap_or(b.len());
+            let (na, nb) = (
+                a[..ea].trim_start_matches('0'),
+                b[..eb].trim_start_matches('0'),
+            );
+            let order = na.len().cmp(&nb.len()).then_with(|| na.cmp(nb));
+            if order != Ordering::Equal {
+                return order;
+            }
+            (a, b) = (&a[ea..], &b[eb..]);
+        } else {
+            let order = ca.cmp(&cb);
+            if order != Ordering::Equal {
+                return order;
+            }
+            (a, b) = (&a[ca.len_utf8()..], &b[cb.len_utf8()..]);
+        }
+    }
+}
+
 /// The link kind of an interface that might be listed, or `None` to skip it.
 fn kind_of(row: &MIB_IF_ROW2) -> Option<LinkKind> {
     if row.OperStatus != IfOperStatusUp {
@@ -351,6 +483,69 @@ fn wide(units: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_port_belongs_to_the_nearest_listed_interface_below_it() {
+        // As on a Hyper-V host (higher -> lower): two ports of an external switch
+        // over filter shadows (40, 51) and the switch's own adapter (36) to the
+        // card (13); a port of an internal switch (56 -> 38 -> 29) over nothing
+        // listed; and a cycle, which must not hang.
+        let below: HashMap<u32, Vec<u32>> = [
+            (3, vec![40]),
+            (12, vec![40]),
+            (40, vec![36]),
+            (36, vec![51]),
+            (51, vec![13]),
+            (56, vec![38]),
+            (38, vec![29]),
+            (70, vec![71]),
+            (71, vec![70]),
+        ]
+        .into_iter()
+        .collect();
+        let listed: HashMap<u32, u64> = [(3, 103), (12, 112), (13, 113), (56, 156), (70, 170)]
+            .into_iter()
+            .collect();
+        assert_eq!(parent_of(3, &below, &listed), Some(113));
+        assert_eq!(parent_of(12, &below, &listed), Some(113));
+        assert_eq!(
+            parent_of(13, &below, &listed),
+            None,
+            "the card is the bottom"
+        );
+        assert_eq!(parent_of(56, &below, &listed), None, "an internal switch");
+        assert_eq!(
+            parent_of(70, &below, &listed),
+            None,
+            "a cycle back to itself"
+        );
+    }
+
+    #[test]
+    fn names_sort_by_the_numbers_in_them() {
+        let mut names = [
+            "vEthernet (VLAN-11)",
+            "vEthernet (VLAN-3)",
+            "vEthernet (VLAN-FMS)",
+            "vEthernet (VLAN-099)",
+            "vEthernet (VLAN-5)",
+            "Ethernet 2",
+            "Ethernet",
+        ];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            names,
+            [
+                "Ethernet",
+                "Ethernet 2",
+                "vEthernet (VLAN-3)",
+                "vEthernet (VLAN-5)",
+                "vEthernet (VLAN-11)",
+                "vEthernet (VLAN-099)",
+                "vEthernet (VLAN-FMS)",
+            ]
+        );
+    }
 
     #[test]
     fn this_machine_lists_an_adapter_and_measures_it() {
@@ -382,6 +577,14 @@ mod tests {
         // switch's adapter carries them).
         assert!(out.iter().any(|a| !a.info.addresses.is_empty()), "{out:?}");
         assert!(out.iter().any(|a| a.info.mac.is_some()), "{out:?}");
+        // A port's parent is listed, and is not a port itself.
+        for a in &out {
+            if let Some(p) = a.parent_in(&out) {
+                assert!(p.info.parent.is_none(), "{out:?}");
+            } else {
+                assert!(a.info.parent.is_none(), "an unlisted parent: {out:?}");
+            }
+        }
         for a in &out {
             let v4s = a
                 .info

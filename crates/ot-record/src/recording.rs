@@ -76,13 +76,13 @@ impl Recording {
         let header: RecordHeader = postcard::from_bytes(&header_raw)?;
         let body_start = PREAMBLE_LEN + RECORD_HEADER_LEN + header_raw.len() as u64;
 
-        let mut readers = Readers::default();
+        let mut readers = Readers::new(version);
         let (frames, had_index) = match read_index(&mut file, body_start, file_len)? {
             Some((index, index_at)) if load_tables(&mut file, &index, index_at, &mut readers) => {
                 (index.frames, true)
             }
             _ => {
-                readers = Readers::default();
+                readers = Readers::new(version);
                 (scan(&mut file, body_start, file_len, &mut readers)?, false)
             }
         };
