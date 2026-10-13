@@ -4,19 +4,21 @@
 //! [`crate::charts::Shapes`]) into one buffer, a record per shape into another, and
 //! the shapes cut into [`Piece`]s, strips a few pixels wide and only as tall as the
 //! shape is there, into a third; then, for each run, one instanced draw of a quad
-//! per piece into the run's texture. The pixel shader finds the shape's top and
-//! bottom (a band) or nearest segment (a graph) at its pixel by binary search over
-//! the points, which are ascending in x, narrowed to the piece's points, and
-//! computes the same coverage as
+//! per piece into the run's texture. For a band the CPU also works out its top and
+//! bottom at each column's four sample points ([`crate::charts::Columns`]), which
+//! the pixel shader reads; for a graph the shader finds the nearest segment by
+//! binary search over the points, which are ascending in x, narrowed to the
+//! piece's points. It computes the same coverage as
 //! [`ot_paint::ChartRaster`]: four sub-samples across the pixel, exact vertically,
 //! for a band; distance to the line for a graph. Blending is premultiplied
 //! source-over, as Direct2D's.
 //!
-//! The pieces are what keep the GPU's work to the pixels a shape covers. With a
-//! quad per shape, its bounding box, a full History (nine bands and their
-//! hairlines, each box most of the plot) ran the shader over the plot about
-//! eighteen times a frame: half of an integrated GPU's 3D engine at 60 frames a
-//! second, for a chart whose CPU side took under a millisecond.
+//! The pieces are what keep the GPU's work to the pixels a shape covers, and the
+//! columns what keep a band's pixel cheap. With a quad per shape, its bounding box,
+//! and each band pixel searching the points for its eight samples, a full History
+//! (nine bands and their hairlines) took 3.3-3.5 ms of an Intel UHD's time a
+//! frame, half of its 3D engine at 60 frames a second, for a chart whose CPU side
+//! took under a millisecond.
 //!
 //! The shaders are compiled from source when the renderer starts (`D3DCompile`,
 //! `d3dcompiler_47.dll`, part of Windows since 8.1), which takes a few
@@ -42,7 +44,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIEWPORT,
 };
 
-use crate::charts::{Kind, Piece, Shapes};
+use crate::charts::{Columns, Kind, Piece, Shapes};
 
 /// The shaders. `Shape` must match [`GpuShape`] field for field, and `Piece`
 /// [`GpuPiece`].
@@ -65,11 +67,15 @@ struct Piece {
     uint aHi;
     uint bLo;
     uint bHi;
-    uint3 pad;
+    uint columns;   // a band's samples: index of its first column's, or ~0
+    uint column;    // and that column
+    uint pad;
 };
 StructuredBuffer<float2> points : register(t0);
 StructuredBuffer<Shape> shapes : register(t1);
 StructuredBuffer<Piece> pieces : register(t2);
+struct Column { float4 tops; float4 bottoms; };
+StructuredBuffer<Column> columns : register(t3);  // a band's, per column
 cbuffer Run : register(b0) {
     float2 size;
     uint firstPiece;
@@ -126,7 +132,14 @@ float4 ps(VOut v) : SV_Target {
     Shape s = shapes[pc.shape];
     float2 px = v.pos.xy;
     float cov = 0.0;
-    if (s.kind == 0) {
+    if (s.kind == 0 && pc.columns != 0xFFFFFFFF) {
+        float row = floor(px.y);
+        uint c = pc.columns + (uint(px.x) - pc.column);
+        float4 t = columns[c].tops;
+        float4 b = columns[c].bottoms;
+        float4 k = max(min(max(t, b), row + 1.0) - max(min(t, b), row), 0.0);
+        cov = (((k.x + k.y) + k.z) + k.w) / 4.0;
+    } else if (s.kind == 0) {
         float x0 = max(max(points[s.aFirst].x, points[s.bFirst].x), 0.0);
         float x1 = min(points[s.aFirst + s.aCount - 1].x, points[s.bFirst + s.bCount - 1].x);
         float col = floor(px.x);
@@ -182,7 +195,9 @@ struct GpuPiece {
     a_hi: u32,
     b_lo: u32,
     b_hi: u32,
-    pad: [u32; 3],
+    columns: u32,
+    column: u32,
+    pad: u32,
 }
 
 /// The constant buffer (`Run` in [`HLSL`]).
@@ -213,11 +228,13 @@ pub struct GpuCharts {
     points: Option<Structured>,
     shapes: Option<Structured>,
     pieces: Option<Structured>,
+    columns: Option<Structured>,
     upload: Vec<GpuShape>,
     /// This frame's pieces, and where each shape's start (one more than there are
     /// shapes, the last the end).
     cut: Vec<Piece>,
     gpu_pieces: Vec<GpuPiece>,
+    samples: Columns,
     starts: Vec<u32>,
     /// Draw each shape as one quad, its bounds, as before pieces: for checking
     /// that the pieces draw the same pixels.
@@ -289,9 +306,11 @@ impl GpuCharts {
                 points: None,
                 shapes: None,
                 pieces: None,
+                columns: None,
                 upload: Vec::new(),
                 cut: Vec::new(),
                 gpu_pieces: Vec::new(),
+                samples: Columns::new(),
                 starts: Vec::new(),
                 whole_shapes: false,
             })
@@ -321,10 +340,11 @@ impl GpuCharts {
             }
         }));
         self.cut.clear();
+        self.samples.clear();
         self.starts.clear();
         for i in 0..shapes.shapes.len() {
             self.starts.push(self.cut.len() as u32);
-            shapes.pieces(i, self.whole_shapes, &mut self.cut);
+            shapes.pieces(i, self.whole_shapes, &mut self.cut, &mut self.samples);
         }
         self.starts.push(self.cut.len() as u32);
         self.gpu_pieces.clear();
@@ -335,12 +355,16 @@ impl GpuCharts {
             a_hi: p.a.1,
             b_lo: p.b.0,
             b_hi: p.b.1,
-            pad: [0; 3],
+            columns: p.columns,
+            column: p.column,
+            pad: 0,
         }));
         let points: Vec<[f32; 2]> = shapes.points.iter().map(|p| [p.x, p.y]).collect();
         fill(&self.device, &self.ctx, &mut self.points, &points)?;
         fill(&self.device, &self.ctx, &mut self.shapes, &self.upload)?;
-        fill(&self.device, &self.ctx, &mut self.pieces, &self.gpu_pieces)
+        fill(&self.device, &self.ctx, &mut self.pieces, &self.gpu_pieces)?;
+        // Each column's tops then bottoms (`Column` in the shader).
+        fill(&self.device, &self.ctx, &mut self.columns, &self.samples)
     }
 
     /// The pieces of shapes `range`, as a first piece and a count.
@@ -359,7 +383,8 @@ impl GpuCharts {
         h: u32,
         range: (u32, u32),
     ) -> Result<()> {
-        let (Some(points), Some(shapes), Some(pieces)) = (&self.points, &self.shapes, &self.pieces)
+        let (Some(points), Some(shapes), Some(pieces), Some(columns)) =
+            (&self.points, &self.shapes, &self.pieces, &self.columns)
         else {
             return Ok(());
         };
@@ -398,6 +423,7 @@ impl GpuCharts {
                 Some(points.view.clone()),
                 Some(shapes.view.clone()),
                 Some(pieces.view.clone()),
+                Some(columns.view.clone()),
             ];
             ctx.VSSetShaderResources(0, Some(&views));
             ctx.PSSetShaderResources(0, Some(&views));
@@ -425,7 +451,7 @@ impl GpuCharts {
         // SAFETY: unbinding is always valid.
         unsafe {
             self.ctx.OMSetRenderTargets(None, None);
-            let none = [None, None, None];
+            let none = [None, None, None, None];
             self.ctx.VSSetShaderResources(0, Some(&none));
             self.ctx.PSSetShaderResources(0, Some(&none));
         }

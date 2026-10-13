@@ -157,9 +157,13 @@ pub const PIECE_W: u32 = 8;
 /// A shape's bounds are mostly empty: a History band is a thin ribbon across a
 /// plot, its bounding box most of the plot. Drawn as one quad, every pixel of the
 /// box ran the coverage shader, binary searches and all, nine bands and nine
-/// hairlines deep. Cut into pieces only the ribbon's pixels run it, each once, and
-/// each search starts already narrowed to the piece's few points. The coverage is
-/// computed as before, so the pixels come out the same.
+/// hairlines deep. Cut into pieces only the ribbon's pixels run it, each once.
+///
+/// A band's pixel needs, for each of its four samples across the column, the
+/// band's top and bottom there: the same eight numbers for every pixel of the
+/// column. So a band's piece also carries them, worked out once a column on the
+/// CPU ([`Columns`]), and its pixels read them rather than each searching the
+/// points eight times. A line's piece carries where its pixels' searches can land.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Piece {
     /// `[x0, y0, x1, y1]` in the run's pixels: whole columns, cut to the shape's
@@ -169,21 +173,34 @@ pub struct Piece {
     pub shape: u32,
     /// For the band's top (the graph's line) and its bottom, the range of answers
     /// the shader's lower-bound search can give for a pixel of the piece, relative
-    /// to the line's first point: `lo..=hi`.
+    /// to the line's first point: `lo..=hi`. Only searched for a line, or a band
+    /// in one whole piece.
     pub a: (u32, u32),
     pub b: (u32, u32),
+    /// A band's samples: the index in [`Columns`] of its first column's, and that
+    /// column. [`NO_COLUMNS`] for a line, or a band in one whole piece.
+    pub columns: u32,
+    pub column: u32,
 }
 
+/// [`Piece::columns`] of a piece whose pixels search the points themselves.
+pub const NO_COLUMNS: u32 = u32::MAX;
+
+/// A band's top and bottom at the four sample points across one column of pixels
+/// (`x + 0.125`, `+ 0.375`, `+ 0.625`, `+ 0.875`): `[tops, bottoms]`. A sample
+/// outside the band's x range has its top and bottom equal, so it covers nothing.
+pub type Columns = Vec<[[f32; 4]; 2]>;
+
 /// The index of the first point whose x is at least `x`; `pts.len()` when there is
-/// none. The shader's `lowerBound`.
+/// none. The shader's `lowerBound`; what [`Walk::seek`] gives, by searching.
+#[cfg(test)]
 fn lower_bound(pts: &[Point], x: f32) -> u32 {
     pts.partition_point(|p| p.x < x) as u32
 }
 
-/// The line through `pts` at `x`, its end values beyond either end. The shader's
-/// `lineAt`.
-fn line_at(pts: &[Point], x: f32) -> f32 {
-    let i = lower_bound(pts, x) as usize;
+/// The line through `pts` at `x`, given `i`, the index of the first point whose x is at least `x`: its end
+/// values beyond either end. The shader's `lineAt`.
+fn value(pts: &[Point], i: usize, x: f32) -> f32 {
     if i == 0 {
         return pts[0].y;
     }
@@ -198,20 +215,72 @@ fn line_at(pts: &[Point], x: f32) -> f32 {
     a.y + (b.y - a.y) * ((x - a.x) / span).min(1.0)
 }
 
-/// The lowest and highest the line through `pts` is over `l..=r`: at its ends, and
-/// at every point between, where a piecewise linear line turns.
-fn extent(pts: &[Point], l: f32, r: f32) -> (f32, f32) {
-    let (a, b) = (line_at(pts, l), line_at(pts, r));
-    let (mut lo, mut hi) = (a.min(b), a.max(b));
-    let first = pts.partition_point(|p| p.x < l);
-    for p in pts[first..].iter().take_while(|p| p.x <= r) {
-        lo = lo.min(p.y);
-        hi = hi.max(p.y);
-    }
-    (lo, hi)
+/// The line through `pts` read at places that only move right, by walking the
+/// points rather than searching them: where `x` falls among them and [`value`], in
+/// one pass over a shape for all its pieces.
+struct Walk<'a> {
+    pts: &'a [Point],
+    /// The first point whose x is at least the last place asked for.
+    i: usize,
 }
 
-/// Slack, in pixels, on a piece's rows, so that rounding in [`extent`] can never
+impl<'a> Walk<'a> {
+    fn new(pts: &'a [Point]) -> Self {
+        Self { pts, i: 0 }
+    }
+
+    /// The index of the first point whose x is at least `x`, no less than any `x`
+    /// before.
+    fn seek(&mut self, x: f32) -> usize {
+        let pts = self.pts;
+        while self.i < pts.len() && pts[self.i].x < x {
+            self.i += 1;
+        }
+        self.i
+    }
+
+    /// The line at `x`, no less than any `x` before.
+    fn at(&mut self, x: f32) -> f32 {
+        let i = self.seek(x);
+        value(self.pts, i, x)
+    }
+
+    /// Over `left..=right` (`left` no less than any place before): the lowest and highest
+    /// the line is, at the ends and at every point between, where a piecewise
+    /// linear line turns; and where `left` and `right` fall, as [`Walk::seek`].
+    fn span(&mut self, left: f32, right: f32) -> (f32, f32, u32, u32) {
+        let pts = self.pts;
+        let il = self.seek(left);
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut ir = None;
+        let mut at = il;
+        while at < pts.len() && pts[at].x <= right {
+            if ir.is_none() && pts[at].x >= right {
+                ir = Some(at);
+            }
+            lo = lo.min(pts[at].y);
+            hi = hi.max(pts[at].y);
+            at += 1;
+        }
+        let ir = ir.unwrap_or(at);
+        let (at_left, at_right) = (value(pts, il, left), value(pts, ir, right));
+        (
+            lo.min(at_left).min(at_right),
+            hi.max(at_left).max(at_right),
+            il as u32,
+            ir as u32,
+        )
+    }
+}
+
+/// The line through `pts` at `x`: what [`Walk::at`] gives, by searching. Checks
+/// the walk in tests.
+#[cfg(test)]
+fn line_at(pts: &[Point], x: f32) -> f32 {
+    value(pts, lower_bound(pts, x) as usize, x)
+}
+
+/// Slack, in pixels, on a piece's rows, so that rounding in [`Walk::span`] can never
 /// leave out a row the shader would give a sliver of coverage.
 const ROW_SLACK: f32 = 0.01;
 
@@ -287,12 +356,12 @@ impl Shapes {
         &self.points[start as usize..(start + len) as usize]
     }
 
-    /// Cut shape `index` into pieces [`PIECE_W`] columns wide onto `out`, or, with
-    /// `whole`, into one piece that is its bounds, its searches over all its points
-    /// (how shapes were drawn before pieces, kept to check them against). A piece
-    /// holds every pixel of its columns that the shape gives any coverage, and no
-    /// pixel is in two pieces of a shape.
-    pub fn pieces(&self, index: usize, whole: bool, out: &mut Vec<Piece>) {
+    /// Cut shape `index` into pieces [`PIECE_W`] columns wide onto `out`, a band's
+    /// samples onto `columns`; or, with `whole`, into one piece that is its bounds,
+    /// its searches over all its points (how shapes were drawn before pieces, kept
+    /// to check them against). A piece holds every pixel of its columns that the
+    /// shape gives any coverage, and no pixel is in two pieces of a shape.
+    pub fn pieces(&self, index: usize, whole: bool, out: &mut Vec<Piece>, columns: &mut Columns) {
         let it = &self.shapes[index];
         let shape = index as u32;
         let [bx0, by0, bx1, by1] = it.bounds;
@@ -307,6 +376,8 @@ impl Shapes {
                 shape,
                 a: (0, top.len() as u32),
                 b: (0, bottom.len() as u32),
+                columns: NO_COLUMNS,
+                column: 0,
             });
             return;
         }
@@ -315,27 +386,57 @@ impl Shapes {
         let reach = if band { 0.0 } else { it.width * 0.5 + 0.5 };
         let last = bx1.ceil() as u32;
         let mut c0 = bx0.floor() as u32;
+        // Where a band has a top and a bottom both, as the shader's `x0`, `x1`.
+        let (x0, x1) = if band {
+            (
+                top[0].x.max(bottom[0].x).max(0.0),
+                top[top.len() - 1].x.min(bottom[bottom.len() - 1].x),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        // One walk along each line for the pieces' extents and searches, one for
+        // the band's samples: each only ever moves right.
+        let (mut along_a, mut along_b) = (Walk::new(top), Walk::new(bottom));
+        let mut walk = (Walk::new(top), Walk::new(bottom));
         while c0 < last {
             let c1 = (c0 + PIECE_W).min(last);
             // Every x a pixel of these columns looks at: a band's samples, inside
             // the columns; a line's segments, within reach of the centers.
             let (left, right) = (c0 as f32 - reach, c1 as f32 + reach);
-            let (mut lo, mut hi) = extent(top, left, right);
+            let (mut lo, mut hi, a_lo, a_hi) = along_a.span(left, right);
             let mut range_b = (0, 0);
             if band {
-                let (blo, bhi) = extent(bottom, left, right);
-                lo = lo.min(blo);
-                hi = hi.max(bhi);
-                range_b = (lower_bound(bottom, left), lower_bound(bottom, right));
+                let (low, high, first_b, last_b) = along_b.span(left, right);
+                lo = lo.min(low);
+                hi = hi.max(high);
+                range_b = (first_b, last_b);
             }
             let y0 = (lo - reach - ROW_SLACK).floor().max(by0);
             let y1 = (hi + reach + ROW_SLACK).ceil().min(by1);
             if y1 > y0 {
+                let first = columns.len() as u32;
+                if band {
+                    for col in c0..c1 {
+                        let (mut tops, mut bottoms) = ([0.0; 4], [0.0; 4]);
+                        for (k, (t, b)) in tops.iter_mut().zip(&mut bottoms).enumerate() {
+                            // As the shader places them: `col + (k + 0.5) / 4`.
+                            let xs = col as f32 + (k as f32 + 0.5) / 4.0;
+                            if xs >= x0 && xs <= x1 {
+                                *t = walk.0.at(xs);
+                                *b = walk.1.at(xs);
+                            }
+                        }
+                        columns.push([tops, bottoms]);
+                    }
+                }
                 out.push(Piece {
                     rect: [(c0 as f32).max(bx0), y0, (c1 as f32).min(bx1), y1],
                     shape,
-                    a: (lower_bound(top, left), lower_bound(top, right)),
+                    a: (a_lo, a_hi),
                     b: range_b,
+                    columns: if band { first } else { NO_COLUMNS },
+                    column: c0,
                 });
             }
             c0 = c1;
@@ -516,6 +617,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn pieces_hold_every_pixel_a_shape_covers_once() {
         for scale in [1.0, 1.25, 1.5, 2.0] {
             let dl = awkward();
@@ -526,12 +628,14 @@ mod tests {
             let (w, h) = (runs[0].px.w, runs[0].px.h);
             let mut raster = ChartRaster::new();
             let mut pieces = Vec::new();
+            let mut columns = Columns::new();
             for i in range.0..range.0 + range.1 {
                 let i = i as usize;
                 pieces.clear();
-                shapes.pieces(i, false, &mut pieces);
+                columns.clear();
+                shapes.pieces(i, false, &mut pieces, &mut columns);
                 let mut whole = Vec::new();
-                shapes.pieces(i, true, &mut whole);
+                shapes.pieces(i, true, &mut whole, &mut Columns::new());
                 // The shape alone, with the coverage the shader computes.
                 raster.reset(w, h);
                 shapes.rasterize((i as u32, 1), w, h, &mut raster);
@@ -565,6 +669,34 @@ mod tests {
                     assert!(q.a.0 <= q.a.1 && q.a.1 <= s.a.1, "{q:?}");
                     assert!(q.b.0 <= q.b.1 && q.b.1 <= s.b.1, "{q:?}");
                 }
+                // A band's samples are the line at each sample point, inside
+                // where it has a top and a bottom, and nothing outside.
+                if s.kind == Kind::Band {
+                    let (top, bottom) = (shapes.slice(s.a), shapes.slice(s.b));
+                    let x0 = top[0].x.max(bottom[0].x).max(0.0);
+                    let x1 = top[top.len() - 1].x.min(bottom[bottom.len() - 1].x);
+                    let mut seen = 0;
+                    for q in &pieces {
+                        assert_ne!(q.columns, NO_COLUMNS);
+                        let cols = (q.rect[2].ceil() as u32).saturating_sub(q.column);
+                        for c in 0..cols {
+                            let [tops, bottoms] = columns[(q.columns + c) as usize];
+                            for (k, (&t, &b)) in tops.iter().zip(&bottoms).enumerate() {
+                                let xs = (q.column + c) as f32 + (k as f32 + 0.5) / 4.0;
+                                if xs >= x0 && xs <= x1 {
+                                    assert_eq!(t, line_at(top, xs), "top at {xs}");
+                                    assert_eq!(b, line_at(bottom, xs), "bottom at {xs}");
+                                } else {
+                                    assert_eq!(t, b, "nothing outside at {xs}");
+                                }
+                                seen += 1;
+                            }
+                        }
+                    }
+                    assert!(seen > 0);
+                } else {
+                    assert!(pieces.iter().all(|q| q.columns == NO_COLUMNS));
+                }
             }
         }
     }
@@ -583,9 +715,10 @@ mod tests {
                 .sum()
         };
         let (mut cut, mut whole) = (Vec::new(), Vec::new());
+        let mut columns = Columns::new();
         for i in range.0..range.0 + range.1 {
-            shapes.pieces(i as usize, false, &mut cut);
-            shapes.pieces(i as usize, true, &mut whole);
+            shapes.pieces(i as usize, false, &mut cut, &mut columns);
+            shapes.pieces(i as usize, true, &mut whole, &mut columns);
         }
         let (cut, whole) = (area(&cut), area(&whole));
         assert!(cut < whole * 0.4, "pieces {cut} px, bounds {whole} px");
