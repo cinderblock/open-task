@@ -495,6 +495,48 @@ pub(crate) struct UsageChart {
     ago: String,
     text: String,
     ancestry: Ancestry,
+    /// What the chip says above the band, filled in by the view each frame.
+    head: ChipHead,
+}
+
+/// The top of the chip: the process a right-click on the band under the pointer
+/// would act on, named, and its numbers now. The view, which has the snapshot,
+/// fills it in ([`UsageChart::head_mut`]) before each paint.
+#[derive(Debug, Default)]
+pub(crate) struct ChipHead {
+    /// The chip is not drawn: a menu is up where it would be.
+    pub hidden: bool,
+    /// There is such a process: `title` and `detail` say what it is.
+    pub some: bool,
+    /// Its name and PID.
+    pub title: String,
+    /// Its numbers now: CPU, memory.
+    pub detail: String,
+}
+
+impl ChipHead {
+    /// Its width and height in the chip; nothing when there is no process.
+    fn size(&self, theme: &Theme) -> (f32, f32) {
+        if !self.some {
+            return (0.0, 0.0);
+        }
+        let w = label_w(&self.title, theme.title.size).max(label_w(&self.detail, theme.small.size));
+        (w + 2.0 * LABEL_PAD, 2.0 * TREE_LINE_H + LABEL_PAD)
+    }
+
+    /// The process's name over its numbers, in `rect` at the top of the chip, and
+    /// a rule under them, between the process and the band it is in.
+    fn paint(&self, dl: &mut DisplayList, rect: Rect, theme: &Theme) {
+        if !self.some {
+            return;
+        }
+        let inner = rect.inset(LABEL_PAD, LABEL_PAD * 0.5);
+        let (title, detail) = inner.split_top(TREE_LINE_H);
+        dl.label(&self.title, title, theme.title, theme.text);
+        dl.label(&self.detail, detail, theme.small, theme.text_dim);
+        let rule = Rect::new(rect.x + 1.0, rect.bottom().floor(), rect.w - 2.0, 1.0);
+        dl.fill_rect(rule, theme.surface_border);
+    }
 }
 
 /// The smallest of 1, 2 and 5 times a power of ten that is at least `v`.
@@ -1505,6 +1547,19 @@ impl UsageChart {
             .and_then(|b| self.slots.get(b).copied().flatten())
     }
 
+    /// The program of the band under the pointer, and the moment of the column
+    /// there ([`Self::moment_at`]), as of the last build.
+    #[must_use]
+    pub fn pointed(&self) -> Option<(ProgramId, Option<(i64, i64)>)> {
+        let p = self.pointer?;
+        Some((self.program_at(p)?, self.moment_at(p)))
+    }
+
+    /// The top of the chip, for the view to fill in.
+    pub fn head_mut(&mut self) -> &mut ChipHead {
+        &mut self.head
+    }
+
     /// Follow the pointer, `None` when it left. Returns whether to paint again.
     pub fn set_pointer(&mut self, at: Option<Point>) -> bool {
         let inside = |p: Option<Point>| p.is_some_and(|p| self.area.contains(p));
@@ -1629,9 +1684,10 @@ impl UsageChart {
         dl.pop_clip();
     }
 
-    /// Beside the pointer, the band under it: its color, name and value at the
-    /// marked moment, the readout a legend row would give, and under that the
-    /// tree of its processes then and their ancestors.
+    /// Beside the pointer, the band under it. On top, the process a right-click
+    /// would act on, with its numbers now ([`ChipHead`]); then the band's color,
+    /// name and value at the marked moment, the readout a legend row would give;
+    /// and under that the tree of its processes then and their ancestors.
     fn paint_chip(
         &mut self,
         dl: &mut DisplayList,
@@ -1644,6 +1700,9 @@ impl UsageChart {
         else {
             return;
         };
+        if self.head.hidden {
+            return;
+        }
         // Everything else, and what is in no process, are many programs or none.
         if let Some(program) = self.slots.get(band).copied().flatten() {
             let key = (program, column.after_ms, column.end_ms, usage.revision());
@@ -1684,6 +1743,7 @@ impl UsageChart {
             n => format!("\u{2026} and {n} more processes"),
         });
         let size = theme.small.size;
+        let (head_w, head_h) = self.head.size(theme);
         let tree_w = shown
             .iter()
             .map(|l| l.depth as f32 * TREE_INDENT + label_w(&l.text, size))
@@ -1691,13 +1751,15 @@ impl UsageChart {
             .fold(0.0, f32::max);
         let width = (label_w(buf, size) + SWATCH + 6.0)
             .max(tree_w + LABEL_PAD)
+            .max(head_w)
             .min(area.w);
         let rows = shown.len() + usize::from(more.is_some());
-        let height = if rows == 0 {
-            LEGEND_ROW_H
-        } else {
-            LEGEND_ROW_H + rows as f32 * TREE_LINE_H + LABEL_PAD
-        };
+        let height = head_h
+            + if rows == 0 {
+                LEGEND_ROW_H
+            } else {
+                LEGEND_ROW_H + rows as f32 * TREE_LINE_H + LABEL_PAD
+            };
         // Below right of the pointer, or wherever that keeps it in the chart.
         let mut left = pointer.x + CHIP_OFFSET;
         if left + width > area.right() {
@@ -1712,7 +1774,9 @@ impl UsageChart {
         let chip = Rect::new(left, top, width, height);
         dl.fill_round_rect(chip, theme.card_radius, theme.bg_solid.with_alpha(0.92));
         dl.stroke_round_rect(chip, theme.card_radius, theme.surface_border, 1.0);
-        let (head, body) = chip.split_top(LEGEND_ROW_H);
+        let (top, rest) = chip.split_top(head_h);
+        self.head.paint(dl, top, theme);
+        let (head, body) = rest.split_top(LEGEND_ROW_H);
         let inner = head.inset(LABEL_PAD, 0.0);
         let swatch = Rect::new(inner.x, inner.center().y - SWATCH * 0.5, SWATCH, SWATCH);
         dl.fill_round_rect(swatch, 2.0, band_color(theme, band));

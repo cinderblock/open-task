@@ -46,18 +46,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadImageW, MessageBoxW,
     PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HICON,
-    HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_CROSS, IDC_IBEAM,
-    IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_STYLE, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MSG, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WHEEL_DELTA, WM_ACTIVATEAPP,
-    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    TranslateMessage, WindowFromPoint, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
+    HCURSOR, HICON, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW,
+    IDC_CROSS, IDC_IBEAM, IDC_SIZEWE, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_DEFBUTTON2,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_STYLE,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_RESTORE,
+    SW_SHOW, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+    WHEEL_DELTA, WM_ACTIVATEAPP, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::actions::{self, WinPlatform};
@@ -494,6 +494,30 @@ fn screen_to_dips(hwnd: HWND, x: i32, y: i32, dpi: f32) -> Point {
         let _ = ScreenToClient(hwnd, &raw mut p);
     }
     to_dips_point(p.x, p.y, dpi)
+}
+
+/// Where the pointer is in the client area, in DIPs, if it is over the window and
+/// not over another one in front of it.
+fn pointer_over(hwnd: HWND, dpi: f32) -> Option<Point> {
+    let mut screen = POINT::default();
+    let mut client = RECT::default();
+    // SAFETY: hwnd is valid; the out-structs are valid.
+    unsafe {
+        GetCursorPos(&raw mut screen).ok()?;
+        GetClientRect(hwnd, &raw mut client).ok()?;
+        if WindowFromPoint(screen) != hwnd {
+            return None;
+        }
+    }
+    let p = screen_to_dips(hwnd, screen.x, screen.y, dpi);
+    let size = to_dips_size(
+        (
+            u32::try_from(client.right).unwrap_or(0),
+            u32::try_from(client.bottom).unwrap_or(0),
+        ),
+        dpi,
+    );
+    (p.x >= 0.0 && p.y >= 0.0 && p.x < size.w && p.y < size.h).then_some(p)
 }
 
 fn key_down(vk: VIRTUAL_KEY) -> bool {
@@ -1238,10 +1262,10 @@ fn answer(cell: &RefCell<State>, hwnd: HWND, ask: Ask, more: &mut Vec<Out>) {
             unsafe {
                 let _ = ClientToScreen(hwnd, &raw mut p);
             }
-            if let Some(id) = actions::show_menu(hwnd, p, &nodes) {
-                if let Ok(mut st) = cell.try_borrow_mut() {
-                    st.shell.menu_chosen(id, more);
-                }
+            let chosen = actions::show_menu(hwnd, p, &nodes);
+            let at = pointer_over(hwnd, dpi);
+            if let Ok(mut st) = cell.try_borrow_mut() {
+                st.shell.menu_closed(chosen, at, more);
             }
         }
         Ask::Confirm { question, then } => {

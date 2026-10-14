@@ -13,7 +13,7 @@
 //! ([`Ask`]), tell the user something ([`Notice`]), or perform a [`HostEffect`]
 //! such as revealing a file. Nothing here blocks on the user. An [`Ask`] carries
 //! what to do with the answer, and the host hands the answer back
-//! ([`Shell::menu_chosen`], [`Shell::confirmed`], [`Shell::record_to`]) whenever
+//! ([`Shell::menu_closed`], [`Shell::confirmed`], [`Shell::record_to`]) whenever
 //! it has one, so a modal dialog (Win32, Qt) and an asynchronous one (GTK 4) are
 //! the same to this crate. The host calls in only with the shell unborrowed by
 //! anything re-entrant, which is what lets Win32's modal loops re-enter the
@@ -199,7 +199,7 @@ pub struct Notice {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ask {
     /// A popup menu at `at` (DIPs in the window). Answer with
-    /// [`Shell::menu_chosen`].
+    /// [`Shell::menu_closed`].
     Menu { at: Point, nodes: Vec<MenuNode> },
     /// A yes/no question, No the default. On Yes, call [`Shell::confirmed`] with
     /// `then`.
@@ -538,9 +538,12 @@ impl Shell {
         }
     }
 
-    /// The user chose item `id` of the menu last asked for.
-    pub fn menu_chosen(&mut self, id: usize, out: &mut Vec<Out>) {
-        if let Some(action) = self.menu.get(id).copied() {
+    /// The menu last asked for closed: `chosen` is the item picked, if one was,
+    /// and `at` where the pointer is now, if the shell knows and it is over the
+    /// window.
+    pub fn menu_closed(&mut self, chosen: Option<usize>, at: Option<Point>, out: &mut Vec<Out>) {
+        self.handle(UiEvent::MenuClosed { at }, out);
+        if let Some(action) = chosen.and_then(|id| self.menu.get(id).copied()) {
             self.handle(UiEvent::Command(Command::Menu(action)), out);
         }
     }

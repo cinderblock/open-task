@@ -3,7 +3,7 @@
 //! [`MenuEntry::Affinity`] is filled in here, from the process's affinity as it
 //! stands when the menu opens, so every shell shows the same submenu. Each item
 //! gets an id; the shell answers with the id of the item chosen
-//! ([`crate::Shell::menu_chosen`]) and never sees a [`MenuAction`].
+//! ([`crate::Shell::menu_closed`]) and never sees a [`MenuAction`].
 
 use std::fmt::Write as _;
 

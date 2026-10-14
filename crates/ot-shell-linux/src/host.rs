@@ -325,14 +325,10 @@ unsafe extern "C" fn on_timer(ctx: *mut c_void, id: u32) {
 }
 
 unsafe extern "C" fn on_menu_chosen(ctx: *mut c_void, _token: u64, chosen: bool, id: u64) {
-    if !chosen {
-        return;
-    }
     guard(ctx, |cx| {
-        let Ok(id) = usize::try_from(id) else {
-            return;
-        };
-        cx.with_shell(|shell, outs| shell.menu_chosen(id, outs));
+        let id = usize::try_from(id).ok().filter(|_| chosen);
+        // The toolkit's motion and leave events say where the pointer went.
+        cx.with_shell(|shell, outs| shell.menu_closed(id, None, outs));
     });
 }
 

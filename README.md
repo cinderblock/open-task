@@ -212,7 +212,8 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   clearly better place opens up (and not within two seconds of its last move) it
   slides over there. Names fade only as they first appear, or when their band
   becomes too thin for them anywhere, and a band that thin goes unnamed. Point at a band and a readout beside the pointer
-  gives its name and value at that moment, and under them, as a small tree, the
+  names, on top, the process a click or right-click there acts on, with its PID,
+  CPU and memory now; then gives the band's name and value at that moment, and under them, as a small tree, the
   processes that made up the band then, each under its parent and that under its
   own, up to the root: `explorer.exe › pwsh.exe › cargo.exe › 12 × rustc.exe`.
   Processes that have exited since are still named, marked "exited"; the History
@@ -229,7 +230,8 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   off from the others; a click selects the program's busiest process still running
   (of those in the band at the moment pointed at, if any of them still runs),
   right-click gives its menu, which starts with **Show in List** and **Show in
-  Tree** to go to that process there, and the search dims the programs it does not
+  Tree** to go to that process there (the band stays set off while the menu is
+  up, as a row of the table stays lit under its menu), and the search dims the programs it does not
   match.
 
 In List, Tree and History, a thin **usage strip** between the graphs and the table

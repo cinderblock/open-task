@@ -192,7 +192,9 @@ impl ListPage {
                 self.search.focused = true;
                 ListOutcome::Repaint
             }
-            UiEvent::MouseUp { .. } | UiEvent::Command(_) => ListOutcome::Nothing,
+            UiEvent::MouseUp { .. } | UiEvent::MenuClosed { .. } | UiEvent::Command(_) => {
+                ListOutcome::Nothing
+            }
         }
     }
 

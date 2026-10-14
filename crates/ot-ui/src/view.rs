@@ -404,6 +404,12 @@ pub enum UiEvent {
     ContextMenu {
         at: Option<Point>,
     },
+    /// The menu last asked for ([`Effect::Menu`]) closed, chosen from or not; a
+    /// choice follows as [`Command::Menu`]. `at` is where the pointer is now, when
+    /// the shell knows and it is over the window.
+    MenuClosed {
+        at: Option<Point>,
+    },
     Command(Command),
 }
 
@@ -806,6 +812,77 @@ struct Paused {
     latest: Option<Arc<Snapshot>>,
 }
 
+/// The process of `program` that has used the most cycles, among those still
+/// running: of those that were running at `moment` (a stretch of the History,
+/// [`UsageChart::moment_at`]) if any still are. What a click or a right-click on
+/// the program's band acts on.
+fn busiest(usage: &Usage, program: ProgramId, moment: Option<(i64, i64)>) -> Option<ProcessKey> {
+    let then: HashSet<ProcessKey> = moment
+        .map(|(after, until)| {
+            usage
+                .seen_in(program, after, until)
+                .map(|(k, _)| k)
+                .collect()
+        })
+        .unwrap_or_default();
+    usage
+        .iter()
+        .filter(|(_, u)| u.program == program && u.alive)
+        // Those of the moment first, then by cycles.
+        .max_by(|a, b| {
+            then.contains(&a.0)
+                .cmp(&then.contains(&b.0))
+                .then(a.1.used.total_cmp(&b.1.used))
+        })
+        .map(|(key, _)| key)
+}
+
+/// Fill in the top of the History's chip: the process a right-click on the band
+/// under the pointer would act on, its name, PID and numbers now. Hidden while a
+/// menu is up, which sits where the chip would.
+fn fill_chip_head(
+    chart: &mut UsageChart,
+    usage: &Usage,
+    snap: &Snapshot,
+    menu_up: bool,
+    num: &mut String,
+) {
+    let pointed = chart.pointed();
+    let head = chart.head_mut();
+    head.hidden = menu_up;
+    head.some = false;
+    let Some(p) = pointed
+        .and_then(|(program, moment)| busiest(usage, program, moment))
+        .and_then(|key| snap.processes.iter().find(|p| p.key() == key))
+    else {
+        return;
+    };
+    head.some = true;
+    head.title.clear();
+    let _ = write!(
+        head.title,
+        "{} \u{b7} PID {}",
+        p.statics.label(),
+        p.key().pid
+    );
+    head.detail.clear();
+    format::percent(num, p.cpu.get());
+    let _ = write!(head.detail, "CPU {num}%");
+    format::bytes(num, p.private_bytes);
+    let _ = write!(head.detail, " \u{b7} Memory {num}");
+    if let Some(g) = p.gpu.filter(|g| g.get() > 0.0) {
+        format::percent(num, g.get());
+        let _ = write!(head.detail, " \u{b7} GPU {num}%");
+    }
+}
+
+/// While a menu is up: the pointer left the window under it (the menu took it,
+/// or it went elsewhere), news held back until the menu closes.
+#[derive(Debug, Clone, Copy, Default)]
+struct MenuHold {
+    left: bool,
+}
+
 /// What the area under the toolbar shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InPlace {
@@ -912,6 +989,9 @@ pub struct App {
     shown: Vec<bool>,
     /// Last known pointer position, for the cursor shape.
     mouse: Option<Point>,
+    /// A menu is up. The pointer is the menu's until it closes, so what it was
+    /// over stays lit, as if it were still there.
+    menu: Option<MenuHold>,
     buf: String,
     pid_buf: String,
     subtree: Vec<usize>,
@@ -969,6 +1049,7 @@ impl App {
             matched: Vec::new(),
             shown: Vec::new(),
             mouse: None,
+            menu: None,
             buf: String::with_capacity(64),
             pid_buf: String::with_capacity(12),
             subtree: Vec::new(),
@@ -1487,8 +1568,42 @@ impl App {
     }
 
     /// Handle input. Says whether to repaint and what else to do.
-    #[allow(clippy::too_many_lines)]
     pub fn handle(&mut self, ev: UiEvent) -> Reaction {
+        match ev {
+            // Opening a menu sends the window a leave: the menu has the pointer
+            // now. Keep what it was over lit, the row or band the menu is for.
+            UiEvent::MouseLeave if self.menu.is_some() => {
+                self.menu = Some(MenuHold { left: true });
+                return Reaction::NONE;
+            }
+            UiEvent::MenuClosed { at } => {
+                let left = self.menu.take().is_some_and(|m| m.left);
+                // Where the pointer is now, if the shell says; else the leave held
+                // back, if there was one, until the pointer comes back.
+                let follow = match at {
+                    Some(p) => self.dispatch(UiEvent::MouseMove(p)),
+                    None if left => self.dispatch(UiEvent::MouseLeave),
+                    None => Reaction::NONE,
+                };
+                // The History's chip, hidden under the menu, comes back.
+                return Reaction {
+                    repaint: true,
+                    ..follow
+                };
+            }
+            // The pointer is back with no word of the menu closing.
+            UiEvent::MouseMove(_) | UiEvent::MouseDown { .. } => self.menu = None,
+            _ => {}
+        }
+        let reaction = self.dispatch(ev);
+        if matches!(reaction.effect, Some(Effect::Menu { .. })) {
+            self.menu = Some(MenuHold::default());
+        }
+        reaction
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch(&mut self, ev: UiEvent) -> Reaction {
         self.full_due = true;
         if let Some(t) = self.transport.as_mut() {
             if let Some(r) = t.handle(ev) {
@@ -1710,7 +1825,8 @@ impl App {
                 // (via `ContextMenu`) applies to the row under the pointer.
                 Reaction::painted(self.select_at(at))
             }
-            UiEvent::MouseUp { .. } => Reaction::NONE,
+            // A menu closing is taken care of in `handle`.
+            UiEvent::MouseUp { .. } | UiEvent::MenuClosed { .. } => Reaction::NONE,
             UiEvent::Wheel { .. } if self.table_off() => Reaction::NONE,
             UiEvent::Wheel {
                 lines, horizontal, ..
@@ -1799,34 +1915,14 @@ impl App {
         }
     }
 
-    /// Select the process of `program` that has used the most cycles, among those
-    /// still running: of those that were running at `moment` (a stretch of the
-    /// History, [`UsageChart::moment_at`]) if any still are. Returns whether the
-    /// selection changed.
+    /// Select the process of `program` a click picks ([`busiest`]). Returns
+    /// whether the selection changed.
     fn select_program(&mut self, program: ProgramId, moment: Option<(i64, i64)>) -> bool {
         let usage = match &self.paused {
             Some(p) => &p.usage,
             None => &self.usage,
         };
-        let then: HashSet<ProcessKey> = moment
-            .map(|(after, until)| {
-                usage
-                    .seen_in(program, after, until)
-                    .map(|(k, _)| k)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let busiest = usage
-            .iter()
-            .filter(|(_, u)| u.program == program && u.alive)
-            // Those of the moment first, then by cycles.
-            .max_by(|a, b| {
-                then.contains(&a.0)
-                    .cmp(&then.contains(&b.0))
-                    .then(a.1.used.total_cmp(&b.1.used))
-            })
-            .map(|(key, _)| process_rows::row_id(key));
-        match busiest {
+        match busiest(usage, program, moment).map(process_rows::row_id) {
             Some(id) => self.table.selected.replace(id) != Some(id),
             None => false,
         }
@@ -2413,6 +2509,13 @@ impl App {
             Page::Processes if id == HISTORY_LAYER => {
                 self.history
                     .build(self.history.area(), &self.usage, None, axis);
+                fill_chip_head(
+                    &mut self.history,
+                    &self.usage,
+                    &self.snap,
+                    self.menu.is_some(),
+                    &mut self.pid_buf,
+                );
                 self.history.paint(
                     dl,
                     &self.usage,
@@ -2563,6 +2666,13 @@ impl App {
                 .filter(|_| self.charts.pointed())
                 .map(|c| c.age_ms);
             self.history.build(table_rect, usage, outside, axis);
+            fill_chip_head(
+                &mut self.history,
+                usage,
+                &self.snap,
+                self.menu.is_some(),
+                &mut self.pid_buf,
+            );
             let _ = self.charts.mark(self.history.hover_age());
         } else {
             let _ = self.charts.mark(None);
@@ -3285,6 +3395,47 @@ mod tests {
             button: MouseButton::Left,
         });
         assert!(!app.toolbar.search.focused);
+    }
+
+    #[test]
+    fn the_row_a_menu_is_for_stays_lit_while_it_is_up() {
+        let mut app = by_cpu();
+        app.set_snapshot(family());
+        ready(&mut app);
+        let theme = app.theme.clone();
+        let row = |pos: usize| {
+            Point::new(
+                100.0,
+                table_top(&theme) + theme.header_h + theme.row_h * (pos as f32 + 0.5),
+            )
+        };
+        let open_menu = |app: &mut App, at: Point| {
+            app.handle(UiEvent::MouseMove(at));
+            app.handle(UiEvent::MouseDown {
+                at,
+                button: MouseButton::Right,
+            });
+            let r = app.handle(UiEvent::ContextMenu { at: Some(at) });
+            assert!(matches!(r.effect, Some(Effect::Menu { .. })), "{r:?}");
+        };
+
+        // The menu takes the pointer, which the window hears as a leave.
+        open_menu(&mut app, row(1));
+        assert!(!app.handle(UiEvent::MouseLeave).repaint);
+        assert_eq!(app.table.hover, Some(1));
+        // Closed with the pointer elsewhere: the leave, held back, goes through.
+        app.handle(UiEvent::MenuClosed { at: None });
+        assert_eq!(app.table.hover, None);
+
+        // Closed over another row: that row is the one lit.
+        open_menu(&mut app, row(1));
+        app.handle(UiEvent::MouseLeave);
+        app.handle(UiEvent::MenuClosed { at: Some(row(0)) });
+        assert_eq!(app.table.hover, Some(0));
+
+        // With the menu gone, a leave is a leave.
+        assert!(app.handle(UiEvent::MouseLeave).repaint);
+        assert_eq!(app.table.hover, None);
     }
 
     #[test]
@@ -4689,8 +4840,29 @@ mod tests {
         for want in ["p4.exe · 4", "p10.exe · 10", "p11.exe · 11"] {
             assert!(strings.iter().any(|s| s == want), "{want}: {strings:?}");
         }
+        // On top, the process a right-click acts on, and its numbers now.
+        let title = "p11.exe \u{b7} PID 11";
+        assert!(strings.iter().any(|s| s == title), "{strings:?}");
+        assert!(
+            strings
+                .iter()
+                .any(|s| s.starts_with("CPU ") && s.contains(" \u{b7} Memory ")),
+            "{strings:?}"
+        );
         let age = app.history.hover_age().expect("over the plot");
         assert_eq!(app.charts.hover_age(), Some(age));
+
+        // Under the menu the band stays pointed at, and the chip steps aside for
+        // the menu until it closes.
+        let r = app.handle(UiEvent::ContextMenu { at: Some(at) });
+        assert!(matches!(r.effect, Some(Effect::Menu { .. })), "{r:?}");
+        assert!(!app.handle(UiEvent::MouseLeave).repaint);
+        let strings = painted_strings(&mut app);
+        assert!(!strings.iter().any(|s| s == title), "{strings:?}");
+        assert_eq!(app.history.program_at(at), Some(p11));
+        assert_eq!(app.charts.hover_age(), Some(age));
+        assert!(app.handle(UiEvent::MenuClosed { at: Some(at) }).repaint);
+        assert!(painted_strings(&mut app).iter().any(|s| s == title));
         app.handle(UiEvent::MouseLeave);
         painted_strings(&mut app);
         assert_eq!(app.charts.hover_age(), None);
