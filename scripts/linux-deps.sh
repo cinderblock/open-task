@@ -21,7 +21,7 @@ if [ "$(id -u)" != 0 ]; then sudo="sudo"; fi
 
 packages=(
     build-essential pkg-config git curl ca-certificates
-    libgtk-4-dev qt6-base-dev
+    libgtk-4-dev qt6-base-dev qt6-base-dev-tools
 )
 if [ "$test_deps" = 1 ]; then
     packages+=(
@@ -35,4 +35,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 $sudo apt-get update -qq
 $sudo apt-get install -y -qq --no-install-recommends "${packages[@]}" > /dev/null
-pkg-config --modversion gtk4 Qt6Widgets | paste -sd ' ' | sed 's/^/GTK and Qt: /'
+echo "GTK $(pkg-config --modversion gtk4)"
+# Ubuntu 22.04's Qt has no pkg-config files; its qmake knows the version.
+qmake="$(command -v qmake6 || echo /usr/lib/qt6/bin/qmake)"
+echo "Qt $("$qmake" -query QT_VERSION)"
