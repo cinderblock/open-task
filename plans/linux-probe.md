@@ -142,14 +142,12 @@ Later (not this pass; listed so they are not forgotten):
 - [x] 3. Devices — `fcef473`
 - [x] 4. Control, inventory, sessions — `16f81ed`
 - [x] 5a. CI smoke step requires exit 0 on Linux; README, crate docs
-- [ ] 5b. Push and release (waiting on the user)
+- [x] 5b. Released in v0.16.0 (`0a0f61c`, 2026-10-13); the published
+  x86_64 binary checked in WSL: checksum OK, headless exits 0 with real data
 
 ## Open questions for the user
 
-1. Push to `origin/master` and cut a release (v0.16.0) so the published Linux
-   binaries measure? Recommended: yes. The working tree also holds another
-   thread's uncommitted `ot-core`/`ot-ui` work, which a release commit must not
-   sweep in.
+- (none)
 
 ## Things not to do
 
