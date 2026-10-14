@@ -51,12 +51,6 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             archive: zip
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
@@ -157,6 +151,108 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-linux:
+    # Linux is built in Ubuntu 22.04: its GTK 4.6 and Qt 6.2 are the oldest the
+    # toolkit plugins support, and what they are built against runs on every
+    # newer one. Its glibc is 2.35; a step checks nothing needs more than the
+    # 2.34 the README promises (RHEL 9). Both plugins are built first and
+    # embedded in the one binary
+    # (scripts/build-linux.sh), which is then checked alone on Xvfb with each
+    # toolkit before it is packaged.
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Git and jq, for the checkout and the version checks
+        run: apt-get update -qq && apt-get install -y -qq git ca-certificates curl jq > /dev/null
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          # The build names itself with `git describe`, which needs the tags.
+          fetch-depth: 0
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Toolkit and test packages
+        run: scripts/linux-deps.sh --test
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}-22.04
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          tag="${TAG#v}"
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ot-app") | .version')"
+          echo "tag=$tag cargo=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match ot-app version $ver"; exit 1; }
+
+      - name: Build with the plugins inside
+        shell: bash
+        run: echo "OPEN_TASK=$(scripts/build-linux.sh --release --target ${{ matrix.target }})" >> "$GITHUB_ENV"
+
+      - name: Verify the binary reports the tag
+        shell: bash
+        run: |
+          got="$("$OPEN_TASK" --version)"
+          echo "$got"
+          [ "$got" = "open-task $TAG" ] || { echo "::error::the binary says '$got', not 'open-task $TAG'"; exit 1; }
+
+      - name: Verify nothing needs a glibc newer than 2.34
+        # Weak references (Rust's std probes for pidfd_spawnp and the like) are
+        # skipped: the loader accepts those missing.
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(dirname "$OPEN_TASK")"
+          for f in "$OPEN_TASK" "$dir"/embed/*.so; do
+            newest="$(objdump -T "$f" | awk '$2 != "w" && /GLIBC_[0-9]/ { match($0, /GLIBC_[0-9.]+/); print substr($0, RSTART + 6, RLENGTH - 6) }' | sort -uV | tail -1)"
+            echo "$(basename "$f"): GLIBC $newest"
+            if [ "$(printf '%s\n2.34\n' "$newest" | sort -V | tail -1)" != "2.34" ]; then
+              echo "::error::$(basename "$f") needs glibc $newest, newer than 2.34"
+              exit 1
+            fi
+          done
+
+      - name: Headless and GUI smoke test
+        timeout-minutes: 3
+        run: scripts/linux-gui-smoke.sh "$OPEN_TASK" smoke
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-gui-smoke-${{ matrix.target }}
+          path: smoke/
+          if-no-files-found: ignore
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${BIN}-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "$OPEN_TASK" "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          rm -r "$name"
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   installer:
     name: Windows installer
     needs: build
@@ -195,7 +291,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: [build, installer]
+    needs: [build, build-linux, installer]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -205,6 +301,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Keep only the release's files
+        # The Linux smoke tests' screenshots and logs are artifacts too, for
+        # looking at; they are not part of the release.
+        run: find dist -type f ! -name '*.zip' ! -name '*.tar.gz' ! -name '*.exe' -print -delete
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS && cat SHA256SUMS
