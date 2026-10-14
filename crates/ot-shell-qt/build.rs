@@ -35,13 +35,15 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=QMAKE");
 
-    let qt = from_pkg_config().or_else(from_qmake).unwrap_or_else(|e| {
-        panic!(
-            "Qt 6 Widgets not found ({e}). Install its development files \
+    let qt = from_pkg_config()
+        .or_else(|e| from_qmake(&e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "Qt 6 Widgets not found ({e}). Install its development files \
              (Debian and Ubuntu: qt6-base-dev qt6-base-dev-tools), or build \
              without this crate: cargo build --workspace --exclude ot-shell-qt"
-        )
-    });
+            )
+        });
 
     let mut build = cc::Build::new();
     build
@@ -77,7 +79,7 @@ fn from_pkg_config() -> Result<Qt, String> {
 }
 
 /// Qt through `qmake -query`: its version, headers and libraries.
-fn from_qmake(pkg_config_error: String) -> Result<Qt, String> {
+fn from_qmake(pkg_config_error: &str) -> Result<Qt, String> {
     let candidates: Vec<String> = std::env::var("QMAKE").map_or_else(
         |_| {
             [
