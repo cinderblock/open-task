@@ -117,7 +117,7 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 
 ## Plan / steps
 
-**Current step: 3 (GTK plugin) — in progress.**
+**Current step: 4 (Qt plugin).**
 
 0. Plan (this document).
 1. **Shared glue.** Extract the toolkit-neutral parts of `window.rs` (App lifetime,
@@ -209,6 +209,17 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
   (`process.rs`), so Restart on Linux re-splits them (`desktop::split`) and loses
   an argument that had a space in it. Carrying argv in `ProcessAction::Restart`
   would fix it; not done.
+- **Idle cost on Xvfb (release build): about 21% of one core.** The view
+  animates continuously (chart clock ticks, rows slide after each re-sort), so
+  frames run at 60/s, by design and as on Windows. Host paint ~30 us/frame,
+  snapshot building ~0.5 ms for ~400 commands; the rest is GSK on `llvmpipe`
+  (software, because WSL/Xvfb has no GPU). Turning SmoothCharts off did not
+  change it. Needs a measurement on real hardware before deciding whether to
+  cache or split snapshots further. A background window now gets half the
+  frames (cannot be seen on Xvfb, where the window always counts as active).
+- **Cross-clippy for Linux from Windows must `--exclude ot-shell-gtk`**: its
+  `gtk4-sys` build script needs `pkg-config` and the GTK headers, which only
+  the Linux environments (WSL, CI) have.
 - WSL Ubuntu had no GTK 4 or Qt 6 and no Docker/Podman. `sudo` asks for a
   password, but `wsl.exe -d Ubuntu -u root bash -c '...'` runs as root without
   one; that is how the toolkit packages were installed.
@@ -223,12 +234,28 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
       codec moved to the core. 21 tests on Linux (WSL) including memfd loading and
       a fake-plugin session; clippy clean on Windows, Linux and macOS targets; the
       Linux binary links no GTK/Qt/GLib (`ldd`) and falls back to headless.
-- [ ] 3. GTK MVP
+- [x] 3. GTK MVP (`b9cee6e`, `299c543`): every `DrawCmd`, input, menus, dialogs,
+      Run box. Checked on Xvfb: processes list and tree, Performance page, context
+      menu, Run dialog (Escape closes), End-task question (No default). Also on
+      WSLg Wayland (first launch, screenshot). Idle cost: see findings.
 - [ ] 4. Qt MVP
 - [ ] 5. Effects
 - [ ] 6. Desktop integration
 - [ ] 7. Packaging and CI
 - [ ] 8. Docs
+
+### Testing the Linux GUI (how it is done here)
+
+- **Xvfb + xdotool + ImageMagick** in WSL is the reliable harness (and what CI
+  will use): a private `Xvfb :77`, `GDK_BACKEND=x11`, `xdotool mousemove X Y
+  click 1`, `import -window root shot.png`. No window manager, so dialogs sit at
+  0,0 and popovers show a black shadow area; neither happens on a real desktop.
+- **WSLg is not drivable**: XTEST *keys* reach an XWayland window but pointer
+  clicks do not, and `import -window root` fails on its rootless X server. WSLg
+  windows can be captured from Windows with `PrintWindow` on class `RAIL_WINDOW`
+  (each popup is its own `RAIL_WINDOW`).
+- Driver scripts used this session lived in `%TEMP%\otdrive` (`xdrive.sh`,
+  `cpu.sh`, `grab.ps1`); they are scratch, to be turned into a CI script in step 7.
 
 ## Open questions for the user
 
