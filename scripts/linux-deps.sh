@@ -21,6 +21,8 @@ if [ "$(id -u)" != 0 ]; then sudo="sudo"; fi
 
 packages=(
     build-essential pkg-config git curl ca-certificates
+    # appimagetool (scripts/build-appimage.sh) needs `file`.
+    file
     libgtk-4-dev qt6-base-dev qt6-base-dev-tools
 )
 if [ "$test_deps" = 1 ]; then

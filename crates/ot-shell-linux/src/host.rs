@@ -93,6 +93,7 @@ pub fn run(
         let loaded = match source.load(toolkit) {
             Ok(l) => l,
             Err(e) => {
+                tracing::warn!(toolkit = toolkit.name(), error = %e, "the toolkit plugin could not be loaded");
                 failures.push(format!("{}: {e}", toolkit.name()));
                 continue;
             }
