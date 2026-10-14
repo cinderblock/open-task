@@ -117,7 +117,7 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 
 ## Plan / steps
 
-**Current step: 3 (GTK plugin) — blocked on open question 1 (toolkit packages in WSL).**
+**Current step: 3 (GTK plugin) — in progress.**
 
 0. Plan (this document).
 1. **Shared glue.** Extract the toolkit-neutral parts of `window.rs` (App lifetime,
@@ -209,7 +209,9 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
   (`process.rs`), so Restart on Linux re-splits them (`desktop::split`) and loses
   an argument that had a space in it. Carrying argv in `ProcessAction::Restart`
   would fix it; not done.
-- WSL Ubuntu has no GTK 4 or Qt 6 runtime either, and no Docker/Podman.
+- WSL Ubuntu had no GTK 4 or Qt 6 and no Docker/Podman. `sudo` asks for a
+  password, but `wsl.exe -d Ubuntu -u root bash -c '...'` runs as root without
+  one; that is how the toolkit packages were installed.
 
 ## Progress log
 
@@ -230,10 +232,9 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 
 ## Open questions for the user
 
-1. **Install the toolkit dev packages in WSL Ubuntu** (needs your sudo password):
-   `sudo apt install pkg-config libgtk-4-dev qt6-base-dev`. Steps 1–2 are done;
-   3–4 cannot build or run without these (WSL has neither toolkit, nor a
-   container runtime to build in).
+1. ~~Install the toolkit dev packages in WSL.~~ Done 2026-10-14 at the user's
+   request, as root through `wsl.exe -d Ubuntu -u root` (no password needed):
+   `pkg-config libgtk-4-dev qt6-base-dev` → GTK 4.14.5, Qt 6.4.2.
 2. Building against 22.04's GTK 4.6 / Qt 6.2 locally would need a 22.04 WSL distro or
    a container (Docker/Podman). Recommendation: develop against 24.04's packages
    locally and let CI's 22.04 build enforce the floor; no local action needed.
