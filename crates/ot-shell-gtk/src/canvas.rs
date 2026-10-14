@@ -33,6 +33,10 @@ mod imp {
         pub size: Cell<(i32, i32)>,
         /// A tick callback is asking for frames.
         pub ticking: Cell<bool>,
+        /// Alternates each tick, to skip every other one in the background.
+        pub odd_tick: Cell<bool>,
+        /// With `OT_FRAME_STATS` set: what building the snapshots cost.
+        pub stats: RefCell<crate::draw::DrawStats>,
     }
 
     #[glib::object_subclass]
@@ -70,9 +74,11 @@ mod imp {
             // SAFETY: as the ABI promises for a painted list.
             let frame = unsafe { Frame::from_abi(&list) };
             let widget = self.obj();
+            let drawing = std::time::Instant::now();
             self.painter
                 .borrow_mut()
                 .draw(snapshot, &frame, widget.upcast_ref());
+            self.stats.borrow_mut().add(drawing.elapsed(), frame.len());
             // SAFETY: the host's callback, on the UI thread.
             if unsafe { (h.animating)(h.ctx) } && !self.ticking.replace(true) {
                 widget.add_tick_callback(|w, _clock| {
@@ -80,7 +86,18 @@ mod imp {
                         // SAFETY: as above.
                         .is_some_and(|h| unsafe { (h.animating)(h.ctx) });
                     if animating {
-                        w.queue_draw();
+                        // In the background the window gets every other frame:
+                        // still smooth, at half the cost, for a window glanced
+                        // at rather than watched. The Windows shell does the same.
+                        let imp = w.imp();
+                        let odd = imp.odd_tick.replace(!imp.odd_tick.get());
+                        let active = w
+                            .root()
+                            .and_downcast::<gtk::Window>()
+                            .is_none_or(|win| win.is_active());
+                        if active || !odd {
+                            w.queue_draw();
+                        }
                         glib::ControlFlow::Continue
                     } else {
                         w.imp().ticking.set(false);

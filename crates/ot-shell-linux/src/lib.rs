@@ -18,6 +18,8 @@
 #[cfg(target_os = "linux")]
 pub mod desktop;
 #[cfg(target_os = "linux")]
+mod frame_stats;
+#[cfg(target_os = "linux")]
 mod host;
 pub mod keys;
 #[cfg(target_os = "linux")]

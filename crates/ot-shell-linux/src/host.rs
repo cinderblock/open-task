@@ -25,6 +25,7 @@ use ot_shell_core::{
 use ot_ui::{Cursor, MouseButton, TaskManager, UiEvent};
 
 use crate::desktop::{self, LinuxPlatform};
+use crate::frame_stats::FrameLog;
 use crate::keys;
 use crate::loader::{self, Embedded};
 use crate::prefs::FilePrefs;
@@ -57,6 +58,8 @@ struct State {
     confirms: HashMap<u64, Confirmed>,
     theme_pref: ThemePreference,
     dark: bool,
+    /// With `OT_FRAME_STATS` set: what the frames cost.
+    frame_log: Option<FrameLog>,
 }
 
 struct Ctx {
@@ -124,6 +127,7 @@ pub fn run(
                     next_token: 1,
                     confirms: HashMap::new(),
                     theme_pref: options.theme,
+                    frame_log: FrameLog::from_env(),
                 }),
                 armed: Cell::new(false),
             }))
@@ -290,7 +294,11 @@ unsafe extern "C" fn on_paint(ctx: *mut c_void, out: *mut AbiList) {
             return;
         };
         let st = &mut *st;
+        let painting = std::time::Instant::now();
         st.shell.app_mut().paint(&mut st.dl);
+        if let Some(log) = st.frame_log.as_mut() {
+            log.add(st.shell.app().last_paint(), painting.elapsed());
+        }
         // The list lives in the state, unchanged until the plugin calls in again.
         *out = AbiList::of(&st.dl);
     });
@@ -960,6 +968,7 @@ mod tests {
                 confirms: HashMap::new(),
                 theme_pref: ThemePreference::System,
                 dark: true,
+                frame_log: None,
             }),
             armed: Cell::new(false),
         };

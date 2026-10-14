@@ -72,6 +72,11 @@ impl Frame<'_> {
         }
     }
 
+    /// How many commands the frame has.
+    pub fn len(&self) -> usize {
+        self.cmds.len()
+    }
+
     fn points(&self, s: Span) -> &[Point] {
         let (a, n) = (s.start as usize, s.len as usize);
         self.points.get(a..a + n).unwrap_or(&[])
@@ -80,6 +85,56 @@ impl Frame<'_> {
     fn str(&self, s: Span) -> &str {
         let (a, n) = (s.start as usize, s.len as usize);
         self.strings.get(a..a + n).unwrap_or("")
+    }
+}
+
+/// `OT_FRAME_STATS`: the time spent turning lists into snapshot nodes, logged
+/// through the host every few seconds. GSK's own rendering comes after and is
+/// not counted.
+#[derive(Debug)]
+pub struct DrawStats {
+    on: bool,
+    since: std::time::Instant,
+    frames: u32,
+    cmds: usize,
+    time: std::time::Duration,
+}
+
+impl Default for DrawStats {
+    fn default() -> Self {
+        Self {
+            on: std::env::var_os("OT_FRAME_STATS").is_some(),
+            since: std::time::Instant::now(),
+            frames: 0,
+            cmds: 0,
+            time: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl DrawStats {
+    pub fn add(&mut self, time: std::time::Duration, cmds: usize) {
+        if !self.on {
+            return;
+        }
+        self.frames += 1;
+        self.cmds += cmds;
+        self.time += time;
+        let elapsed = self.since.elapsed();
+        if elapsed.as_secs() >= 5 {
+            let n = self.frames.max(1);
+            crate::plugin::log(
+                ot_shell_abi::log::INFO,
+                &format!(
+                    "snapshots: {} frames, {:.1} per second, {} commands and {} us each",
+                    self.frames,
+                    f64::from(self.frames) / elapsed.as_secs_f64(),
+                    self.cmds / n as usize,
+                    (self.time / n).as_micros()
+                ),
+            );
+            *self = Self::default();
+        }
     }
 }
 
