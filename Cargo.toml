@@ -11,6 +11,7 @@ members = [
     "crates/ot-shell-win",
     "crates/ot-shell-linux",
     "crates/ot-shell-gtk",
+    "crates/ot-shell-qt",
     "crates/ot-record",
     "crates/ot-update",
     "crates/ot-app",

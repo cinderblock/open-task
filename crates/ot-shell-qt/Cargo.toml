@@ -1,0 +1,28 @@
+[package]
+name = "ot-shell-qt"
+description = "Qt 6 plugin for open-task's Linux shell: the window, the display list drawn with QPainter, and the dialogs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+# Loaded by open-task at run time (ot-shell-linux), never linked into it.
+crate-type = ["cdylib"]
+
+[dependencies]
+ot-shell-abi.workspace = true
+
+# The C++ is compiled against Qt 6 Widgets as pkg-config finds it. Qt keeps
+# binary compatibility within a major version, so a build against the oldest
+# supported Qt (6.2) runs on every newer one.
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[lints]
+workspace = true
