@@ -511,14 +511,23 @@ thinks it was forgotten:
 
 ## Linux
 
-Linux has a full sampling backend but no window yet. The window is being built as
-two toolkit plugins, GTK 4 and Qt 6, carried inside the one binary and loaded at
-run time, so the same file still runs on a server with neither installed (see
-`plans/linux-gui-shells.md`). Until a release carries them, `open-task` says it
-found no toolkit and runs headless: it prints a few passes of live state and exits
-(`--passes N` for more, `--headless` to skip looking for a window), and
+On Linux `open-task` opens the same window as on Windows, drawn with the desktop's
+own toolkit: **Qt 6** on KDE Plasma and LXQt, **GTK 4** everywhere else
+(`--toolkit gtk` or `--toolkit qt`, or `OPEN_TASK_TOOLKIT`, to choose). Both are
+carried inside the one `open-task` file as plugins it loads at run time; the
+binary itself links neither, so it also runs on a server with no toolkit at all.
+If the chosen toolkit's libraries are missing it tries the other; with no display
+(an SSH session) or no toolkit it runs headless, printing a few passes of live
+state (`--passes N` for more; `--headless` to skip looking for a window), and
 `--record <file>` captures a session that the Windows app can replay with
-`--replay <file>`.
+`--replay <file>`. GTK 4.6 and Qt 6.2 are the oldest supported; Qt draws theme
+icons only with its SVG image plugin (`qt6-svg-plugins`, or `libqt6svg6` on
+Ubuntu 22.04), which every Plasma desktop has.
+
+Releases up to v0.16.0 predate the window and run headless only. To build one with
+it, `scripts/build-linux.sh --release` (after `scripts/linux-deps.sh` for the
+build dependencies); a plain `cargo build` also works and finds the plugins beside
+the binary.
 
 Everything comes from `/proc` and `/sys`, with no daemon and no kernel module:
 
@@ -539,8 +548,10 @@ As an ordinary user, the kernel hides another user's disk I/O, file descriptors
 and sockets, so those processes show none and their connections no owner; run it
 with `sudo` to see everything.
 
-Not on Linux yet: the window, GPUs, CPU sampling (`--sample`), the full list of
-services, and installed apps.
+Not on Linux yet: GPUs, CPU sampling (`--sample`), the full list of services,
+installed apps, program icons in the table, the notification-area icon, running as
+root from the window, the window crosshair, and self-update. The settings live in
+`$XDG_CONFIG_HOME/open-task/settings` (normally `~/.config/open-task/settings`).
 
 The binaries need glibc 2.34 or later: Ubuntu 22.04, Debian 12, RHEL 9 and newer.
 
@@ -567,6 +578,8 @@ class: tens of megabytes, not hundreds.
 | `ot-shell-core` | What every shell shares: the app with its feed, updater and worker threads, and every effect that needs no window. A shell reports input to it and carries out the menus, questions and platform actions it hands back. |
 | `ot-shell-abi` | The C ABI between the Linux host and its toolkit plugins: a header and its Rust mirror. The display list crosses it as is (`ot-paint` is `#[repr(C)]`). |
 | `ot-shell-linux` | Linux shell host: picks a toolkit, loads its plugin from inside the binary (`memfd_create`, `dlopen`), and drives it. Links no toolkit itself. |
+| `ot-shell-gtk` | GTK 4 plugin: the window drawn with GSK and Pango, and the dialogs. |
+| `ot-shell-qt` | Qt 6 plugin (C++): the window drawn with `QPainter`, and the dialogs. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
 | `ot-app` | The binary. |
 
@@ -600,8 +613,9 @@ The installer and the binaries are not code-signed yet, so SmartScreen asks you 
 confirm the first run.
 
 The bare binaries for every platform are on the same release as `.zip` / `.tar.gz`
-with a `SHA256SUMS` file. Linux and macOS have no installer: Linux runs headless
-(see [Linux](#linux)) and macOS measures nothing yet.
+with a `SHA256SUMS` file. Linux and macOS have no installer: on Linux the one
+`open-task` file is the whole program, window included (see [Linux](#linux)), and
+macOS measures nothing yet.
 
 On Windows, `open-task.exe` comes with `open-task.com` beside it. The `.exe` is a
 windowed program, and shells do not wait for those, so a command-line mode typed at

@@ -117,7 +117,9 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 
 ## Plan / steps
 
-**Current step: 4 (Qt plugin).**
+**Current step: 7 (packaging and CI) is committed but unverified: the workflows
+have not run (nothing is pushed). Then steps 5 and 6 (the remaining effects and
+desktop integration).**
 
 0. Plan (this document).
 1. **Shared glue.** Extract the toolkit-neutral parts of `window.rs` (App lifetime,
@@ -238,11 +240,20 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
       Run box. Checked on Xvfb: processes list and tree, Performance page, context
       menu, Run dialog (Escape closes), End-task question (No default). Also on
       WSLg Wayland (first launch, screenshot). Idle cost: see findings.
-- [ ] 4. Qt MVP
+- [x] 4. Qt MVP (`02bb62e`): C++ against Qt 6 Widgets, no moc. Same checks as
+      GTK on Xvfb. Icons need Qt's SVG image plugin (`qt6-svg-plugins`); an icon
+      theme (Breeze, else Adwaita) is set when no desktop set one.
 - [ ] 5. Effects
 - [ ] 6. Desktop integration
-- [ ] 7. Packaging and CI
-- [ ] 8. Docs
+- [~] 7. Packaging and CI (`b4e7650`): `scripts/build-linux.sh` (plugins, then
+      `ot-app` embedding them), `scripts/linux-gui-smoke.sh` (the binary alone:
+      no toolkit in NEEDED, headless without a display, each toolkit's window on
+      Xvfb takes a click and is not blank), `scripts/linux-deps.sh`. CI's Linux job
+      and the release's Linux builds run in `ubuntu:22.04`; the release checks the
+      glibc floor (2.34) and keeps smoke screenshots out of its assets. Verified
+      locally (release build 3.7 MB, plugins ~400 KB each, smoke OK, glibc <= 2.34);
+      **the workflows themselves have not run yet.** `.desktop` file not done.
+- [~] 8. Docs: README Linux section, install note and crate table updated.
 
 ### Testing the Linux GUI (how it is done here)
 
@@ -265,6 +276,13 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 2. Building against 22.04's GTK 4.6 / Qt 6.2 locally would need a 22.04 WSL distro or
    a container (Docker/Podman). Recommendation: develop against 24.04's packages
    locally and let CI's 22.04 build enforce the floor; no local action needed.
+
+3. **Push, so CI runs the new Linux job?** It is the first run of the container
+   jobs (`ubuntu:22.04`, x64 in CI; x64 and arm64 in releases). Nothing is pushed
+   yet; recommendation: push `master` and watch CI.
+4. **Cut a release (v0.17.0) so a downloaded binary has the window?** That is
+   what makes the GUI reach someone who downloads it. Recommendation: after CI
+   passes, through the `publishing` skill.
 
 ## Things not to do
 
