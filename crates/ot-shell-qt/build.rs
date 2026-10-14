@@ -80,10 +80,15 @@ fn from_pkg_config() -> Result<Qt, String> {
 fn from_qmake(pkg_config_error: String) -> Result<Qt, String> {
     let candidates: Vec<String> = std::env::var("QMAKE").map_or_else(
         |_| {
-            ["qmake6", "/usr/lib/qt6/bin/qmake", "/usr/lib/qt6/bin/qmake6", "qmake"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+            [
+                "qmake6",
+                "/usr/lib/qt6/bin/qmake",
+                "/usr/lib/qt6/bin/qmake6",
+                "qmake",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
         },
         |q| vec![q],
     );
