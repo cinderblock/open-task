@@ -44,6 +44,28 @@ const CHART_KNEE: PCWSTR = w!("ChartKneeSamples");
 const CHART_LEGEND: PCWSTR = w!("ChartLegend");
 const LAYOUT: PCWSTR = w!("Layout");
 
+/// The settings in the registry, for `ot_shell_core`.
+#[derive(Debug)]
+pub(crate) struct WinPrefs;
+
+impl ot_shell_core::Prefs for WinPrefs {
+    fn load(&self) -> Settings {
+        load()
+    }
+
+    fn save(&self, settings: &Settings) {
+        save(settings);
+    }
+
+    fn load_layout(&self) -> Option<ViewLayout> {
+        load_layout()
+    }
+
+    fn save_layout(&self, layout: &ViewLayout) {
+        save_layout(layout);
+    }
+}
+
 /// The settings as last saved, defaults for anything never saved.
 pub fn load() -> Settings {
     let defaults = Settings::default();

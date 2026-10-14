@@ -228,6 +228,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ot-shell-core"
+version = "0.16.0"
+dependencies = [
+ "ot-core",
+ "ot-model",
+ "ot-paint",
+ "ot-probe",
+ "ot-ui",
+ "ot-update",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "ot-shell-win"
 version = "0.16.0"
 dependencies = [
@@ -235,6 +249,7 @@ dependencies = [
  "ot-model",
  "ot-paint",
  "ot-probe",
+ "ot-shell-core",
  "ot-ui",
  "ot-update",
  "thiserror",

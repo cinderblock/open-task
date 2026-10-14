@@ -1,27 +1,16 @@
-//! What the view asks the shell to do with native means, beyond ending a process:
-//! menus with submenus and check marks, the Run dialog, relaunching elevated, the
-//! clipboard, Explorer's Properties sheet, bringing a window forward, the actions
-//! on services, sessions and startup entries, and the lists read off the UI
-//! thread.
-//!
-//! Anything that can block (stopping a service waits for it; a dump of a large
-//! process takes seconds; reading the installed programs walks a thousand registry
-//! keys) runs on a worker thread and reports back to the window with a posted
-//! message, the way CPU sampling does, so the table keeps moving meanwhile.
+//! What the shell does with native means: menus with submenus and check marks,
+//! the Save dialog, starting programs, relaunching elevated, the clipboard,
+//! Explorer's Properties sheet, and bringing a window forward. Everything that
+//! needs no window (ending processes, services, sessions, the lists read off
+//! the UI thread) is `ot_shell_core`'s.
 
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use ot_model::process::{WaitChain, WaitKind, WaitStatus};
-use ot_model::ProcessKey;
-use ot_probe::{
-    Affinity, ControlError, Inventory as _, PlatformControl, ProcessControl, ServiceControl,
-    SessionControl, StartupControl,
-};
-use ot_ui::{Inventory, MenuAction, MenuEntry, ProcessAction, Query, ServiceAction, SessionAction};
+use ot_shell_core::MenuNode;
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -35,67 +24,60 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetWindowThreadProcessId, IsIconic,
-    PostMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenuEx, WindowFromPoint, GA_ROOT,
-    MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE,
-    SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+    SetForegroundWindow, ShowWindow, TrackPopupMenuEx, WindowFromPoint, GA_ROOT, HMENU, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE, SW_SHOWNORMAL, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
 };
 
 /// `CF_UNICODETEXT`.
 const CF_UNICODETEXT: u32 = 13;
 
-/// What a worker thread hands back to the window: what was attempted, in words
-/// for a message box, and how it went.
-pub(crate) struct ActionOutcome {
-    /// `end chrome.exe`, `stop the service Spooler`.
-    pub what: String,
-    pub result: Result<Option<String>, String>,
+/// Starting programs, for `ot_shell_core`'s Restart and uninstallers.
+#[derive(Debug)]
+pub(crate) struct WinPlatform;
+
+impl ot_shell_core::Platform for WinPlatform {
+    fn launch(&self, command_line: &str, directory: Option<&str>) -> Result<(), String> {
+        launch(command_line, directory)
+    }
 }
 
-/// Build and show a popup menu from the view's entries, submenus and check marks
-/// included. Blocks until the user picks or dismisses; messages keep flowing
-/// meanwhile, so the table under it stays live. Returns the chosen action.
+/// Show a popup menu built from `nodes`, submenus and check marks included.
+/// Blocks until the user picks or dismisses; messages keep flowing meanwhile, so
+/// the table under it stays live. Returns the chosen item's id.
 pub(crate) fn show_menu(
     hwnd: HWND,
     at: windows::Win32::Foundation::POINT,
-    entries: &[MenuEntry],
-    control: PlatformControl,
-) -> Option<MenuAction> {
-    // Item ids are 1-based indices into `actions`; 0 means dismissed.
-    let mut actions: Vec<MenuAction> = Vec::new();
+    nodes: &[MenuNode],
+) -> Option<usize> {
     // SAFETY: the menu tree is destroyed before returning; AppendMenuW copies
     // labels, and a submenu handed to MF_POPUP is owned by its parent from then on.
     let chosen = unsafe {
-        let menu = build_menu(entries, &mut actions, control)?;
+        let menu = build_menu(nodes)?;
         let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN;
         let chosen = TrackPopupMenuEx(menu, flags.0, at.x, at.y, hwnd, None);
         let _ = DestroyMenu(menu);
         chosen.0
     };
-    let index = usize::try_from(chosen).ok()?.checked_sub(1)?;
-    actions.get(index).copied()
+    // Command ids are item ids plus one; 0 means dismissed.
+    usize::try_from(chosen).ok()?.checked_sub(1)
 }
 
-/// One level of the menu. `actions` collects every item's action; an item's id is
-/// its position there plus one.
+/// One level of the menu.
 ///
 /// # Safety
 /// The caller destroys the returned menu (which destroys the submenus).
-unsafe fn build_menu(
-    entries: &[MenuEntry],
-    actions: &mut Vec<MenuAction>,
-    control: PlatformControl,
-) -> Option<windows::Win32::UI::WindowsAndMessaging::HMENU> {
+unsafe fn build_menu(nodes: &[MenuNode]) -> Option<HMENU> {
     // SAFETY: plain call; the caller owns the result.
     let menu = unsafe { CreatePopupMenu() }.ok()?;
-    for e in entries {
-        let r = match e {
-            MenuEntry::Item {
-                action,
+    for node in nodes {
+        let r = match node {
+            MenuNode::Item {
+                id,
                 label,
                 enabled,
                 checked,
             } => {
-                actions.push(*action);
                 let mut flags = MF_STRING;
                 if !enabled {
                     flags |= MF_GRAYED;
@@ -104,296 +86,33 @@ unsafe fn build_menu(
                     flags |= MF_CHECKED;
                 }
                 // SAFETY: the label outlives the call, which copies it.
-                unsafe { AppendMenuW(menu, flags, actions.len(), &HSTRING::from(label.as_ref())) }
+                unsafe { AppendMenuW(menu, flags, id + 1, &HSTRING::from(label.as_str())) }
             }
-            MenuEntry::Submenu { label, entries } => {
+            MenuNode::Submenu {
+                label,
+                enabled,
+                children,
+            } => {
                 // SAFETY: as for this function; the submenu is owned by `menu`.
-                let Some(sub) = (unsafe { build_menu(entries, actions, control) }) else {
+                let Some(sub) = (unsafe { build_menu(children) }) else {
                     continue;
                 };
-                // SAFETY: a popup handle is passed in the id slot, as MF_POPUP asks.
-                unsafe { AppendMenuW(menu, MF_POPUP, sub.0 as usize, &HSTRING::from(*label)) }
-            }
-            MenuEntry::Affinity { target } => {
-                let affinity = control.affinity(*target);
-                let known = affinity.is_ok();
-                // SAFETY: as above.
-                let Some(sub) = (unsafe { affinity_menu(&affinity, actions) }) else {
-                    continue;
-                };
-                let flags = if known {
+                let flags = if *enabled {
                     MF_POPUP
                 } else {
                     MF_POPUP | MF_GRAYED
                 };
-                // SAFETY: as above.
-                unsafe { AppendMenuW(menu, flags, sub.0 as usize, w!("Set affinity")) }
+                // SAFETY: a popup handle is passed in the id slot, as MF_POPUP asks.
+                unsafe { AppendMenuW(menu, flags, sub.0 as usize, &HSTRING::from(label.as_str())) }
             }
             // SAFETY: a separator has no label.
-            MenuEntry::Separator => unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) },
+            MenuNode::Separator => unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) },
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "AppendMenuW");
         }
     }
     Some(menu)
-}
-
-/// The affinity submenu: "All processors", then one check item per logical
-/// processor the system has. Choosing one toggles that processor in the mask;
-/// the resulting mask is what the action carries.
-///
-/// # Safety
-/// As for [`build_menu`].
-unsafe fn affinity_menu(
-    affinity: &Result<Affinity, ControlError>,
-    actions: &mut Vec<MenuAction>,
-) -> Option<windows::Win32::UI::WindowsAndMessaging::HMENU> {
-    // SAFETY: plain call; owned by the caller's menu.
-    let menu = unsafe { CreatePopupMenu() }.ok()?;
-    let Ok(a) = affinity else {
-        return Some(menu);
-    };
-    let all = a.mask == a.system;
-    actions.push(MenuAction::SetAffinity(a.system));
-    let flags = if all {
-        MF_STRING | MF_CHECKED
-    } else {
-        MF_STRING
-    };
-    // SAFETY: static label.
-    let _ = unsafe { AppendMenuW(menu, flags, actions.len(), w!("All processors")) };
-    // SAFETY: no label.
-    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
-    let mut label = String::new();
-    for cpu in 0..64u32 {
-        let bit = 1u64 << cpu;
-        if a.system & bit == 0 {
-            continue;
-        }
-        let on = a.mask & bit != 0;
-        // Toggling the last processor would leave nothing to run on; the menu
-        // offers it anyway and the action refuses an empty mask.
-        let next = a.mask ^ bit;
-        actions.push(MenuAction::SetAffinity(next));
-        let flags: MENU_ITEM_FLAGS = if on {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        label.clear();
-        let _ = write!(label, "CPU {cpu}");
-        // SAFETY: the label outlives the call, which copies it.
-        let _ = unsafe { AppendMenuW(menu, flags, actions.len(), &HSTRING::from(label.as_str())) };
-    }
-    Some(menu)
-}
-
-/// Carry out a process action through the platform's control, right away. The
-/// quick ones; a dump goes through [`spawn_action`] instead.
-pub(crate) fn process_action(
-    control: PlatformControl,
-    target: ProcessKey,
-    action: &ProcessAction,
-) -> Result<(), ControlError> {
-    match action {
-        ProcessAction::SetPriority(p) => control.set_priority(target, *p),
-        ProcessAction::SetAffinity(mask) => control.set_affinity(target, *mask),
-        ProcessAction::Suspend => control.suspend(target),
-        ProcessAction::Resume => control.resume(target),
-        ProcessAction::EfficiencyMode(on) => control.set_efficiency_mode(target, *on),
-        ProcessAction::WriteDump
-        | ProcessAction::Restart { .. }
-        | ProcessAction::WaitChain { .. } => Ok(()),
-    }
-}
-
-/// What a [`ProcessAction`] is called in a message.
-pub(crate) fn describe(action: &ProcessAction, name: &str) -> String {
-    match action {
-        ProcessAction::SetPriority(p) => format!("set the priority of {name} to {}", p.label()),
-        ProcessAction::SetAffinity(_) => format!("set the affinity of {name}"),
-        ProcessAction::Suspend => format!("suspend {name}"),
-        ProcessAction::Resume => format!("resume {name}"),
-        ProcessAction::EfficiencyMode(true) => format!("put {name} in efficiency mode"),
-        ProcessAction::EfficiencyMode(false) => format!("take {name} out of efficiency mode"),
-        ProcessAction::WriteDump => format!("write a dump of {name}"),
-        ProcessAction::WaitChain { .. } => format!("analyze the wait chain of {name}"),
-        ProcessAction::Restart { .. } => format!("restart {name}"),
-    }
-}
-
-/// Run `work` on a worker thread and post its outcome to `hwnd` as `message`,
-/// with a `Box<ActionOutcome>` in `lparam`. `what` names the attempt for the
-/// message box if it fails.
-pub(crate) fn spawn_action(
-    hwnd: HWND,
-    message: u32,
-    what: String,
-    work: impl FnOnce() -> Result<Option<String>, String> + Send + 'static,
-) {
-    let hwnd_bits = hwnd.0 as isize;
-    let spawned = std::thread::Builder::new()
-        .name("ot-action".into())
-        .spawn(move || {
-            let result = work();
-            post_box(hwnd_bits, message, Box::new(ActionOutcome { what, result }));
-        });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "could not start a worker thread");
-    }
-}
-
-/// Read a list on a worker thread and post it back as `message` with a
-/// `Box<Inventory>` in `lparam`.
-pub(crate) fn spawn_query(hwnd: HWND, message: u32, query: Query) {
-    let hwnd_bits = hwnd.0 as isize;
-    let spawned = std::thread::Builder::new()
-        .name("ot-inventory".into())
-        .spawn(move || {
-            let control = PlatformControl;
-            let inventory = match query {
-                Query::Startup => Inventory::Startup(control.startup_entries()),
-                Query::InstalledApps => Inventory::InstalledApps(control.installed_apps()),
-                Query::Connections => Inventory::Connections(control.connections()),
-                Query::System => Inventory::System(Box::new(control.system_facts())),
-            };
-            post_box(hwnd_bits, message, Box::new(inventory));
-        });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "could not start the inventory thread");
-    }
-}
-
-/// Post a boxed value to a window; if the window is gone the box is reclaimed.
-fn post_box<T>(hwnd_bits: isize, message: u32, value: Box<T>) {
-    let ptr = Box::into_raw(value);
-    // SAFETY: posting to a window handle is thread-safe. If the post fails the
-    // message was not delivered and the box is still ours to free.
-    let posted = unsafe {
-        PostMessageW(
-            Some(HWND(hwnd_bits as *mut c_void)),
-            message,
-            WPARAM(0),
-            LPARAM(ptr as isize),
-        )
-    };
-    if posted.is_err() {
-        // SAFETY: not delivered, so this is the only owner.
-        drop(unsafe { Box::from_raw(ptr) });
-    }
-}
-
-/// Start, stop or restart a service, blocking; for a worker thread.
-pub(crate) fn service_action(name: &str, action: ServiceAction) -> Result<(), ControlError> {
-    let control = PlatformControl;
-    match action {
-        ServiceAction::Start => control.start_service(name),
-        ServiceAction::Stop => control.stop_service(name),
-        ServiceAction::Restart => {
-            control.stop_service(name)?;
-            control.start_service(name)
-        }
-    }
-}
-
-pub(crate) fn session_action(id: u32, action: SessionAction) -> Result<(), ControlError> {
-    let control = PlatformControl;
-    match action {
-        SessionAction::Disconnect => control.disconnect_session(id),
-        SessionAction::SignOut => control.logoff_session(id),
-    }
-}
-
-pub(crate) fn startup_action(
-    entry: &ot_model::startup::StartupEntry,
-    on: bool,
-) -> Result<(), ControlError> {
-    PlatformControl.set_startup_enabled(entry, on)
-}
-
-/// Write a dump of `target` into the temporary directory; for a worker thread.
-/// Returns the file's path for the message.
-pub(crate) fn write_dump(target: ProcessKey) -> Result<Option<String>, String> {
-    let dir = std::env::temp_dir();
-    PlatformControl
-        .write_dump(target, &dir)
-        .map(|p| Some(p.display().to_string()))
-        .map_err(|e| e.to_string())
-}
-
-/// Analyze the wait chain of `threads` of the process behind `target`, blocking;
-/// for a worker thread. The result is a report for a message box.
-pub(crate) fn wait_chain(
-    target: ProcessKey,
-    name: &str,
-    threads: &[u32],
-) -> Result<Option<String>, String> {
-    let chain = PlatformControl
-        .wait_chain(target, threads)
-        .map_err(|e| e.to_string())?;
-    Ok(Some(wait_chain_report(name, target.pid, &chain)))
-}
-
-/// The wait chain as text: a line per thread that waits on something nameable,
-/// the chain written left to right, and a verdict first.
-fn wait_chain_report(name: &str, pid: u32, chain: &WaitChain) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let threads = chain.threads.len();
-    let blocked = chain.blocked();
-    if chain.deadlocked() {
-        let _ = writeln!(out, "{name} (PID {pid}) is deadlocked.");
-    } else if blocked == 0 {
-        let _ = writeln!(
-            out,
-            "{name} (PID {pid}): none of its {threads} threads is waiting on another \
-             thread or process. They are running, or waiting on something the system \
-             cannot trace (an event, a timer, I/O)."
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "{name} (PID {pid}): {blocked} of {threads} threads wait on another thread \
-             or process."
-        );
-    }
-    for t in chain.threads.iter().filter(|t| t.nodes.len() > 1) {
-        let _ = write!(
-            out,
-            "\n{}Thread {}",
-            if t.cycle { "DEADLOCK: " } else { "" },
-            t.tid
-        );
-        for n in t.nodes.iter().skip(1) {
-            match n.kind {
-                WaitKind::Thread => {
-                    let process = n.process.as_deref().unwrap_or("another process");
-                    if n.pid == pid {
-                        let _ = write!(out, " \u{2192} thread {} ({})", n.tid, n.status.label());
-                    } else {
-                        let _ = write!(
-                            out,
-                            " \u{2192} thread {} of {process} (PID {}, {})",
-                            n.tid,
-                            n.pid,
-                            n.status.label()
-                        );
-                    }
-                }
-                kind => {
-                    let _ = write!(out, " \u{2192} {}", kind.label());
-                    if !n.name.is_empty() {
-                        let _ = write!(out, " \"{}\"", n.name);
-                    }
-                    if n.status != WaitStatus::Owned {
-                        let _ = write!(out, " ({})", n.status.label());
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 /// The Save dialog for a Flight Recorder file: the path chosen, or `None` if the
@@ -664,72 +383,6 @@ pub(crate) fn install_folder(location: Option<&str>, uninstall: Option<&str>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_wait_chain_report_reads_left_to_right_and_calls_a_cycle_a_deadlock() {
-        use ot_model::process::{ThreadWait, WaitNode};
-        let thread = |pid, tid, status, process: Option<&str>| WaitNode {
-            kind: WaitKind::Thread,
-            status,
-            pid,
-            tid,
-            process: process.map(str::to_owned),
-            wait_ms: 0,
-            name: String::new(),
-        };
-        let lock = |kind, name: &str, status| WaitNode {
-            kind,
-            status,
-            pid: 0,
-            tid: 0,
-            process: None,
-            wait_ms: 0,
-            name: name.to_owned(),
-        };
-        let chain = WaitChain {
-            threads: vec![
-                ThreadWait {
-                    tid: 10,
-                    nodes: vec![thread(7, 10, WaitStatus::Running, Some("app"))],
-                    cycle: false,
-                },
-                ThreadWait {
-                    tid: 11,
-                    nodes: vec![
-                        thread(7, 11, WaitStatus::Blocked, Some("app")),
-                        lock(WaitKind::Mutex, "Global\\Lock", WaitStatus::Owned),
-                        thread(9, 42, WaitStatus::Blocked, Some("other")),
-                        lock(WaitKind::SendMessage, "", WaitStatus::Blocked),
-                        thread(7, 11, WaitStatus::Blocked, Some("app")),
-                    ],
-                    cycle: true,
-                },
-            ],
-        };
-        let text = wait_chain_report("app.exe", 7, &chain);
-        assert!(text.starts_with("app.exe (PID 7) is deadlocked."), "{text}");
-        assert!(
-            text.contains(
-                "DEADLOCK: Thread 11 \u{2192} mutex \"Global\\Lock\" \u{2192} thread 42 of other \
-                 (PID 9, blocked) \u{2192} SendMessage (blocked) \u{2192} thread 11 (blocked)"
-            ),
-            "{text}"
-        );
-        assert!(
-            !text.contains("Thread 10"),
-            "a running thread is not listed: {text}"
-        );
-
-        let quiet = WaitChain {
-            threads: vec![ThreadWait {
-                tid: 10,
-                nodes: vec![thread(7, 10, WaitStatus::Running, None)],
-                cycle: false,
-            }],
-        };
-        let text = wait_chain_report("app.exe", 7, &quiet);
-        assert!(text.contains("none of its 1 threads is waiting"), "{text}");
-    }
 
     #[test]
     fn command_lines_split_at_the_first_token() {

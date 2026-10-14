@@ -57,60 +57,16 @@ mod window;
 use ot_core::SamplerConfig;
 use ot_probe::SystemProbe;
 
+pub use ot_shell_core::{ShellOptions, ThemePreference};
 pub use ot_ui::{Page, ViewMode};
-
-/// Which theme to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemePreference {
-    /// Follow the Windows "default app mode" setting, including live changes.
-    #[default]
-    System,
-    Dark,
-    Light,
-}
-
-impl ThemePreference {
-    /// Parse a command-line value. Unknown values fall back to `System`.
-    #[must_use]
-    pub fn parse(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "dark" => Self::Dark,
-            "light" => Self::Light,
-            _ => Self::System,
-        }
-    }
-}
-
-/// Startup options for the shell.
-#[derive(Debug, Clone, Default)]
-pub struct ShellOptions {
-    pub theme: ThemePreference,
-    /// How the process table starts out; Ctrl+T switches at runtime.
-    pub view: ViewMode,
-    /// The page shown first; the rail and Ctrl+Tab switch at runtime.
-    pub page: Page,
-    /// Whether `view` and `page` were asked for on the command line. When not,
-    /// the window opens where the last session left off.
-    pub view_given: bool,
-    pub page_given: bool,
-    /// This build's version, as `crates/ot-app/build.rs` made it: shown on the
-    /// update button, and what updates are compared with.
-    pub version: &'static str,
-    /// Play this recording instead of sampling the machine.
-    pub replay: Option<String>,
-}
 
 /// Why the shell could not run.
 #[derive(Debug, thiserror::Error)]
 pub enum ShellError {
     #[error("the Windows shell only runs on Windows")]
     Unsupported,
-    #[error("cannot replay {path}: {source}")]
-    Replay {
-        path: String,
-        #[source]
-        source: ot_core::RecordError,
-    },
+    #[error(transparent)]
+    Start(#[from] ot_shell_core::StartError),
     #[cfg(windows)]
     #[error("{context}: {source}")]
     Win {

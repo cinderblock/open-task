@@ -1,0 +1,22 @@
+[package]
+name = "ot-shell-core"
+description = "Toolkit-neutral shell logic for open-task: the app, its feed and updater, and every effect that needs no window."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ot-core.workspace = true
+ot-model.workspace = true
+ot-paint.workspace = true
+ot-probe.workspace = true
+ot-ui.workspace = true
+ot-update.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

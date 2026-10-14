@@ -560,6 +560,7 @@ class: tens of megabytes, not hundreds.
 | `ot-ui` | UI-agnostic view models: theme, the pages, navigation rail, virtualized table with a column chooser, charts. |
 | `ot-record` | Flight Recorder: writes the snapshot stream to a file (shared values once, keyframes plus deltas, lz4) and reads it back by frame. |
 | `ot-update` | Self-updater: finds signed releases, downloads, verifies and installs them. |
+| `ot-shell-core` | What every shell shares: the app with its feed, updater and worker threads, and every effect that needs no window. A shell reports input to it and carries out the menus, questions and platform actions it hands back. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
 | `ot-app` | The binary. |
 

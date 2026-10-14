@@ -6,6 +6,7 @@ members = [
     "crates/ot-core",
     "crates/ot-paint",
     "crates/ot-ui",
+    "crates/ot-shell-core",
     "crates/ot-shell-win",
     "crates/ot-record",
     "crates/ot-update",
@@ -27,6 +28,7 @@ ot-probe = { path = "crates/ot-probe", version = "0.16.0" }
 ot-core = { path = "crates/ot-core", version = "0.16.0" }
 ot-paint = { path = "crates/ot-paint", version = "0.16.0" }
 ot-ui = { path = "crates/ot-ui", version = "0.16.0" }
+ot-shell-core = { path = "crates/ot-shell-core", version = "0.16.0" }
 ot-shell-win = { path = "crates/ot-shell-win", version = "0.16.0" }
 ot-record = { path = "crates/ot-record", version = "0.16.0" }
 ot-update = { path = "crates/ot-update", version = "0.16.0" }
