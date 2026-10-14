@@ -7,6 +7,7 @@
 
 /// An icon, by meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
 pub enum Icon {
     /// Three horizontal lines: show or hide navigation labels.
     Menu,

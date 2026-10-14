@@ -117,7 +117,7 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 
 ## Plan / steps
 
-**Current step: 0 — waiting on open questions 1–2; step 1 can start meanwhile.**
+**Current step: 3 (GTK plugin) — blocked on open question 1 (toolkit packages in WSL).**
 
 0. Plan (this document).
 1. **Shared glue.** Extract the toolkit-neutral parts of `window.rs` (App lifetime,
@@ -125,8 +125,8 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
    `ot-shell-core`. Windows behaves identically; clippy/tests pass on all targets.
 2. **ABI + loader.** `ot-paint` types `#[repr(C)]`; `ot-shell-abi` (header, Rust
    mirror, layout tests); `ot-shell-linux` with toolkit selection, memfd/dlopen,
-   version handshake, headless fallback; `ot-app` runs it on Linux. A test plugin
-   (no toolkit) proves load/handshake/unload in CI.
+   version handshake, headless fallback; `ot-app` runs it on Linux. A fake
+   in-process plugin drives a whole session through the real callbacks in a test.
 3. **GTK plugin, MVP.** Window, executor for every `DrawCmd`, input → events, scale,
    wakeup. Exit criterion: the Processes, Performance and every other page run live
    under GTK on WSLg (Wayland and X11), visually matching the Windows layout.
@@ -151,17 +151,76 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 8. **Docs.** README (Linux section, Install, "Not on Linux yet"),
    `plans/open-task-architecture.md` step 10, `plans/linux-probe.md` "Not done".
 
+## Architecture as built (steps 1–2)
+
+- **`ot-shell-core::Shell`** owns `App`, the feed, the updater and worker threads.
+  A host calls `handle(UiEvent, &mut Vec<Out>)` and carries out each `Out`:
+  `Repaint`, `Title`, `Notice`, `Ask` (menu, confirm, record path, Run dialog),
+  `Do(HostEffect)`, `Settings`, `Meters` (tray), `RefreshIn`, `Close`. Answers go
+  back through `menu_chosen(id)`, `confirmed(Confirmed)`, `record_to(path)`,
+  `set_last_run`. Nothing in the core blocks, so Win32's modal loops and GTK 4's
+  async dialogs both fit. Workers wake the host through a `Waker` and the host
+  calls `drain` on its UI thread. Windows uses one `WM_APP_WAKE` for all of it.
+- **`settings_store`** in the core is the one list of setting names; the Windows
+  registry and the Linux file (`$XDG_CONFIG_HOME/open-task/settings`, `Name=value`
+  lines) both use it.
+- **`ot-shell-abi/include/ot_shell.h`** is the ABI (version 1). Entry symbol
+  `ot_shell_plugin`. Plugin owns the loop and the one window (global state, one
+  window per process). Plugin calls never block or nest a loop; answers come back
+  through `OtHost` callbacks with a token. `OtPlugin.wake` is the only
+  thread-safe call, and it may be called *before* `run` (the shell's first
+  snapshot flag fires during `Shell::start`), so a plugin must remember it and
+  deliver it once the loop runs.
+- **Layout guards:** Rust `const` asserts plus header `_Static_assert`s on the same
+  numbers (`DrawCmd` 72 bytes, `TextCmd` 68, `OtEvent` 40), and a test that
+  compiles the header against Rust's `offset_of!` values when a C compiler is
+  present (verified to fail on a wrong size).
+- **Host (`ot-shell-linux`)**: `host.rs` maps callbacks to `Shell` and `Out`s to
+  plugin calls with the state unborrowed; `loader.rs` does memfd+dlopen and the
+  ABI check; `select.rs` the toolkit order; `keys.rs` the Windows key bindings;
+  `desktop.rs` `xdg-open`, `FileManager1` over `dbus-send`, launching, and the
+  portal's colour scheme; `prefs.rs` the settings file.
+- **`ot-app`**: on Linux, GUI when `WAYLAND_DISPLAY` or `DISPLAY` is set and
+  `--headless` is not; `--toolkit gtk|qt` / `OPEN_TASK_TOOLKIT`. If no plugin opens
+  a window it prints each toolkit's reason and runs headless with a fresh probe.
+  `build.rs` embeds the `.so` files named by `OT_SHELL_GTK_SO` / `OT_SHELL_QT_SO`
+  into `$OUT_DIR/embedded_shells.rs`; with neither set the binary looks beside
+  itself for `libot_shell_gtk.so` / `libot_shell_qt.so`.
+
 ## Findings / gotchas
 
 - `ot-paint` is `#![forbid(unsafe_code)]`; `#[repr(C)]` needs no unsafe, so that holds.
 - Wayland: no client-side window positioning, no global window picking, no
   activating another app's window. These features must degrade, not fail.
+- **`ot-shell-win`'s `the_clipboard_takes_text` fails with "Access is denied" on
+  this machine, on unmodified HEAD too** (checked in a temp worktree at `bfb9e68`).
+  Environmental (something holds the clipboard), not from this work.
+- **Screen captures of the app come out black** from `CopyFromScreen` when the
+  window is not on the visible desktop; `PrintWindow(hwnd, hdc, 2)` on the window
+  itself works, including on a popup menu (class `#32768`). `scripts/screenshot.ps1`
+  only sends left clicks; a right-click/menu check needed a one-off driver
+  (WM_RBUTTONDOWN + WM_CONTEXTMENU, then find `#32768` owned by the pid).
+- **Python on this box writes CRLF in text mode** (it is Windows Python), and a
+  backslash-n escape typed into a Bash-tool heredoc arrives as a real line break,
+  even inside a quoted heredoc. Edit with `newline=''`, run scripts with
+  `python -X utf8` (the plan has non-ASCII dashes), and use the Edit tool for any
+  line that needs an escape sequence.
+- **Linux command lines in the probe are argv joined by spaces, unquoted**
+  (`process.rs`), so Restart on Linux re-splits them (`desktop::split`) and loses
+  an argument that had a space in it. Carrying argv in `ProcessAction::Restart`
+  would fix it; not done.
+- WSL Ubuntu has no GTK 4 or Qt 6 runtime either, and no Docker/Podman.
 
 ## Progress log
 
 - [x] Plan written (2026-10-13).
-- [ ] 1. Shared glue extracted
-- [ ] 2. ABI + loader
+- [x] 1. Shared glue extracted: `ot-shell-core` (`399f06b`). Windows verified in
+      the real app: live data, Startup apps and Connections lists (worker → waker
+      → drain), context menu with greyed items and submenus, clean close.
+- [x] 2. ABI + loader: `ot-shell-abi`, `ot-shell-linux`, `ot-app` wiring; settings
+      codec moved to the core. 21 tests on Linux (WSL) including memfd loading and
+      a fake-plugin session; clippy clean on Windows, Linux and macOS targets; the
+      Linux binary links no GTK/Qt/GLib (`ldd`) and falls back to headless.
 - [ ] 3. GTK MVP
 - [ ] 4. Qt MVP
 - [ ] 5. Effects
@@ -172,8 +231,9 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 ## Open questions for the user
 
 1. **Install the toolkit dev packages in WSL Ubuntu** (needs your sudo password):
-   `sudo apt install pkg-config libgtk-4-dev qt6-base-dev`. Until then, steps 1–2
-   proceed; 3–4 need these.
+   `sudo apt install pkg-config libgtk-4-dev qt6-base-dev`. Steps 1–2 are done;
+   3–4 cannot build or run without these (WSL has neither toolkit, nor a
+   container runtime to build in).
 2. Building against 22.04's GTK 4.6 / Qt 6.2 locally would need a 22.04 WSL distro or
    a container (Docker/Podman). Recommendation: develop against 24.04's packages
    locally and let CI's 22.04 build enforce the floor; no local action needed.

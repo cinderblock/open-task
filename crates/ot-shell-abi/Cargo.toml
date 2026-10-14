@@ -1,0 +1,16 @@
+[package]
+name = "ot-shell-abi"
+description = "The C ABI between open-task and its toolkit plugins on Linux (GTK 4, Qt 6): a header and its Rust mirror."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+include = ["src/**", "include/**", "Cargo.toml"]
+
+[dependencies]
+ot-paint.workspace = true
+
+[lints]
+workspace = true

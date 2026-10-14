@@ -5,6 +5,7 @@
 //! in sRGB and rendered as-is, which is what every native toolkit does.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
 pub struct Color {
     pub r: f32,
     pub g: f32,

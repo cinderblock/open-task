@@ -1,8 +1,11 @@
 //! open-task entry point.
 //!
-//! On Windows this opens the native window. `--headless` (the only mode on other
-//! platforms until their shells exist) runs the measuring core and prints live
-//! snapshots to the terminal instead. The headless path is permanent: it is the
+//! On Windows this opens the native window. On Linux it opens one too when there
+//! is a display, through a GTK 4 or Qt 6 plugin carried inside the binary
+//! (`ot-shell-linux`; `--toolkit gtk|qt` picks one), and runs headless when there
+//! is no display or no toolkit. `--headless` (the only mode on macOS until its
+//! shell exists) runs the measuring core and prints live snapshots to the terminal
+//! instead. The headless path is permanent: it is the
 //! CI smoke test for the probe on every platform and the seed of a future CLI.
 //!
 //! `--replace-task-manager` and `--restore-task-manager` make Windows start this
@@ -37,6 +40,13 @@ use ot_probe::{CpuSampler, PlatformProbe, PlatformSampler, SystemProbe};
 /// (`0.2.1-19-g892159c`, `-dirty` with uncommitted changes). Set by `build.rs`.
 const VERSION: &str = env!("OT_VERSION");
 
+/// The toolkit plugins `build.rs` embedded, from `OT_SHELL_GTK_SO` and
+/// `OT_SHELL_QT_SO`; empty in a development build, which finds them beside itself.
+#[cfg(target_os = "linux")]
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/embedded_shells.rs"));
+}
+
 /// `println!` for the command-line modes, which must not panic when stdout goes
 /// away: a pipe whose reader stopped early (`| Select-Object -First 3`), or a shell
 /// that did not wait. See [`stdout_line`].
@@ -66,7 +76,7 @@ fn main() {
     let record = arg_value(&args, "--record");
     let replay = arg_value(&args, "--replay");
     let replay_info = arg_value(&args, "--replay-info");
-    let headless = args.iter().any(|a| a == "--headless") || !cfg!(windows);
+    let headless = args.iter().any(|a| a == "--headless") || !gui_available();
     // Everything but the window is a command-line mode, and prints.
     let window = !(version
         || check_update
@@ -419,6 +429,23 @@ fn stdout_line(args: std::fmt::Arguments) {
     }
 }
 
+/// Whether this platform and session can show the window: always on Windows; on
+/// Linux when there is a display to open it on.
+fn gui_available() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ot_shell_linux::display_available()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
 /// Value following `flag`, if present.
 fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter()
@@ -463,7 +490,50 @@ fn fail(message: &str, code: i32, gui: bool) -> ! {
     std::process::exit(code)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn run_gui(
+    probe: Box<dyn SystemProbe>,
+    config: SamplerConfig,
+    theme: &str,
+    view: Option<&str>,
+    page: Option<&str>,
+    replay: Option<&str>,
+) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let asked = arg_value(&args, "--toolkit")
+        .and_then(ot_shell_linux::Toolkit::parse)
+        .or_else(ot_shell_linux::toolkit_from_env);
+    let options = ot_shell_linux::ShellOptions {
+        theme: ot_shell_linux::ThemePreference::parse(theme),
+        view: ot_shell_linux::ViewMode::parse(view.unwrap_or("list")),
+        page: page
+            .and_then(ot_shell_linux::Page::parse)
+            .unwrap_or_default(),
+        view_given: view.is_some(),
+        page_given: page.is_some(),
+        version: VERSION,
+        replay: replay.map(str::to_owned),
+    };
+    match ot_shell_linux::run(embedded::EMBEDDED, asked, probe, config, &options) {
+        Ok(()) => {}
+        // No window after all: say why and do what this build did before it had
+        // one, so a terminal still gets something.
+        Err(ot_shell_linux::RunError::NoToolkit(reasons)) => {
+            eprintln!("open-task could not open a window:");
+            for r in &reasons {
+                eprintln!("  {r}");
+            }
+            eprintln!("Running headless instead; pass --headless to skip trying.");
+            match PlatformProbe::new() {
+                Ok(p) => run_headless(Box::new(p), config, 3, None),
+                Err(e) => fail(&format!("failed to initialize probe: {e}"), 2, false),
+            }
+        }
+        Err(e) => fail(&format!("shell failed: {e}"), 1, false),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn run_gui(
     probe: Box<dyn SystemProbe>,
     config: SamplerConfig,

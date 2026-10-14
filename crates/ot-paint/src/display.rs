@@ -7,6 +7,7 @@ use crate::text::{HAlign, TextStyle, VAlign};
 
 /// A range into one of the list's arenas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
 pub struct Span {
     pub start: u32,
     pub len: u32,
@@ -21,6 +22,7 @@ impl Span {
 
 /// A run of text laid out inside a rectangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
 pub struct TextCmd {
     /// Indexes [`DisplayList::str`].
     pub text: Span,
@@ -42,6 +44,7 @@ pub struct TextCmd {
 
 /// One drawing primitive.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C, u32)]
 pub enum DrawCmd {
     /// Fill the whole surface. Backends composited over a system backdrop use a
     /// transparent color here to let the backdrop show through.
@@ -285,6 +288,19 @@ impl DisplayList {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.cmds.is_empty()
+    }
+
+    /// Every point the commands index, for a backend that hands the list on
+    /// whole (across the plugin boundary on Linux).
+    #[must_use]
+    pub fn point_arena(&self) -> &[Point] {
+        &self.points
+    }
+
+    /// Every string the commands index, likewise.
+    #[must_use]
+    pub fn string_arena(&self) -> &str {
+        &self.strings
     }
 
     /// Resolve a point span.

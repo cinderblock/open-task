@@ -37,6 +37,10 @@ fn main() {
     println!("cargo:rustc-env=OT_VERSION={}", build.version);
     watch(&manifest_dir);
 
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        embed_shells();
+    }
+
     let windows_msvc = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if windows_msvc {
@@ -198,6 +202,38 @@ fn watch(manifest_dir: &Path) {
     for p in paths.into_iter().filter(|p| p.exists()) {
         println!("cargo:rerun-if-changed={}", p.display());
     }
+}
+
+/// On Linux, write `embedded_shells.rs`: the toolkit plugins to carry inside the
+/// binary, from the paths in `OT_SHELL_GTK_SO` and `OT_SHELL_QT_SO` (the release
+/// build sets them after building the plugins). A plugin not named is not
+/// embedded; the binary then looks for it beside itself, which is how a
+/// development build finds the ones `cargo build` put there.
+fn embed_shells() {
+    let mut entries = String::new();
+    for (var, toolkit) in [("OT_SHELL_GTK_SO", "Gtk"), ("OT_SHELL_QT_SO", "Qt")] {
+        println!("cargo:rerun-if-env-changed={var}");
+        let Some(path) = std::env::var_os(var).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "{var} names {}, which is not a file",
+            path.display()
+        );
+        println!("cargo:rerun-if-changed={}", path.display());
+        let _ = writeln!(
+            entries,
+            "    ot_shell_linux::Embedded {{ toolkit: ot_shell_linux::Toolkit::{toolkit}, bytes: include_bytes!({:?}) }},",
+            path.display().to_string()
+        );
+    }
+    let code = format!(
+        "/// The toolkit plugins built into this binary.\npub static EMBEDDED: &[ot_shell_linux::Embedded] = &[\n{entries}];\n"
+    );
+    let out = PathBuf::from(env("OUT_DIR")).join("embedded_shells.rs");
+    std::fs::write(out, code).expect("write embedded_shells.rs");
 }
 
 /// `major.minor.patch.build` for the numeric version fields: the tag's numbers, and

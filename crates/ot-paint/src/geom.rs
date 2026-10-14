@@ -2,6 +2,7 @@
 
 /// A point in DIPs.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
 pub struct Point {
     pub x: f32,
     pub y: f32,
@@ -16,6 +17,7 @@ impl Point {
 
 /// A size in DIPs.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
 pub struct Size {
     pub w: f32,
     pub h: f32,
@@ -30,6 +32,7 @@ impl Size {
 
 /// An axis-aligned rectangle in DIPs, stored as origin plus size.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,

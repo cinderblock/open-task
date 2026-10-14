@@ -13,6 +13,10 @@
 //!   across frames, which is what makes a 1000-row table cheap when 59 of every 60
 //!   frames draw identical strings.
 //! - **Units are DIPs.** Backends apply DPI. The UI never sees physical pixels.
+//! - **The layout is C's.** Every type a list holds is `#[repr(C)]` (the enums
+//!   `#[repr(u32)]`, [`DrawCmd`] a tagged union), so a list crosses into a toolkit
+//!   plugin written in another language without conversion. `ot-shell-abi`'s
+//!   header spells the layout out and both sides assert it.
 
 #![forbid(unsafe_code)]
 

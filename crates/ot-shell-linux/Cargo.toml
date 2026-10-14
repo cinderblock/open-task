@@ -1,0 +1,26 @@
+[package]
+name = "ot-shell-linux"
+description = "Linux shell for open-task: picks and loads a toolkit plugin (GTK 4 or Qt 6) at run time and drives it through ot-shell-abi."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ot-core.workspace = true
+ot-paint.workspace = true
+ot-probe.workspace = true
+ot-shell-abi.workspace = true
+ot-shell-core.workspace = true
+ot-ui.workspace = true
+ot-update.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

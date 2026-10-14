@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 
 /// Logical font family. Each backend maps these to the platform UI fonts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u32)]
 pub enum FontFamily {
     /// The system UI font: Segoe UI Variable on Windows 11, SF Pro on macOS, the
     /// desktop's interface font on Linux.
@@ -20,6 +21,7 @@ pub enum FontFamily {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u32)]
 pub enum FontWeight {
     #[default]
     Regular,
@@ -28,6 +30,7 @@ pub enum FontWeight {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u32)]
 pub enum HAlign {
     #[default]
     Left,
@@ -36,6 +39,7 @@ pub enum HAlign {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u32)]
 pub enum VAlign {
     Top,
     #[default]
@@ -45,6 +49,7 @@ pub enum VAlign {
 
 /// How a run of text should be shaped.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct TextStyle {
     pub family: FontFamily,
     /// Size in DIPs.

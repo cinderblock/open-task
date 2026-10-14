@@ -511,8 +511,12 @@ thinks it was forgotten:
 
 ## Linux
 
-Linux has a full sampling backend but no window yet, so `open-task` runs headless
-there: it prints a few passes of live state and exits (`--passes N` for more), and
+Linux has a full sampling backend but no window yet. The window is being built as
+two toolkit plugins, GTK 4 and Qt 6, carried inside the one binary and loaded at
+run time, so the same file still runs on a server with neither installed (see
+`plans/linux-gui-shells.md`). Until a release carries them, `open-task` says it
+found no toolkit and runs headless: it prints a few passes of live state and exits
+(`--passes N` for more, `--headless` to skip looking for a window), and
 `--record <file>` captures a session that the Windows app can replay with
 `--replay <file>`.
 
@@ -561,6 +565,8 @@ class: tens of megabytes, not hundreds.
 | `ot-record` | Flight Recorder: writes the snapshot stream to a file (shared values once, keyframes plus deltas, lz4) and reads it back by frame. |
 | `ot-update` | Self-updater: finds signed releases, downloads, verifies and installs them. |
 | `ot-shell-core` | What every shell shares: the app with its feed, updater and worker threads, and every effect that needs no window. A shell reports input to it and carries out the menus, questions and platform actions it hands back. |
+| `ot-shell-abi` | The C ABI between the Linux host and its toolkit plugins: a header and its Rust mirror. The display list crosses it as is (`ot-paint` is `#[repr(C)]`). |
+| `ot-shell-linux` | Linux shell host: picks a toolkit, loads its plugin from inside the binary (`memfd_create`, `dlopen`), and drives it. Links no toolkit itself. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
 | `ot-app` | The binary. |
 
@@ -663,7 +669,10 @@ page.
 instead and exits (the processor and its caches, the top processes by CPU with
 their CPU time, cycles and owning user, the busiest
 service hosts with the services they run, and the hottest threads with the service
-each works for); that is the only mode on Linux and macOS for now, and on macOS it
+each works for); that is the only mode on macOS for now, and what Linux falls
+back to without a display or a toolkit plugin (`--toolkit gtk|qt`, or
+`OPEN_TASK_TOOLKIT`, picks the plugin; by default Qt on KDE Plasma and LXQt, GTK
+elsewhere). On macOS it
 exits with code 3 ("no probe on this platform yet"). `--headless --sample <pid>
 [--seconds N]` takes one CPU sample of a process and prints it (see "Sample CPU"
 above; needs an elevated terminal).

@@ -31,5 +31,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(windows)'.dependencies]
 ot-shell-win.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ot-shell-linux.workspace = true
+
 [lints]
 workspace = true
