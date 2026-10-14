@@ -468,15 +468,23 @@ impl Painter {
         let px = size.round().max(1.0) as u32;
         let paintable = self.icons.entry((icon, px, scale)).or_insert_with(|| {
             let theme = gtk::IconTheme::for_display(&widget.display());
-            let name = icon_names(icon).iter().find(|n| theme.has_icon(n))?;
-            Some(theme.lookup_icon(
-                name,
-                &[],
-                i32::try_from(px).unwrap_or(i32::MAX),
-                scale,
-                gtk::TextDirection::Ltr,
-                gtk::IconLookupFlags::FORCE_SYMBOLIC,
-            ))
+            // `has_icon` is not to be trusted (GTK 4.6 says yes to names its
+            // Adwaita lacks, then draws "image-missing"); look each name up and
+            // keep the first that resolves to a real icon.
+            icon_names(icon).iter().find_map(|name| {
+                let p = theme.lookup_icon(
+                    name,
+                    &[],
+                    i32::try_from(px).unwrap_or(i32::MAX),
+                    scale,
+                    gtk::TextDirection::Ltr,
+                    gtk::IconLookupFlags::FORCE_SYMBOLIC,
+                );
+                let missing = p
+                    .icon_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("image-missing"));
+                (!missing).then_some(p)
+            })
         });
         let Some(p) = paintable else {
             return;
