@@ -15,7 +15,8 @@
 
 use std::ffi::c_void;
 
-use ot_ui::{ChartDrawing, ChartLegend, Settings, ViewLayout};
+use ot_shell_core::settings_store;
+use ot_ui::{Settings, ViewLayout};
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
@@ -27,21 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const KEY: PCWSTR = w!(r"Software\open-task");
 const PLACEMENTS_KEY: PCWSTR = w!(r"Software\open-task\Placements");
-const ANIMATE_ROWS: PCWSTR = w!("AnimateRows");
-const SMOOTH_CHARTS: PCWSTR = w!("SmoothCharts");
-const CHECK_UPDATES: PCWSTR = w!("CheckForUpdates");
-const DOWNLOAD_UPDATES: PCWSTR = w!("DownloadUpdates");
-const INSTALL_UPDATES: PCWSTR = w!("InstallUpdates");
-const USAGE_DECAY: PCWSTR = w!("UsageDecayPercent");
-const HISTORY_MINUTES: PCWSTR = w!("HistoryMinutes");
-const ALWAYS_ON_TOP: PCWSTR = w!("AlwaysOnTop");
-const HIDE_WHEN_MINIMIZED: PCWSTR = w!("HideWhenMinimized");
-const MINIMIZE_ON_USE: PCWSTR = w!("MinimizeOnUse");
-const RESOURCE_PERCENT: PCWSTR = w!("ResourceValuesAsPercent");
-const UPDATE_INTERVAL: PCWSTR = w!("UpdateIntervalMs");
-const CHART_DRAWING: PCWSTR = w!("ChartDrawing");
-const CHART_KNEE: PCWSTR = w!("ChartKneeSamples");
-const CHART_LEGEND: PCWSTR = w!("ChartLegend");
+/// [`settings_store::LAYOUT`].
 const LAYOUT: PCWSTR = w!("Layout");
 
 /// The settings in the registry, for `ot_shell_core`.
@@ -68,72 +55,21 @@ impl ot_shell_core::Prefs for WinPrefs {
 
 /// The settings as last saved, defaults for anything never saved.
 pub fn load() -> Settings {
-    let defaults = Settings::default();
-    let flag = |name, default| read_dword(name).map_or(default, |v| v != 0);
-    let settings = Settings {
-        animate_rows: read_dword(ANIMATE_ROWS).map(|v| v != 0),
-        smooth_charts: flag(SMOOTH_CHARTS, defaults.smooth_charts),
-        check_updates: flag(CHECK_UPDATES, defaults.check_updates),
-        download_updates: flag(DOWNLOAD_UPDATES, defaults.download_updates),
-        install_updates: flag(INSTALL_UPDATES, defaults.install_updates),
-        always_on_top: flag(ALWAYS_ON_TOP, defaults.always_on_top),
-        hide_when_minimized: flag(HIDE_WHEN_MINIMIZED, defaults.hide_when_minimized),
-        minimize_on_use: flag(MINIMIZE_ON_USE, defaults.minimize_on_use),
-        resource_percent: flag(RESOURCE_PERCENT, defaults.resource_percent),
-        chart_drawing: read_dword(CHART_DRAWING)
-            .map_or(defaults.chart_drawing, ChartDrawing::from_index),
-        chart_legend: read_dword(CHART_LEGEND)
-            .map_or(defaults.chart_legend, ChartLegend::from_index),
-        ..defaults
-    };
-    let settings = match read_dword(UPDATE_INTERVAL) {
-        Some(ms) => settings.with_interval(ms),
-        None => settings,
-    };
-    let settings = match read_dword(CHART_KNEE) {
-        Some(samples) => settings.with_knee_samples(samples),
-        None => settings,
-    };
-    let settings = match read_dword(USAGE_DECAY) {
-        Some(percent) => settings.with_usage_decay(percent),
-        None => settings,
-    };
-    match read_dword(HISTORY_MINUTES) {
-        Some(minutes) => settings.with_history_minutes(minutes),
-        None => settings,
-    }
+    settings_store::decode(read_dword)
 }
 
 /// Store the settings for the next start. A setting still following the system
 /// (never chosen) is not written.
 pub fn save(s: &Settings) {
-    let values = [
-        (ANIMATE_ROWS, s.animate_rows.map(u32::from)),
-        (SMOOTH_CHARTS, Some(u32::from(s.smooth_charts))),
-        (CHECK_UPDATES, Some(u32::from(s.check_updates))),
-        (DOWNLOAD_UPDATES, Some(u32::from(s.download_updates))),
-        (INSTALL_UPDATES, Some(u32::from(s.install_updates))),
-        (USAGE_DECAY, Some(u32::from(s.usage_decay_percent))),
-        (HISTORY_MINUTES, Some(s.history_minutes)),
-        (ALWAYS_ON_TOP, Some(u32::from(s.always_on_top))),
-        (HIDE_WHEN_MINIMIZED, Some(u32::from(s.hide_when_minimized))),
-        (MINIMIZE_ON_USE, Some(u32::from(s.minimize_on_use))),
-        (RESOURCE_PERCENT, Some(u32::from(s.resource_percent))),
-        (UPDATE_INTERVAL, Some(s.update_interval_ms)),
-        (CHART_DRAWING, Some(s.chart_drawing.index())),
-        (CHART_KNEE, Some(u32::from(s.chart_knee_samples))),
-        (CHART_LEGEND, Some(s.chart_legend.index())),
-    ];
     let Some(key) = open_for_writing(KEY) else {
         return;
     };
-    for (name, value) in values {
-        let Some(value) = value else {
-            continue;
-        };
+    for (name, value) in settings_store::encode(s) {
         let data = value.to_le_bytes();
-        // SAFETY: `key` was just opened with KEY_SET_VALUE; the data outlives the call.
-        let status = unsafe { RegSetValueExW(key, name, None, REG_DWORD, Some(&data)) };
+        let name = HSTRING::from(name);
+        // SAFETY: `key` was just opened with KEY_SET_VALUE; the name and data
+        // outlive the call.
+        let status = unsafe { RegSetValueExW(key, &name, None, REG_DWORD, Some(&data)) };
         if status.is_err() {
             tracing::warn!(?status, "could not save a setting");
         }
@@ -249,7 +185,8 @@ fn read_string(path: PCWSTR, name: PCWSTR) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
-fn read_dword(name: PCWSTR) -> Option<u32> {
+fn read_dword(name: &str) -> Option<u32> {
+    let name = HSTRING::from(name);
     let mut value: u32 = 0;
     let mut size = size_of::<u32>() as u32;
     // SAFETY: the out-pointers reference locals that outlive the call; `size` matches.
@@ -257,7 +194,7 @@ fn read_dword(name: PCWSTR) -> Option<u32> {
         RegGetValueW(
             HKEY_CURRENT_USER,
             KEY,
-            name,
+            &name,
             RRF_RT_REG_DWORD,
             None,
             Some((&raw mut value).cast::<c_void>()),

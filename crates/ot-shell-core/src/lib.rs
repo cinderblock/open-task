@@ -27,6 +27,7 @@
 
 mod menu;
 mod report;
+pub mod settings_store;
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
