@@ -1578,6 +1578,7 @@ impl App {
             }
             UiEvent::MenuClosed { at } => {
                 let left = self.menu.take().is_some_and(|m| m.left);
+                self.history.latch(false);
                 // Where the pointer is now, if the shell says; else the leave held
                 // back, if there was one, until the pointer comes back.
                 let follow = match at {
@@ -1599,6 +1600,9 @@ impl App {
         if matches!(reaction.effect, Some(Effect::Menu { .. })) {
             self.menu = Some(MenuHold::default());
         }
+        // The History holds the band and the moment the menu is for, as the chart
+        // moves under the pointer.
+        self.history.latch(self.menu.is_some());
         reaction
     }
 

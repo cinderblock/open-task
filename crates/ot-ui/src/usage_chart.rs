@@ -497,6 +497,20 @@ pub(crate) struct UsageChart {
     ancestry: Ancestry,
     /// What the chip says above the band, filled in by the view each frame.
     head: ChipHead,
+    /// While a menu is up, the band and the moment it was opened on, held as the
+    /// chart scrolls under the pointer ([`Self::latch`]).
+    latched: Option<Latched>,
+}
+
+/// A band and a moment, held while a menu is up.
+#[derive(Debug, Clone, Copy)]
+struct Latched {
+    band: usize,
+    /// The band's program, followed should its band change; none for the bands of
+    /// many programs.
+    program: Option<ProgramId>,
+    /// The moment: a time, so it scrolls with the chart.
+    at_ms: i64,
 }
 
 /// The top of the chip: the process a right-click on the band under the pointer
@@ -903,7 +917,56 @@ impl UsageChart {
             ChartLegend::Beside => {}
         }
         self.lay_out_legend();
-        self.hover_band = self.pointer.and_then(|p| self.band_at(p));
+        self.hover_band = match self.latched {
+            Some(l) => match l.program {
+                Some(g) => self.slots.iter().position(|&s| s == Some(g)),
+                None => Some(l.band),
+            },
+            None => self.pointer.and_then(|p| self.band_at(p)),
+        };
+    }
+
+    /// Hold the band under the pointer and the moment marked while `on` (a menu
+    /// is up for them), whatever comes under the pointer as the chart moves; let
+    /// them go when not.
+    pub fn latch(&mut self, on: bool) {
+        if !on {
+            self.latched = None;
+            return;
+        }
+        if self.latched.is_some() {
+            return;
+        }
+        let Some(p) = self.pointer else {
+            return;
+        };
+        let (Some(band), Some(column)) = (self.band_at(p), self.column_at(p)) else {
+            return;
+        };
+        self.latched = Some(Latched {
+            band,
+            program: self.slots.get(band).copied().flatten(),
+            at_ms: self.points[column].end_ms,
+        });
+    }
+
+    /// The column under `p`, while `p` is over the plot.
+    fn column_at(&self, p: Point) -> Option<usize> {
+        if !self.plot.contains(p) || self.over_legend(p) {
+            return None;
+        }
+        self.nearest(p.x)
+    }
+
+    /// The column marked: the latched moment's, or the one under the pointer.
+    fn marked_column(&self) -> Option<usize> {
+        let Some(l) = self.latched else {
+            return self.column_at(self.pointer?);
+        };
+        let inside = self.plot.x..=self.plot.right();
+        (0..self.points.len())
+            .filter(|&i| inside.contains(&self.points[i].x))
+            .find(|&i| (self.points[i].after_ms + 1..=self.points[i].end_ms).contains(&l.at_ms))
     }
 
     /// Whether the bands are drawn, with what to name: shown when it has a band of
@@ -1445,10 +1508,7 @@ impl UsageChart {
 
     /// The age of the plotted column nearest the pointer, while it is over the plot.
     fn pointed_age(&self) -> Option<f32> {
-        let p = self
-            .pointer
-            .filter(|p| self.plot.contains(*p) && !self.over_legend(*p))?;
-        self.nearest(p.x).map(|i| self.points[i].age_ms)
+        self.marked_column().map(|i| self.points[i].age_ms)
     }
 
     /// Whether `p` is on a legend floating over the plot, which hides what is under
@@ -1533,10 +1593,7 @@ impl UsageChart {
     /// since the Unix epoch.
     #[must_use]
     pub fn moment_at(&self, p: Point) -> Option<(i64, i64)> {
-        if !self.plot.contains(p) || self.over_legend(p) {
-            return None;
-        }
-        self.nearest(p.x)
+        self.column_at(p)
             .map(|i| (self.points[i].after_ms, self.points[i].end_ms))
     }
 
@@ -1551,8 +1608,11 @@ impl UsageChart {
     /// there ([`Self::moment_at`]), as of the last build.
     #[must_use]
     pub fn pointed(&self) -> Option<(ProgramId, Option<(i64, i64)>)> {
-        let p = self.pointer?;
-        Some((self.program_at(p)?, self.moment_at(p)))
+        let program = self.slots.get(self.hover_band?).copied().flatten()?;
+        let moment = self
+            .marked_column()
+            .map(|i| (self.points[i].after_ms, self.points[i].end_ms));
+        Some((program, moment))
     }
 
     /// The top of the chip, for the view to fill in.
@@ -2423,6 +2483,35 @@ mod tests {
         c.build(RECT, &u, Some(30_000.0), TimeAxis::DEFAULT);
         assert_eq!(c.hover_age(), None);
         assert_eq!(c.crosshair.map(|c| c.age_ms), Some(30_000.0));
+    }
+
+    #[test]
+    fn a_latch_holds_the_band_and_the_moment_as_the_chart_moves() {
+        let rate = |i: usize, _| if i == 0 { 3 } else { 1 };
+        let u = session(&["a.exe", "b.exe"], 60, rate);
+        let mut c = UsageChart::default();
+        let _ = painted(&mut c, &u, "");
+        let ours = band(&c, &u, "a.exe");
+        // Ten seconds ago, a third of the way up a.exe's band.
+        let x = c.time.x(c.plot, 10_000.0);
+        let column = c.at_age(10_000.0).copied().unwrap();
+        let y = c.y(column.v[ours] / 3.0);
+        c.set_pointer(Some(Point::new(x, y)));
+        let _ = painted(&mut c, &u, "");
+        assert_eq!(c.hover_band, Some(ours));
+        let moment = c.pointed().and_then(|(_, m)| m);
+        c.latch(true);
+        // Fifteen seconds on, the pointer has not moved: the same band and moment
+        // stay marked, now 25 s ago.
+        let later = session(&["a.exe", "b.exe"], 75, rate);
+        let _ = painted(&mut c, &later, "");
+        assert_eq!(c.hover_band, Some(ours));
+        assert_eq!(c.hover_age(), Some(25_000.0));
+        assert_eq!(c.pointed(), later.program("a.exe").map(|g| (g, moment)));
+        // Let go, the pointer's place counts again.
+        c.latch(false);
+        let _ = painted(&mut c, &later, "");
+        assert_eq!(c.hover_age(), Some(10_000.0));
     }
 
     #[test]
