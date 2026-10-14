@@ -20,6 +20,9 @@ const MODULES: [&str; 3] = ["Widgets", "Gui", "Core"];
 struct Qt {
     include_paths: Vec<PathBuf>,
     defines: Vec<(String, Option<String>)>,
+    /// Link lines to print after the C++ archive's, which needs them: a linker
+    /// using --as-needed drops a library named before anything uses it.
+    link: Vec<String>,
 }
 
 fn main() {
@@ -56,6 +59,9 @@ fn main() {
         .flag("-fPIC")
         .flag("-fvisibility=hidden")
         .flag_if_supported("-Wno-deprecated-declarations")
+        // As every release Qt application is built: Q_ASSERT compiles away, so
+        // the plugin calls no qt_assert, which arm64's Qt 6.2 does not resolve.
+        .define("QT_NO_DEBUG", None)
         .warnings(true);
     for dir in &qt.include_paths {
         build.include(dir);
@@ -64,17 +70,28 @@ fn main() {
         build.define(name, value.as_deref());
     }
     build.compile("ot_shell_qt_cpp");
+    for line in &qt.link {
+        println!("{line}");
+    }
 }
 
 /// Qt through its pkg-config files, which also tell Cargo what to link.
 fn from_pkg_config() -> Result<Qt, String> {
     let lib = pkg_config::Config::new()
         .atleast_version("6.2")
+        .cargo_metadata(false)
         .probe("Qt6Widgets")
         .map_err(|e| e.to_string())?;
+    let mut link: Vec<String> = lib
+        .link_paths
+        .iter()
+        .map(|p| format!("cargo:rustc-link-search=native={}", p.display()))
+        .collect();
+    link.extend(lib.libs.iter().map(|l| format!("cargo:rustc-link-lib={l}")));
     Ok(Qt {
         include_paths: lib.include_paths,
         defines: lib.defines.into_iter().collect(),
+        link,
     })
 }
 
@@ -118,19 +135,20 @@ fn from_qmake(pkg_config_error: &str) -> Result<Qt, String> {
     let libs = PathBuf::from(query(qmake, "QT_INSTALL_LIBS").ok_or("qmake gave no libraries")?);
     let mut include_paths = vec![headers.clone()];
     let mut defines = Vec::new();
+    let mut link = vec![format!("cargo:rustc-link-search=native={}", libs.display())];
     for m in MODULES {
         include_paths.push(headers.join(format!("Qt{m}")));
         defines.push((format!("QT_{}_LIB", m.to_uppercase()), None));
         if !has_lib(&libs, m) {
             return Err(format!("libQt6{m} not in {}", libs.display()));
         }
-        println!("cargo:rustc-link-lib=Qt6{m}");
+        link.push(format!("cargo:rustc-link-lib=Qt6{m}"));
     }
-    println!("cargo:rustc-link-search=native={}", libs.display());
     println!("cargo:warning=Qt {version} found through {qmake} (no pkg-config files)");
     Ok(Qt {
         include_paths,
         defines,
+        link,
     })
 }
 
