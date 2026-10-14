@@ -583,7 +583,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "ot-app"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "ot-core",
  "ot-model",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "ot-core"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "arc-swap",
  "ot-model",
@@ -609,21 +609,21 @@ dependencies = [
 
 [[package]]
 name = "ot-model"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ot-paint"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "wide",
 ]
 
 [[package]]
 name = "ot-probe"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "libc",
  "ot-model",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "ot-record"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "lz4_flex",
  "ot-model",
@@ -645,14 +645,14 @@ dependencies = [
 
 [[package]]
 name = "ot-shell-abi"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "ot-paint",
 ]
 
 [[package]]
 name = "ot-shell-core"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "ot-core",
  "ot-model",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "ot-shell-gtk"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "gtk4",
  "ot-paint",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "ot-shell-linux"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "libc",
  "ot-core",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "ot-shell-qt"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "cc",
  "ot-shell-abi",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "ot-shell-win"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "ot-core",
  "ot-model",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "ot-ui"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "ot-core",
  "ot-model",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "ot-update"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "minisign-verify",
  "sha2",
