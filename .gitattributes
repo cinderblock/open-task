@@ -7,6 +7,7 @@
 *.yaml    text eol=crlf
 
 *.sh      text eol=lf
+*.desktop text eol=lf
 *.png     binary
 *.ico     binary
 *.icns    binary
