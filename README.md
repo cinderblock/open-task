@@ -615,6 +615,8 @@ confirm the first run.
 The bare binaries for every platform are on the same release as `.zip` / `.tar.gz`
 with a `SHA256SUMS` file. Linux and macOS have no installer: on Linux the one
 `open-task` file is the whole program, window included (see [Linux](#linux)), and
+the release also has it as an AppImage (`open-task-vX.Y.Z-x86_64.AppImage`, and
+`aarch64`), the same program with a desktop entry and icon for app launchers.
 macOS measures nothing yet.
 
 On Windows, `open-task.exe` comes with `open-task.com` beside it. The `.exe` is a

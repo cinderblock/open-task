@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=open-task
+GenericName=Task Manager
+Comment=See and manage what is running on this computer
+Exec=open-task
+Icon=io.github.cinderblock.open-task
+Terminal=false
+Categories=System;Monitor;
+Keywords=task;process;monitor;cpu;memory;system;
+StartupWMClass=io.github.cinderblock.open-task

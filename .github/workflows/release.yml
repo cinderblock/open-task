@@ -3,8 +3,9 @@ name: Release
 # Pushing a tag like v1.2.3 builds every target, packages it, and publishes a GitHub
 # release with checksums. The self-updater reads these releases, so the asset naming
 # below is a contract: <name>-<tag>-<target>.<zip|tar.gz>, the Windows installer
-# <name>-<tag>-windows-setup.exe (both architectures in one file), plus SHA256SUMS
-# and SHA256SUMS.minisig. A Windows zip holds open-task.exe and its console launcher,
+# <name>-<tag>-windows-setup.exe (both architectures in one file), the Linux
+# AppImages <name>-<tag>-<x86_64|aarch64>.AppImage, plus SHA256SUMS and
+# SHA256SUMS.minisig. A Windows zip holds open-task.exe and its console launcher,
 # open-task.com (crates/ot-app/src/console.rs).
 #
 # The updater trusts a release only through SHA256SUMS.minisig: a minisign signature
@@ -247,6 +248,21 @@ jobs:
           rm -r "$name"
           ls -la
 
+      - name: AppImage
+        # The same binary with a desktop entry and icon, for launchers and
+        # AppImage tools. It bundles no toolkit: like the bare binary it uses
+        # the system's GTK or Qt.
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.target }}"
+          arch="${arch%%-*}"
+          image="dist/${BIN}-${TAG}-${arch}.AppImage"
+          scripts/build-appimage.sh "$OPEN_TASK" "$arch" "$image"
+          got="$(APPIMAGE_EXTRACT_AND_RUN=1 "$image" --version)"
+          echo "$got"
+          [ "$got" = "open-task $TAG" ] || { echo "::error::the AppImage says '$got', not 'open-task $TAG'"; exit 1; }
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -304,7 +320,7 @@ jobs:
       - name: Keep only the release's files
         # The Linux smoke tests' screenshots and logs are artifacts too, for
         # looking at; they are not part of the release.
-        run: find dist -type f ! -name '*.zip' ! -name '*.tar.gz' ! -name '*.exe' -print -delete
+        run: find dist -type f ! -name '*.zip' ! -name '*.tar.gz' ! -name '*.exe' ! -name '*.AppImage' -print -delete
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS && cat SHA256SUMS
