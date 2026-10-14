@@ -1,0 +1,28 @@
+[package]
+name = "ot-shell-gtk"
+description = "GTK 4 plugin for open-task's Linux shell: the window, the display list drawn with GSK and Pango, and the dialogs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+# Loaded by open-task at run time (ot-shell-linux), never linked into it.
+crate-type = ["cdylib"]
+
+[dependencies]
+ot-paint.workspace = true
+ot-shell-abi.workspace = true
+
+# GTK 4.6 is the floor (Ubuntu 22.04, RHEL 9): nothing newer is linked, or the
+# plugin would fail to load there.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "0.11", features = ["v4_6"] }
+# Tabular figures need Pango 1.38's font-feature attribute.
+pango = { version = "0.22", features = ["v1_44"] }
+
+[lints]
+workspace = true
