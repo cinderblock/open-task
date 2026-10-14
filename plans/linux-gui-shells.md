@@ -117,9 +117,8 @@ refactor is behaviour-preserving for Windows and is verified on Windows first.
 
 ## Plan / steps
 
-**Current step: 7 (packaging and CI) is committed but unverified: the workflows
-have not run (nothing is pushed). Then steps 5 and 6 (the remaining effects and
-desktop integration).**
+**Released in v0.17.1 (2026-10-14).** Next: steps 5 and 6 (the remaining effects
+and desktop integration), and GTK's software-rendering cost (see findings).
 
 0. Plan (this document).
 1. **Shared glue.** Extract the toolkit-neutral parts of `window.rs` (App lifetime,
@@ -219,6 +218,18 @@ desktop integration).**
   change it. Needs a measurement on real hardware before deciding whether to
   cache or split snapshots further. A background window now gets half the
   frames (cannot be seen on Xvfb, where the window always counts as active).
+- **Ubuntu 22.04's Qt 6.2 has no pkg-config files.** The Qt build script falls
+  back to `qmake -query` (needs `qt6-base-dev-tools`). Test that path with
+  `PKG_CONFIG=/bin/false`.
+- **arm64 Qt 6.2 does not resolve `qt_assert`** (from `Q_ASSERT` in Qt's inline
+  headers): the plugin linked on x64 but not arm64, and in the v0.17.0 release it
+  failed to load there and fell back to GTK silently. Fixed by `QT_NO_DEBUG`;
+  plugin load failures are now logged.
+- **appimagetool needs `file`**, which the 22.04 container lacks.
+- **On CI's GPU-less runner, GTK 4.6 used ~107% CPU and Qt ~11%** with the same
+  view: GSK on `llvmpipe` is far costlier than Qt's raster painter in software.
+  Real GPUs untested. Worth a look: fewer nodes per frame, or render-node caching
+  of unchanged regions.
 - **Cross-clippy for Linux from Windows must `--exclude ot-shell-gtk`**: its
   `gtk4-sys` build script needs `pkg-config` and the GTK headers, which only
   the Linux environments (WSL, CI) have.
@@ -245,14 +256,16 @@ desktop integration).**
       theme (Breeze, else Adwaita) is set when no desktop set one.
 - [ ] 5. Effects
 - [ ] 6. Desktop integration
-- [~] 7. Packaging and CI (`b4e7650`): `scripts/build-linux.sh` (plugins, then
+- [x] 7. Packaging and CI, released as **v0.17.1** (the downloaded tarball passes
+      the smoke test in WSL; the AppImage runs). CI's Linux job runs on x64 and
+      arm64 in `ubuntu:22.04`. AppImages (`scripts/build-appimage.sh`,
+      `assets/linux/*.desktop`) ship beside the tarballs. History (`b4e7650`): `scripts/build-linux.sh` (plugins, then
       `ot-app` embedding them), `scripts/linux-gui-smoke.sh` (the binary alone:
       no toolkit in NEEDED, headless without a display, each toolkit's window on
       Xvfb takes a click and is not blank), `scripts/linux-deps.sh`. CI's Linux job
       and the release's Linux builds run in `ubuntu:22.04`; the release checks the
       glibc floor (2.34) and keeps smoke screenshots out of its assets. Verified
-      locally (release build 3.7 MB, plugins ~400 KB each, smoke OK, glibc <= 2.34);
-      **the workflows themselves have not run yet.** `.desktop` file not done.
+      locally (release build 3.7 MB, plugins ~400 KB each, smoke OK, glibc <= 2.34).
 - [~] 8. Docs: README Linux section, install note and crate table updated.
 
 ### Testing the Linux GUI (how it is done here)
@@ -277,12 +290,9 @@ desktop integration).**
    a container (Docker/Podman). Recommendation: develop against 24.04's packages
    locally and let CI's 22.04 build enforce the floor; no local action needed.
 
-3. **Push, so CI runs the new Linux job?** It is the first run of the container
-   jobs (`ubuntu:22.04`, x64 in CI; x64 and arm64 in releases). Nothing is pushed
-   yet; recommendation: push `master` and watch CI.
-4. **Cut a release (v0.17.0) so a downloaded binary has the window?** That is
-   what makes the GUI reach someone who downloads it. Recommendation: after CI
-   passes, through the `publishing` skill.
+3. ~~Push?~~ Done at the user's request ("Push end release"), 2026-10-14.
+4. ~~Release?~~ v0.17.1 published 2026-10-14 (v0.17.0 was tagged but its Linux
+   builds failed and it was never published; the tag remains, with no release).
 
 ## Things not to do
 
