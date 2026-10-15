@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define OT_SHELL_ABI_VERSION 1u
+#define OT_SHELL_ABI_VERSION 2u
 
 /* ---- Drawing: the layout of crates/ot-paint ---------------------------- */
 
@@ -73,8 +73,26 @@ enum OtIcon {
     OT_ICON_PAUSE,
     OT_ICON_PREVIOUS,
     OT_ICON_NEXT,
+    /* The process menu's entries. */
+    OT_ICON_TREE,
+    OT_ICON_END_TASK,
+    OT_ICON_END_TREE,
+    OT_ICON_RESTART,
+    OT_ICON_EFFICIENCY,
+    OT_ICON_PRIORITY,
+    OT_ICON_AFFINITY,
+    OT_ICON_SWITCH_TO,
+    OT_ICON_OPEN_FOLDER,
+    OT_ICON_SEARCH_ONLINE,
+    OT_ICON_PROPERTIES,
+    OT_ICON_COPY,
+    OT_ICON_DUMP,
+    OT_ICON_WAIT_CHAIN,
+    OT_ICON_STOPWATCH,
     OT_ICON_COUNT
 };
+/* A menu item with no icon. */
+#define OT_ICON_NONE 0xFFFFFFFFu
 
 typedef struct OtTextStyle {
     uint32_t family; /* OtFontFamily */
@@ -245,6 +263,7 @@ typedef struct OtMenuItem {
     uint64_t id; /* what OtHost.menu_chosen reports for an item */
     const char *label;
     size_t label_len;
+    uint32_t icon; /* OtIcon, or OT_ICON_NONE */
 } OtMenuItem;
 
 /* ---- The host's callbacks ----------------------------------------------- */

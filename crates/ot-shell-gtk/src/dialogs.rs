@@ -23,6 +23,8 @@ fn parent() -> Option<gtk::Window> {
 
 /// A popup menu at `x`, `y`. Items are actions in a group of the popover's own;
 /// a checked item's action has a boolean state, which GTK shows as a check mark.
+/// Items go without their icons: GTK 4's popover menus draw an item's icon only
+/// when it has no label, as GNOME's guidelines would have menus.
 pub fn menu(token: u64, x: f32, y: f32, items: &[abi::MenuItem]) {
     let Some(canvas) = with_ui(|ui| ui.canvas.clone()) else {
         return;

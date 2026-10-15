@@ -627,6 +627,7 @@ impl Ctx {
                         id: f.id,
                         label: labels[f.label].as_ptr().cast(),
                         label_len: labels[f.label].len(),
+                        icon: f.icon,
                     })
                     .collect();
                 // SAFETY: the items and their labels outlive the call.
@@ -718,26 +719,45 @@ impl Ctx {
 }
 
 /// One menu line, flattened for the ABI; `label` indexes the labels.
+#[derive(Debug, Clone, Copy)]
 struct Flat {
     kind: u32,
     enabled: bool,
     checked: bool,
     id: u64,
     label: usize,
+    icon: u32,
+}
+
+impl Flat {
+    /// A line of `kind`, enabled, with no id, label or icon yet.
+    fn of(kind: u32) -> Self {
+        Self {
+            kind,
+            enabled: true,
+            checked: false,
+            id: 0,
+            label: 0,
+            icon: abi::ICON_NONE,
+        }
+    }
+}
+
+/// `f`, labelled `label`.
+fn push(f: Flat, label: &str, out: &mut Vec<Flat>, labels: &mut Vec<String>) {
+    labels.push(label.to_owned());
+    out.push(Flat {
+        label: labels.len() - 1,
+        ..f
+    });
+}
+
+/// An icon as the ABI numbers it.
+fn icon_index(icon: Option<ot_paint::Icon>) -> u32 {
+    icon.map_or(abi::ICON_NONE, |i| i as u32)
 }
 
 fn flatten(nodes: &[MenuNode], out: &mut Vec<Flat>, labels: &mut Vec<String>) {
-    let push =
-        |kind, enabled, checked, id, label: &str, labels: &mut Vec<String>, out: &mut Vec<Flat>| {
-            labels.push(label.to_owned());
-            out.push(Flat {
-                kind,
-                enabled,
-                checked,
-                id,
-                label: labels.len() - 1,
-            });
-        };
     for node in nodes {
         match node {
             MenuNode::Item {
@@ -745,35 +765,48 @@ fn flatten(nodes: &[MenuNode], out: &mut Vec<Flat>, labels: &mut Vec<String>) {
                 label,
                 enabled,
                 checked,
-                ..
-            } => push(
-                menu::ITEM,
-                *enabled,
-                *checked,
-                *id as u64,
-                label,
-                labels,
-                out,
-            ),
+                icon,
+            } => {
+                let item = Flat {
+                    enabled: *enabled,
+                    checked: *checked,
+                    id: *id as u64,
+                    // The toolkits show a check where the icon would be, or
+                    // frame the icon instead: a checked item shows its check.
+                    icon: icon_index(icon.filter(|_| !checked)),
+                    ..Flat::of(menu::ITEM)
+                };
+                push(item, label, out, labels);
+            }
             MenuNode::Submenu {
                 label,
                 enabled,
+                icon,
                 children,
-                ..
             } => {
-                push(menu::SUBMENU, *enabled, false, 0, label, labels, out);
+                let sub = Flat {
+                    enabled: *enabled,
+                    icon: icon_index(*icon),
+                    ..Flat::of(menu::SUBMENU)
+                };
+                push(sub, label, out, labels);
                 flatten(children, out, labels);
-                push(menu::SUBMENU_END, true, false, 0, "", labels, out);
+                push(Flat::of(menu::SUBMENU_END), "", out, labels);
             }
-            MenuNode::Separator => push(menu::SEPARATOR, true, false, 0, "", labels, out),
+            MenuNode::Separator => push(Flat::of(menu::SEPARATOR), "", out, labels),
             // The plugins draw no header: its lines go in as items that cannot
             // be chosen, with an id no action has.
             MenuNode::Header(h) => {
                 let lines = std::iter::once(&h.title)
                     .chain(&h.lines)
                     .chain(h.path.as_ref());
-                for line in lines {
-                    push(menu::ITEM, false, false, u64::MAX, line, labels, out);
+                let line = Flat {
+                    enabled: false,
+                    id: u64::MAX,
+                    ..Flat::of(menu::ITEM)
+                };
+                for text in lines {
+                    push(line, text, out, labels);
                 }
             }
         }
@@ -792,7 +825,7 @@ mod tests {
                 label: "End task".into(),
                 enabled: true,
                 checked: false,
-                icon: None,
+                icon: Some(ot_paint::Icon::EndTask),
             },
             MenuNode::Separator,
             MenuNode::Submenu {
@@ -821,6 +854,8 @@ mod tests {
                 menu::SUBMENU_END
             ]
         );
+        assert_eq!(flat[0].icon, ot_paint::Icon::EndTask as u32);
+        assert_eq!(flat[1].icon, abi::ICON_NONE);
         assert_eq!(labels[flat[3].label], "High");
         assert!(flat[3].checked);
         assert_eq!(flat[3].id, 1);

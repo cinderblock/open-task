@@ -15,7 +15,7 @@ use std::mem::{offset_of, size_of};
 pub use ot_paint::{Color, DrawCmd, Point, Rect, Span, TextCmd, TextStyle};
 
 /// Bumped on any change to the header.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// The symbol a plugin exports: `const OtPlugin *ot_shell_plugin(void)`.
 pub const PLUGIN_SYMBOL: &[u8] = b"ot_shell_plugin\0";
@@ -173,7 +173,12 @@ pub struct MenuItem {
     pub id: u64,
     pub label: *const c_char,
     pub label_len: usize,
+    /// `OtIcon` ([`ot_paint::Icon`] as `u32`), or [`ICON_NONE`].
+    pub icon: u32,
 }
+
+/// `OT_ICON_NONE`: a menu item with no icon.
+pub const ICON_NONE: u32 = u32::MAX;
 
 /// `OtHost`.
 #[repr(C)]
@@ -297,6 +302,8 @@ mod tests {
             "offsetof(OtMenuItem, label_len)",
             offset_of!(MenuItem, label_len),
         );
+        check("offsetof(OtMenuItem, icon)", offset_of!(MenuItem, icon));
+        check("OT_ICON_COUNT", ot_paint::Icon::ALL.len());
         check("sizeof(OtDisplayList)", size_of::<DisplayList>());
         check("sizeof(OtHost)", size_of::<Host>());
         check("offsetof(OtHost, log)", offset_of!(Host, log));

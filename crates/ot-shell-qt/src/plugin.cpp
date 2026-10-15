@@ -32,6 +32,7 @@
 #include <QPainterPath>
 #include <QPointer>
 #include <QStaticText>
+#include <QStyle>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
@@ -135,6 +136,19 @@ const std::vector<const char *> &icon_names(uint32_t icon) {
     };
     static const std::vector<const char *> none;
     return icon < names.size() ? names[icon] : none;
+}
+
+// `src` in one colour: freedesktop symbolic icons are single-colour, and outside
+// KDE nothing recolours them for Qt.
+QPixmap tint(const QPixmap &src, const QColor &c) {
+    QImage img = src.toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QPainter tp(&img);
+    tp.setCompositionMode(QPainter::CompositionMode_SourceIn);
+    tp.fillRect(img.rect(), c);
+    tp.end();
+    QPixmap out = QPixmap::fromImage(img);
+    out.setDevicePixelRatio(src.devicePixelRatio());
+    return out;
 }
 
 // ---- Drawing ---------------------------------------------------------------
@@ -367,13 +381,7 @@ private:
                 if (i.isNull()) continue;
                 QPixmap src = i.pixmap(QSize(px, px), dpr);
                 if (src.isNull()) continue;
-                QImage img = src.toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
-                QPainter tp(&img);
-                tp.setCompositionMode(QPainter::CompositionMode_SourceIn);
-                tp.fillRect(img.rect(), qc);
-                tp.end();
-                tinted = QPixmap::fromImage(img);
-                tinted.setDevicePixelRatio(src.devicePixelRatio());
+                tinted = tint(src, qc);
                 break;
             }
             it = icons_.insert(key, tinted);
@@ -601,6 +609,27 @@ QMessageBox *box(QMessageBox::Icon icon, const QString &t) {
     return b;
 }
 
+// A menu entry's icon from the theme, in the menu's own text colours for each
+// state it is drawn in; none for OT_ICON_NONE or a theme without it.
+QIcon menu_icon(uint32_t icon, const QMenu *menu) {
+    if (icon == OT_ICON_NONE) return {};
+    const int px = menu->style()->pixelMetric(QStyle::PM_SmallIconSize, nullptr, menu);
+    for (const char *name : icon_names(icon)) {
+        const QIcon themed = QIcon::fromTheme(QString::fromLatin1(name));
+        if (themed.isNull()) continue;
+        const QPixmap src = themed.pixmap(QSize(px, px), menu->devicePixelRatioF());
+        if (src.isNull()) continue;
+        const QPalette pal = menu->palette();
+        QIcon out;
+        out.addPixmap(tint(src, pal.color(QPalette::Active, QPalette::Text)), QIcon::Normal);
+        // The highlighted entry.
+        out.addPixmap(tint(src, pal.color(QPalette::Active, QPalette::HighlightedText)), QIcon::Active);
+        out.addPixmap(tint(src, pal.color(QPalette::Disabled, QPalette::Text)), QIcon::Disabled);
+        return out;
+    }
+    return {};
+}
+
 void show_menu(uint64_t token, float x, float y, const OtMenuItem *items, size_t count) {
     if (!g_canvas) return;
     auto *top = new QMenu(g_canvas);
@@ -613,7 +642,7 @@ void show_menu(uint64_t token, float x, float y, const OtMenuItem *items, size_t
         const QString label = text(it.label, it.label_len);
         switch (it.kind) {
         case OT_MENU_ITEM: {
-            QAction *a = menu->addAction(label);
+            QAction *a = menu->addAction(menu_icon(it.icon, menu), label);
             a->setEnabled(it.enabled);
             if (it.checked) {
                 a->setCheckable(true);
@@ -630,7 +659,7 @@ void show_menu(uint64_t token, float x, float y, const OtMenuItem *items, size_t
             menu->addSeparator();
             break;
         case OT_MENU_SUBMENU: {
-            QMenu *sub = menu->addMenu(label);
+            QMenu *sub = menu->addMenu(menu_icon(it.icon, menu), label);
             sub->setEnabled(it.enabled);
             stack.push_back(sub);
             break;

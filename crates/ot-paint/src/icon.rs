@@ -72,6 +72,12 @@ pub enum Icon {
 }
 
 impl Icon {
+    /// The icon numbered `i` (its `repr(u32)` value), if there is one.
+    #[must_use]
+    pub fn from_index(i: u32) -> Option<Self> {
+        Self::ALL.get(i as usize).copied()
+    }
+
     /// Every icon, for backends that want to check their mapping is complete.
     pub const ALL: [Self; 31] = [
         Self::Menu,
