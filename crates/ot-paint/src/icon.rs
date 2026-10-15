@@ -38,11 +38,42 @@ pub enum Icon {
     Pause,
     Previous,
     Next,
+    // The process menu's entries.
+    /// A branching tree: the process tree.
+    Tree,
+    /// A cross: end a process.
+    EndTask,
+    /// A cross in a circle: end a process and all under it.
+    EndTree,
+    /// A circular arrow: start again.
+    Restart,
+    /// A leaf: efficiency mode, as Task Manager draws it.
+    Efficiency,
+    /// A gauge: scheduling priority.
+    Priority,
+    /// A chip: which processors to run on.
+    Affinity,
+    /// An arrow out of a box: bring a window forward.
+    SwitchTo,
+    /// An open folder.
+    OpenFolder,
+    /// A globe under a magnifier: search the web.
+    SearchOnline,
+    /// An i in a circle: the file's properties.
+    Properties,
+    /// Two sheets: copy.
+    Copy,
+    /// A disk: save a dump file.
+    Dump,
+    /// A chain link: what a process waits on.
+    WaitChain,
+    /// A stopwatch: sample for a while.
+    Stopwatch,
 }
 
 impl Icon {
     /// Every icon, for backends that want to check their mapping is complete.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 31] = [
         Self::Menu,
         Self::Summary,
         Self::Processes,
@@ -59,5 +90,20 @@ impl Icon {
         Self::Pause,
         Self::Previous,
         Self::Next,
+        Self::Tree,
+        Self::EndTask,
+        Self::EndTree,
+        Self::Restart,
+        Self::Efficiency,
+        Self::Priority,
+        Self::Affinity,
+        Self::SwitchTo,
+        Self::OpenFolder,
+        Self::SearchOnline,
+        Self::Properties,
+        Self::Copy,
+        Self::Dump,
+        Self::WaitChain,
+        Self::Stopwatch,
     ];
 }

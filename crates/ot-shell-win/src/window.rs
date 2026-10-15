@@ -64,6 +64,7 @@ use crate::actions::{self, WinPlatform};
 use crate::frame_stats::FrameLog;
 use crate::gfx::Gfx;
 use crate::icons;
+use crate::menu_art;
 use crate::placement;
 use crate::prefs::WinPrefs;
 use crate::task_manager::{self, Elevated};
@@ -434,7 +435,9 @@ fn set_window_icons(hwnd: HWND, dpi: u32) {
     }
 }
 
+/// The title bar, and the menus, dark or light.
 fn apply_title_bar_theme(hwnd: HWND, dark: bool) {
+    menu_art::set_dark(hwnd, dark);
     let flag = BOOL(i32::from(dark));
     // SAFETY: the value is a local that outlives the call; the size matches.
     unsafe {
@@ -1256,13 +1259,15 @@ fn show_notice(hwnd: HWND, notice: &Notice) {
 fn answer(cell: &RefCell<State>, hwnd: HWND, ask: Ask, more: &mut Vec<Out>) {
     match ask {
         Ask::Menu { at, nodes } => {
-            let dpi = cell.try_borrow().map_or(96.0, |st| st.dpi);
+            let (dpi, dark) = cell
+                .try_borrow()
+                .map_or((96.0, false), |st| (st.dpi, st.dark));
             let mut p = to_px_point(at, dpi);
             // SAFETY: hwnd is valid; POINT is a plain in-out struct.
             unsafe {
                 let _ = ClientToScreen(hwnd, &raw mut p);
             }
-            let chosen = actions::show_menu(hwnd, p, &nodes);
+            let chosen = actions::show_menu(hwnd, p, &nodes, dpi.round() as u32, dark);
             let at = pointer_over(hwnd, dpi);
             if let Ok(mut st) = cell.try_borrow_mut() {
                 st.shell.menu_closed(chosen, at, more);

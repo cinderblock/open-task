@@ -16,7 +16,7 @@ use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
 use ot_model::process::Priority;
 use ot_model::ProcessKey;
-use ot_paint::{Color, DisplayList, HAlign, Point, Rect, Size, VAlign};
+use ot_paint::{Color, DisplayList, HAlign, Icon, Point, Rect, Size, VAlign};
 
 use crate::charts::{self, ChartClock, ChartGroup, Charted};
 use crate::format;
@@ -170,6 +170,56 @@ pub enum MenuAction {
     OpenInstallLocation,
 }
 
+impl MenuAction {
+    /// The icon its menu item shows, if it has one.
+    #[must_use]
+    pub fn icon(self) -> Option<Icon> {
+        Some(match self {
+            Self::EndTask => Icon::EndTask,
+            Self::EndTree => Icon::EndTree,
+            Self::Restart | Self::ServiceRestart => Icon::Restart,
+            Self::Suspend => Icon::Pause,
+            Self::Resume | Self::ServiceStart => Icon::Play,
+            Self::EfficiencyMode(_) => Icon::Efficiency,
+            Self::SwitchTo => Icon::SwitchTo,
+            Self::OpenFileLocation | Self::OpenInstallLocation => Icon::OpenFolder,
+            Self::SearchOnline => Icon::SearchOnline,
+            Self::Properties => Icon::Properties,
+            Self::Copy => Icon::Copy,
+            Self::CreateDump => Icon::Dump,
+            Self::WaitChain => Icon::WaitChain,
+            Self::SampleCpu => Icon::Stopwatch,
+            Self::ShowIn(ViewMode::List) | Self::GoToProcess => Icon::Processes,
+            Self::ShowIn(ViewMode::Tree) => Icon::Tree,
+            Self::OpenServices => Icon::Services,
+            // The choices of a set, already marked by their checks, and what has
+            // no fitting picture.
+            Self::SetPriority(_)
+            | Self::SetAffinity(_)
+            | Self::ToggleColumn(_)
+            | Self::ResetColumns
+            | Self::ShowIn(_)
+            | Self::ServiceStop
+            | Self::SessionDisconnect
+            | Self::SessionSignOut
+            | Self::StartupEnable(_)
+            | Self::Uninstall => return None,
+        })
+    }
+}
+
+/// The top of a process's menu, saying what it is for: not an item, and not
+/// chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuHeader {
+    /// What the process is: its description, else its name.
+    pub title: String,
+    /// More about it, a line each: name, PID and user; publisher.
+    pub lines: Vec<String>,
+    /// Its executable, when known: shown last, and where the shell finds its icon.
+    pub path: Option<String>,
+}
+
 /// One line of a context menu, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuEntry {
@@ -183,6 +233,7 @@ pub enum MenuEntry {
     },
     Submenu {
         label: &'static str,
+        icon: Option<Icon>,
         entries: Vec<MenuEntry>,
     },
     /// The "Set affinity" submenu, which the shell fills in: one check item per
@@ -193,6 +244,8 @@ pub enum MenuEntry {
         target: ProcessKey,
     },
     Separator,
+    /// What the menu is for, at its top ([`MenuHeader`]).
+    Header(MenuHeader),
 }
 
 impl MenuEntry {
@@ -2123,7 +2176,10 @@ impl App {
         let Some(row) = self.selected_process() else {
             return Reaction::NONE;
         };
-        let mut entries = Vec::new();
+        let mut entries = vec![
+            MenuEntry::Header(self.process_header(row)),
+            MenuEntry::Separator,
+        ];
         // The Map and the History take the table's place; from them, the way back
         // to the process in it.
         if self.table_off() {
@@ -2138,6 +2194,30 @@ impl App {
             at: anchor,
             entries,
         })
+    }
+
+    /// The top of the process menu for the process in snapshot row `row`: its
+    /// description (else its name), then its name, PID and user, its publisher,
+    /// and its executable.
+    fn process_header(&self, row: usize) -> MenuHeader {
+        let s = &self.snap.processes[row].statics;
+        let described = s.description.as_deref().filter(|d| !d.trim().is_empty());
+        let mut first = format!("{} \u{b7} PID {}", s.label(), s.key.pid);
+        if let Some(user) = s.user.as_deref() {
+            let _ = write!(first, " \u{b7} {user}");
+        }
+        let mut lines = vec![first];
+        lines.extend(
+            s.company
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .map(str::to_owned),
+        );
+        MenuHeader {
+            title: described.map_or_else(|| s.label().to_string(), str::to_owned),
+            lines,
+            path: s.image_path.clone(),
+        }
     }
 
     /// The process menu's entries for the process in snapshot row `row`.
@@ -2181,6 +2261,7 @@ impl App {
             ),
             MenuEntry::Submenu {
                 label: "Set priority",
+                icon: Some(Icon::Priority),
                 entries: priority,
             },
             MenuEntry::Affinity { target: p.key() },
@@ -3477,9 +3558,14 @@ mod tests {
                 MenuEntry::Item { label, enabled, .. } => Some((label.to_string(), *enabled)),
                 MenuEntry::Submenu { label, .. } => Some(((*label).to_owned(), true)),
                 MenuEntry::Affinity { .. } => Some(("Set affinity".to_owned(), true)),
-                MenuEntry::Separator => None,
+                MenuEntry::Separator | MenuEntry::Header(_) => None,
             })
             .collect();
+        // On top, what the menu is for.
+        let Some(MenuEntry::Header(header)) = entries.first() else {
+            panic!("{entries:?}");
+        };
+        assert!(header.lines[0].contains("PID 20"), "{header:?}");
         let expect = |label: &str, enabled: bool| {
             assert!(
                 labels.iter().any(|(l, e)| l == label && *e == enabled),
@@ -3501,7 +3587,7 @@ mod tests {
         expect("Create dump file", true);
         expect("Sample CPU for 5 s", false);
         assert!(matches!(
-            entries[0],
+            entries[2],
             MenuEntry::Item {
                 action: MenuAction::EndTask,
                 ..
@@ -4912,7 +4998,8 @@ mod tests {
                 }
                 (_, e) => panic!("{view:?}: {e:?}"),
             };
-            let first: Vec<_> = entries.iter().take(2).filter_map(item).collect();
+            // Under the header and its separator.
+            let first: Vec<_> = entries.iter().skip(2).take(2).filter_map(item).collect();
             assert_eq!(
                 first,
                 [

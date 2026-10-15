@@ -7,8 +7,9 @@
 
 use std::fmt::Write as _;
 
+use ot_paint::Icon;
 use ot_probe::{ControlError, PlatformControl, ProcessControl};
-use ot_ui::{MenuAction, MenuEntry};
+use ot_ui::{MenuAction, MenuEntry, MenuHeader};
 
 /// One line of a menu, ready to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,14 +20,18 @@ pub enum MenuNode {
         label: String,
         enabled: bool,
         checked: bool,
+        icon: Option<Icon>,
     },
     Submenu {
         label: String,
         /// A submenu that cannot be opened, shown greyed.
         enabled: bool,
+        icon: Option<Icon>,
         children: Vec<MenuNode>,
     },
     Separator,
+    /// What the menu is for, at its top; not an item.
+    Header(MenuHeader),
 }
 
 /// Turn the view's entries into nodes, collecting each item's action in
@@ -51,11 +56,17 @@ pub(crate) fn build(
                     label: label.to_string(),
                     enabled: *enabled,
                     checked: *checked,
+                    icon: action.icon(),
                 }
             }
-            MenuEntry::Submenu { label, entries } => MenuNode::Submenu {
+            MenuEntry::Submenu {
+                label,
+                icon,
+                entries,
+            } => MenuNode::Submenu {
                 label: (*label).to_owned(),
                 enabled: true,
+                icon: *icon,
                 children: build(entries, actions, control),
             },
             MenuEntry::Affinity { target } => {
@@ -63,10 +74,12 @@ pub(crate) fn build(
                 MenuNode::Submenu {
                     label: "Set affinity".to_owned(),
                     enabled: affinity.is_ok(),
+                    icon: Some(Icon::Affinity),
                     children: affinity_items(&affinity, actions),
                 }
             }
             MenuEntry::Separator => MenuNode::Separator,
+            MenuEntry::Header(h) => MenuNode::Header(h.clone()),
         });
     }
     nodes
@@ -89,6 +102,7 @@ fn affinity_items(
         label: "All processors".to_owned(),
         enabled: true,
         checked: a.mask == a.system,
+        icon: None,
     });
     nodes.push(MenuNode::Separator);
     for cpu in 0..64u32 {
@@ -106,6 +120,7 @@ fn affinity_items(
             label,
             enabled: true,
             checked: a.mask & bit != 0,
+            icon: None,
         });
     }
     nodes
@@ -122,6 +137,7 @@ mod tests {
             MenuEntry::Separator,
             MenuEntry::Submenu {
                 label: "More",
+                icon: None,
                 entries: vec![MenuEntry::item(MenuAction::EndTree, "End tree", false)],
             },
         ];
@@ -139,5 +155,29 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn items_take_their_icons_from_their_actions_and_the_header_passes_through() {
+        let header = MenuHeader {
+            title: "Google Chrome".to_owned(),
+            lines: vec!["chrome.exe \u{b7} PID 7".to_owned()],
+            path: None,
+        };
+        let entries = vec![
+            MenuEntry::Header(header.clone()),
+            MenuEntry::item(MenuAction::EndTask, "End task", true),
+            MenuEntry::item(MenuAction::ResetColumns, "Reset columns", true),
+        ];
+        let nodes = build(&entries, &mut Vec::new(), PlatformControl);
+        assert_eq!(nodes[0], MenuNode::Header(header));
+        let icons: Vec<Option<Icon>> = nodes[1..]
+            .iter()
+            .map(|n| match n {
+                MenuNode::Item { icon, .. } => *icon,
+                _ => panic!("{n:?}"),
+            })
+            .collect();
+        assert_eq!(icons, [Some(Icon::EndTask), None]);
     }
 }

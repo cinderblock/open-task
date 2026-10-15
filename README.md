@@ -302,7 +302,10 @@ limited-rights handle to each process; a process that refuses even that (another
 user's, from an unelevated open-task) still shows its image path, but those stay
 blank.
 
-**Right-click a process** for **End task**, **End process tree** (the process and
+**Right-click a process** for its menu. It opens with what the process is: its
+icon, its description (else its name), its name, PID and user, its publisher and
+its path. Each entry has its icon, and the menu follows the app's light or dark
+theme. It offers **End task**, **End process tree** (the process and
 everything under it, parents first), **Restart** (end it, then start its command
 line again in its directory), **Suspend** / **Resume**, **Efficiency mode** (EcoQoS
 and idle priority, as Task Manager's), **Set priority**, **Set affinity** (a check

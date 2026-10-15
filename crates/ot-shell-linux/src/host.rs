@@ -745,6 +745,7 @@ fn flatten(nodes: &[MenuNode], out: &mut Vec<Flat>, labels: &mut Vec<String>) {
                 label,
                 enabled,
                 checked,
+                ..
             } => push(
                 menu::ITEM,
                 *enabled,
@@ -758,12 +759,23 @@ fn flatten(nodes: &[MenuNode], out: &mut Vec<Flat>, labels: &mut Vec<String>) {
                 label,
                 enabled,
                 children,
+                ..
             } => {
                 push(menu::SUBMENU, *enabled, false, 0, label, labels, out);
                 flatten(children, out, labels);
                 push(menu::SUBMENU_END, true, false, 0, "", labels, out);
             }
             MenuNode::Separator => push(menu::SEPARATOR, true, false, 0, "", labels, out),
+            // The plugins draw no header: its lines go in as items that cannot
+            // be chosen, with an id no action has.
+            MenuNode::Header(h) => {
+                let lines = std::iter::once(&h.title)
+                    .chain(&h.lines)
+                    .chain(h.path.as_ref());
+                for line in lines {
+                    push(menu::ITEM, false, false, u64::MAX, line, labels, out);
+                }
+            }
         }
     }
 }
@@ -780,16 +792,19 @@ mod tests {
                 label: "End task".into(),
                 enabled: true,
                 checked: false,
+                icon: None,
             },
             MenuNode::Separator,
             MenuNode::Submenu {
                 label: "Set priority".into(),
                 enabled: true,
+                icon: None,
                 children: vec![MenuNode::Item {
                     id: 1,
                     label: "High".into(),
                     enabled: true,
                     checked: true,
+                    icon: None,
                 }],
             },
         ];

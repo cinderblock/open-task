@@ -42,6 +42,8 @@ mod instance;
 #[cfg(windows)]
 pub mod launcher;
 #[cfg(windows)]
+mod menu_art;
+#[cfg(windows)]
 mod placement;
 #[cfg(windows)]
 mod prefs;

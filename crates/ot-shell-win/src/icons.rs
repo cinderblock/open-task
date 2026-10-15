@@ -104,7 +104,7 @@ impl IconLoader {
 }
 
 /// The icon for `path`, or the generic program icon when the file will not say.
-fn extract(wic: &IWICImagingFactory, path: &str) -> IconPixels {
+pub(crate) fn extract(wic: &IWICImagingFactory, path: &str) -> IconPixels {
     let mut pixels = IconPixels {
         path: path.to_owned(),
         width: 0,

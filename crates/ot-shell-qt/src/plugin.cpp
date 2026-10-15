@@ -117,6 +117,21 @@ const std::vector<const char *> &icon_names(uint32_t icon) {
         {"media-playback-pause-symbolic", "media-playback-pause"},
         {"media-skip-backward-symbolic", "media-skip-backward"},
         {"media-skip-forward-symbolic", "media-skip-forward"},
+        {"view-list-tree-symbolic", "view-list-tree", "view-list-symbolic"},
+        {"window-close-symbolic", "process-stop", "window-close"},
+        {"process-stop-symbolic", "process-stop", "edit-delete"},
+        {"view-refresh-symbolic", "view-refresh"},
+        {"power-profile-power-saver-symbolic", "battery-profile-powersave", "battery"},
+        {"power-profile-balanced-symbolic", "speedometer", "power-profile-performance-symbolic"},
+        {"application-x-firmware-symbolic", "cpu", "computer"},
+        {"go-jump-symbolic", "go-jump", "window-new"},
+        {"folder-open-symbolic", "document-open-folder", "folder-open"},
+        {"system-search-symbolic", "edit-find", "system-search"},
+        {"document-properties-symbolic", "document-properties", "dialog-information"},
+        {"edit-copy-symbolic", "edit-copy"},
+        {"document-save-symbolic", "document-save"},
+        {"insert-link-symbolic", "insert-link"},
+        {"alarm-symbolic", "chronometer", "preferences-system-time"},
     };
     static const std::vector<const char *> none;
     return icon < names.size() ? names[icon] : none;

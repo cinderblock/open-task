@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use ot_shell_core::MenuNode;
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -23,11 +24,14 @@ use windows::Win32::UI::Shell::{
     SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetWindowThreadProcessId, IsIconic,
-    SetForegroundWindow, ShowWindow, TrackPopupMenuEx, WindowFromPoint, GA_ROOT, HMENU, MF_CHECKED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_RESTORE, SW_SHOWNORMAL, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetMenuItemCount,
+    GetWindowThreadProcessId, IsIconic, SetForegroundWindow, SetMenuItemInfoW, ShowWindow,
+    TrackPopupMenuEx, WindowFromPoint, GA_ROOT, HMENU, MENUITEMINFOW, MF_BITMAP, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, SW_RESTORE,
+    SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
 };
+
+use crate::menu_art;
 
 /// `CF_UNICODETEXT`.
 const CF_UNICODETEXT: u32 = 13;
@@ -42,41 +46,68 @@ impl ot_shell_core::Platform for WinPlatform {
     }
 }
 
-/// Show a popup menu built from `nodes`, submenus and check marks included.
-/// Blocks until the user picks or dismisses; messages keep flowing meanwhile, so
-/// the table under it stays live. Returns the chosen item's id.
+/// Show a popup menu built from `nodes`, submenus and check marks included,
+/// each item with its icon and a picture of a [`MenuNode::Header`] on top
+/// ([`crate::menu_art`]), at `dpi`, dark or light. Blocks until the user picks or
+/// dismisses; messages keep flowing meanwhile, so the table under it stays live.
+/// Returns the chosen item's id.
 pub(crate) fn show_menu(
     hwnd: HWND,
     at: windows::Win32::Foundation::POINT,
     nodes: &[MenuNode],
+    dpi: u32,
+    dark: bool,
 ) -> Option<usize> {
-    // SAFETY: the menu tree is destroyed before returning; AppendMenuW copies
-    // labels, and a submenu handed to MF_POPUP is owned by its parent from then on.
+    // The header's picture, which must outlive the menu.
+    let header = nodes.iter().find_map(|n| match n {
+        MenuNode::Header(h) => {
+            menu_art::header_bitmap(&h.title, &h.lines, h.path.as_deref(), dpi, dark)
+        }
+        _ => None,
+    });
+    let look = Look {
+        dpi,
+        dark,
+        header: header.as_ref().map(|h| h.0),
+    };
+    // SAFETY: the menu tree is destroyed before returning, and the header with
+    // it; AppendMenuW copies labels, and a submenu handed to MF_POPUP is owned by
+    // its parent from then on.
     let chosen = unsafe {
-        let menu = build_menu(nodes)?;
+        let menu = build_menu(nodes, &look)?;
         let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN;
         let chosen = TrackPopupMenuEx(menu, flags.0, at.x, at.y, hwnd, None);
         let _ = DestroyMenu(menu);
         chosen.0
     };
+    drop(header);
     // Command ids are item ids plus one; 0 means dismissed.
     usize::try_from(chosen).ok()?.checked_sub(1)
+}
+
+/// How a menu is drawn: at what DPI, dark or not, and its header's picture.
+struct Look {
+    dpi: u32,
+    dark: bool,
+    header: Option<HBITMAP>,
 }
 
 /// One level of the menu.
 ///
 /// # Safety
-/// The caller destroys the returned menu (which destroys the submenus).
-unsafe fn build_menu(nodes: &[MenuNode]) -> Option<HMENU> {
+/// The caller destroys the returned menu (which destroys the submenus), and keeps
+/// `look.header` alive until then.
+unsafe fn build_menu(nodes: &[MenuNode], look: &Look) -> Option<HMENU> {
     // SAFETY: plain call; the caller owns the result.
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     for node in nodes {
-        let r = match node {
+        let (r, icon) = match node {
             MenuNode::Item {
                 id,
                 label,
                 enabled,
                 checked,
+                icon,
             } => {
                 let mut flags = MF_STRING;
                 if !enabled {
@@ -86,15 +117,18 @@ unsafe fn build_menu(nodes: &[MenuNode]) -> Option<HMENU> {
                     flags |= MF_CHECKED;
                 }
                 // SAFETY: the label outlives the call, which copies it.
-                unsafe { AppendMenuW(menu, flags, id + 1, &HSTRING::from(label.as_str())) }
+                let r = unsafe { AppendMenuW(menu, flags, id + 1, &HSTRING::from(label.as_str())) };
+                // The icon and the check share a place: a checked item shows its check.
+                (r, icon.filter(|_| !checked).map(|i| (i, *enabled)))
             }
             MenuNode::Submenu {
                 label,
                 enabled,
+                icon,
                 children,
             } => {
                 // SAFETY: as for this function; the submenu is owned by `menu`.
-                let Some(sub) = (unsafe { build_menu(children) }) else {
+                let Some(sub) = (unsafe { build_menu(children, look) }) else {
                     continue;
                 };
                 let flags = if *enabled {
@@ -103,13 +137,52 @@ unsafe fn build_menu(nodes: &[MenuNode]) -> Option<HMENU> {
                     MF_POPUP | MF_GRAYED
                 };
                 // SAFETY: a popup handle is passed in the id slot, as MF_POPUP asks.
-                unsafe { AppendMenuW(menu, flags, sub.0 as usize, &HSTRING::from(label.as_str())) }
+                let r = unsafe {
+                    AppendMenuW(menu, flags, sub.0 as usize, &HSTRING::from(label.as_str()))
+                };
+                (r, icon.map(|i| (i, *enabled)))
             }
             // SAFETY: a separator has no label.
-            MenuNode::Separator => unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) },
+            MenuNode::Separator => (
+                unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) },
+                None,
+            ),
+            MenuNode::Header(_) => {
+                let Some(h) = look.header else {
+                    continue;
+                };
+                // A picture, never chosen: disabled, but not grayed (it has its
+                // own colors), with no id an item has.
+                // SAFETY: a bitmap item takes the bitmap's handle as its "text";
+                // the bitmap outlives the menu.
+                let r = unsafe {
+                    AppendMenuW(menu, MF_BITMAP | MF_DISABLED, 0, PCWSTR(h.0 as *const u16))
+                };
+                (r, None)
+            }
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "AppendMenuW");
+            continue;
+        }
+        let Some(bitmap) =
+            icon.and_then(|(i, on)| menu_art::icon_bitmap(i, look.dpi, look.dark, on))
+        else {
+            continue;
+        };
+        let info = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_BITMAP,
+            hbmpItem: bitmap,
+            ..Default::default()
+        };
+        // SAFETY: the item was just appended, last; the bitmap stays alive in
+        // `menu_art`'s cache.
+        unsafe {
+            let last = GetMenuItemCount(Some(menu)) - 1;
+            if let Err(e) = SetMenuItemInfoW(menu, last as u32, true, &raw const info) {
+                tracing::warn!(error = %e, "SetMenuItemInfoW");
+            }
         }
     }
     Some(menu)

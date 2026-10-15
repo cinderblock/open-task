@@ -1571,24 +1571,39 @@ fn create_d3d_device(warp_only: bool) -> Result<ID3D11Device> {
 
 /// The Segoe Fluent Icons / MDL2 Assets codepoint for each icon, picked by
 /// rendering the candidates (see `plans/performance-view.md`).
-fn glyph(icon: Icon) -> char {
+pub(crate) fn glyph(icon: Icon) -> char {
     match icon {
-        Icon::Menu => '\u{E700}',        // GlobalNavigationButton
-        Icon::Summary => '\u{F246}',     // ViewDashboard, tiles of a dashboard
-        Icon::Processes => '\u{E71D}',   // AllApps, drawn as a checklist
-        Icon::Performance => '\u{E9D9}', // Diagnostic, a pulse in a box
-        Icon::Settings => '\u{E713}',    // Setting, a gear
-        Icon::Update => '\u{E895}',      // Sync, Windows Update's own
-        Icon::Users => '\u{E716}',       // People
-        Icon::Services => '\u{E9F5}',    // Processing, two gears
-        Icon::Startup => '\u{E7E8}',     // PowerButton
-        Icon::Connections => '\u{E774}', // Globe
-        Icon::Apps => '\u{E7B8}',        // Package
-        Icon::System => '\u{E7F4}',      // Devices, a monitor
-        Icon::Play => '\u{E768}',        // Play
-        Icon::Pause => '\u{E769}',       // Pause
-        Icon::Previous => '\u{E892}',    // Previous
-        Icon::Next => '\u{E893}',        // Next
+        Icon::Menu => '\u{E700}',         // GlobalNavigationButton
+        Icon::Summary => '\u{F246}',      // ViewDashboard, tiles of a dashboard
+        Icon::Processes => '\u{E71D}',    // AllApps, drawn as a checklist
+        Icon::Performance => '\u{E9D9}',  // Diagnostic, a pulse in a box
+        Icon::Settings => '\u{E713}',     // Setting, a gear
+        Icon::Update => '\u{E895}',       // Sync, Windows Update's own
+        Icon::Users => '\u{E716}',        // People
+        Icon::Services => '\u{E9F5}',     // Processing, two gears
+        Icon::Startup => '\u{E7E8}',      // PowerButton
+        Icon::Connections => '\u{E774}',  // Globe
+        Icon::Apps => '\u{E7B8}',         // Package
+        Icon::System => '\u{E7F4}',       // Devices, a monitor
+        Icon::Play => '\u{E768}',         // Play
+        Icon::Pause => '\u{E769}',        // Pause
+        Icon::Previous => '\u{E892}',     // Previous
+        Icon::Next => '\u{E893}',         // Next
+        Icon::Tree => '\u{F003}',         // Share, three linked nodes
+        Icon::EndTask => '\u{E711}',      // Cancel
+        Icon::EndTree => '\u{EA39}',      // StatusErrorCircle, a cross in a circle
+        Icon::Restart => '\u{E72C}',      // Refresh
+        Icon::Efficiency => '\u{EC0A}',   // Leaf, as Task Manager
+        Icon::Priority => '\u{EC4A}',     // SpeedHigh, a gauge
+        Icon::Affinity => '\u{E950}',     // Processing chip
+        Icon::SwitchTo => '\u{E8A7}',     // OpenInNewWindow
+        Icon::OpenFolder => '\u{E838}',   // OpenFolderHorizontal
+        Icon::SearchOnline => '\u{F6FA}', // a globe under a magnifier
+        Icon::Properties => '\u{E946}',   // Info
+        Icon::Copy => '\u{E8C8}',         // Copy
+        Icon::Dump => '\u{E74E}',         // Save
+        Icon::WaitChain => '\u{E71B}',    // Link
+        Icon::Stopwatch => '\u{E916}',    // Stopwatch
     }
 }
 

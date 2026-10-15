@@ -209,6 +209,27 @@ fn icon_names(icon: Icon) -> &'static [&'static str] {
         Icon::Pause => &["media-playback-pause-symbolic"],
         Icon::Previous => &["media-skip-backward-symbolic"],
         Icon::Next => &["media-skip-forward-symbolic"],
+        Icon::Tree => &["view-list-tree-symbolic", "view-list-symbolic"],
+        Icon::EndTask => &["window-close-symbolic", "process-stop-symbolic"],
+        Icon::EndTree => &["process-stop-symbolic", "edit-delete-symbolic"],
+        Icon::Restart => &["view-refresh-symbolic"],
+        Icon::Efficiency => &["power-profile-power-saver-symbolic", "battery-symbolic"],
+        Icon::Priority => &[
+            "power-profile-balanced-symbolic",
+            "power-profile-performance-symbolic",
+        ],
+        Icon::Affinity => &["application-x-firmware-symbolic", "computer-symbolic"],
+        Icon::SwitchTo => &["go-jump-symbolic", "window-new-symbolic"],
+        Icon::OpenFolder => &["folder-open-symbolic"],
+        Icon::SearchOnline => &["system-search-symbolic", "web-browser-symbolic"],
+        Icon::Properties => &[
+            "document-properties-symbolic",
+            "dialog-information-symbolic",
+        ],
+        Icon::Copy => &["edit-copy-symbolic"],
+        Icon::Dump => &["document-save-symbolic"],
+        Icon::WaitChain => &["insert-link-symbolic"],
+        Icon::Stopwatch => &["alarm-symbolic", "preferences-system-time-symbolic"],
     }
 }
 
