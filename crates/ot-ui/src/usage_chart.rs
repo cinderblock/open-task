@@ -1404,10 +1404,14 @@ impl UsageChart {
             self.history.push(row);
         }
         // The fading total: the same sum the totals are, run over the history
-        // oldest first. Fading is the same for every program, so "everything
-        // else" fades as one.
+        // oldest first, from what had faded out of it by then. Fading is the same
+        // for every program, so "everything else" fades as one.
         if self.mode == ChartMode::Total {
             let mut total = [0.0f64; BANDS];
+            for (g, &x) in usage.faded_out().iter().enumerate() {
+                let band = self.band_of.get(g).map_or(OTHER, |&b| usize::from(b));
+                total[band] += x;
+            }
             for r in self.history.iter_mut().rev() {
                 let (kept, arrived) = fade(self.decay, f64::from(r.secs));
                 for (t, v) in total.iter_mut().zip(&mut r.v) {
@@ -2250,7 +2254,16 @@ mod tests {
     /// A session of `secs` seconds sampled once a second, where `rate(name, s)` is
     /// the G cycles program `name` uses in second `s`.
     fn session(names: &[&str], secs: u64, rate: impl Fn(usize, u64) -> u64) -> Usage {
-        let mut u = Usage::new(0.05);
+        session_into(Usage::new(0.05), names, secs, rate)
+    }
+
+    /// [`session`] fed into `u`.
+    fn session_into(
+        mut u: Usage,
+        names: &[&str],
+        secs: u64,
+        rate: impl Fn(usize, u64) -> u64,
+    ) -> Usage {
         let mut used = vec![0u64; names.len()];
         for s in 0..=secs {
             let procs = names
@@ -2413,6 +2426,23 @@ mod tests {
         assert!(now.v[b] < peak * 0.06);
         assert!(texts(&dl).iter().any(|s| s
             .starts_with("Cycles each program has used, fading 5% a second (halving in 14 s).")));
+    }
+
+    #[test]
+    fn the_fading_total_does_not_start_from_nothing_once_history_has_left() {
+        // A steady 2 G a second for five minutes, with a minute of history kept:
+        // the total had long settled by the oldest stretch still held.
+        let mut u = Usage::new(0.05);
+        u.set_history_span(60_000);
+        let u = session_into(u, &["a.exe"], 300, |_, _| 2);
+        let mut c = UsageChart::default();
+        painted(&mut c, &u, "");
+        let a = band(&c, &u, "a.exe");
+        let (newest, oldest) = (c.points[0].v[a], c.points.last().unwrap().v[a]);
+        assert!(
+            (oldest / newest - 1.0).abs() < 1e-3,
+            "flat across: {oldest} at the left, {newest} at the right"
+        );
     }
 
     #[test]

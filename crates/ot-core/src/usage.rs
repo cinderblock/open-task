@@ -320,6 +320,10 @@ pub struct Usage {
     raw: VecDeque<Stored>,
     coarse: VecDeque<Stored>,
     open: Option<Open>,
+    /// Each program's fading total of the cycles in the stretches that have passed
+    /// the reach, as at the end of the newest of them ([`Usage::faded_out`]).
+    faded_out: Vec<f64>,
+    faded_out_ms: Option<i64>,
     /// Scratch: this interval's numbers by program, one of each kind of list,
     /// then the same as lists; and room for merging lists.
     by_program: Vec<[f64; KINDS]>,
@@ -372,6 +376,8 @@ impl Usage {
             raw: VecDeque::new(),
             coarse: VecDeque::new(),
             open: None,
+            faded_out: Vec::new(),
+            faded_out_ms: None,
             by_program: Vec::new(),
             interval: Lists::default(),
             merged: Vec::new(),
@@ -628,13 +634,38 @@ impl Usage {
                 merge(into, from, &mut self.merged);
             }
         }
-        // Steps that have passed the reach go, the one being filled included.
-        if self.open.as_ref().is_some_and(|o| now - o.end_ms > reach) {
-            self.open = None;
-        }
+        // Steps that have passed the reach go, oldest first, the one being filled
+        // included; their cycles stay on in the faded-out totals.
         while self.coarse.front().is_some_and(|f| now - f.end_ms > reach) {
-            self.coarse.pop_front();
+            if let Some(old) = self.coarse.pop_front() {
+                self.fade_out(old.end_ms, old.span_ms, &old.lists[CYCLES]);
+            }
         }
+        if self.open.as_ref().is_some_and(|o| now - o.end_ms > reach) {
+            if let Some(o) = self.open.take() {
+                self.fade_out(o.end_ms, o.span_ms, &o.lists[CYCLES]);
+            }
+        }
+    }
+
+    /// Fold the cycles of a stretch leaving the history, ending at `end_ms` and
+    /// `span_ms` long, into the faded-out totals.
+    fn fade_out(&mut self, end_ms: i64, span_ms: i64, cycles: &[(ProgramId, f32)]) {
+        // Stretches follow one another, so the totals are as at this one's start.
+        let since_ms = self.faded_out_ms.map_or(span_ms, |t| end_ms - t);
+        let (kept, _) = fade(self.decay, since_ms.max(0) as f64 / 1000.0);
+        let (_, arrived) = fade(self.decay, span_ms.max(0) as f64 / 1000.0);
+        for t in &mut self.faded_out {
+            *t *= kept;
+        }
+        for &(g, x) in cycles {
+            let g = g as usize;
+            if g >= self.faded_out.len() {
+                self.faded_out.resize(g + 1, 0.0);
+            }
+            self.faded_out[g] += f64::from(x) * arrived;
+        }
+        self.faded_out_ms = Some(end_ms);
     }
 
     /// Forget the processes last seen before the history's reach, except those that
@@ -757,6 +788,16 @@ impl Usage {
     #[must_use]
     pub fn programs(&self) -> usize {
         self.programs.len()
+    }
+
+    /// Each program's fading total of the cycles used before the history's oldest
+    /// stretch, as at that stretch's start, indexed by [`ProgramId`] (programs past
+    /// the end have none). A fading sum run over [`Self::frames`], oldest first,
+    /// starts from here, so that it comes to the totals even once the history no
+    /// longer reaches back to the session's start.
+    #[must_use]
+    pub fn faded_out(&self) -> &[f64] {
+        &self.faded_out
     }
 
     /// The history, newest first: every sample of the last ten minutes, then steps
@@ -933,6 +974,48 @@ mod tests {
             used(&u, 1)
         );
         assert!(close(u.total(), used(&u, 1)));
+    }
+
+    #[test]
+    fn a_sum_over_the_history_from_what_faded_out_of_it_comes_to_the_totals() {
+        let mut u = Usage::new(0.05);
+        u.set_history_span(60_000);
+        assert!(u.faded_out().is_empty(), "nothing has left yet");
+        // p1 steady at a G a second; p2 busy for its first minute only, which
+        // has left the history by the end.
+        for s in 0..=300u64 {
+            let busy = s.min(60);
+            u.observe(&snap(
+                1000 + s,
+                vec![proc(1, Some(0), s * G), proc(2, Some(0), 3 * busy * G)],
+            ));
+        }
+        let oldest = u.frames().last().unwrap();
+        assert!(u.now_ms() - oldest.end_ms <= 60_000, "the history was cut");
+        let mut sum = u.faded_out().to_vec();
+        sum.resize(u.programs(), 0.0);
+        let frames: Vec<_> = u.frames().collect();
+        for f in frames.iter().rev() {
+            let (kept, arrived) = fade(u.decay(), f.span_ms as f64 / 1000.0);
+            for t in &mut sum {
+                *t *= kept;
+            }
+            for &(g, x) in f.cycles {
+                sum[g as usize] += f64::from(x) * arrived;
+            }
+        }
+        let of = |pid| u.program(&format!("p{pid}.exe")).unwrap() as usize;
+        for pid in [1, 2] {
+            assert!(
+                (sum[of(pid)] / used(&u, pid) - 1.0).abs() < 1e-5,
+                "p{pid}: {} {}",
+                sum[of(pid)],
+                used(&u, pid)
+            );
+        }
+        // The steady one had long settled by the history's start.
+        let settled = G as f64 * u.time_constant();
+        assert!((u.faded_out()[of(1)] / settled - 1.0).abs() < 1e-3);
     }
 
     #[test]
