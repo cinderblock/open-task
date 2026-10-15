@@ -34,6 +34,7 @@ pub use task_manager::{Replacement, TaskManager};
 pub use theme::Theme;
 pub use update::{UpdateAction, UpdateView};
 pub use view::{
-    App, Command, Cursor, Effect, Inventory, Key, MenuAction, MenuEntry, MenuHeader, MouseButton, PaintKind,
-    ProcessAction, Query, Reaction, ServiceAction, SessionAction, UiEvent, ViewLayout, ViewMode,
+    App, Command, Cursor, Effect, Inventory, Key, MenuAction, MenuEntry, MenuHeader, MouseButton,
+    PaintKind, ProcessAction, Query, Reaction, ServiceAction, SessionAction, UiEvent, ViewLayout,
+    ViewMode,
 };
