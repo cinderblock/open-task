@@ -137,11 +137,13 @@ rate is on the **Settings** page, from 1 % to 50 %). A process that was busy lat
 is at the top, one that has been steadily at work for a long time stays in view, and
 a short burst shows for a while and then sinks. At a steady rate a total settles at
 about twenty seconds' worth of cycles (at 5 %; a total halves in 14 s), so read it
-as "what was used recently". The **Cycles** column, the Map, the usage strip and the
-History all show these totals. The fading goes by the clock, not by the sample, so
-the numbers are the same however often the system is sampled; a process that exits
-stays in the Map and the strip until its total has faded away, and in the History
-for as long as the chart reaches back.
+as "what was used recently". A process already running when open-task starts begins
+from a guess, the total it would have if it had used its cycles evenly since it
+started, so the totals do not all start from nothing. The **Cycles** column, the
+Map, the usage strip and the History all show these totals. The fading goes by the
+clock, not by the sample, so the numbers are the same however often the system is
+sampled; a process that exits stays in the Map and the strip until its total has
+faded away, and in the History for as long as the chart reaches back.
 
 Cycles are what Windows counts for each process, exactly, where CPU time is charged
 a clock tick (15.6 ms) at a time, so a short burst that CPU % misses still shows.

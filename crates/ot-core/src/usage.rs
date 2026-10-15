@@ -17,7 +17,10 @@
 //!
 //! Edges, handled so the numbers stay honest:
 //! - a process that starts while the session runs counts everything it has used; one
-//!   that was already running when the session began counts from then;
+//!   that was already running when the session began starts from a guess, the total
+//!   it would have if it had used its cycles evenly since it started (exact for one
+//!   started just before, its average rate for a long-running one); one first seen
+//!   later that was running before the session counts from when it was seen;
 //! - a process that exits stays, as a ghost fading like the rest, until its total is
 //!   too small to matter;
 //! - cycles a process uses between its last sample and its exit, and all of a
@@ -55,7 +58,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ot_model::process::ProcessStatic;
+use ot_model::process::{ProcessSample, ProcessStatic};
 use ot_model::{ProcessKey, Tick};
 
 use crate::snapshot::Snapshot;
@@ -515,8 +518,12 @@ impl Usage {
                 // Started since the last snapshot: everything it has used is new.
                 (p.cycles, p.cpu_time)
             } else {
-                // Already running when first seen: what it used before then was
-                // used before anyone was watching.
+                // Already running when first seen: used before anyone watched,
+                // so at the session's start a guess, which the history starts on.
+                if first {
+                    e.total = guess_before(self.decay, now, p);
+                    add_to(&mut self.faded_out, e.program, e.total);
+                }
                 (0, Duration::ZERO)
             };
             e.last = p.cycles;
@@ -524,21 +531,7 @@ impl Usage {
             if used > 0 {
                 e.total += used as f64 * arrived;
             }
-            self.seen
-                .entry(p.key())
-                .and_modify(|s| {
-                    s.last_ms = now;
-                    // The probe can learn the parent after first sight.
-                    s.parent = p.statics.parent;
-                    s.lost_parent = lost_parent(&p.statics);
-                })
-                .or_insert(Seen {
-                    parent: p.statics.parent,
-                    lost_parent: lost_parent(&p.statics),
-                    program: e.program,
-                    first_ms: now,
-                    last_ms: now,
-                });
+            see(&mut self.seen, p, e.program, now);
             let program = e.program as usize;
             if program >= self.by_program.len() {
                 self.by_program.resize(program + 1, [0.0; KINDS]);
@@ -659,11 +652,7 @@ impl Usage {
             *t *= kept;
         }
         for &(g, x) in cycles {
-            let g = g as usize;
-            if g >= self.faded_out.len() {
-                self.faded_out.resize(g + 1, 0.0);
-            }
-            self.faded_out[g] += f64::from(x) * arrived;
+            add_to(&mut self.faded_out, g, f64::from(x) * arrived);
         }
         self.faded_out_ms = Some(end_ms);
     }
@@ -828,6 +817,26 @@ pub fn half_life(decay: f64) -> f64 {
     time_constant(decay) * std::f64::consts::LN_2
 }
 
+/// The fading total a process already running at `now_ms` would have, had it used
+/// the cycles it has used evenly since it started: exact for one started just
+/// before, its average rate settled for a long-running one. Nothing without a
+/// known start.
+fn guess_before(decay: f64, now_ms: i64, p: &ProcessSample) -> f64 {
+    p.statics.started_unix_ms.map_or(0.0, |started| {
+        let age_s = (now_ms - started).max(0) as f64 / 1000.0;
+        p.cycles as f64 * fade(decay, age_s).1
+    })
+}
+
+/// Add `x` to program `g`'s entry of `totals`, growing it to reach.
+fn add_to(totals: &mut Vec<f64>, g: ProgramId, x: f64) {
+    let g = g as usize;
+    if g >= totals.len() {
+        totals.resize(g + 1, 0.0);
+    }
+    totals[g] += x;
+}
+
 fn clamp_decay(decay: f64) -> f64 {
     if decay.is_finite() {
         decay.clamp(0.001, 0.9)
@@ -849,6 +858,25 @@ fn program_id(
     programs.push(label.clone().into_owned());
     ids.insert(label.into_owned(), id);
     id
+}
+
+/// Note in the lineage that `p`, charted under `program`, was in the snapshot at
+/// `now_ms`.
+fn see(seen: &mut HashMap<ProcessKey, Seen>, p: &ProcessSample, program: ProgramId, now_ms: i64) {
+    seen.entry(p.key())
+        .and_modify(|s| {
+            s.last_ms = now_ms;
+            // The probe can learn the parent after first sight.
+            s.parent = p.statics.parent;
+            s.lost_parent = lost_parent(&p.statics);
+        })
+        .or_insert(Seen {
+            parent: p.statics.parent,
+            lost_parent: lost_parent(&p.statics),
+            program,
+            first_ms: now_ms,
+            last_ms: now_ms,
+        });
 }
 
 /// The PID of a parent the probe could not find: one the system reported (not the
@@ -1073,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn what_was_used_before_the_session_does_not_count() {
+    fn what_was_used_before_the_session_starts_as_a_guess() {
         let mut u = Usage::new(0.05);
         // Running since long before, 50 G behind it; and one started ten seconds
         // before the session began.
@@ -1084,10 +1112,29 @@ mod tests {
             ]
         };
         u.observe(&snap(1000, procs(0)));
-        assert!(close(used(&u, 1), 0.0) && close(used(&u, 2), 0.0));
+        // As though each had used its cycles evenly since it started: the old
+        // one's 50 G over 1000 s settled at 50 M a second times the time
+        // constant, the young one's 5 G mostly still there.
+        let guess = |cycles: u64, age_s: f64| cycles as f64 * fade(0.05, age_s).1;
+        let (g1, g2) = (guess(50 * G, 1000.0), guess(5 * G, 10.0));
+        assert!(close(used(&u, 1), g1) && close(used(&u, 2), g2));
+        assert!((g1 / (0.05 * G as f64 * u.time_constant()) - 1.0).abs() < 1e-6);
+        assert!(g2 > 3.5 * G as f64 && g2 < 4.5 * G as f64, "{g2}");
+        // The history starts from the guesses.
+        let of = |pid| u.program(&format!("p{pid}.exe")).unwrap() as usize;
+        assert!(close(u.faded_out()[of(1)], g1) && close(u.faded_out()[of(2)], g2));
+        // From there on, what each uses adds as usual.
         u.observe(&snap(1001, procs(G)));
-        assert!(used(&u, 1) > 0.0 && used(&u, 1) < G as f64);
-        assert!(close(used(&u, 1), used(&u, 2)));
+        let (kept, arrived) = fade(0.05, 1.0);
+        assert!(close(used(&u, 1), g1 * kept + G as f64 * arrived));
+        assert!(close(used(&u, 2), g2 * kept + G as f64 * arrived));
+        // One first seen later, though running before the session, counts from
+        // when it was seen: there is no guess for it in the history's start.
+        u.observe(&snap(
+            1002,
+            vec![proc(1, Some(0), 52 * G), proc(3, Some(0), 70 * G)],
+        ));
+        assert!(close(used(&u, 3), 0.0));
     }
 
     #[test]
