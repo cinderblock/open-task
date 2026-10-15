@@ -506,6 +506,11 @@ protected:
         case Qt::Key_Enter: ev.key = OT_KEY_ENTER; break;
         case Qt::Key_Tab:
         case Qt::Key_Backtab: ev.key = OT_KEY_TAB; break;
+        // The menu key comes as a context menu event; Shift+F10, its stand-in, Qt
+        // leaves as a key.
+        case Qt::Key_F10:
+            if (e->modifiers() & Qt::ShiftModifier) ev.key = OT_KEY_MENU;
+            break;
         default: break;
         }
         if (ev.key != OT_KEY_NONE) {
