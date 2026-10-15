@@ -304,7 +304,8 @@ blank.
 
 **Right-click a process** for its menu. It opens with what the process is: its
 icon, its description (else its name), its name, PID and user, its publisher and
-its path. Each entry has its icon, and the menu follows the app's light or dark
+its path. Each entry has its icon (on Windows and under Qt; GTK menus go without
+icons), and the menu follows the app's light or dark
 theme. It offers **End task**, **End process tree** (the process and
 everything under it, parents first), **Restart** (end it, then start its command
 line again in its directory), **Suspend** / **Resume**, **Efficiency mode** (EcoQoS

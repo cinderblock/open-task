@@ -82,11 +82,25 @@ room for icons, and none of the entries have them. also, dark mode".
 - [x] Real app, dark and light, a process with a path, one without, one with
       efficiency mode on (check shown).
 - [x] README.
+- [x] Linux: Qt menu icons, GTK left text-only (see above), Qt Shift+F10.
 
-## Follow-ups (not started)
+## Linux menu icons (user: "do it", 2026-10-15)
 
-- Icons in the Linux menus would need an icon field in `abi::MenuItem` (GTK and
-  Qt plugins both).
+- `OtMenuItem.icon` (an `OtIcon`, or `OT_ICON_NONE`), ABI version 2; the C
+  header's `OtIcon` now lists the 15 process-menu icons too (it had fallen
+  behind), and the layout test checks `OT_ICON_COUNT`.
+- Qt: each item's theme icon, tinted per state from the menu's palette (Text,
+  HighlightedText, disabled Text), since symbolic icons are single-colour. Checked
+  items drop the icon, as on Windows (done in the host for both toolkits).
+- **GTK: no icons, by the toolkit's design.** GTK 4's `GtkPopoverMenu` draws an
+  item's `icon` attribute only when the item has no label (seen in WSL with GTK
+  4.14: icons set, none drawn). The only way round is custom child widgets per
+  row, which would lose the model buttons' highlight, keyboard navigation and
+  checks. Left text-only, with a note in `ot-shell-gtk/src/dialogs.rs`.
+- Found on the way: Shift+F10 did nothing under Qt (Qt reports only the menu key
+  as a context menu event). Fixed in its own commit.
+- Checked in WSL on Xvfb (`%TEMP%\otdrive\menudrive.sh` with `xdrive.sh`), Qt and
+  GTK, light and dark.
 
 ## Things not to do
 
