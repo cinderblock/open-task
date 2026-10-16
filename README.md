@@ -199,7 +199,7 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   driver is left out. **Dedicated** is the GPU's own memory each program has in use
   (an integrated GPU has none), and **Shared** the system memory the GPU uses for
   it, both in bytes. In every Percent and Bytes reading, and in Dedicated, a last
-  band, "Not in a process", tops the stack up to what the graph above shows: CPU or
+  band, "Not in a process", brings the stack up to what the graph above shows: CPU or
   GPU time no process is charged for, or memory in use that no process holds alone
   (the kernel, drivers, pages shared between processes). Shared has none: memory
   several programs share counts in each of them (that is how Windows reports it), so
@@ -208,7 +208,9 @@ binding), **Ctrl+M** opens the Map and **Ctrl+H** the History:
   chart get a band and a color each, and the rest are one grey band, "Everything
   else". A program keeps its color for as long as it keeps a band, and a band
   changes hands only when a newcomer is clearly bigger, so the chart does not
-  recolor itself as you watch. Each band's name is written inside it, where the band
+  recolor itself as you watch. The steadiest bands are stacked at the bottom and the
+  spikiest on top, so a program's spikes do not lift every band above it; bands
+  trade places only when one is clearly steadier than the other. Each band's name is written inside it, where the band
   is thick enough for a line of text, so the chart takes the whole width; a name
   scrolls with its band and glides as the band's edges shift under it; when a
   clearly better place opens up (and not within two seconds of its last move) it

@@ -24,7 +24,7 @@
 //!   memory, in bytes.
 //!
 //! In the readings that are shares of the machine, and in bytes, a last band, "Not
-//! in a process", tops the stack up to what the summary chart shows: CPU or GPU
+//! in a process", brings the stack up to what the summary chart shows: CPU or GPU
 //! time no process is charged for, or memory in use that no process holds alone
 //! (the kernel, drivers, pages shared between processes). Not in Shared: there an
 //! allocation several processes share counts in each, so the programs together
@@ -34,6 +34,9 @@
 //! chart get a band and a color each, and the rest are one grey band. A program
 //! keeps its color for as long as it keeps a band, and bands change hands only when
 //! a newcomer is clearly bigger, so a chart watched live does not recolor itself.
+//! The steadiest bands are stacked lowest and the spikiest on top, since a spike
+//! lifts every band above it; a band changes places only with one clearly steadier
+//! or spikier than itself, so the order holds still too.
 //! The bands are named one of three ways ([`ChartLegend`]):
 //!
 //! - **In the bands**: each band's name is written inside it, where it is thick
@@ -69,7 +72,7 @@ use crate::sparkline::{self, TimeAxis, COLUMN_W};
 use crate::theme::Theme;
 
 /// Programs with a band of their own, and the bands in all: those, "everything
-/// else", and on top what the machine's whole is short of their sum.
+/// else", and what the machine's whole is short of their sum.
 const SERIES: usize = 8;
 const BANDS: usize = SERIES + 2;
 const OTHER: usize = SERIES;
@@ -140,6 +143,9 @@ const BAND_SHARE: f32 = 0.005;
 /// A program without a band takes one from the smallest that has one only when
 /// this share of its own size is still the bigger.
 const KEEP: f32 = 0.8;
+/// A band moves down past the one under it only when its thickness strays less
+/// than this share of what the other's does.
+const RESTACK: f32 = 0.7;
 
 /// How strongly a band that is not the one in question is drawn: one the search
 /// does not match, or any other than the one pointed at.
@@ -441,6 +447,10 @@ pub(crate) struct UsageChart {
     /// so that switching back does not recolor the chart.
     slots: [Option<ProgramId>; SERIES],
     parked: [[Option<ProgramId>; SERIES]; RESOURCES.len()],
+    /// The bands bottom to top, the steadiest lowest ([`Self::restack`]); until
+    /// `stacked`, still to be worked out from scratch.
+    stack: [usize; BANDS],
+    stacked: bool,
     /// Top of the value scale, kept between frames so it does not breathe.
     scale: f32,
     /// Newest first.
@@ -898,6 +908,7 @@ impl UsageChart {
         if self.rows_key != Some(key) {
             self.assign_bands(usage);
             self.fill_rows(usage);
+            self.restack();
             self.rows_key = Some(key);
         }
         self.place();
@@ -1009,6 +1020,7 @@ impl UsageChart {
             self.parked[from] = std::mem::take(&mut self.parked[to]);
             std::mem::swap(&mut self.slots, &mut self.parked[from]);
             self.labels = [Names::default(); BANDS];
+            self.stacked = false;
         }
         self.mode = mode;
         // The readings are in different units.
@@ -1084,7 +1096,7 @@ impl UsageChart {
         let mut window = std::mem::take(&mut self.window);
         cum.clear();
         cum.resize(n, 0.0);
-        for b in 0..BANDS {
+        for b in self.stack {
             let mut names = self.labels[b];
             let width = label_w(self.band_name(usage, b), font).min(LABEL_MAX_W);
             let fit = if ready && self.shown(b) && width < self.plot.w {
@@ -1422,6 +1434,55 @@ impl UsageChart {
         }
     }
 
+    /// Order the bands bottom to top by how far each one's thickness strays from
+    /// its average over the reach (its standard deviation, over time): a spike
+    /// lifts every band above it, so the steadiest go lowest and the spikiest on
+    /// top, where they move nothing else. Starting from the last order, a band
+    /// moves down past the one under it only when clearly steadier, so near ties
+    /// do not reshuffle the chart as it is watched.
+    fn restack(&mut self) {
+        let mut weight = 0.0f64;
+        let mut sum = [0.0f64; BANDS];
+        let mut squares = [0.0f64; BANDS];
+        for r in &self.history {
+            if self.time.age(self.now_ms, r.end_ms) >= self.time.span_ms {
+                break;
+            }
+            let w = f64::from(r.secs);
+            weight += w;
+            for (b, &v) in r.v.iter().enumerate() {
+                let v = f64::from(v);
+                sum[b] += v * w;
+                squares[b] += v * v * w;
+            }
+        }
+        let mut spread = [0.0f32; BANDS];
+        if weight > 0.0 {
+            for b in 0..BANDS {
+                let mean = sum[b] / weight;
+                spread[b] = (squares[b] / weight - mean * mean).max(0.0).sqrt() as f32;
+            }
+        }
+        let stack = &mut self.stack;
+        if !self.stacked {
+            *stack = std::array::from_fn(|b| b);
+            stack.sort_by(|&a, &b| spread[a].total_cmp(&spread[b]));
+            self.stacked = true;
+            return;
+        }
+        // Each swap puts a clearly steadier band under a spikier one, so this ends.
+        let mut moved = true;
+        while moved {
+            moved = false;
+            for i in 1..BANDS {
+                if spread[stack[i]] < spread[stack[i - 1]] * RESTACK {
+                    stack.swap(i, i - 1);
+                    moved = true;
+                }
+            }
+        }
+    }
+
     /// Place the rows in columns across the plot, on this frame's time axis.
     fn place(&mut self) {
         self.points.clear();
@@ -1501,7 +1562,7 @@ impl UsageChart {
             self.rows = rows;
             return;
         }
-        for b in (0..BANDS).rev() {
+        for &b in self.stack.iter().rev() {
             if self.shown(b) && y + LEGEND_ROW_H <= self.legend.bottom() {
                 rows[b] = Rect::new(self.legend.x, y, self.legend.w, LEGEND_ROW_H);
                 y += LEGEND_ROW_H;
@@ -1583,7 +1644,7 @@ impl UsageChart {
         let far = older.unwrap_or(near);
         let value = (self.plot.bottom() - p.y) / self.plot.h * self.scale;
         let mut top = 0.0;
-        for band in 0..BANDS {
+        for band in self.stack {
             top += near.v[band] + (far.v[band] - near.v[band]) * toward_older;
             if value < top {
                 return Some(band);
@@ -1928,7 +1989,7 @@ impl UsageChart {
         }
     }
 
-    /// The bands, stacked from the first up, "everything else" on top.
+    /// The bands, stacked from the steadiest up.
     fn paint_bands(&mut self, dl: &mut DisplayList, dim: [bool; BANDS], theme: &Theme) {
         let plot = self.plot;
         if self.points.len() < 2 {
@@ -1964,7 +2025,8 @@ impl UsageChart {
         // its values from there to the edge until the next one lands on it.
         let hold =
             (self.time.now_ms.is_some() && self.points[0].x < plot.right()).then_some(plot.right());
-        for (b, &dim) in dim.iter().enumerate() {
+        for b in self.stack {
+            let dim = dim[b];
             if self.points.iter().all(|p| p.v[b] <= 0.0) {
                 continue;
             }
@@ -2485,8 +2547,7 @@ mod tests {
         // Ten seconds ago, a third of the way up a's band.
         let x = c.time.x(c.plot, 10_000.0);
         let at = c.at_age(10_000.0).copied().unwrap();
-        let lower = if a < b { 0.0 } else { at.v[b] };
-        let y = c.y(lower + at.v[a] / 3.0);
+        let y = c.y(below(&c, &at, a) + at.v[a] / 3.0);
         assert!(c.set_pointer(Some(Point::new(x, y))));
         let dl = painted(&mut c, &u, "");
         assert_eq!(c.hover_age(), Some(10_000.0));
@@ -2525,7 +2586,7 @@ mod tests {
         // Ten seconds ago, a third of the way up a.exe's band.
         let x = c.time.x(c.plot, 10_000.0);
         let column = c.at_age(10_000.0).copied().unwrap();
-        let y = c.y(column.v[ours] / 3.0);
+        let y = c.y(below(&c, &column, ours) + column.v[ours] / 3.0);
         c.set_pointer(Some(Point::new(x, y)));
         let _ = painted(&mut c, &u, "");
         assert_eq!(c.hover_band, Some(ours));
@@ -2563,10 +2624,69 @@ mod tests {
         assert!(fills.contains(&theme.series[b].with_alpha(0.9)));
     }
 
+    /// The sum of the bands stacked under band `b` in column `p`.
+    fn below(c: &UsageChart, p: &Pt, b: usize) -> f32 {
+        let at = c.stack.iter().position(|&s| s == b).unwrap();
+        c.stack[..at].iter().map(|&s| p.v[s]).sum()
+    }
+
     /// The y range band `b` covers at column `i`, top first, on screen.
     fn band_span(c: &UsageChart, b: usize, i: usize) -> (f32, f32) {
-        let below: f32 = c.points[i].v[..b].iter().sum();
-        (c.y(below + c.points[i].v[b]), c.y(below))
+        let p = &c.points[i];
+        let below = below(c, p, b);
+        (c.y(below + p.v[b]), c.y(below))
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)] // three programs, a chart, a point
+    fn the_steadiest_bands_are_stacked_lowest_and_near_ties_stay_put() {
+        // a is flat, b spikes every ten seconds, c wavers a little.
+        let rate = |spike: u64| {
+            move |i: usize, s: u64| match i {
+                0 => 5,
+                1 if s.is_multiple_of(10) => spike,
+                1 => 1,
+                _ => 2 + s % 2,
+            }
+        };
+        let names = ["a.exe", "b.exe", "c.exe"];
+        let u = session(&names, 60, rate(20));
+        let mut c = UsageChart {
+            mode: ChartMode::Rate,
+            ..Default::default()
+        };
+        c.set_legend(ChartLegend::Beside);
+        let _ = painted(&mut c, &u, "");
+        let [a, b, w] = names.map(|n| band(&c, &u, n));
+        let level = |c: &UsageChart, band| c.stack.iter().position(|&s| s == band).unwrap();
+        assert!(
+            level(&c, a) < level(&c, w) && level(&c, w) < level(&c, b),
+            "{:?}",
+            c.stack
+        );
+        // The legend reads top to bottom as the bands are stacked.
+        assert!(c.rows[b].y < c.rows[w].y && c.rows[w].y < c.rows[a].y);
+        // Pointing low in a column picks the steadiest band, not the first slot.
+        let x = c.time.x(c.plot, 5_000.0);
+        let at = c.at_age(5_000.0).copied().unwrap();
+        assert_eq!(c.band_at(Point::new(x, c.y(at.v[a] / 2.0))), Some(a));
+
+        // c's wavering grows just past b's spikes: close, so nothing moves.
+        let before = c.stack;
+        let u = session(&names, 60, |i, s| match i {
+            2 => 2 + 12 * (s % 2),
+            _ => rate(20)(i, s),
+        });
+        let _ = painted(&mut c, &u, "");
+        assert_eq!(c.stack, before, "a near tie changes nothing");
+        // b calms right down: clearly steadier than c now, it moves under it.
+        let u = session(&names, 60, |i, s| match i {
+            1 => 1,
+            2 => 2 + 12 * (s % 2),
+            _ => 5,
+        });
+        let _ = painted(&mut c, &u, "");
+        assert!(level(&c, b) < level(&c, w), "{:?}", c.stack);
     }
 
     #[test]
