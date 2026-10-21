@@ -61,6 +61,65 @@ steadily. Bring it down without losing what it shows.
   never for a process whose fds are denied. With 15 churning processes: mean
   2.3 ms, median 1.6 ms, worst 6 ms a pass.
 
+- **GUI: chart drawing is about half the window's cost, and it is not the
+  points.** WSL, Xvfb 1280x860, GTK 4.14.5 (software GSK), release, default
+  Processes page (List, the CPU and Memory cards: two small charts, ~850 path
+  points a frame), 60 fps, CPU of the process over 30 s after 60 s:
+  - charts drawn: **21.6 %** of a core; host paint 55 us, snapshot build 475 us
+    a frame, of which the Cairo path commands 54 us;
+  - chart paths skipped (scratch `OT_SCRATCH_NOCHARTS`): **12.1 %**.
+  So ~9.5 % of a core goes to the two charts' Cairo nodes *after* our code: GSK
+  replays each Cairo node, rasterizes it on the CPU and uploads it as a new
+  texture, every frame (a new node each frame, nothing to cache).
+- **The data is already decimated twice.** Stored: 600 raw 1 s frames, then
+  coarse steps (>= 10 s, at most 720). Drawn: rows averaged into time bins about
+  one DIP wide (`sparkline::COLUMN_W = 1.0`), then the smoothed curve puts a point
+  every ~2 DIPs (`SMOOTH_STEP`), at least one per bin. So an edge is ~1 point per
+  1-2 DIPs whatever the history holds.
+- **Fewer points changes nothing** (`gui-suite.sh`, two interleaved rounds,
+  quiet WSL, CPU of the process; "quarter" = `COLUMN_W` 4 and `SMOOTH_STEP` 8,
+  ~10 000 -> ~3 700 path points a frame on the History view):
+
+  | Processes page | round 1 | round 2 |
+  | --- | --- | --- |
+  | History, as now | 152.5 % | 168.7 % |
+  | History, quarter of the points | 155.7 % | 164.2 % |
+  | History, chart paths skipped | 28.9 % | 36.5 % |
+  | List, as now | 35.8 % | 24.2 % |
+  | List, quarter of the points | 37.0 % | 25.3 % |
+
+  On the History view the chart bands are ~85 % of the window's cost, and the
+  cost is the area GTK rasterizes and composites each frame, not the points.
+  (Software GSK on Xvfb puts compositing on the CPU too, so the absolute numbers
+  are high; Cairo's rasterizing is CPU on any machine.) Our own path code fell
+  from ~400 us to ~160 us a frame with a quarter of the points: real, but ~1 % of
+  a core.
+- **Our rasterizer as a texture barely helps on Xvfb** (`OT_SCRATCH_RASTER`,
+  `ChartRaster` into a `gdk::MemoryTexture` per run): History 146 % vs 152-162 %
+  with Cairo; List worse (30-40 % vs 22-33 %). The texture GSK then composites
+  in software dominates. On equal terms (Cairo drawn into an image surface and
+  handed over as the same kind of texture, `OT_SCRATCH_CAIROIMG`), per History
+  frame: Cairo 1.9 ms (5.7 ms in a disturbed run), `ChartRaster` 1.3 ms (2.1
+  ms disturbed). So about 1.5x faster: on a real GPU, where compositing is
+  cheap, roughly 11 % -> 8 % of a core at 60 fps for the History's bands. Not the
+  4x the Direct3D renderer gave on Windows.
+- WSLg has `/dev/dxg` and Mesa's `d3d12_dri.so`, so GTK there could render on
+  the host GPU, but its windows open on the user's desktop: not used without
+  asking.
+- **Windows met the same wall** (`plans/chart-renderers.md`): History at full
+  history, 30 fps: Direct2D 21 %, our CPU rasterizer (`ot-paint::chart_raster`,
+  SIMD) 24 %, the Direct3D shader renderer 5.9 %. Linux's Cairo path is the
+  Direct2D-like one.
+- Measuring in WSL collides with other projects' builds (DeskyPi agents ran
+  `cargo test` there on 2026-10-21, load 7, host CPU 100 %): two runs were
+  discarded. `%TEMP%\ot-linux\gui-suite.sh` waits for no `rustc` and a load
+  under 1.5 before each run.
+- Scratch instrumentation lives in a detached worktree,
+  `%TEMP%\ot-scratch-wt` (env switches `OT_SCRATCH_NOCHARTS`,
+  `OT_SCRATCH_COLUMN`, `OT_SCRATCH_SMOOTH`; path time and points in the
+  `snapshots:` log line). Not for committing; remove with
+  `git worktree remove --force` when done.
+
 ## Plan / steps
 
 1. Profile the probe pass under load. (done)
@@ -68,11 +127,16 @@ steadily. Bring it down without losing what it shows.
    every 5, idle multi-threaded processes keep their thread rows for up to 5
    passes. (done)
 3. GPU probe relisting. (done)
-4. **Ask the user for an on-machine split** (current): headless `probe cost`,
-   and `OT_FRAME_STATS=1` with the window open, to see how much of the 5 % is the
-   window drawing at 60 frames a second.
-5. Depending on 4: the GUI's idle frame rate (design question for the user),
-   or `openat` relative to the pid directory.
+4. Ask the user for an on-machine split: headless `probe cost`, and
+   `OT_FRAME_STATS=1` with the window open. (asked; no answer yet)
+5. User asked (2026-10-21): would decimating the stored data cut the drawing?
+   Measured: no (above). (done)
+6. Prototype: GTK draws runs of `Band`/`Graph` with `ot-paint::ChartRaster`
+   into a texture instead of Cairo. Measured: ~1.5x faster rasterizing. (done)
+7. **Report to the user and ask** (current): which desktop/toolkit (GTK or Qt)
+   and GPU; on-machine numbers; whether a WSLg run (window on their desktop) is
+   OK; which lever to build (GPU chart drawing like Windows, `ChartRaster` as a
+   texture, or both).
 
 ## Progress log
 
@@ -80,11 +144,17 @@ steadily. Bring it down without losing what it shows.
 - [x] Profile (before and after).
 - [x] Process pass cuts; tests + clippy pass in WSL.
 - [x] GPU probe relist limits; `gpu_cost` measurement test.
+- [x] GUI baseline on Xvfb, and with charts skipped.
+- [x] Fewer-points variants and History view: no gain.
+- [x] ChartRaster-as-texture prototype measured (and Cairo-to-image on equal
+  terms).
 - [ ] On-machine numbers from the user.
 - [ ] GUI idle cost, if it is the bigger part.
 
 ## Open questions for the user
 
+0. Which desktop is it (KDE uses the Qt plugin, which draws everything with
+   QPainter on the CPU; others GTK), and which GPU?
 1. On your Linux machine, what do `open-task --headless --passes 10` (the
    `probe cost` column) and `OT_FRAME_STATS=1 open-task` (the log lines every
    5 s) print? And is the 5 % per core (top, htop) or of the whole machine?
