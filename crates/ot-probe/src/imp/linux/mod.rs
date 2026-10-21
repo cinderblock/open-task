@@ -64,6 +64,7 @@ impl LinuxProbe {
             processes: process::ProcessProbe::new(
                 hardware.logical_processors,
                 hardware.boot_unix_ms,
+                hardware.base_frequency,
             ),
             disks: disks::DiskProbe::default(),
             net: net::NetProbe::default(),

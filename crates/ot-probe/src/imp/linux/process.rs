@@ -17,7 +17,7 @@ use ot_model::process::{
 };
 use ot_model::service::{ServiceInfo, ServiceState};
 use ot_model::thread::{ServiceTag, ThreadSample, ThreadState, WaitReason};
-use ot_model::units::{Bytes, Percent};
+use ot_model::units::{Bytes, Hertz, Percent};
 use ot_model::ProcessKey;
 
 use super::fs;
@@ -300,6 +300,8 @@ pub(super) struct ProcessProbe {
     no_services: Arc<[ServiceInfo]>,
     /// Clock ticks per second, the unit of `stat`'s times.
     hz: u64,
+    /// The rate cycles are counted at, in hertz: the processor's rated clock.
+    cycle_rate: u64,
     boot_unix_ms: Option<i64>,
     max_cpu: f32,
     pass: u64,
@@ -310,7 +312,10 @@ pub(super) struct ProcessProbe {
 }
 
 impl ProcessProbe {
-    pub(super) fn new(logical: u32, boot_unix_ms: Option<i64>) -> Self {
+    /// `rated_clock` is the rate a process's CPU time is turned into cycles at.
+    /// Without one it is a gigahertz, so a cycle is a nanosecond: the cycle
+    /// readings still compare processes, though their totals are not the clock's.
+    pub(super) fn new(logical: u32, boot_unix_ms: Option<i64>, rated_clock: Option<Hertz>) -> Self {
         // SAFETY: sysconf has no preconditions.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         let systemd = std::path::Path::new("/run/systemd/system").exists();
@@ -322,6 +327,7 @@ impl ProcessProbe {
             services: systemd.then(HashMap::new),
             no_services: Vec::new().into(),
             hz: u64::try_from(hz).ok().filter(|&h| h > 0).unwrap_or(100),
+            cycle_rate: rated_clock.map_or(1_000_000_000, |f| f.0.max(1)),
             boot_unix_ms,
             max_cpu: logical.max(1) as f32 * 100.0,
             pass: 0,
@@ -339,6 +345,14 @@ impl ProcessProbe {
 
     fn ticks_to_duration(&self, ticks: u64) -> Duration {
         Duration::from_nanos(ticks.saturating_mul(1_000_000_000) / self.hz)
+    }
+
+    /// The cycles in `ticks` of CPU time at the rated clock. Linux counts no cycles
+    /// per process; Windows counts them at the timestamp counter's rate, which is
+    /// the rated clock, so this is the same measure, a clock tick at a time.
+    fn ticks_to_cycles(&self, ticks: u64) -> u64 {
+        let cycles = u128::from(ticks) * u128::from(self.cycle_rate) / u128::from(self.hz);
+        u64::try_from(cycles).unwrap_or(u64::MAX)
     }
 
     fn started_unix_ms(&self, starttime: u64) -> Option<i64> {
@@ -446,6 +460,7 @@ impl ProcessProbe {
             statics,
             cpu,
             cpu_time: self.ticks_to_duration(stat.ticks),
+            cycles: self.ticks_to_cycles(stat.ticks),
             working_set: Bytes(status.rss),
             private_working_set: Bytes(status.rss_anon),
             private_bytes: Bytes(status.rss_anon + status.swap),
@@ -886,6 +901,7 @@ mod tests {
         let mut probe = ProcessProbe::new(
             1,
             super::super::cpu::boot_time_secs().map(|s| s.cast_signed() * 1000),
+            Some(Hertz::from_mhz(3000)),
         );
         let (mut out, mut threads) = (Vec::new(), Vec::new());
         probe.sample(&mut out, &mut threads);
@@ -905,6 +921,13 @@ mod tests {
             .find(|p| p.key().pid == me)
             .expect("this process");
         assert!(p.cpu.get() > 10.0, "cpu {}", p.cpu.get());
+        // Cycles are CPU time at the rated clock.
+        let at_clock = p.cpu_time.as_secs_f64() * 3e9;
+        assert!(
+            p.cycles > 0 && (p.cycles as f64 - at_clock).abs() < 1e3,
+            "cycles {}",
+            p.cycles
+        );
         assert!(p.working_set.get() > 0);
         assert!(p.handles > 0);
         assert!(p.statics.user.is_some());
@@ -923,7 +946,7 @@ mod tests {
         // SAFETY: plain signal to our own child.
         unsafe { libc::kill(pid.cast_signed(), libc::SIGSTOP) };
         std::thread::sleep(Duration::from_millis(50));
-        let mut probe = ProcessProbe::new(1, None);
+        let mut probe = ProcessProbe::new(1, None, None);
         let (mut out, mut threads) = (Vec::new(), Vec::new());
         probe.sample(&mut out, &mut threads);
         let p = out.iter().find(|p| p.key().pid == pid).expect("the child");

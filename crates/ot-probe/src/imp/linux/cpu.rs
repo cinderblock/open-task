@@ -188,6 +188,7 @@ pub(super) fn hardware() -> Hardware {
     let mut hw = Hardware::default();
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let mut flags: HashSet<&str> = HashSet::new();
+    let mut measured_mhz = None;
     for line in cpuinfo.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -196,6 +197,7 @@ pub(super) fn hardware() -> Hardware {
         match key {
             "model name" if hw.cpu_name.is_none() => hw.cpu_name = Some(value.to_owned()),
             "flags" if flags.is_empty() => flags = value.split(' ').collect(),
+            "cpu MHz" if measured_mhz.is_none() => measured_mhz = value.parse::<f64>().ok(),
             _ => {}
         }
     }
@@ -226,12 +228,55 @@ pub(super) fn hardware() -> Hardware {
     hw.cache_l2 = l2;
     hw.cache_l3 = l3;
 
-    // intel_pstate and amd-pstate publish the rated clock; acpi-cpufreq does not.
-    hw.base_frequency =
-        fs::read_u64(format!("{CPU_DIR}/cpu0/cpufreq/base_frequency")).map(|khz| Hertz(khz * 1000));
+    hw.base_frequency = rated_clock(
+        fs::read_u64(format!("{CPU_DIR}/cpu0/cpufreq/base_frequency")),
+        hw.cpu_name.as_deref(),
+        fs::read_u64(format!("{CPU_DIR}/cpu0/cpufreq/cpuinfo_max_freq")),
+        measured_mhz,
+    );
 
     hw.boot_unix_ms = boot_time_secs().map(|s| s.cast_signed() * 1000);
     hw
+}
+
+/// The processor's rated clock, from the best source there is: what `intel_pstate`
+/// and `amd-pstate` publish (`base_frequency`, kHz); the clock an Intel model name
+/// states (`... CPU @ 3.60GHz`); the top of the cpufreq range (`cpuinfo_max_freq`,
+/// kHz), the rated clock under acpi-cpufreq and on most ARM parts; and last, the
+/// clock `/proc/cpuinfo` says it measured (MHz), which in a virtual machine is the
+/// host's timestamp counter rate.
+///
+/// Process cycles are counted at this rate (see `process.rs`), as Windows counts
+/// them at the timestamp counter's, which runs at the rated clock.
+fn rated_clock(
+    base_khz: Option<u64>,
+    model: Option<&str>,
+    max_khz: Option<u64>,
+    measured_mhz: Option<f64>,
+) -> Option<Hertz> {
+    let khz = |k: u64| (k > 0).then(|| Hertz(k * 1000));
+    base_khz
+        .and_then(khz)
+        .or_else(|| model.and_then(model_clock))
+        .or_else(|| max_khz.and_then(khz))
+        .or_else(|| {
+            measured_mhz
+                .filter(|&m| m.is_finite() && m >= 1.0)
+                .map(|m| Hertz((m * 1e6).round() as u64))
+        })
+}
+
+/// The clock a model name states: `Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz`.
+fn model_clock(model: &str) -> Option<Hertz> {
+    let (_, rest) = model.rsplit_once('@')?;
+    let rest = rest.trim();
+    let (number, scale) = if let Some(n) = rest.strip_suffix("GHz") {
+        (n, 1e9)
+    } else {
+        (rest.strip_suffix("MHz")?, 1e6)
+    };
+    let v: f64 = number.trim().parse().ok()?;
+    (v.is_finite() && v > 0.0).then(|| Hertz((v * scale).round() as u64))
 }
 
 /// Totals of each cache level across the machine. Each cache is counted once,
@@ -308,6 +353,32 @@ mod tests {
         let online = std::thread::available_parallelism().map_or(1, usize::from);
         assert!(out.cores.len() >= online, "{} < {online}", out.cores.len());
         assert!((0.0..=100.0).contains(&out.total.get()));
+    }
+
+    #[test]
+    fn the_rated_clock_comes_from_the_best_source_there_is() {
+        let ghz = |g: f64| Some(Hertz((g * 1e9) as u64));
+        let intel = Some("Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz");
+        let amd = Some("AMD Ryzen 9 7950X 16-Core Processor");
+        assert_eq!(
+            rated_clock(Some(4_500_000), intel, Some(4_200_000), Some(800.0)),
+            ghz(4.5)
+        );
+        assert_eq!(
+            rated_clock(None, intel, Some(4_200_000), Some(800.0)),
+            ghz(3.6)
+        );
+        assert_eq!(
+            rated_clock(None, amd, Some(4_500_000), Some(800.0)),
+            ghz(4.5)
+        );
+        assert_eq!(
+            rated_clock(None, amd, None, Some(2_994.374)),
+            Some(Hertz(2_994_374_000))
+        );
+        assert_eq!(rated_clock(Some(0), amd, Some(0), None), None);
+        assert_eq!(model_clock("Some CPU @ 2400MHz"), ghz(2.4));
+        assert_eq!(model_clock("Some CPU @ fast"), None);
     }
 
     #[test]
