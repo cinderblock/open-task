@@ -16,12 +16,17 @@
 //! itself (amdgpu's `gpu_busy_percent`) the utilization is the larger of the two,
 //! and the rest is no process's.
 //!
-//! Finding the clients means reading where each open file points. A process's
-//! files are listed when it is first seen, when its count of open files changes
-//! (the process pass counts them anyway), and every [`RESCAN_PASSES`] passes; in
-//! between, only the files found on a GPU are read. A client open in two files or
-//! two processes (a duplicated or passed descriptor) has one `drm-client-id` and
-//! is counted once.
+//! Finding the clients means listing each process's open files and reading where
+//! each points, which costs the kernel an entry per file: about 90 ms for 9000
+//! files. So a process's files are listed when it is first seen, when one found on
+//! a GPU has closed, and when its count of open files has changed (the process
+//! pass counts them anyway), but then no more than every [`CHANGED_PASSES`]
+//! passes, since a browser's changes all the time; in between, only the files
+//! found on a GPU are read. Opening a GPU's device node changes the count, unless
+//! the process closed another file in the same pass and then never opens or
+//! closes another; that client is missed. A process whose files cannot be read (another user's)
+//! is not tried again. A client open in two files or two processes (a duplicated
+//! or passed descriptor) has one `drm-client-id` and is counted once.
 //!
 //! Adapters are the devices behind `/sys/class/drm/card*` and `renderD*`, named
 //! from the PCI ID database where they are PCI devices. Firmware framebuffers,
@@ -61,7 +66,8 @@ const SOFTWARE_DRIVERS: &[&str] = &[
 /// Drivers that publish no client stats, whose adapters are left out.
 const UNREAD_DRIVERS: &[&str] = &["nvidia"];
 /// A process's open files are listed again at least this often, in passes.
-const RESCAN_PASSES: u64 = 10;
+/// A process whose count of open files changed is listed again at most this often.
+const CHANGED_PASSES: u64 = 3;
 /// Unknown device nodes are looked for again at most this often, in passes.
 const DISCOVER_PASSES: u64 = 10;
 /// Where the PCI ID database is kept, by distribution.
@@ -121,6 +127,8 @@ struct Files {
     seen: u64,
     /// A file thought to be on a GPU no longer is: list them again.
     stale: bool,
+    /// The files cannot be read: another user's process.
+    denied: bool,
 }
 
 /// One process's load on one engine this pass.
@@ -406,12 +414,12 @@ impl GpuProbe {
         let pass = self.pass;
         let mut files = self.files.remove(&key).unwrap_or_default();
         files.seen = pass;
-        if files.listed == 0
+        let since = pass - files.listed;
+        let relist = files.listed == 0
             || files.stale
-            || files.handles != sample.handles
-            || pass - files.listed >= RESCAN_PASSES
-        {
-            self.list_files(key.pid, &mut files.fds);
+            || (files.handles != sample.handles && since >= CHANGED_PASSES);
+        if relist && !files.denied {
+            files.denied = !self.list_files(key.pid, &mut files.fds);
             files.handles = sample.handles;
             files.listed = pass;
             files.stale = false;
@@ -551,12 +559,14 @@ impl GpuProbe {
         }
     }
 
-    /// Which of a process's open files are on a GPU's device node.
-    fn list_files(&mut self, pid: u32, fds: &mut Vec<u32>) {
+    /// Which of a process's open files are on a GPU's device node. False when
+    /// this user may not list them.
+    fn list_files(&mut self, pid: u32, fds: &mut Vec<u32>) -> bool {
         fds.clear();
         self.set_path(pid, "fd", u32::MAX);
-        let Ok(dir) = std::fs::read_dir(&self.path) else {
-            return;
+        let dir = match std::fs::read_dir(&self.path) {
+            Ok(dir) => dir,
+            Err(e) => return e.kind() != std::io::ErrorKind::PermissionDenied,
         };
         for entry in dir.flatten() {
             let Some(fd) = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
@@ -566,6 +576,7 @@ impl GpuProbe {
                 fds.push(fd);
             }
         }
+        true
     }
 
     /// The GPU device node a process's open file is on, if it is on one.
@@ -1165,6 +1176,37 @@ mod tests {
         t.file(10, 5, "/dev/dri/renderD128", &xe(1500, 3000));
         p.sample_over(&mut procs, &mut out, 1.0);
         assert_eq!(out[1].utilization, Percent::ZERO);
+    }
+
+    /// What a pass costs against this machine's real processes, with a fake GPU
+    /// so the probe runs. Run under load: `cargo test -p ot-probe --release
+    /// gpu_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn gpu_cost() {
+        let t = Tree::new("cost");
+        let mut gpu = GpuProbe::at(Path::new("/proc"), &t.root.join("sys")).unwrap();
+        let mut procs = super::super::process::ProcessProbe::new(1, None, None);
+        let (mut out, mut threads, mut gpus) = (Vec::new(), Vec::new(), Vec::new());
+        let mut times = Vec::new();
+        for _ in 0..30 {
+            out.clear();
+            threads.clear();
+            procs.sample(&mut out, &mut threads);
+            let start = Instant::now();
+            gpu.sample(&mut out, &mut gpus);
+            times.push(start.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let first = times.remove(0);
+        times.sort();
+        let mean = times.iter().sum::<std::time::Duration>() / 29;
+        println!(
+            "{} processes: first pass {first:?}; then mean {mean:?}, median {:?}, worst {:?}",
+            out.len(),
+            times[14],
+            times[28],
+        );
     }
 
     #[test]
