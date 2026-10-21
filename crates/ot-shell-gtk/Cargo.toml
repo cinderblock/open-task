@@ -23,6 +23,8 @@ ot-shell-abi.workspace = true
 gtk4 = { version = "0.11", features = ["v4_6"] }
 # Tabular figures need Pango 1.38's font-feature attribute.
 pango = { version = "0.22", features = ["v1_44"] }
+# dlsym, for the few functions newer than 4.6 that are used when present.
+libc = "0.2"
 
 [lints]
 workspace = true

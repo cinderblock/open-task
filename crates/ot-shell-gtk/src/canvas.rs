@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 
+use gtk::glib::translate::ToGlibPtr;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use gtk4 as gtk;
@@ -67,13 +68,14 @@ mod imp {
             let Some(h) = plugin::host() else {
                 return;
             };
+            let widget = self.obj();
+            let scale = super::scale(widget.upcast_ref());
             let mut list = abi::DisplayList::EMPTY;
             // SAFETY: the host's callback, on the UI thread; it fills `list`,
             // which stays valid until the next call into the host.
-            unsafe { (h.paint)(h.ctx, &raw mut list) };
+            unsafe { (h.paint)(h.ctx, scale, &raw mut list) };
             // SAFETY: as the ABI promises for a painted list.
             let frame = unsafe { Frame::from_abi(&list) };
-            let widget = self.obj();
             let drawing = std::time::Instant::now();
             self.painter
                 .borrow_mut()
@@ -119,6 +121,32 @@ impl Default for Canvas {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `gdk_surface_get_scale`, GTK 4.12's fractional scale, when this GTK has it.
+type SurfaceScale = unsafe extern "C" fn(*mut gdk::ffi::GdkSurface) -> f64;
+
+/// Device pixels a DIP for `widget`'s window: the surface's fractional scale
+/// where GTK has it (4.12), else the integer scale factor.
+fn scale(widget: &gtk::Widget) -> f32 {
+    static GET_SCALE: std::sync::OnceLock<Option<SurfaceScale>> = std::sync::OnceLock::new();
+    let get = GET_SCALE.get_or_init(|| {
+        // SAFETY: looking a symbol up in what the process has loaded; a found
+        // `gdk_surface_get_scale` has this signature.
+        unsafe {
+            let p = libc::dlsym(libc::RTLD_DEFAULT, c"gdk_surface_get_scale".as_ptr());
+            (!p.is_null()).then(|| std::mem::transmute::<*mut libc::c_void, SurfaceScale>(p))
+        }
+    });
+    let surface = widget.native().and_then(|n| n.surface());
+    if let (Some(get), Some(surface)) = (get, surface) {
+        // SAFETY: a live surface, for the call.
+        let s = unsafe { get(surface.to_glib_none().0) } as f32;
+        if s.is_finite() && s > 0.0 {
+            return s;
+        }
+    }
+    widget.scale_factor().max(1) as f32
 }
 
 /// The ABI's modifier bits from GDK's.

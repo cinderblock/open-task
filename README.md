@@ -117,7 +117,9 @@ virtual desktop. **Chart drawing** under **Charts** chooses what draws the chart
 lines and filled areas: **GPU** (the default), Direct3D shaders that work out each
 pixel's coverage on the graphics card; **CPU**, open-task's own rasterizer for
 chart shapes; or **Direct2D**, Windows' general path renderer, which antialiases on
-the CPU and costs the most once a chart is full. The three look the same.
+the CPU and costs the most once a chart is full. The three look the same. On Linux
+the choice is **CPU** (the default there) or the toolkit's own painter: **Cairo**
+under GTK, **QPainter** under Qt.
 The first sample is on screen a quarter of a second after start, drawn across the
 interval it measured. Recent history is drawn sample by sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point
@@ -573,6 +575,13 @@ installed apps, program icons in the table, the notification-area icon, running 
 root from the window, the window crosshair, and self-update. The settings live in
 `$XDG_CONFIG_HOME/open-task/settings` (normally `~/.config/open-task/settings`).
 
+The Settings page offers only what works there: no update switches, no **Run as
+administrator**, no **Hide when minimized** (there is no tray icon to come back
+from) and no **Minimize on use** (no **Switch to**). **Always on top** is there
+under Qt on X11; GTK 4 and Wayland have no way to ask for it, though the window
+manager's own menu may offer it. Under GTK, row animation follows the desktop's
+animation setting.
+
 The binaries need glibc 2.34 or later: Ubuntu 22.04, Debian 12, RHEL 9 and newer.
 
 ## Why not a webview
@@ -591,13 +600,13 @@ class: tens of megabytes, not hundreds.
 | `ot-model` | Pure data types. No I/O, no platform code. |
 | `ot-probe` | Platform sampling. Windows and Linux are real; macOS is a stub. |
 | `ot-core` | Sampling thread, multi-resolution history, lock-free snapshot publication. |
-| `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list. |
+| `ot-paint` | Portable draw-command layer: geometry, colors, text styles, display list, and the CPU rasterizer for chart shapes. |
 | `ot-ui` | UI-agnostic view models: theme, the pages, navigation rail, virtualized table with a column chooser, charts. |
 | `ot-record` | Flight Recorder: writes the snapshot stream to a file (shared values once, keyframes plus deltas, lz4) and reads it back by frame. |
 | `ot-update` | Self-updater: finds signed releases, downloads, verifies and installs them. |
 | `ot-shell-core` | What every shell shares: the app with its feed, updater and worker threads, and every effect that needs no window. A shell reports input to it and carries out the menus, questions and platform actions it hands back. |
 | `ot-shell-abi` | The C ABI between the Linux host and its toolkit plugins: a header and its Rust mirror. The display list crosses it as is (`ot-paint` is `#[repr(C)]`). |
-| `ot-shell-linux` | Linux shell host: picks a toolkit, loads its plugin from inside the binary (`memfd_create`, `dlopen`), and drives it. Links no toolkit itself. |
+| `ot-shell-linux` | Linux shell host: picks a toolkit, loads its plugin from inside the binary (`memfd_create`, `dlopen`), and drives it, drawing the charts itself when the CPU draws them. Links no toolkit itself. |
 | `ot-shell-gtk` | GTK 4 plugin: the window drawn with GSK and Pango, and the dialogs. |
 | `ot-shell-qt` | Qt 6 plugin (C++): the window drawn with `QPainter`, and the dialogs. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
@@ -751,7 +760,8 @@ For performance work, `OT_FRAME_STATS=1` logs every five seconds what the frames
 cost: frames a second by kind (charts only, rows sliding, whole), how many were drawn
 in part and how much of the window, the time to build, diff, draw, copy and present
 a frame, and the process's CPU. `OT_CHARTS=gpu`, `cpu` or `d2d` overrides the **Chart
-drawing** setting, for comparing them. `cargo build --profile profiling` is the release build
+drawing** setting, for comparing them; on Linux, `cpu` or `native` (Cairo or QPainter),
+and the frame log there says how long the CPU took to draw the charts. `cargo build --profile profiling` is the release build
 with symbols kept, for a sampling profiler such as WPR or xperf.
 
 Two environment variables help with drawing faults on Windows. With

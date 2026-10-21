@@ -6,18 +6,20 @@
 //! theme's symbolic icons, recoloured. Lines that are not axis-aligned,
 //! polylines, polygons and chart bands are Cairo: GTK 4.6 has no path node
 //! (`GskPath` came in 4.14), so each run of them in a row becomes one Cairo node
-//! covering what they touch, rather than one node apiece.
+//! covering what they touch, rather than one node apiece. A run of chart shapes
+//! the host has drawn itself (the CPU choice of chart drawing) comes as an image
+//! ([`abi::Raster`]), drawn as a texture in place of its commands.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use gtk::prelude::*;
-use gtk::{gdk, graphene, gsk};
+use gtk::{gdk, glib, graphene, gsk};
 use gtk4 as gtk;
 use ot_paint::{
     Color, DrawCmd, FontFamily, FontWeight, HAlign, Icon, Point, Rect, Span, TextCmd, VAlign,
 };
-use ot_shell_abi::DisplayList as AbiList;
+use ot_shell_abi::{self as abi, DisplayList as AbiList};
 
 /// A layout not drawn for this many frames is dropped.
 const LAYOUT_TTL_FRAMES: u64 = 120;
@@ -29,6 +31,7 @@ pub struct Frame<'a> {
     cmds: &'a [DrawCmd],
     points: &'a [Point],
     strings: &'a str,
+    rasters: &'a [abi::Raster],
 }
 
 impl std::fmt::Debug for Frame<'_> {
@@ -37,6 +40,7 @@ impl std::fmt::Debug for Frame<'_> {
             .field("cmds", &self.cmds.len())
             .field("points", &self.points.len())
             .field("strings", &self.strings.len())
+            .field("rasters", &self.rasters.len())
             .finish()
     }
 }
@@ -64,10 +68,16 @@ impl Frame<'_> {
                 let bytes = std::slice::from_raw_parts(list.strings.cast::<u8>(), list.strings_len);
                 std::str::from_utf8(bytes).unwrap_or("")
             };
+            let rasters = if list.rasters.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(list.rasters, list.raster_count)
+            };
             Frame {
                 cmds,
                 points,
                 strings,
+                rasters,
             }
         }
     }
@@ -248,6 +258,16 @@ fn is_path(cmd: &DrawCmd) -> bool {
     }
 }
 
+/// Where the run of path commands starting at `start` ends: at the first command
+/// that is not one, or at `stop`.
+fn path_run_end(cmds: &[DrawCmd], start: usize, stop: usize) -> usize {
+    let stop = stop.clamp(start + 1, cmds.len());
+    cmds[start..stop]
+        .iter()
+        .position(|c| !is_path(c))
+        .map_or(stop, |n| start + n)
+}
+
 /// The smallest rectangle around some points, grown by `pad` each way.
 fn bounds_of<'a>(pts: impl IntoIterator<Item = &'a Point>, pad: f32, acc: &mut Option<Rect>) {
     for p in pts {
@@ -286,15 +306,19 @@ impl Painter {
         // The clip rectangles pushed, for bounding Cairo runs.
         let mut clips: Vec<Rect> = vec![full];
         let cmds = frame.cmds;
+        let mut rasters = frame.rasters.iter().peekable();
         let mut i = 0;
         while i < cmds.len() {
+            if let Some(end) = draw_raster_at(s, &mut rasters, i) {
+                i = end;
+                continue;
+            }
             if is_path(&cmds[i]) {
-                let start = i;
-                while i < cmds.len() && is_path(&cmds[i]) {
-                    i += 1;
-                }
-                let clip = clips.last().copied().unwrap_or(full);
-                draw_paths(s, frame, &cmds[start..i], clip);
+                // A path run stops where an image's run starts.
+                let stop = rasters.peek().map_or(cmds.len(), |r| r.first as usize);
+                let end = path_run_end(cmds, i, stop);
+                draw_paths(s, frame, &cmds[i..end], *clips.last().unwrap_or(&full));
+                i = end;
                 continue;
             }
             match cmds[i] {
@@ -522,6 +546,42 @@ impl Painter {
         );
         s.restore();
     }
+}
+
+/// The image the host drew for the run starting at command `i`, if there is one:
+/// drawn, and where its run ends. Images for runs before `i` are passed over.
+fn draw_raster_at(
+    s: &gtk::Snapshot,
+    rasters: &mut std::iter::Peekable<std::slice::Iter<'_, abi::Raster>>,
+    i: usize,
+) -> Option<usize> {
+    while rasters.next_if(|r| (r.first as usize) < i).is_some() {}
+    let r = rasters.next_if(|r| r.first as usize == i)?;
+    draw_raster(s, r);
+    Some((r.end as usize).max(i + 1))
+}
+
+/// An image the host drew, one pixel to a device pixel at its rect.
+fn draw_raster(s: &gtk::Snapshot, r: &abi::Raster) {
+    if r.pixels.is_null() || r.width == 0 || r.height == 0 {
+        return;
+    }
+    let (Ok(w), Ok(h)) = (i32::try_from(r.width), i32::try_from(r.height)) else {
+        return;
+    };
+    let stride = r.width as usize * 4;
+    // SAFETY: the host's image, `height` rows of `width * 4` bytes, valid until
+    // the next call into the host; copied into the texture's bytes here.
+    let pixels = unsafe { std::slice::from_raw_parts(r.pixels, stride * r.height as usize) };
+    let bytes = glib::Bytes::from(pixels);
+    let texture = gdk::MemoryTexture::new(
+        w,
+        h,
+        gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        &bytes,
+        stride,
+    );
+    s.append_texture(&texture, &grect(r.rect));
 }
 
 /// What a run of path commands touches, strokes included.

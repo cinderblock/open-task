@@ -69,8 +69,20 @@ recording) works on both.
 - ABI v3: `paint(ctx, scale, out)` (the host needs device scale to rasterize;
   neither plugin sends `SCALE` events today); `OtDisplayList` gains `rasters` /
   `raster_count` (`OtRaster { first, end, rect (DIPs), width, height (px),
-  pixels }`); `OtPlugin` gains `features()` (keep-above bit, path renderer name)
-  and the animation setting where the toolkit knows it.
+  pixels }`); `OtPlugin` gains `features()` (`OT_FEATURE_KEEP_ABOVE`,
+  `OT_FEATURE_ANIMATIONS`), asked once the loop runs (the host's first wake);
+  `OT_EVENT_ANIMATIONS` carries the desktop's setting. The path renderer's name
+  comes from the toolkit (`Toolkit::Gtk` -> Cairo), not the ABI.
+- GTK: scale is `gdk_surface_get_scale` (4.12, fractional) looked up with
+  `dlsym`, else `scale_factor()`; images become `gdk::MemoryTexture`s. Animations
+  from `gtk-enable-animations`, live. Qt: `devicePixelRatioF()`, images wrapped
+  as `QImage` (no copy) with that device pixel ratio; keep-above only on `xcb`;
+  no animation setting (Unknown).
+- The host's `Charts` (`ot-shell-linux/src/charts.rs`) runs `find_runs` and
+  `ChartRaster::draw_run` per frame in CPU mode; `OT_CHARTS` overrides;
+  `OT_FRAME_STATS` logs `charts_avg_us`.
+- No scheduled update checks on Linux (the timer is armed only with
+  `caps.updates`): the switches to stop them are not on the page.
 - Chart runs (`find_runs`, `ChartRun`, `PxRect`) move from `ot-shell-win` to
   `ot-paint` so both shells share them.
 
@@ -99,6 +111,55 @@ recording) works on both.
 - Other thread's numbers (WSL, Xvfb, software GSK): History frame, on equal terms
   (both into an image), Cairo 1.9 ms vs `ChartRaster` 1.3 ms; whole-process CPU
   History 146 % (raster) vs 152-162 % (Cairo), List 30-40 % vs 22-33 % (noisy).
+- **Escapes in Bash-tool heredocs are mangled**: a Python patch typed in a
+  heredoc wrote a literal `\r` (backslash, r) plus CRLF where a Rust line
+  continuation (backslash, CRLF) was meant, so three chart drawing texts showed
+  a CR and spaces on the page (seen in the Xvfb screenshot). Fixed at the byte
+  level; `every_text_on_the_page_is_one_clean_line` now fails on it (checked by
+  putting the bad bytes back). Write patch scripts with the Write tool and
+  build escape bytes with `bytes([...])`. `sed -i` also turned `gfx.rs` to LF;
+  restore CRLF with Python.
+- The fake-plugin session's first frame comes before any sample, so it has no
+  charts and no rasters: the session test checks the images' invariants only;
+  `charts::tests` checks that images are made.
+- Xvfb checks (`%TEMP%\ot-settings\gui.sh`, display `:78`; another thread uses
+  `:93`): Settings page right under both toolkits (GTK: no Window section, "CPU |
+  Cairo", "Following the desktop's animation setting."; Qt on X11: Always on top
+  shown, "CPU | QPainter", no claim about animations). History and Performance
+  charts drawn in both modes; at scale 2 (`GDK_SCALE=2`, `QT_SCALE_FACTOR=2`) the
+  host's images are crisp and in place (4x zoom of line edges: 2 px AA, as
+  native).
+
+- **Measurements (WSL, Xvfb 1280x900, release, CPU of the process over 30 s
+  after 20 s; `%TEMP%\ot-settings\measure.sh`).** Round 1 ran while another
+  project built in WSL (load 2-3) and is noisy:
+
+  | toolkit | view | CPU mode | native |
+  | --- | --- | --- | --- |
+  | GTK | History | 187.7 % at 60 fps (charts 2.0-2.3 ms/frame) | 186.8 % at 53 fps |
+  | GTK | List | 34.1 % (charts 0.15-0.19 ms) | 33.4 % |
+  | Qt | History | 36.9 % (charts 4.1 ms) | 57.0 % |
+  | Qt | List | 28.2 % (charts 0.23-0.35 ms) | 15.0 % |
+
+  Round 2 began: GTK History CPU 181.1 % at 60 fps, native 150.5 % at only
+  22.5 fps (GSK in software cannot keep up with Cairo nodes): per frame native
+  costs about twice CPU mode. The Qt List outlier did not reproduce on a quiet
+  WSL (three interleaved pairs, load < 0.2): CPU 15.1 / 19.1 / 16.1 %, native
+  19.1 / 21.4 / 16.9 %.
+- **Clean rerun (load < 1.5, no rustc), two rounds, CPU of the process:**
+
+  | toolkit | view | CPU mode | native |
+  | --- | --- | --- | --- |
+  | GTK | History | 164.7 / 171.9 % (charts 1.2-1.6 ms/frame) | 159.0 / 170.8 % |
+  | GTK | List | 23.2 / 23.7 % (charts 0.12-0.15 ms) | 23.0 / 24.3 % |
+  | Qt | History | **14.4 / 16.9 %** (charts 1.0-1.7 ms) | 31.5 / 39.1 % |
+  | Qt | List | **14.2 / 18.9 %** (charts 0.13-0.23 ms) | 18.3 / 18.1 % |
+
+  Under Qt the CPU rasterizer halves the History view's cost; under GTK on Xvfb
+  it ties, because GSK composites in software there and that dominates (the
+  other thread's equal-terms numbers put `ChartRaster` ~1.5x ahead of Cairo,
+  which a real GPU's compositing would let show). **Decision: CPU stays the
+  Linux default** (the fallback rule already gives it).
 
 ## Progress log
 
@@ -109,10 +170,12 @@ recording) works on both.
   `ChartDrawing::Native`; per-renderer texts; Linux-shaped tests.
 - [x] 4. `Start::capabilities`; Windows passes `Capabilities::WINDOWS`; the Linux
   host passes a first Linux set (only `Native` charts, so no chart card yet).
-- [ ] 5. ABI v3 + host
-- [ ] 6. Plugins
-- [ ] 7. Verify + measure
-- [ ] 8. Docs, commit
+- [x] 5. ABI v3 + host (`charts.rs`, features, ANIMATIONS, update timer gated).
+- [x] 6. Plugins: GTK and Qt draw the images, report features.
+- [x] 7. Verify: Windows tests + clippy, Linux (WSL) clippy + all tests, Xvfb
+  screenshots; measured (above), CPU confirmed as the Linux default.
+- [x] 8. README updated (chart drawing on Linux, `OT_CHARTS`, Linux Settings
+  paragraph, crate table); ABI/host/plugins committed.
 
 ## Open questions for the user
 

@@ -1,7 +1,8 @@
 // Qt 6 plugin for open-task's Linux shell.
 //
 // Speaks the C ABI in crates/ot-shell-abi/include/ot_shell.h. One window, one
-// widget (Canvas) that asks the host for a frame and draws it with QPainter;
+// widget (Canvas) that asks the host for a frame and draws it with QPainter (a
+// run of chart shapes the host drew itself comes as an image, drawn in its place);
 // input becomes the ABI's events; menus and dialogs are shown without blocking
 // (QMenu::popup, QDialog::open) and answer through the host's callbacks.
 //
@@ -22,6 +23,7 @@
 #include <QFontMetricsF>
 #include <QHash>
 #include <QIcon>
+#include <QImage>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -39,6 +41,7 @@
 #include <QWidget>
 #include <QWindow>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -163,13 +166,24 @@ struct CachedText {
 
 class Painter {
 public:
-    void draw(QPainter &p, const OtDisplayList &list, const QWidget *widget) {
+    // `dpr` is the scale the frame was asked for, which the host's images are at.
+    void draw(QPainter &p, const OtDisplayList &list, const QWidget *widget, qreal dpr) {
         ++frame_;
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setRenderHint(QPainter::TextAntialiasing, true);
         const OtDrawCmd *cmds = list.cmds;
+        const size_t rasters = list.rasters ? list.raster_count : 0;
+        size_t next = 0;
         int clips = 0;
         for (size_t i = 0; i < list.cmd_count; ++i) {
+            // An image the host drew stands for its run of commands.
+            while (next < rasters && list.rasters[next].first < i) ++next;
+            if (next < rasters && list.rasters[next].first == i) {
+                const OtRaster &r = list.rasters[next++];
+                drawRaster(p, r, dpr);
+                i = std::max<size_t>(r.end, i + 1) - 1;
+                continue;
+            }
             const OtDrawCmd &c = cmds[i];
             switch (c.tag) {
             case OT_CMD_CLEAR: {
@@ -265,6 +279,16 @@ public:
     }
 
 private:
+    // One image pixel to a device pixel, at the image's rect.
+    static void drawRaster(QPainter &p, const OtRaster &r, qreal dpr) {
+        if (!r.pixels || r.width == 0 || r.height == 0) return;
+        // Premultiplied BGRA bytes are ARGB32 words on a little-endian machine.
+        QImage img(r.pixels, static_cast<int>(r.width), static_cast<int>(r.height),
+                   static_cast<qsizetype>(r.width) * 4, QImage::Format_ARGB32_Premultiplied);
+        img.setDevicePixelRatio(dpr);
+        p.drawImage(QPointF(r.rect.x, r.rect.y), img);
+    }
+
     static QPen pen(const OtColor &c, float width) {
         QPen pen(color(c));
         pen.setWidthF(width);
@@ -424,9 +448,10 @@ protected:
     void paintEvent(QPaintEvent *) override {
         if (!g_has_host) return;
         OtDisplayList list{};
-        g_host.paint(g_host.ctx, &list);
+        const qreal dpr = devicePixelRatioF();
+        g_host.paint(g_host.ctx, static_cast<float>(dpr), &list);
         QPainter p(this);
-        painter_.draw(p, list, this);
+        painter_.draw(p, list, this, dpr);
         p.end();
         // While something moves, a timer asks for the next frame, at the display's
         // rate when the window is active and half of it in the background.
@@ -931,6 +956,13 @@ void run_dialog_c(uint64_t token, const char *initial, size_t n) { run_dialog(to
 
 void copy_text(const char *t, size_t n) { QGuiApplication::clipboard()->setText(text(t, n)); }
 
+uint32_t features() {
+    uint32_t f = 0;
+    // Qt::WindowStaysOnTopHint is an X11 hint; Wayland has no way to ask.
+    if (QGuiApplication::platformName() == QLatin1String("xcb")) f |= OT_FEATURE_KEEP_ABOVE;
+    return f;
+}
+
 const OtPlugin PLUGIN = {
     OT_SHELL_ABI_VERSION,
     sizeof(OtPlugin),
@@ -953,6 +985,7 @@ const OtPlugin PLUGIN = {
     save_file,
     run_dialog_c,
     copy_text,
+    features,
 };
 
 } // namespace

@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define OT_SHELL_ABI_VERSION 2u
+#define OT_SHELL_ABI_VERSION 3u
 
 /* ---- Drawing: the layout of crates/ot-paint ---------------------------- */
 
@@ -162,6 +162,21 @@ typedef struct OtDrawCmd {
     } u;
 } OtDrawCmd;
 
+/* A run of chart commands (OT_CMD_BAND, OT_CMD_GRAPH) the host has drawn
+ * itself: the plugin draws commands first..end-1 by drawing this image instead,
+ * at `rect`, one image pixel to one device pixel. */
+typedef struct OtRaster {
+    uint32_t first; /* the run's first command */
+    uint32_t end;   /* one past its last */
+    /* Where, in DIPs: whole device pixels at the scale the frame was asked
+     * for, inside the clip the run's commands are under. */
+    OtRect rect;
+    uint32_t width, height; /* in device pixels */
+    /* Premultiplied BGRA (ARGB32 as little-endian words), width * 4 bytes a
+     * row, top row first. */
+    const uint8_t *pixels;
+} OtRaster;
+
 /* One frame. Valid until the plugin next calls into the host. */
 typedef struct OtDisplayList {
     const OtDrawCmd *cmds;
@@ -170,6 +185,9 @@ typedef struct OtDisplayList {
     size_t point_count;
     const char *strings; /* UTF-8; spans index bytes */
     size_t strings_len;
+    /* Runs of commands drawn as images, in command order, not overlapping. */
+    const OtRaster *rasters;
+    size_t raster_count;
 } OtDisplayList;
 
 /* ---- Input: plugin to host ---------------------------------------------- */
@@ -201,7 +219,11 @@ enum OtEventKind {
     OT_EVENT_VISIBILITY,
     /* The desktop's colour scheme changed: flag 1 dark, 0 light. Plugins that
      * cannot tell never send it; the host also follows the XDG portal. */
-    OT_EVENT_THEME
+    OT_EVENT_THEME,
+    /* The desktop's animation setting: flag 1 on, 0 off. A plugin with
+     * OT_FEATURE_ANIMATIONS sends it once the window is up and whenever it
+     * changes. */
+    OT_EVENT_ANIMATIONS
 };
 
 enum OtMouseButton { OT_BUTTON_LEFT = 0, OT_BUTTON_RIGHT = 1, OT_BUTTON_MIDDLE = 2 };
@@ -275,8 +297,9 @@ enum OtLogLevel { OT_LOG_ERROR = 0, OT_LOG_WARN = 1, OT_LOG_INFO = 2, OT_LOG_DEB
 typedef struct OtHost {
     void *ctx;
     void (*event)(void *ctx, const OtEvent *event);
-    /* Fill *out with the next frame. */
-    void (*paint)(void *ctx, OtDisplayList *out);
+    /* Fill *out with the next frame, to be drawn at `scale` device pixels a
+     * DIP (the window's scale, fractional where the display's is). */
+    void (*paint)(void *ctx, float scale, OtDisplayList *out);
     /* Whether something is moving: the plugin asks for another frame at the
      * display's rate while this is true, and stops when it is not. */
     bool (*animating)(void *ctx);
@@ -315,6 +338,15 @@ typedef struct OtStartup {
     int argc;
     char **argv;
 } OtStartup;
+
+/* What a plugin can do beyond what every plugin must; OtPlugin.features. */
+enum OtFeature {
+    /* set_keep_above works (Qt on X11; GTK 4 has no way to ask). */
+    OT_FEATURE_KEEP_ABOVE = 1,
+    /* The plugin reads the desktop's animation setting and sends
+     * OT_EVENT_ANIMATIONS. */
+    OT_FEATURE_ANIMATIONS = 2
+};
 
 typedef struct OtPlugin {
     uint32_t abi_version; /* OT_SHELL_ABI_VERSION */
@@ -355,6 +387,9 @@ typedef struct OtPlugin {
      * run it as administrator. */
     void (*run_dialog)(uint64_t token, const char *initial, size_t initial_len);
     void (*copy_text)(const char *text, size_t text_len);
+    /* OtFeature bits. Valid once run() has connected to the display; the host
+     * asks from its callbacks. */
+    uint32_t (*features)(void);
 } OtPlugin;
 
 typedef const OtPlugin *(*OtShellPluginFn)(void);
@@ -378,6 +413,8 @@ OT_STATIC_ASSERT(offsetof(OtTextCmd, caret) == 66, "OtTextCmd.caret");
 OT_STATIC_ASSERT(sizeof(OtDrawCmd) == 72, "OtDrawCmd");
 OT_STATIC_ASSERT(offsetof(OtDrawCmd, u) == 4, "OtDrawCmd.u");
 OT_STATIC_ASSERT(sizeof(OtEvent) == 40, "OtEvent");
+OT_STATIC_ASSERT(sizeof(OtRaster) == 40, "OtRaster");
+OT_STATIC_ASSERT(offsetof(OtRaster, pixels) == 32, "OtRaster.pixels");
 #undef OT_STATIC_ASSERT
 
 #ifdef __cplusplus

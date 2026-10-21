@@ -15,13 +15,29 @@ use std::mem::{offset_of, size_of};
 pub use ot_paint::{Color, DrawCmd, Point, Rect, Span, TextCmd, TextStyle};
 
 /// Bumped on any change to the header.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// The symbol a plugin exports: `const OtPlugin *ot_shell_plugin(void)`.
 pub const PLUGIN_SYMBOL: &[u8] = b"ot_shell_plugin\0";
 
 /// `OtShellPluginFn`.
 pub type PluginFn = unsafe extern "C" fn() -> *const Plugin;
+
+/// `OtRaster`: a run of chart commands the host drew itself, which the plugin
+/// draws as this image instead of the commands `first..end`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Raster {
+    pub first: u32,
+    pub end: u32,
+    /// Where, in DIPs: whole device pixels at the frame's scale.
+    pub rect: Rect,
+    /// In device pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Premultiplied BGRA, `width * 4` bytes a row, top row first.
+    pub pixels: *const u8,
+}
 
 /// `OtDisplayList`: one frame, borrowed from the host until the plugin next
 /// calls into it.
@@ -34,6 +50,9 @@ pub struct DisplayList {
     pub point_count: usize,
     pub strings: *const c_char,
     pub strings_len: usize,
+    /// Runs of commands drawn as images, in command order, not overlapping.
+    pub rasters: *const Raster,
+    pub raster_count: usize,
 }
 
 impl DisplayList {
@@ -44,11 +63,14 @@ impl DisplayList {
         point_count: 0,
         strings: std::ptr::null(),
         strings_len: 0,
+        rasters: std::ptr::null(),
+        raster_count: 0,
     };
 
-    /// Point at `list`'s commands and arenas.
+    /// Point at `list`'s commands and arenas, and at `rasters`, which must
+    /// outlive the use of this as much as `list` does.
     #[must_use]
-    pub fn of(list: &ot_paint::DisplayList) -> Self {
+    pub fn of(list: &ot_paint::DisplayList, rasters: &[Raster]) -> Self {
         let cmds = list.cmds();
         let points = list.point_arena();
         let strings = list.string_arena();
@@ -59,6 +81,8 @@ impl DisplayList {
             point_count: points.len(),
             strings: strings.as_ptr().cast(),
             strings_len: strings.len(),
+            rasters: rasters.as_ptr(),
+            raster_count: rasters.len(),
         }
     }
 }
@@ -79,6 +103,13 @@ pub mod event {
     pub const FOCUS: u32 = 11;
     pub const VISIBILITY: u32 = 12;
     pub const THEME: u32 = 13;
+    pub const ANIMATIONS: u32 = 14;
+}
+
+/// `OtFeature` bits.
+pub mod feature {
+    pub const KEEP_ABOVE: u32 = 1;
+    pub const ANIMATIONS: u32 = 2;
 }
 
 /// `OtMouseButton`.
@@ -186,7 +217,7 @@ pub const ICON_NONE: u32 = u32::MAX;
 pub struct Host {
     pub ctx: *mut c_void,
     pub event: unsafe extern "C" fn(ctx: *mut c_void, event: *const Event),
-    pub paint: unsafe extern "C" fn(ctx: *mut c_void, out: *mut DisplayList),
+    pub paint: unsafe extern "C" fn(ctx: *mut c_void, scale: f32, out: *mut DisplayList),
     pub animating: unsafe extern "C" fn(ctx: *mut c_void) -> bool,
     pub wake: unsafe extern "C" fn(ctx: *mut c_void),
     pub timer: unsafe extern "C" fn(ctx: *mut c_void, id: u32),
@@ -262,6 +293,7 @@ pub struct Plugin {
     ),
     pub run_dialog: unsafe extern "C" fn(token: u64, initial: *const c_char, len: usize),
     pub copy_text: unsafe extern "C" fn(text: *const c_char, len: usize),
+    pub features: unsafe extern "C" fn() -> u32,
 }
 
 // The header asserts the same numbers; a change on one side alone fails to build.
@@ -276,6 +308,8 @@ const _: () = {
     assert!(offset_of!(TextCmd, caret) == 66);
     assert!(size_of::<DrawCmd>() == 72);
     assert!(size_of::<Event>() == 40);
+    assert!(size_of::<Raster>() == 40);
+    assert!(offset_of!(Raster, pixels) == 32);
 };
 
 /// The header, for plugins built from this repository (`ot-shell-qt`'s build
@@ -304,7 +338,17 @@ mod tests {
         );
         check("offsetof(OtMenuItem, icon)", offset_of!(MenuItem, icon));
         check("OT_ICON_COUNT", ot_paint::Icon::ALL.len());
+        check("OT_EVENT_ANIMATIONS", event::ANIMATIONS as usize);
+        check("OT_FEATURE_KEEP_ABOVE", feature::KEEP_ABOVE as usize);
+        check("OT_FEATURE_ANIMATIONS", feature::ANIMATIONS as usize);
         check("sizeof(OtDisplayList)", size_of::<DisplayList>());
+        check(
+            "offsetof(OtDisplayList, rasters)",
+            offset_of!(DisplayList, rasters),
+        );
+        check("sizeof(OtRaster)", size_of::<Raster>());
+        check("offsetof(OtRaster, rect)", offset_of!(Raster, rect));
+        check("offsetof(OtRaster, width)", offset_of!(Raster, width));
         check("sizeof(OtHost)", size_of::<Host>());
         check("offsetof(OtHost, log)", offset_of!(Host, log));
         check("sizeof(OtStartup)", size_of::<Startup>());
@@ -316,6 +360,7 @@ mod tests {
             "offsetof(OtPlugin, copy_text)",
             offset_of!(Plugin, copy_text),
         );
+        check("offsetof(OtPlugin, features)", offset_of!(Plugin, features));
         check("sizeof(OtTextCmd)", size_of::<TextCmd>());
         check("offsetof(OtTextCmd, style)", offset_of!(TextCmd, style));
         check("offsetof(OtTextCmd, halign)", offset_of!(TextCmd, halign));

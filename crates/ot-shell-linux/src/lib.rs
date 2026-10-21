@@ -15,6 +15,7 @@
 //!
 //! On other platforms only [`select`] and the stubs compile.
 
+pub mod charts;
 #[cfg(target_os = "linux")]
 pub mod desktop;
 #[cfg(target_os = "linux")]

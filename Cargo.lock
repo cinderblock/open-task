@@ -669,6 +669,7 @@ name = "ot-shell-gtk"
 version = "0.17.6"
 dependencies = [
  "gtk4",
+ "libc",
  "ot-paint",
  "ot-shell-abi",
  "pango",

@@ -19,6 +19,8 @@ pub struct FrameLog {
     fulls: u32,
     paint: Duration,
     worst: Duration,
+    /// Drawing the charts' images (the CPU choice of chart drawing).
+    charts: Duration,
 }
 
 impl FrameLog {
@@ -34,11 +36,13 @@ impl FrameLog {
             fulls: 0,
             paint: Duration::ZERO,
             worst: Duration::ZERO,
+            charts: Duration::ZERO,
         })
     }
 
-    /// One frame: what kind the view made, and how long making it took.
-    pub fn add(&mut self, kind: PaintKind, paint: Duration) {
+    /// One frame: what kind the view made, how long making it took, and how
+    /// long drawing its charts' images took.
+    pub fn add(&mut self, kind: PaintKind, paint: Duration, charts: Duration) {
         self.frames += 1;
         match kind {
             PaintKind::Tick => self.ticks += 1,
@@ -47,6 +51,7 @@ impl FrameLog {
         }
         self.paint += paint;
         self.worst = self.worst.max(paint);
+        self.charts += charts;
         let elapsed = self.since.elapsed();
         if elapsed >= PERIOD {
             let per_frame = self.paint.checked_div(self.frames).unwrap_or_default();
@@ -58,6 +63,11 @@ impl FrameLog {
                 fulls = self.fulls,
                 paint_avg_us = per_frame.as_micros(),
                 paint_worst_us = self.worst.as_micros(),
+                charts_avg_us = self
+                    .charts
+                    .checked_div(self.frames)
+                    .unwrap_or_default()
+                    .as_micros(),
                 "frames"
             );
             *self = Self {
@@ -68,6 +78,7 @@ impl FrameLog {
                 fulls: 0,
                 paint: Duration::ZERO,
                 worst: Duration::ZERO,
+                charts: Duration::ZERO,
             };
         }
     }

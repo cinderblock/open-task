@@ -124,6 +124,11 @@ unsafe extern "C" fn run(
     }
     if let Some(settings) = gtk::Settings::default() {
         settings.set_gtk_application_prefer_dark_theme(startup.dark);
+        // The desktop's animation setting, which GTK reads from it (GNOME's
+        // enable-animations, through the settings portal or XSETTINGS).
+        settings.connect_gtk_enable_animations_notify(|s| {
+            send_animations(s.is_gtk_enable_animations());
+        });
     }
 
     let window = gtk::Window::new();
@@ -162,6 +167,9 @@ unsafe extern "C" fn run(
         .to_string_lossy()
         .into_owned();
     log(abi::log::INFO, &format!("{name} window opening"));
+    if let Some(settings) = gtk::Settings::default() {
+        send_animations(settings.is_gtk_enable_animations());
+    }
     RUNNING.store(true, Ordering::Release);
     if PENDING_WAKE.swap(false, Ordering::AcqRel) {
         deliver_wake();
@@ -172,6 +180,14 @@ unsafe extern "C" fn run(
     RUNNING.store(false, Ordering::Release);
     UI.with(|ui| ui.borrow_mut().take());
     0
+}
+
+fn send_animations(on: bool) {
+    send(&abi::Event {
+        kind: event::ANIMATIONS,
+        flag: u32::from(on),
+        ..abi::Event::default()
+    });
 }
 
 /// Ask the UI thread to call the host's wake, from any thread.
@@ -343,6 +359,11 @@ unsafe extern "C" fn copy_text(t: *const c_char, len: usize) {
     with_ui(|ui| WidgetExt::clipboard(&ui.canvas).set_text(&t));
 }
 
+unsafe extern "C" fn features() -> u32 {
+    // No keep-above: GTK 4 has no way to ask for it.
+    abi::feature::ANIMATIONS
+}
+
 pub static PLUGIN: abi::Plugin = abi::Plugin {
     abi_version: abi::ABI_VERSION,
     struct_size: size_of::<abi::Plugin>() as u32,
@@ -365,4 +386,5 @@ pub static PLUGIN: abi::Plugin = abi::Plugin {
     save_file,
     run_dialog,
     copy_text,
+    features,
 };

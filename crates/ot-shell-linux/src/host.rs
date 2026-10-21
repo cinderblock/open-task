@@ -23,10 +23,10 @@ use ot_shell_core::{
     ShellOptions, Start, ThemePreference,
 };
 use ot_ui::{
-    AnimationSource, Capabilities, ChartDrawing, Cursor, MouseButton, PathRenderer, TaskManager,
-    UiEvent,
+    AnimationSource, Capabilities, Cursor, MouseButton, PathRenderer, TaskManager, UiEvent,
 };
 
+use crate::charts::{self, Charts};
 use crate::desktop::{self, LinuxPlatform};
 use crate::frame_stats::FrameLog;
 use crate::keys;
@@ -54,6 +54,10 @@ static PLUGIN: AtomicPtr<abi::Plugin> = AtomicPtr::new(std::ptr::null_mut());
 struct State {
     shell: Shell,
     dl: DisplayList,
+    /// The charts' images, when the CPU draws them.
+    charts: Charts,
+    /// The drawing area, in DIPs, as last reported.
+    size: Size,
     /// The pointer as last set on the window.
     cursor: Cursor,
     next_token: u64,
@@ -67,6 +71,8 @@ struct State {
 
 struct Ctx {
     plugin: Cell<&'static abi::Plugin>,
+    /// What the plugin is written for.
+    toolkit: Cell<Toolkit>,
     state: RefCell<State>,
     /// The update timer is set once the loop runs.
     armed: Cell<bool>,
@@ -111,8 +117,11 @@ pub fn run(
 
         let cx = if let Some(cx) = &ctx {
             cx.plugin.set(loaded.plugin);
+            cx.toolkit.set(toolkit);
             if let Ok(mut st) = cx.state.try_borrow_mut() {
-                st.shell.app_mut().set_capabilities(capabilities(toolkit));
+                st.shell
+                    .app_mut()
+                    .set_capabilities(capabilities(toolkit, 0));
             }
             cx
         } else {
@@ -122,15 +131,18 @@ pub fn run(
                 config,
                 options,
                 dark,
-                capabilities(toolkit),
+                capabilities(toolkit, 0),
                 Box::new(FilePrefs::standard()),
             )?;
             ctx.insert(Box::new(Ctx {
                 plugin: Cell::new(loaded.plugin),
+                toolkit: Cell::new(toolkit),
                 state: RefCell::new(State {
                     dark,
                     shell,
                     dl: DisplayList::new(),
+                    charts: Charts::from_env(),
+                    size: Size::new(INITIAL_SIZE.0, INITIAL_SIZE.1),
                     cursor: Cursor::Arrow,
                     next_token: 1,
                     confirms: HashMap::new(),
@@ -156,18 +168,22 @@ pub fn run(
     Err(RunError::NoToolkit(failures))
 }
 
-/// What the shell can do under `toolkit`.
-fn capabilities(toolkit: Toolkit) -> Capabilities {
+/// What the shell can do under `toolkit`, whose plugin reports `features`
+/// ([`abi::feature`] bits; 0 until its window is up).
+fn capabilities(toolkit: Toolkit, features: u32) -> Capabilities {
     Capabilities {
         system: "Linux",
-        animations: AnimationSource::Unknown,
-        chart_drawings: &[ChartDrawing::Native],
+        animations: if features & abi::feature::ANIMATIONS != 0 {
+            AnimationSource::Desktop
+        } else {
+            AnimationSource::Unknown
+        },
+        chart_drawings: charts::OFFERED,
         paths: match toolkit {
             Toolkit::Gtk => PathRenderer::Cairo,
             Toolkit::Qt => PathRenderer::QPainter,
         },
-        // GTK 4 has no way to ask for it.
-        keep_above: toolkit == Toolkit::Qt,
+        keep_above: features & abi::feature::KEEP_ABOVE != 0,
         // Not on Linux yet: the tray, Switch to, the updater, a copy as root.
         tray: false,
         switch_to: false,
@@ -313,7 +329,7 @@ unsafe extern "C" fn on_event(ctx: *mut c_void, ev: *const abi::Event) {
     guard(ctx, |cx| cx.event(&ev));
 }
 
-unsafe extern "C" fn on_paint(ctx: *mut c_void, out: *mut AbiList) {
+unsafe extern "C" fn on_paint(ctx: *mut c_void, scale: f32, out: *mut AbiList) {
     // SAFETY: the plugin passes somewhere to write the list.
     let Some(out) = (unsafe { out.as_mut() }) else {
         return;
@@ -326,11 +342,19 @@ unsafe extern "C" fn on_paint(ctx: *mut c_void, out: *mut AbiList) {
         let st = &mut *st;
         let painting = std::time::Instant::now();
         st.shell.app_mut().paint(&mut st.dl);
+        let painted = painting.elapsed();
+        let charting = std::time::Instant::now();
+        let app = st.shell.app();
+        let mode = st
+            .charts
+            .mode(&app.capabilities(), app.settings().chart_drawing);
+        let rasters = st.charts.prepare(&st.dl, mode, scale, st.size);
         if let Some(log) = st.frame_log.as_mut() {
-            log.add(st.shell.app().last_paint(), painting.elapsed());
+            log.add(app.last_paint(), painted, charting.elapsed());
         }
-        // The list lives in the state, unchanged until the plugin calls in again.
-        *out = AbiList::of(&st.dl);
+        // The list and the images live in the state, unchanged until the plugin
+        // calls in again.
+        *out = AbiList::of(&st.dl, rasters);
     });
 }
 
@@ -448,7 +472,12 @@ impl Ctx {
     fn event(&self, ev: &abi::Event) {
         let at = Point::new(ev.x, ev.y);
         let ui = match ev.kind {
-            event::RESIZE => Some(UiEvent::Resize(Size::new(ev.x, ev.y))),
+            event::RESIZE => {
+                if let Ok(mut st) = self.state.try_borrow_mut() {
+                    st.size = Size::new(ev.x, ev.y);
+                }
+                Some(UiEvent::Resize(Size::new(ev.x, ev.y)))
+            }
             event::MOUSE_MOVE => Some(UiEvent::MouseMove(at)),
             event::MOUSE_LEAVE => Some(UiEvent::MouseLeave),
             event::MOUSE_DOWN | event::MOUSE_UP => {
@@ -494,8 +523,15 @@ impl Ctx {
                 self.follow_theme(ev.flag == 1);
                 None
             }
-            // Scale is the plugin's business (it draws in device pixels); focus
-            // and visibility are not used yet.
+            event::ANIMATIONS => {
+                self.with_shell(|shell, outs| {
+                    shell.app_mut().set_system_animations(ev.flag == 1);
+                    outs.push(Out::Repaint);
+                });
+                None
+            }
+            // Scale comes with each frame (the plugin draws in device pixels);
+            // focus and visibility are not used yet.
             _ => None,
         };
         if let Some(ui) = ui {
@@ -550,8 +586,18 @@ impl Ctx {
 
     fn wake(&self) {
         if !self.armed.replace(true) {
-            // SAFETY: a plugin function, called on the UI thread.
-            unsafe { (self.plugin().set_timer)(TIMER_UPDATE, FIRST_CHECK_MS) };
+            // SAFETY: a plugin function, called on the UI thread, the window up.
+            let features = unsafe { (self.plugin().features)() };
+            let caps = capabilities(self.toolkit.get(), features);
+            if let Ok(mut st) = self.state.try_borrow_mut() {
+                st.shell.app_mut().set_capabilities(caps);
+            }
+            // Scheduled checks only where the updater works; where it does not,
+            // its switches are not on the page to turn them off either.
+            if caps.updates {
+                // SAFETY: a plugin function, called on the UI thread.
+                unsafe { (self.plugin().set_timer)(TIMER_UPDATE, FIRST_CHECK_MS) };
+            }
             let settings = self.state.try_borrow().map(|st| st.shell.app().settings());
             if let Ok(settings) = settings {
                 self.carry_out(vec![Out::Settings(settings)]);
@@ -899,6 +945,8 @@ mod tests {
         thread_local! {
             pub static CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
             pub static PAINTED: RefCell<usize> = const { RefCell::new(0) };
+            /// Each raster of the frame painted: its commands, rect and size.
+            pub static RASTERS: RefCell<Vec<abi::Raster>> = const { RefCell::new(Vec::new()) };
         }
 
         fn note(s: impl Into<String>) {
@@ -924,12 +972,25 @@ mod tests {
                 y: 600.0,
                 ..abi::Event::default()
             });
+            // The desktop has animations off.
+            send(abi::Event {
+                kind: event::ANIMATIONS,
+                flag: 0,
+                ..abi::Event::default()
+            });
             // The shell flagged its first snapshot as it started; the waker would
             // have brought the host here.
             unsafe { (h.wake)(h.ctx) };
             let mut list = AbiList::EMPTY;
-            unsafe { (h.paint)(h.ctx, &raw mut list) };
+            unsafe { (h.paint)(h.ctx, 2.0, &raw mut list) };
             PAINTED.with(|p| *p.borrow_mut() = list.cmd_count);
+            let rasters = if list.rasters.is_null() {
+                &[][..]
+            } else {
+                // SAFETY: as the host left them, valid until the next call in.
+                unsafe { std::slice::from_raw_parts(list.rasters, list.raster_count) }
+            };
+            RASTERS.with(|r| *r.borrow_mut() = rasters.to_vec());
             // Ctrl+N: the Run dialog.
             send(abi::Event {
                 kind: event::KEY,
@@ -984,6 +1045,9 @@ mod tests {
             note("run dialog");
         }
         unsafe extern "C" fn copy_text(_: *const c_char, _: usize) {}
+        unsafe extern "C" fn features() -> u32 {
+            abi::feature::KEEP_ABOVE | abi::feature::ANIMATIONS
+        }
 
         pub static PLUGIN: abi::Plugin = abi::Plugin {
             abi_version: abi::ABI_VERSION,
@@ -1007,6 +1071,7 @@ mod tests {
             save_file,
             run_dialog,
             copy_text,
+            features,
         };
     }
 
@@ -1031,15 +1096,18 @@ mod tests {
             },
             &options,
             true,
-            capabilities(Toolkit::Gtk),
+            capabilities(Toolkit::Gtk, 0),
             Box::new(FilePrefs::at(dir.join("settings"))),
         )
         .expect("shell");
         let cx = Ctx {
             plugin: Cell::new(&fake::PLUGIN),
+            toolkit: Cell::new(Toolkit::Gtk),
             state: RefCell::new(State {
                 shell,
                 dl: DisplayList::new(),
+                charts: Charts::default(),
+                size: Size::new(INITIAL_SIZE.0, INITIAL_SIZE.1),
                 cursor: Cursor::Arrow,
                 next_token: 1,
                 confirms: HashMap::new(),
@@ -1051,13 +1119,39 @@ mod tests {
         };
         run_plugin(&cx, &fake::PLUGIN).expect("ran");
         cx.state.borrow_mut().shell.stop_feed();
+        // What the plugin said it can do, once its window was up.
+        {
+            let st = cx.state.borrow();
+            let caps = st.shell.app().capabilities();
+            assert!(caps.keep_above);
+            assert_eq!(caps.animations, AnimationSource::Desktop);
+            assert_eq!(caps.paths, PathRenderer::Cairo);
+            assert!(!st.shell.app().system_animations());
+        }
+        // The GPU, the default, is the CPU here: any charts came as images, in
+        // order, in whole device pixels at the frame's scale. (The first frame
+        // comes before any sample, so it may have none; `charts` tests the
+        // images themselves.)
+        let rasters = fake::RASTERS.with(|r| r.borrow().clone());
+        let painted = fake::PAINTED.with(|p| *p.borrow()) as u32;
+        let mut after = 0;
+        for r in &rasters {
+            assert!(
+                after <= r.first && r.first < r.end && r.end <= painted,
+                "{rasters:?}"
+            );
+            after = r.end;
+            assert!((r.rect.w * 2.0 - r.width as f32).abs() < 1e-3, "{r:?}");
+            assert!((r.rect.h * 2.0 - r.height as f32).abs() < 1e-3, "{r:?}");
+        }
         let calls = fake::CALLS.with(|c| c.borrow().clone());
         assert!(
             fake::PAINTED.with(|p| *p.borrow()) > 0,
             "a frame was painted"
         );
+        // No updater on Linux yet: no scheduled checks.
         assert!(
-            calls.contains(&format!("timer {TIMER_UPDATE}")),
+            !calls.contains(&format!("timer {TIMER_UPDATE}")),
             "{calls:?}"
         );
         assert!(calls.contains(&"run dialog".to_owned()), "{calls:?}");
