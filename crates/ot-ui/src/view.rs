@@ -18,6 +18,7 @@ use ot_model::process::Priority;
 use ot_model::ProcessKey;
 use ot_paint::{Color, DisplayList, HAlign, Icon, Point, Rect, Size, VAlign};
 
+use crate::capabilities::Capabilities;
 use crate::charts::{self, ChartClock, ChartGroup, Charted};
 use crate::format;
 use crate::nav::{NavHit, NavRail, Page};
@@ -1022,6 +1023,8 @@ pub struct App {
     /// Whether the platform has animation effects on; row slides need both this
     /// and the setting.
     system_animations: bool,
+    /// What the platform's shell can do, for the Settings page.
+    capabilities: Capabilities,
     /// The moment the charts' right edge shows, run smoothly between samples.
     clock: ChartClock,
     /// The last full paint, whose charts a frame where only the clock moved paints
@@ -1093,6 +1096,7 @@ impl App {
             update: UpdateView::default(),
             task_manager: TaskManager::default(),
             system_animations: true,
+            capabilities: Capabilities::default(),
             clock: ChartClock::default(),
             kept: DisplayList::new(),
             kept_page: Page::default(),
@@ -1332,6 +1336,18 @@ impl App {
     #[must_use]
     pub fn system_animations(&self) -> bool {
         self.system_animations
+    }
+
+    /// What the platform's shell can do; the Settings page shows only that.
+    pub fn set_capabilities(&mut self, capabilities: Capabilities) {
+        self.full_due = true;
+        self.capabilities = capabilities;
+    }
+
+    /// What the platform's shell can do, as last told.
+    #[must_use]
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
     /// Whether this copy runs as administrator. Set once at start.
@@ -1591,6 +1607,7 @@ impl App {
             let _ = self.perf.handle(UiEvent::MouseLeave);
             let _ = self.summary.handle(UiEvent::MouseLeave);
             let cx = Context {
+                caps: self.capabilities,
                 system_animations: self.system_animations,
                 update: &self.update,
                 task_manager: &self.task_manager,
@@ -1766,6 +1783,7 @@ impl App {
             Page::System => self.system.handle(ev),
             Page::Settings => {
                 let cx = Context {
+                    caps: self.capabilities,
                     system_animations: self.system_animations,
                     update: &self.update,
                     task_manager: &self.task_manager,
@@ -2709,6 +2727,7 @@ impl App {
             }
             Page::Settings => {
                 let cx = Context {
+                    caps: self.capabilities,
                     system_animations: self.system_animations,
                     update: &self.update,
                     task_manager: &self.task_manager,

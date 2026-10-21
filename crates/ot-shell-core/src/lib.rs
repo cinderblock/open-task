@@ -42,9 +42,9 @@ use ot_probe::{
     ServiceControl, SessionControl, StartupControl, SystemProbe,
 };
 use ot_ui::{
-    App, Command, Effect, Inventory, MenuAction, Page, ProcessAction, Query, RecordingView,
-    ReplayAction, ReplayState, ServiceAction, SessionAction, Settings, TaskManager, Theme, UiEvent,
-    UpdateAction, UpdateView, ViewLayout, ViewMode,
+    App, Capabilities, Command, Effect, Inventory, MenuAction, Page, ProcessAction, Query,
+    RecordingView, ReplayAction, ReplayState, ServiceAction, SessionAction, Settings, TaskManager,
+    Theme, UiEvent, UpdateAction, UpdateView, ViewLayout, ViewMode,
 };
 use ot_update::{Installation, Updater};
 
@@ -161,6 +161,8 @@ pub struct Start<'a> {
     pub backdrop: bool,
     /// Whether the system's animation effects are on.
     pub system_animations: bool,
+    /// What this shell can do, which decides what the Settings page offers.
+    pub capabilities: Capabilities,
     /// The "Replace Task Manager" card as it stands.
     pub task_manager: TaskManager,
     /// Where the installer put this copy, if it did; updates install only then.
@@ -402,6 +404,7 @@ impl Shell {
             theme,
             backdrop,
             system_animations,
+            capabilities,
             task_manager,
             installation,
             prefs,
@@ -420,6 +423,7 @@ impl Shell {
         app.set_backdrop(backdrop);
         app.set_settings(prefs.load());
         app.set_system_animations(system_animations);
+        app.set_capabilities(capabilities);
         app.set_elevated(elevated);
         // Where the last session left off, unless the command line says otherwise.
         if let Some(layout) = prefs.load_layout() {

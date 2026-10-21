@@ -22,7 +22,10 @@ use ot_shell_core::{
     theme_for, Ask, CloseOutcome, Confirmed, HostEffect, MenuNode, NoticeKind, Out, Shell,
     ShellOptions, Start, ThemePreference,
 };
-use ot_ui::{Cursor, MouseButton, TaskManager, UiEvent};
+use ot_ui::{
+    AnimationSource, Capabilities, ChartDrawing, Cursor, MouseButton, PathRenderer, TaskManager,
+    UiEvent,
+};
 
 use crate::desktop::{self, LinuxPlatform};
 use crate::frame_stats::FrameLog;
@@ -108,6 +111,9 @@ pub fn run(
 
         let cx = if let Some(cx) = &ctx {
             cx.plugin.set(loaded.plugin);
+            if let Ok(mut st) = cx.state.try_borrow_mut() {
+                st.shell.app_mut().set_capabilities(capabilities(toolkit));
+            }
             cx
         } else {
             let dark = options.theme.dark(desktop::prefers_dark());
@@ -116,6 +122,7 @@ pub fn run(
                 config,
                 options,
                 dark,
+                capabilities(toolkit),
                 Box::new(FilePrefs::standard()),
             )?;
             ctx.insert(Box::new(Ctx {
@@ -149,11 +156,32 @@ pub fn run(
     Err(RunError::NoToolkit(failures))
 }
 
+/// What the shell can do under `toolkit`.
+fn capabilities(toolkit: Toolkit) -> Capabilities {
+    Capabilities {
+        system: "Linux",
+        animations: AnimationSource::Unknown,
+        chart_drawings: &[ChartDrawing::Native],
+        paths: match toolkit {
+            Toolkit::Gtk => PathRenderer::Cairo,
+            Toolkit::Qt => PathRenderer::QPainter,
+        },
+        // GTK 4 has no way to ask for it.
+        keep_above: toolkit == Toolkit::Qt,
+        // Not on Linux yet: the tray, Switch to, the updater, a copy as root.
+        tray: false,
+        switch_to: false,
+        updates: false,
+        run_elevated: false,
+    }
+}
+
 fn start_shell(
     probe: Box<dyn SystemProbe>,
     config: SamplerConfig,
     options: &ShellOptions,
     dark: bool,
+    capabilities: Capabilities,
     prefs: Box<dyn ot_shell_core::Prefs>,
 ) -> Result<Shell, RunError> {
     let waker = Arc::new(|| {
@@ -171,6 +199,7 @@ fn start_shell(
         theme: theme_for(dark),
         backdrop: false,
         system_animations: true,
+        capabilities,
         task_manager: TaskManager {
             replacement: ot_ui::Replacement::Unavailable,
             install: None,
@@ -1002,6 +1031,7 @@ mod tests {
             },
             &options,
             true,
+            capabilities(Toolkit::Gtk),
             Box::new(FilePrefs::at(dir.join("settings"))),
         )
         .expect("shell");

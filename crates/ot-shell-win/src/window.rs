@@ -19,7 +19,10 @@ use ot_probe::SystemProbe;
 use ot_shell_core::{
     theme_for, Ask, CloseOutcome, Closing, HostEffect, Notice, NoticeKind, Out, Shell, Start,
 };
-use ot_ui::{Command, Cursor, Key, MenuAction, MouseButton, Page, Settings, TaskManager, UiEvent};
+use ot_ui::{
+    Capabilities, Command, Cursor, Key, MenuAction, MouseButton, Page, Settings, TaskManager,
+    UiEvent,
+};
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -304,6 +307,7 @@ pub fn run(
         theme: theme_for(dark),
         backdrop,
         system_animations: prefs::system_animations(),
+        capabilities: Capabilities::WINDOWS,
         task_manager: TaskManager {
             replacement: task_manager::replacement(),
             install: installation.as_ref().map(|i| i.scope),

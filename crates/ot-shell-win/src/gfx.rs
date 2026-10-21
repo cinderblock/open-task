@@ -518,7 +518,7 @@ impl Gfx {
         let all = !partial || self.check.is_some();
         if let Err(e) = self.prepare_charts(dl, if all { None } else { Some(&damage) }) {
             tracing::warn!(error = %e, "chart drawing failed; drawing charts with Direct2D");
-            self.charts.fall_back(ChartDrawing::Direct2D);
+            self.charts.fall_back(ChartDrawing::Native);
             self.charts.runs.clear();
         }
         let charted = Instant::now();
@@ -844,7 +844,7 @@ impl Gfx {
         let charts = &mut self.charts;
         charts.runs.clear();
         let mode = charts.mode();
-        if mode == ChartDrawing::Direct2D {
+        if mode == ChartDrawing::Native {
             return Ok(());
         }
         if mode == ChartDrawing::Gpu && charts.gpu.is_none() {
@@ -949,7 +949,7 @@ impl Gfx {
                     }
                 }
             }
-            ChartDrawing::Direct2D => {}
+            ChartDrawing::Native => {}
         }
         Ok(())
     }
@@ -1778,7 +1778,7 @@ impl Charts {
     fn mode(&self) -> ChartDrawing {
         let wanted = self.forced.unwrap_or(self.choice);
         match self.fallback {
-            Some(f) if wanted == ChartDrawing::Gpu || f == ChartDrawing::Direct2D => f,
+            Some(f) if wanted == ChartDrawing::Gpu || f == ChartDrawing::Native => f,
             _ => wanted,
         }
     }
@@ -2137,7 +2137,7 @@ mod tests {
             (ChartDrawing::Gpu, false),
             (ChartDrawing::Gpu, true),
             (ChartDrawing::Cpu, false),
-            (ChartDrawing::Direct2D, false),
+            (ChartDrawing::Native, false),
         ];
         for (mode, whole) in ways {
             gfx.charts.forced = Some(mode);
@@ -2279,7 +2279,7 @@ mod tests {
             let device = create_d3d_device(true).expect("WARP");
             let mut gfx = Gfx::on_device(hwnd, size, dpi, device).expect("graphics");
             let mut frames = Vec::new();
-            for mode in [ChartDrawing::Direct2D, ChartDrawing::Cpu, ChartDrawing::Gpu] {
+            for mode in [ChartDrawing::Native, ChartDrawing::Cpu, ChartDrawing::Gpu] {
                 gfx.charts.forced = Some(mode);
                 gfx.redraw_all = true;
                 gfx.render(&dl, 0).expect("a frame");

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod capabilities;
 mod charts;
 pub mod format;
 mod list_page;
@@ -27,6 +28,7 @@ mod usage_chart;
 mod usage_map;
 pub mod view;
 
+pub use capabilities::{AnimationSource, Capabilities, PathRenderer};
 pub use nav::Page;
 pub use replay::{RecordingView, ReplayAction, ReplayState, SPEEDS};
 pub use settings::{ChartDrawing, ChartLegend, Settings};

@@ -61,7 +61,8 @@ recording) works on both.
 
 ## Design
 
-- `ot-ui`: `Abilities` (name tbd in code) given to `App` by the shell:
+- `ot-ui`: `Capabilities` given to `App` by the shell (`Start::capabilities`,
+  `App::set_capabilities`):
   system name for the section heading, where row animation is followed from (or
   nothing), chart drawings offered and the native renderer's name, keep-above,
   tray (hide when minimized), switch-to (minimize on use), updates, run elevated.
@@ -102,9 +103,12 @@ recording) works on both.
 ## Progress log
 
 - [x] Audit; plan written.
-- [ ] 2. ot-paint chart runs
-- [ ] 3. ot-ui abilities
-- [ ] 4. Windows wiring
+- [x] 2. ot-paint chart runs (`2b06a82`): `find_runs` moved, `ChartRaster::draw_run`,
+  parity test against the Windows CPU path.
+- [x] 3. ot-ui `Capabilities` (`capabilities.rs`): cards and sections ask it;
+  `ChartDrawing::Native`; per-renderer texts; Linux-shaped tests.
+- [x] 4. `Start::capabilities`; Windows passes `Capabilities::WINDOWS`; the Linux
+  host passes a first Linux set (only `Native` charts, so no chart card yet).
 - [ ] 5. ABI v3 + host
 - [ ] 6. Plugins
 - [ ] 7. Verify + measure

@@ -7,10 +7,13 @@
 //! [`Effect::SaveSettings`] so it can be stored.
 //!
 //! A setting that follows a system preference (row animation follows Windows'
-//! animation effects, the reduced-motion switch) does so only until the user flips
+//! animation effects, or the desktop's on Linux) does so only until the user flips
 //! it here; from then on the user's choice stands. Whenever that system preference
 //! is off, the card says so, whichever way the switch is set, so the state of both
 //! is always in view.
+//!
+//! A card for something the platform's shell cannot do ([`Capabilities`]) is not
+//! shown, and a section with no card shown has no heading.
 //!
 //! The Updates section starts with the update button as a card: the full version,
 //! what the updater is doing in a sentence, and a button for the next step, the
@@ -18,10 +21,11 @@
 //! other (checking, then downloading, then installing), so turning one on turns on
 //! those it needs, and turning one off turns off those that need it.
 //!
-//! The Windows section holds the Task Manager card ([`TaskManager`]). It is not a
-//! setting: its switch shows what the system does, and flipping it asks the shell
-//! to change that ([`Effect::ReplaceTaskManager`]) rather than to store anything.
-//! Where there is nothing to replace, the section is not shown.
+//! The system's section, headed with its name, holds the Task Manager card
+//! ([`TaskManager`]). It is not a setting: its switch shows what the system does,
+//! and flipping it asks the shell to change that ([`Effect::ReplaceTaskManager`])
+//! rather than to store anything. Where there is nothing to replace, the card is
+//! not shown.
 //!
 //! The fade card is a number: how fast the cycle totals fade ([`ot_core::Usage`]),
 //! stepped through [`DECAY_STEPS`] with a minus and a plus button, the card saying
@@ -39,6 +43,7 @@ use std::fmt::Write as _;
 use ot_model::Bytes;
 use ot_paint::{DisplayList, HAlign, Point, Rect, VAlign};
 
+use crate::capabilities::{AnimationSource, Capabilities, PathRenderer};
 use crate::format;
 use crate::replay::RecordingView;
 use crate::task_manager::TaskManager;
@@ -159,42 +164,45 @@ impl ChartLegend {
     }
 }
 
-/// How the charts' lines and filled areas are drawn. All three look the same;
-/// they differ in what does the work.
+/// How the charts' lines and filled areas are drawn. All of them look the same;
+/// they differ in what does the work. Which a shell has is its
+/// [`Capabilities::chart_drawings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum ChartDrawing {
-    /// Direct3D shaders: the GPU works out every pixel's coverage, the CPU only
-    /// hands over the points. The least CPU.
+    /// Shaders: the GPU works out every pixel's coverage, the CPU only hands over
+    /// the points. The least CPU. Direct3D on Windows.
     #[default]
     Gpu,
     /// open-task's own rasterizer for chart shapes, on the CPU.
     Cpu,
-    /// Direct2D's general path renderer, which antialiases on the CPU: the most
+    /// The platform's general path renderer, which antialiases on the CPU:
+    /// Direct2D, or the toolkit's painter on Linux ([`PathRenderer`]). The most
     /// CPU, and the reference the other two match.
-    Direct2D,
+    Native,
 }
 
 impl ChartDrawing {
     /// In the order the card lists them.
-    pub const ALL: [Self; 3] = [Self::Gpu, Self::Cpu, Self::Direct2D];
+    pub const ALL: [Self; 3] = [Self::Gpu, Self::Cpu, Self::Native];
 
-    /// The card's name for it.
+    /// The card's name for it, where `paths` draws the native choice.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label(self, paths: PathRenderer) -> &'static str {
         match self {
             Self::Gpu => "GPU",
             Self::Cpu => "CPU",
-            Self::Direct2D => "Direct2D",
+            Self::Native => paths.name(),
         }
     }
 
-    /// From a name: `gpu`, `cpu`, `d2d` or `direct2d`, any case.
+    /// From a name, any case: `gpu`; `cpu`; `native`, or the name of a platform's
+    /// path renderer (`d2d`, `direct2d`, `cairo`, `qpainter`).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "gpu" | "d3d" | "direct3d" => Some(Self::Gpu),
             "cpu" => Some(Self::Cpu),
-            "d2d" | "direct2d" => Some(Self::Direct2D),
+            "native" | "d2d" | "direct2d" | "cairo" | "qpainter" => Some(Self::Native),
             _ => None,
         }
     }
@@ -414,6 +422,8 @@ impl HistoryCost {
 /// What the page shows besides the settings themselves.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Context<'a> {
+    /// What the platform's shell can do: which cards there are.
+    pub caps: Capabilities,
     /// What a setting that still follows the system shows.
     pub system_animations: bool,
     pub update: &'a UpdateView,
@@ -459,13 +469,23 @@ impl Toggle {
     }
 
     /// The line under the title: what the setting does, and while it still
-    /// follows Windows (with Windows' animations on), that it does.
+    /// follows the system (with the system's animations on), that it does.
     fn detail(self, s: Settings, cx: Context<'_>) -> &'static str {
         match (self, s.animate_rows, cx.system_animations) {
-            (Self::AnimateRows, None, true) => {
-                "Rows slide to their new place when the table re-sorts. Following \
-                 Windows' animation effects."
-            }
+            (Self::AnimateRows, None, true) => match cx.caps.animations {
+                AnimationSource::Windows => {
+                    "Rows slide to their new place when the table re-sorts. Following \
+                     Windows' animation effects."
+                }
+                AnimationSource::Desktop => {
+                    "Rows slide to their new place when the table re-sorts. Following \
+                     the desktop's animation setting."
+                }
+                AnimationSource::Unknown => {
+                    "Rows slide to their new place when the table re-sorts, instead of \
+                     jumping there."
+                }
+            },
             (Self::AnimateRows, _, _) => {
                 "Rows slide to their new place when the table re-sorts, instead of \
                  jumping there."
@@ -504,19 +524,43 @@ impl Toggle {
         }
     }
 
-    /// A line of its own under the detail: Windows' animation effects are off,
+    /// A line of its own under the detail: the system's animations are off,
     /// whatever the switch says, with what that means for the switch.
     fn note(self, s: Settings, cx: Context<'_>) -> Option<&'static str> {
-        match self {
-            Self::AnimateRows if !cx.system_animations => Some(match s.animate_rows {
+        match (self, cx.caps.animations) {
+            (Self::AnimateRows, AnimationSource::Windows) if !cx.system_animations => Some(match s
+                .animate_rows
+            {
                 None => {
-                    "Windows' animation effects are off, so this is off until you turn it \
-                     on here."
+                    "Windows' animation effects are off, so this is off until you turn \
+                         it on here."
                 }
                 Some(true) => "Windows' animation effects are off; open-task animates rows anyway.",
                 Some(false) => "Windows' animation effects are off too.",
             }),
+            (Self::AnimateRows, AnimationSource::Desktop) if !cx.system_animations => Some(match s
+                .animate_rows
+            {
+                None => {
+                    "The desktop's animations are off, so this is off until you turn it \
+                         on here."
+                }
+                Some(true) => "The desktop's animations are off; open-task animates rows anyway.",
+                Some(false) => "The desktop's animations are off too.",
+            }),
             _ => None,
+        }
+    }
+
+    /// Whether the switch is on the page: one for something the shell cannot do
+    /// is not.
+    fn shown(self, caps: Capabilities) -> bool {
+        match self {
+            Self::AlwaysOnTop => caps.keep_above,
+            Self::HideWhenMinimized => caps.tray,
+            Self::MinimizeOnUse => caps.switch_to,
+            Self::CheckUpdates | Self::DownloadUpdates | Self::InstallUpdates => caps.updates,
+            Self::AnimateRows | Self::SmoothCharts | Self::ResourcePercent => true,
         }
     }
 
@@ -585,9 +629,11 @@ enum Card {
     Knee,
     /// How the History chart names its bands, side by side to pick from.
     Legend,
-    /// How chart shapes are drawn: GPU, CPU or Direct2D, side by side to pick from.
+    /// How chart shapes are drawn: the ways the shell has, side by side to pick
+    /// from.
     ChartDrawing,
-    /// Start a copy as administrator; shown while this one is not.
+    /// Start a copy as administrator; shown while this one is not, where the shell
+    /// can.
     RunAsAdministrator,
     /// Record every pass to a file the user names, or stop.
     Record,
@@ -597,17 +643,14 @@ impl Card {
     /// Whether the card is on the page at all.
     fn shown(self, cx: Context<'_>) -> bool {
         match self {
+            Self::Toggle(t) => t.shown(cx.caps),
+            Self::Update => cx.caps.updates,
             Self::TaskManager => cx.task_manager.available(),
-            Self::RunAsAdministrator => !cx.elevated,
+            Self::RunAsAdministrator => cx.caps.run_elevated && !cx.elevated,
             Self::Record => !cx.replaying,
-            Self::Toggle(_)
-            | Self::Update
-            | Self::Decay
-            | Self::Speed
-            | Self::History
-            | Self::Knee
-            | Self::Legend
-            | Self::ChartDrawing => true,
+            // One way of drawing charts is no choice.
+            Self::ChartDrawing => cx.caps.chart_drawings.len() > 1,
+            Self::Decay | Self::Speed | Self::History | Self::Knee | Self::Legend => true,
         }
     }
 
@@ -652,10 +695,27 @@ impl Card {
     }
 }
 
+/// A section's heading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heading {
+    Named(&'static str),
+    /// The system's name ([`Capabilities::system`]).
+    System,
+}
+
+impl Heading {
+    fn text(self, caps: Capabilities) -> &'static str {
+        match self {
+            Self::Named(name) => name,
+            Self::System => caps.system,
+        }
+    }
+}
+
 /// The page, top to bottom: each section's heading and its cards.
-const SECTIONS: [(&str, &[Card]); 6] = [
+const SECTIONS: [(Heading, &[Card]); 6] = [
     (
-        "Process table",
+        Heading::Named("Process table"),
         &[
             Card::Toggle(Toggle::AnimateRows),
             Card::Decay,
@@ -664,7 +724,7 @@ const SECTIONS: [(&str, &[Card]); 6] = [
         ],
     ),
     (
-        "Charts",
+        Heading::Named("Charts"),
         &[
             Card::History,
             Card::Knee,
@@ -674,7 +734,7 @@ const SECTIONS: [(&str, &[Card]); 6] = [
         ],
     ),
     (
-        "Window",
+        Heading::Named("Window"),
         &[
             Card::Toggle(Toggle::AlwaysOnTop),
             Card::Toggle(Toggle::HideWhenMinimized),
@@ -682,7 +742,7 @@ const SECTIONS: [(&str, &[Card]); 6] = [
         ],
     ),
     (
-        "Updates",
+        Heading::Named("Updates"),
         &[
             Card::Update,
             Card::Toggle(Toggle::CheckUpdates),
@@ -690,8 +750,11 @@ const SECTIONS: [(&str, &[Card]); 6] = [
             Card::Toggle(Toggle::InstallUpdates),
         ],
     ),
-    ("Windows", &[Card::TaskManager, Card::RunAsAdministrator]),
-    ("Recording", &[Card::Record]),
+    (
+        Heading::System,
+        &[Card::TaskManager, Card::RunAsAdministrator],
+    ),
+    (Heading::Named("Recording"), &[Card::Record]),
 ];
 const CARD_COUNT: usize = 19;
 /// The fade card's place among the cards, the speed card's, the history card's,
@@ -752,7 +815,8 @@ pub(crate) struct SettingsPage {
     /// pointer.
     speed: [Rect; SPEED_STEPS.len()],
     hover_speed: Option<usize>,
-    /// The chart drawing card's choices, in [`ChartDrawing::ALL`] order, and the
+    /// The chart drawing card's choices, in the shell's
+    /// [`Capabilities::chart_drawings`] order ([`Rect::ZERO`] past them), and the
     /// one under the pointer.
     drawing: [Rect; ChartDrawing::ALL.len()],
     hover_drawing: Option<usize>,
@@ -791,7 +855,8 @@ impl SettingsPage {
         self.steppers.iter().position(|r| r.contains(p))
     }
 
-    /// The chart drawing choice under `p`, as an index into [`ChartDrawing::ALL`].
+    /// The chart drawing choice under `p`, as an index into the shell's
+    /// [`Capabilities::chart_drawings`].
     fn drawing_at(&self, p: Point) -> Option<usize> {
         if !self.view.contains(p) {
             return None;
@@ -846,10 +911,13 @@ impl SettingsPage {
     }
 
     /// The chart drawing choice under `at`: pick it, and ask for it to be saved.
-    /// Nothing when it is already the one picked.
-    fn pick_drawing(&self, at: Point, settings: &mut Settings) -> Reaction {
-        match self.drawing_at(at).map(|i| ChartDrawing::ALL[i]) {
-            Some(d) if d != settings.chart_drawing => {
+    /// Nothing when it is already the one in use.
+    fn pick_drawing(&self, at: Point, settings: &mut Settings, caps: Capabilities) -> Reaction {
+        let picked = self
+            .drawing_at(at)
+            .and_then(|i| caps.chart_drawings.get(i).copied());
+        match picked {
+            Some(d) if d != caps.chart_drawing(settings.chart_drawing) => {
                 settings.chart_drawing = d;
                 Reaction {
                     repaint: true,
@@ -941,7 +1009,7 @@ impl SettingsPage {
                     self.step(card, at, settings)
                 }
                 Some(Card::Speed) => self.pick_speed(at, settings),
-                Some(Card::ChartDrawing) => self.pick_drawing(at, settings),
+                Some(Card::ChartDrawing) => self.pick_drawing(at, settings, cx.caps),
                 Some(Card::Legend) => self.pick_legend(at, settings),
                 Some(Card::RunAsAdministrator) => Reaction::effect(Effect::RunAsAdministrator),
                 Some(Card::Record) => Reaction::effect(Effect::Record(cx.recording.is_none())),
@@ -1022,7 +1090,10 @@ impl SettingsPage {
                 );
             }
         };
-        choices(self.cards[DRAWING_CARD], &mut self.drawing);
+        // Only the ways this shell has; the rest are nowhere.
+        let offered = cx.caps.chart_drawings.len().min(self.drawing.len());
+        self.drawing = Default::default();
+        choices(self.cards[DRAWING_CARD], &mut self.drawing[..offered]);
         choices(self.cards[LEGEND_CARD], &mut self.legend);
         choices(self.cards[SPEED_CARD], &mut self.speed);
         self.max_scroll = (y - view.h).max(0.0);
@@ -1074,7 +1145,7 @@ impl SettingsPage {
         dl.push_clip(view);
         for ((heading, _), r) in SECTIONS.iter().zip(self.headings) {
             if let Some(r) = r {
-                dl.label(heading, r, theme.title, theme.text_dim);
+                dl.label(heading.text(cx.caps), r, theme.title, theme.text_dim);
             }
         }
         let cards = SECTIONS.iter().flat_map(|(_, cards)| cards.iter().copied());
@@ -1148,7 +1219,7 @@ impl SettingsPage {
                     paint_choices(
                         dl,
                         &self.speed,
-                        SPEED_STEPS.map(speed_name),
+                        &SPEED_STEPS.map(speed_name),
                         settings.speed_index(),
                         self.hover_speed,
                         theme,
@@ -1234,37 +1305,38 @@ impl SettingsPage {
                     paint_choices(
                         dl,
                         &self.legend,
-                        ChartLegend::ALL.map(ChartLegend::label),
+                        &ChartLegend::ALL.map(ChartLegend::label),
                         settings.chart_legend.index() as usize,
                         self.hover_legend,
                         theme,
                     );
                 }
                 Card::ChartDrawing => {
-                    let detail = match settings.chart_drawing {
-                        ChartDrawing::Gpu => {
-                            "Direct3D shaders on the graphics card work out every pixel: \
-                             the least CPU."
-                        }
-                        ChartDrawing::Cpu => {
-                            "open-task's own rasterizer for chart shapes, on the CPU: \
-                             much less than Direct2D's."
-                        }
-                        ChartDrawing::Direct2D => {
-                            "Direct2D's general path renderer, which antialiases on the \
-                             CPU: the most CPU at full history."
-                        }
-                    };
+                    let caps = cx.caps;
+                    let drawing = caps.chart_drawing(settings.chart_drawing);
                     // The text stops short of the choices, which are wider than
                     // the other cards' controls.
                     let (text, _) =
                         inner.split_left((self.drawing[0].x - inner.x).clamp(0.0, inner.w));
-                    paint_text(dl, text, "Chart drawing", detail, note, theme);
+                    paint_text(
+                        dl,
+                        text,
+                        "Chart drawing",
+                        drawing_detail(drawing, caps.paths),
+                        note,
+                        theme,
+                    );
+                    let offered = caps.chart_drawings;
+                    let mut labels = [""; ChartDrawing::ALL.len()];
+                    for (label, d) in labels.iter_mut().zip(offered) {
+                        *label = d.label(caps.paths);
+                    }
+                    let n = offered.len().min(labels.len());
                     paint_choices(
                         dl,
-                        &self.drawing,
-                        ChartDrawing::ALL.map(ChartDrawing::label),
-                        settings.chart_drawing.index() as usize,
+                        &self.drawing[..n],
+                        &labels[..n],
+                        offered.iter().position(|&d| d == drawing).unwrap_or(0),
                         self.hover_drawing,
                         theme,
                     );
@@ -1316,6 +1388,37 @@ impl SettingsPage {
             }
         }
         dl.pop_clip();
+    }
+}
+
+/// What the chart drawing card says about `drawing`, where `paths` is the
+/// platform's path renderer.
+fn drawing_detail(drawing: ChartDrawing, paths: PathRenderer) -> &'static str {
+    match (drawing, paths) {
+        (ChartDrawing::Gpu, PathRenderer::Direct2D) => {
+            "Direct3D shaders on the graphics card work out every pixel: the least CPU."
+        }
+        (ChartDrawing::Gpu, PathRenderer::Cairo | PathRenderer::QPainter) => {
+            "Shaders on the graphics card work out every pixel: the least CPU."
+        }
+        (ChartDrawing::Cpu, PathRenderer::Direct2D) => {
+            "open-task's own rasterizer for chart shapes, on the CPU: much less than \
+             Direct2D's."
+        }
+        (ChartDrawing::Cpu, PathRenderer::Cairo | PathRenderer::QPainter) => {
+            "open-task's own rasterizer for chart shapes, on the CPU, handed to the \
+             toolkit as an image."
+        }
+        (ChartDrawing::Native, PathRenderer::Direct2D) => {
+            "Direct2D's general path renderer, which antialiases on the CPU: the most \
+             CPU at full history."
+        }
+        (ChartDrawing::Native, PathRenderer::Cairo) => {
+            "Cairo, GTK's general path renderer, which antialiases on the CPU."
+        }
+        (ChartDrawing::Native, PathRenderer::QPainter) => {
+            "QPainter, Qt's general path renderer, which antialiases on the CPU."
+        }
     }
 }
 
@@ -1394,10 +1497,10 @@ fn paint_button(dl: &mut DisplayList, r: Rect, label: &str, enabled: bool, theme
 /// A row of choices side by side, one of them picked, in the look of the
 /// toolbar's List / Tree / Map / History control: `rects` from the layout,
 /// `labels` in the same order.
-fn paint_choices<const N: usize>(
+fn paint_choices(
     dl: &mut DisplayList,
-    rects: &[Rect; N],
-    labels: [&str; N],
+    rects: &[Rect],
+    labels: &[&str],
     picked: usize,
     hover: Option<usize>,
     theme: &Theme,
@@ -1408,7 +1511,7 @@ fn paint_choices<const N: usize>(
     let group = Rect::new(first.x, first.y, last.right() - first.x, first.h);
     dl.fill_round_rect(group, theme.card_radius, theme.input_bg);
     dl.stroke_round_rect(group, theme.card_radius, theme.surface_border, 1.0);
-    for (i, (&r, label)) in rects.iter().zip(labels).enumerate() {
+    for (i, (&r, &label)) in rects.iter().zip(labels).enumerate() {
         let active = i == picked;
         let fill = if active {
             Some(theme.button_active)
@@ -1538,6 +1641,7 @@ mod tests {
     fn cx(system_animations: bool, update: &UpdateView) -> Context<'_> {
         // Elevated: the Run as administrator card is out of the way.
         Context {
+            caps: Capabilities::WINDOWS,
             system_animations,
             update,
             task_manager: &NO_TASK_MANAGER,
@@ -1820,7 +1924,7 @@ mod tests {
         // saved, in any order.
         assert_eq!(click(&mut page, gpu.center(), &mut s, cx), Reaction::NONE);
         let r = click(&mut page, d2d.center(), &mut s, cx);
-        assert_eq!(s.chart_drawing, ChartDrawing::Direct2D);
+        assert_eq!(s.chart_drawing, ChartDrawing::Native);
         assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
         let _ = click(&mut page, cpu.center(), &mut s, cx);
         assert_eq!(s.chart_drawing, ChartDrawing::Cpu);
@@ -1832,7 +1936,10 @@ mod tests {
             assert_eq!(ChartDrawing::from_index(d.index()), d);
         }
         assert_eq!(ChartDrawing::from_index(9), ChartDrawing::Gpu);
-        assert_eq!(ChartDrawing::parse(" D2D "), Some(ChartDrawing::Direct2D));
+        // Native is saved as 2, as Direct2D was before it had other names.
+        assert_eq!(ChartDrawing::Native.index(), 2);
+        assert_eq!(ChartDrawing::parse(" D2D "), Some(ChartDrawing::Native));
+        assert_eq!(ChartDrawing::parse("Cairo"), Some(ChartDrawing::Native));
         assert_eq!(ChartDrawing::parse("cpu"), Some(ChartDrawing::Cpu));
         assert_eq!(ChartDrawing::parse("vulkan"), None);
     }
@@ -2204,5 +2311,193 @@ mod tests {
         assert_eq!(wheel(&mut page, &mut s, -50.0), Reaction::REPAINT);
         assert!(page.cards[0].y > 0.0 && page.cards[0].y < 100.0);
         assert_eq!(wheel(&mut page, &mut s, -1.0), Reaction::NONE);
+    }
+
+    /// A Linux shell under GTK as it stands: no tray, updater, Switch to, keep
+    /// above or running as root; charts by the CPU or Cairo.
+    const GTK: Capabilities = Capabilities {
+        system: "Linux",
+        animations: AnimationSource::Desktop,
+        chart_drawings: &[ChartDrawing::Cpu, ChartDrawing::Native],
+        paths: PathRenderer::Cairo,
+        keep_above: false,
+        tray: false,
+        switch_to: false,
+        updates: false,
+        run_elevated: false,
+    };
+
+    fn on(caps: Capabilities, system_animations: bool, update: &UpdateView) -> Context<'_> {
+        Context {
+            caps,
+            elevated: false,
+            ..cx(system_animations, update)
+        }
+    }
+
+    #[test]
+    fn a_shell_that_cannot_do_something_shows_no_card_for_it() {
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let s = Settings::default();
+        let strings = texts(&paint(&mut page, s, on(GTK, true, &update)));
+        for gone in [
+            "Window",
+            "Always on top",
+            "Hide when minimized",
+            "Minimize on use",
+            "Updates",
+            "Check for updates automatically",
+            "Download updates automatically",
+            "Install updates automatically",
+            "Linux",
+            "Windows",
+            "Run as administrator",
+            "GPU",
+            "Direct2D",
+        ] {
+            assert!(!strings.iter().any(|t| t == gone), "{gone} in {strings:?}");
+        }
+        for kept in [
+            "Process table",
+            "Animate rows as the order changes",
+            "Charts",
+            "Chart drawing",
+            "Recording",
+        ] {
+            assert!(
+                strings.iter().any(|t| t == kept),
+                "{kept} not in {strings:?}"
+            );
+        }
+        // The cards that are gone take no room.
+        let window = SECTIONS
+            .iter()
+            .position(|(h, _)| *h == Heading::Named("Window"))
+            .expect("a Window section");
+        assert_eq!(page.headings[window], None);
+        assert_eq!(page.cards[TASK_MANAGER + 1], Rect::ZERO);
+
+        // Once the shell can, its card is back, under the system's name.
+        let root = Capabilities {
+            run_elevated: true,
+            keep_above: true,
+            ..GTK
+        };
+        let strings = texts(&paint(&mut page, s, on(root, true, &update)));
+        for back in ["Linux", "Run as administrator", "Window", "Always on top"] {
+            assert!(
+                strings.iter().any(|t| t == back),
+                "{back} not in {strings:?}"
+            );
+        }
+        assert!(!strings.iter().any(|t| t == "Hide when minimized"));
+    }
+
+    #[test]
+    fn the_chart_drawing_card_offers_what_the_shell_has() {
+        let update = UpdateView::new("0.2.1", true);
+        let cx = on(GTK, true, &update);
+        let mut page = SettingsPage::default();
+        let mut s = Settings::default();
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(strings.iter().any(|t| t == "CPU") && strings.iter().any(|t| t == "Cairo"));
+        // The GPU, saved by default, is not here: the CPU draws, and says so.
+        assert!(
+            strings
+                .iter()
+                .any(|t| t == drawing_detail(ChartDrawing::Cpu, PathRenderer::Cairo)),
+            "{strings:?}"
+        );
+        let card = page.cards[DRAWING_CARD];
+        let [cpu, cairo, none] = page.drawing;
+        assert!(card.contains(cpu.center()) && card.contains(cairo.center()));
+        assert!(cpu.right() <= cairo.x);
+        assert!(
+            (cairo.right() - (card.right() - 16.0)).abs() < 0.01,
+            "at the right"
+        );
+        assert_eq!(none.w, 0.0, "no third choice");
+
+        // The CPU is already in use: picking it changes nothing.
+        assert_eq!(click(&mut page, cpu.center(), &mut s, cx), Reaction::NONE);
+        let r = click(&mut page, cairo.center(), &mut s, cx);
+        assert_eq!(s.chart_drawing, ChartDrawing::Native);
+        assert_eq!(r.effect, Some(Effect::SaveSettings(s)));
+        let strings = texts(&paint(&mut page, s, cx));
+        assert!(strings
+            .iter()
+            .any(|t| t == drawing_detail(ChartDrawing::Native, PathRenderer::Cairo)));
+        let _ = click(&mut page, cpu.center(), &mut s, cx);
+        assert_eq!(s.chart_drawing, ChartDrawing::Cpu);
+
+        // Under Qt, the toolkit's painter is QPainter.
+        let qt = Capabilities {
+            paths: PathRenderer::QPainter,
+            ..GTK
+        };
+        let strings = texts(&paint(&mut page, s, on(qt, true, &update)));
+        assert!(strings.iter().any(|t| t == "QPainter"), "{strings:?}");
+
+        // One way is no choice: no card.
+        let one = Capabilities {
+            chart_drawings: &[ChartDrawing::Native],
+            ..GTK
+        };
+        let strings = texts(&paint(&mut page, s, on(one, true, &update)));
+        assert!(!strings.iter().any(|t| t == "Chart drawing"));
+    }
+
+    #[test]
+    fn every_text_on_the_page_is_one_clean_line() {
+        // A string continued across source lines must not carry the line break
+        // (or an escape for one) onto the page.
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let qt = Capabilities {
+            paths: PathRenderer::QPainter,
+            ..GTK
+        };
+        for caps in [Capabilities::WINDOWS, GTK, qt] {
+            for drawing in ChartDrawing::ALL {
+                for system_animations in [true, false] {
+                    let s = Settings {
+                        chart_drawing: drawing,
+                        ..Settings::default()
+                    };
+                    let strings = texts(&paint(&mut page, s, on(caps, system_animations, &update)));
+                    for t in &strings {
+                        assert!(!t.chars().any(char::is_control), "{t:?}");
+                        assert!(!t.contains("  ") && !t.contains('\\'), "{t:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_animation_follows_the_desktop_or_says_nothing_of_it() {
+        let update = UpdateView::new("0.2.1", true);
+        let mut page = SettingsPage::default();
+        let s = Settings::default();
+        let strings = texts(&paint(&mut page, s, on(GTK, true, &update)));
+        assert!(strings
+            .iter()
+            .any(|t| t.ends_with("Following the desktop's animation setting.")));
+        let dl = paint(&mut page, s, on(GTK, false, &update));
+        assert_eq!(state_of(&dl, page.cards[0]), "Off");
+        assert!(texts(&dl)
+            .iter()
+            .any(|t| t
+                == "The desktop's animations are off, so this is off until you turn it on here."));
+
+        // A shell that cannot read the setting claims nothing about it.
+        let unknown = Capabilities {
+            animations: AnimationSource::Unknown,
+            ..GTK
+        };
+        let strings = texts(&paint(&mut page, s, on(unknown, true, &update)));
+        assert!(!strings.iter().any(|t| t.contains("Following")));
+        assert!(!strings.iter().any(|t| t.contains("animations are off")));
     }
 }
