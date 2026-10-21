@@ -150,6 +150,8 @@ a clock tick (15.6 ms) at a time, so a short burst that CPU % misses still shows
 They are counted at the processor's fixed base clock (1.6 billion a second for each
 busy logical processor on a chip with a 1.6 GHz base speed), whatever speed the core
 is running at that moment: a cycle here is a slice of time, not a unit of work done.
+Linux counts no cycles per process, so there they are the process's CPU time at the
+rated clock: the same measure, but charged a clock tick (10 ms) at a time, like CPU %.
 Two things are not seen: the cycles a process uses between its last sample and its
 exit, and a process that starts and ends between two samples.
 
@@ -553,12 +555,19 @@ Everything comes from `/proc` and `/sys`, with no daemon and no kernel module:
 - The CPU's temperature (`coretemp`, or `k10temp`'s Tctl), and its package power
   from RAPL, which most kernels let only root read.
 - Logon sessions from systemd-logind, and open connections with their processes.
+- Each GPU's load by engine and each process's share of it, with its memory, from
+  the kernel's DRM client usage stats (`/proc/<pid>/fdinfo`, kernel 5.19 or later):
+  Intel (i915, Xe), AMD (amdgpu) and most open drivers. On AMD the driver's own
+  busy reading and memory in use count as well. NVIDIA's own driver publishes no
+  such stats, so its GPUs are not shown yet.
 
 As an ordinary user, the kernel hides another user's disk I/O, file descriptors
 and sockets, so those processes show none and their connections no owner; run it
-with `sudo` to see everything.
+with `sudo` to see everything. The same goes for their GPU use, which as an
+ordinary user is part of "Not in a process" where the driver measures the whole
+GPU, and missing where it does not.
 
-Not on Linux yet: GPUs, CPU sampling (`--sample`), the full list of services,
+Not on Linux yet: NVIDIA GPUs, CPU sampling (`--sample`), the full list of services,
 installed apps, program icons in the table, the notification-area icon, running as
 root from the window, the window crosshair, and self-update. The settings live in
 `$XDG_CONFIG_HOME/open-task/settings` (normally `~/.config/open-task/settings`).

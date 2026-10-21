@@ -101,7 +101,8 @@ Later (not this pass; listed so they are not forgotten):
   (`imp/windows/smbios.rs`) could read `/sys/firmware/dmi/tables/DMI` if moved
   out of the Windows module.
 - Session sign-out / disconnect (logind over D-Bus).
-- GPU (amdgpu `gpu_busy_percent`, i915/xe via PMU, NVIDIA via NVML).
+- GPU: done from DRM fdinfo in `plans/linux-history-cpu-gpu.md`; NVIDIA via NVML
+  still to do.
 - CPU sampling (`perf_event_open`).
 - A Linux GUI shell.
 

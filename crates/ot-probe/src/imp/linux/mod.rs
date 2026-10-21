@@ -7,6 +7,7 @@ mod control;
 mod cpu;
 mod disks;
 mod fs;
+mod gpu;
 mod inventory;
 mod net;
 mod power;
@@ -37,6 +38,7 @@ pub fn is_elevated() -> bool {
 pub struct LinuxProbe {
     cpu: cpu::CpuProbe,
     processes: process::ProcessProbe,
+    gpu: Option<gpu::GpuProbe>,
     disks: disks::DiskProbe,
     net: net::NetProbe,
     volumes: volumes::VolumeProbe,
@@ -66,6 +68,7 @@ impl LinuxProbe {
                 hardware.boot_unix_ms,
                 hardware.base_frequency,
             ),
+            gpu: gpu::GpuProbe::new(),
             disks: disks::DiskProbe::default(),
             net: net::NetProbe::default(),
             volumes: volumes::VolumeProbe::default(),
@@ -131,6 +134,8 @@ impl SystemProbe for LinuxProbe {
         Capabilities {
             per_process_cpu: true,
             per_process_disk: true,
+            per_process_gpu: self.gpu.is_some(),
+            gpu: self.gpu.is_some(),
             core_frequency: self.cpu.has_frequency(),
             package_power: self.rapl.is_some(),
             thermals: self.thermal.is_some(),
@@ -149,6 +154,9 @@ impl SystemProbe for LinuxProbe {
             .sample(&mut out.cpu)
             .map_err(|e| ProbeError::os("reading /proc/stat", e))?;
         self.processes.sample(&mut out.processes, &mut out.threads);
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.sample(&mut out.processes, &mut out.gpus);
+        }
         out.cpu.package_power = self.rapl.as_mut().and_then(power::Rapl::sample);
         out.cpu.hotspot_celsius = self.thermal.as_ref().and_then(power::Thermal::read);
         out.memory = self.sample_memory()?;
