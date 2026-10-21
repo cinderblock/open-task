@@ -1,10 +1,30 @@
 //! Processes and their threads, from `/proc`.
 //!
-//! Each pass reads `stat` and `status` for every process, `io` and the `fd`
-//! directory for those this user may read (all of them as root), and each thread's
-//! `stat` for multi-threaded processes. Facts that do not change over a process's
-//! life (its name, path, command line, owner, services) are read once, at first
-//! sight, and shared by pointer after that.
+//! Each pass reads `stat` and `statm` for every process, the size of its `fd`
+//! directory (its count of open files), `io` for those this user may read (all of
+//! them as root), and each thread's `stat` for multi-threaded processes that used
+//! the CPU. Facts that do not change over a process's life (its name, path, command
+//! line, owner, services) are read once, at first sight, and shared by pointer
+//! after that.
+//!
+//! What a pass costs is mostly the kernel's: opening each small file and
+//! formatting it. So the costly files are read only when they can have changed,
+//! or now and then:
+//!
+//! - `status`, about 55 formatted lines, is read at first sight and every
+//!   [`STATUS_PASSES`] passes, for the peak resident size and swap; resident and
+//!   private memory come from `statm`, a single line, every pass.
+//! - The open files are counted from the size of the `fd` directory (Linux 6.2
+//!   and later), one `stat` call, rather than by listing it, which makes the
+//!   kernel build an entry for every file; the size can also be read for other
+//!   users' processes. Older kernels list it.
+//! - A multi-threaded process that used no CPU since the last pass keeps its
+//!   threads from then, at no CPU, for up to [`THREAD_PASSES`] passes; its
+//!   threads cannot have used any either, at the clock tick the kernel counts in.
+//!   They are read again every [`THREAD_PASSES`] passes for their states.
+//!
+//! The every-N reads are staggered by PID, so a pass reads a share of them rather
+//! than all of them at once.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -31,6 +51,15 @@ const SCHED_RR: u64 = 2;
 const UNSET_ID: u64 = u32::MAX as u64;
 /// The Windows wait reason the UI labels "Suspended", given to a stopped thread.
 const WAIT_SUSPENDED: WaitReason = WaitReason(5);
+/// `status` is read at least this often, in passes.
+const STATUS_PASSES: u64 = 5;
+/// An idle multi-threaded process's threads are read at least this often.
+const THREAD_PASSES: u64 = 5;
+
+/// Whether `pid` is due its every-`every`-passes read on `pass`. Staggered by PID.
+fn due(pass: u64, pid: u32, every: u64) -> bool {
+    (pass + u64::from(pid)).is_multiple_of(every)
+}
 
 /// The fields of `/proc/<pid>/stat` (or a thread's) that the probe uses.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -106,6 +135,18 @@ struct Status {
     rss_anon: u64,
     peak_rss: u64,
     swap: u64,
+}
+
+/// `/proc/<pid>/statm`, as resident and private resident bytes. `status`'s
+/// `VmRSS` and `RssAnon` are the same counters: resident is anonymous, file and
+/// shared memory pages, and `statm`'s "shared" is the file and shared ones.
+fn parse_statm(buf: &[u8], page: u64) -> Option<(u64, u64)> {
+    let mut f = buf
+        .split(|&b| b == b' ' || b == b'\n')
+        .filter(|p| !p.is_empty());
+    let resident = fs::num(f.nth(1)?);
+    let shared = fs::num(f.next()?);
+    Some((resident * page, resident.saturating_sub(shared) * page))
 }
 
 fn parse_status(buf: &[u8]) -> Status {
@@ -272,7 +313,7 @@ pub(super) fn user_name(uid: u32) -> String {
 }
 
 /// A process between passes.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Tracked {
     statics: Arc<ProcessStatic>,
     services: Arc<[ServiceInfo]>,
@@ -287,6 +328,11 @@ struct Tracked {
     fd_denied: bool,
     /// The previous pass's threads, `(tid, birth, ticks)`, by tid.
     threads: Vec<(u32, u64, u64)>,
+    /// A multi-threaded process's thread rows when they were last read.
+    thread_rows: Vec<ThreadSample>,
+    /// From the last `status` read: the peak resident size and swap, in bytes.
+    peak_rss: u64,
+    swap: u64,
 }
 
 #[derive(Debug)]
@@ -304,6 +350,10 @@ pub(super) struct ProcessProbe {
     cycle_rate: u64,
     boot_unix_ms: Option<i64>,
     max_cpu: f32,
+    /// Bytes in a page, `statm`'s unit.
+    page: u64,
+    /// The `fd` directory's size is its count of open files (Linux 6.2 on).
+    fd_count_by_size: bool,
     pass: u64,
     last_pass: Option<Instant>,
     buf: Vec<u8>,
@@ -318,6 +368,8 @@ impl ProcessProbe {
     pub(super) fn new(logical: u32, boot_unix_ms: Option<i64>, rated_clock: Option<Hertz>) -> Self {
         // SAFETY: sysconf has no preconditions.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        // SAFETY: as above.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let systemd = std::path::Path::new("/run/systemd/system").exists();
         Self {
             tracked: HashMap::with_capacity(512),
@@ -330,6 +382,9 @@ impl ProcessProbe {
             cycle_rate: rated_clock.map_or(1_000_000_000, |f| f.0.max(1)),
             boot_unix_ms,
             max_cpu: logical.max(1) as f32 * 100.0,
+            page: u64::try_from(page).ok().filter(|&p| p > 0).unwrap_or(4096),
+            // This process has at least its standard streams open.
+            fd_count_by_size: std::fs::metadata("/proc/self/fd").is_ok_and(|m| m.len() > 0),
             pass: 0,
             last_pass: None,
             buf: Vec::with_capacity(4096),
@@ -404,23 +459,25 @@ impl ProcessProbe {
         let Some((comm, stat)) = parse_stat(&self.buf) else {
             return;
         };
-        let comm = String::from_utf8_lossy(comm).into_owned();
         let key = ProcessKey::new(pid, stat.starttime);
-
-        self.set_path(pid, "status");
-        let status = if fs::read_into(&self.path, &mut self.buf).is_ok() {
-            parse_status(&self.buf)
-        } else {
-            Status::default()
-        };
-
         let pass = self.pass;
         let first_sight = !self.tracked.contains_key(&key);
-        if first_sight {
-            let t = self.first_sight(key, &comm, &stat, &status);
+        let comm = first_sight.then(|| String::from_utf8_lossy(comm).into_owned());
+
+        let status = if first_sight || due(pass, pid, STATUS_PASSES) {
+            self.set_path(pid, "status");
+            fs::read_into(&self.path, &mut self.buf)
+                .ok()
+                .map(|()| parse_status(&self.buf))
+        } else {
+            None
+        };
+        if let Some(comm) = comm {
+            let t = self.first_sight(key, &comm, &stat, &status.unwrap_or_default());
             self.tracked.insert(key, t);
             self.new_this_pass.push(out.len() as u32);
         }
+        let memory = self.memory(key, status);
 
         let (io, handles) = self.read_access_gated(pid, key);
 
@@ -461,9 +518,9 @@ impl ProcessProbe {
             cpu,
             cpu_time: self.ticks_to_duration(stat.ticks),
             cycles: self.ticks_to_cycles(stat.ticks),
-            working_set: Bytes(status.rss),
-            private_working_set: Bytes(status.rss_anon),
-            private_bytes: Bytes(status.rss_anon + status.swap),
+            working_set: Bytes(memory.rss),
+            private_working_set: Bytes(memory.rss_anon),
+            private_bytes: Bytes(memory.rss_anon + memory.swap),
             disk_read,
             disk_write,
             threads: stat.num_threads.max(n_threads),
@@ -478,7 +535,7 @@ impl ProcessProbe {
             },
             priority: priority(stat.nice, stat.policy),
             page_faults: u32::try_from(stat.minflt + stat.majflt).unwrap_or(u32::MAX),
-            peak_working_set: Bytes(status.peak_rss),
+            peak_working_set: Bytes(memory.peak_rss),
             virtual_size: Bytes(stat.vsize),
             io: IoCounters {
                 reads: io.syscr,
@@ -495,9 +552,36 @@ impl ProcessProbe {
         });
     }
 
-    /// `io` and the `fd` count, which need the same access as ptrace's read mode:
-    /// this user's processes, or every process as root. A process found unreadable
-    /// is not tried again.
+    /// A tracked process's memory: resident and private from `statm`, peak and
+    /// swap from `status` when this pass read it, else from the last that did.
+    fn memory(&mut self, key: ProcessKey, status: Option<Status>) -> Status {
+        self.set_path(key.pid, "statm");
+        let statm = fs::read_into(&self.path, &mut self.buf)
+            .ok()
+            .and_then(|()| parse_statm(&self.buf, self.page));
+        let t = self.tracked.get_mut(&key).expect("tracked");
+        if let Some(s) = status {
+            t.peak_rss = s.peak_rss;
+            t.swap = s.swap;
+        }
+        let (rss, rss_anon) = statm
+            .or_else(|| status.map(|s| (s.rss, s.rss_anon)))
+            .unwrap_or_default();
+        // The peak `status` gave may be a few passes old.
+        t.peak_rss = t.peak_rss.max(rss);
+        Status {
+            euid: None,
+            rss,
+            rss_anon,
+            peak_rss: t.peak_rss,
+            swap: t.swap,
+        }
+    }
+
+    /// `io` and the `fd` count. `io`, and listing `fd`, need the same access as
+    /// ptrace's read mode: this user's processes, or every process as root. A
+    /// process found unreadable is not tried again. The size of `fd`, where it is
+    /// the count, anyone may read.
     fn read_access_gated(&mut self, pid: u32, key: ProcessKey) -> (Option<Io>, u32) {
         let (io_denied, fd_denied) = {
             let t = &self.tracked[&key];
@@ -517,7 +601,10 @@ impl ProcessProbe {
                 }
             }
         };
-        let handles = if fd_denied {
+        let handles = if self.fd_count_by_size {
+            self.set_path(pid, "fd");
+            std::fs::metadata(&self.path).map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX))
+        } else if fd_denied {
             0
         } else {
             self.set_path(pid, "fd");
@@ -546,6 +633,10 @@ impl ProcessProbe {
         wall: f64,
         out: &mut Vec<ThreadSample>,
     ) -> (u32, u32) {
+        if let Some(counts) = self.idle_threads(pid, key, stat, out) {
+            return counts;
+        }
+        let first_row = out.len();
         let mut now = std::mem::take(&mut self.threads_scratch);
         now.clear();
         let mut stopped = 0;
@@ -604,8 +695,42 @@ impl ProcessProbe {
         now.sort_unstable_by_key(|e| e.0);
         let t = self.tracked.get_mut(&key).expect("tracked");
         t.threads = now;
+        t.thread_rows.clear();
+        if n > 1 {
+            t.thread_rows.extend_from_slice(&out[first_row..]);
+        }
         self.threads_scratch = prev;
         (stopped, n)
+    }
+
+    /// A multi-threaded process that used no CPU since the last pass, not yet due
+    /// a fresh read, keeps its threads' rows, at no CPU: with no CPU used, no
+    /// thread can have used any. Returns the counts as [`Self::sample_threads`]
+    /// does, or `None` when the threads must be read.
+    fn idle_threads(
+        &self,
+        pid: u32,
+        key: ProcessKey,
+        stat: &Stat,
+        out: &mut Vec<ThreadSample>,
+    ) -> Option<(u32, u32)> {
+        let t = &self.tracked[&key];
+        let idle = stat.num_threads > 1
+            && t.ticks == stat.ticks
+            && t.thread_rows.len() == stat.num_threads as usize
+            && !due(self.pass, pid, THREAD_PASSES);
+        if !idle {
+            return None;
+        }
+        let mut stopped = 0;
+        for row in &t.thread_rows {
+            stopped += u32::from(row.wait_reason == WAIT_SUSPENDED);
+            out.push(ThreadSample {
+                cpu: Percent::ZERO,
+                ..*row
+            });
+        }
+        Some((stopped, stat.num_threads))
     }
 
     /// Read what does not change over the process's life.
@@ -714,11 +839,9 @@ impl ProcessProbe {
             kernel,
             last_seen: self.pass,
             ticks: stat.ticks,
-            read_bytes: 0,
-            write_bytes: 0,
-            io_denied: false,
-            fd_denied: false,
-            threads: Vec::new(),
+            peak_rss: status.peak_rss,
+            swap: status.swap,
+            ..Tracked::default()
         }
     }
 
@@ -812,6 +935,22 @@ mod tests {
         assert_eq!(s.rss_anon, 1000 * 1024);
         assert_eq!(s.peak_rss, 5000 * 1024);
         assert_eq!(s.swap, 10 * 1024);
+    }
+
+    #[test]
+    fn statm_gives_what_status_does() {
+        assert_eq!(
+            parse_statm(b"5000 1000 400 10 0 700 0\n", 4096),
+            Some((1000 * 4096, 600 * 4096))
+        );
+        assert_eq!(parse_statm(b"5000\n", 4096), None);
+        // The same counters, read from this process: equal but for what changed
+        // between the two reads.
+        let status = parse_status(&std::fs::read("/proc/self/status").unwrap());
+        let (rss, anon) = parse_statm(&std::fs::read("/proc/self/statm").unwrap(), 4096).unwrap();
+        let near = |a: u64, b: u64| a.abs_diff(b) < 4 << 20;
+        assert!(near(rss, status.rss), "{rss} vs {}", status.rss);
+        assert!(near(anon, status.rss_anon), "{anon} vs {}", status.rss_anon);
     }
 
     #[test]

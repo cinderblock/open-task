@@ -561,9 +561,10 @@ Everything comes from `/proc` and `/sys`, with no daemon and no kernel module:
   busy reading and memory in use count as well. NVIDIA's own driver publishes no
   such stats, so its GPUs are not shown yet.
 
-As an ordinary user, the kernel hides another user's disk I/O, file descriptors
-and sockets, so those processes show none and their connections no owner; run it
-with `sudo` to see everything. The same goes for their GPU use, which as an
+As an ordinary user, the kernel hides another user's disk I/O and sockets, and
+which files it has open, so those processes show none and their connections no
+owner; run it with `sudo` to see everything. (How many files they have open it
+tells anyone, from Linux 6.2.) The same goes for their GPU use, which as an
 ordinary user is part of "Not in a process" where the driver measures the whole
 GPU, and missing where it does not.
 
