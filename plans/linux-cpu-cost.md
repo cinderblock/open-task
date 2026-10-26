@@ -28,6 +28,16 @@ steadily. Bring it down without losing what it shows.
 
 ## Decisions already made (don't re-ask)
 
+- User's machine (2026-10-21): **KDE, so the Qt plugin; a Radeon 6000-series
+  GPU** (amdgpu: the DRM fdinfo GPU probe and `gpu_busy_percent` apply). They
+  have not run the on-machine commands yet.
+- WSLg may be used for GPU-accelerated runs (windows on the user's desktop are
+  fine). `ssh -X sentinel` is offered too; sentinel is Ubuntu 24.04, R9 7900X3D,
+  RTX 4090 (ops `servers/README.md`): real hardware for headless probe numbers,
+  but X forwarding draws without its GPU.
+- User on Qt painting the whole window on the CPU: "this seems suboptimal... any
+  acceleration options here?" -> look at acceleration for Qt.
+
 - The user asked "how do we make it better?" (2026-10-20): measured cuts to the
   probe are in scope; anything that changes what the app shows or how it
   animates is a question for them.
@@ -120,6 +130,33 @@ steadily. Bring it down without losing what it shows.
   `snapshots:` log line). Not for committing; remove with
   `git worktree remove --force` when done.
 
+- **Qt repaints everything, every frame.** `Canvas::tick` calls `update()` on
+  the whole widget at 60 fps and `Painter::draw` replays the whole list through
+  `QPainter`'s raster engine: every text run and rectangle, not just the charts.
+  The Linux host does not pass damage to plugins. Windows already has the
+  answer: `DisplayList::damage_since` (`ot-paint/src/damage.rs`) and `gfx.rs`
+  replaying only commands touching the damage onto the kept frame.
+- **CPU chart drawing landed on Linux in another thread** (`c11cd91`,
+  `plans/settings-per-platform.md`): the host rasterizes chart runs with
+  `ot-paint`'s `ChartRaster` and hands Qt/GTK images. Qt History on Xvfb went
+  from 31-39 % to 14-17 % of a core; List 14-19 %. Everything below about Qt is
+  measured on top of it.
+- The first damage A/B (suite6, on the older code, 2026-10-21) was ruined by
+  another project's builds (the same variant read 31.5 % and 51.7 %):
+  discarded.
+- **WSLg GPU GL needs forcing:** by default Qt's `QOpenGLWidget` gets
+  `llvmpipe` (software). `GALLIUM_DRIVER=d3d12
+  LD_LIBRARY_PATH=/usr/lib/wsl/lib` gives `D3D12 (Intel(R) UHD Graphics)`;
+  the first context takes ~15 s. Under Wayland (`QT_QPA_PLATFORM=wayland`) EGL
+  fails to find the device and falls back to `llvmpipe`.
+- **WSLg test windows:** `xdotool` clicks do not reach them, and `import` /
+  `xwd` cannot read their pixels ("Resource temporarily unavailable"), so open
+  History with `--view history` and check rendering on Xvfb instead. A Windows
+  screenshot shows whatever the user has on top (it caught their calendar;
+  deleted): don't. The app halves its frame rate when its window is not the
+  active one, so compare WSLg runs per frame (`frames` log line), and don't
+  `windowactivate` (it steals the user's focus).
+
 ## Plan / steps
 
 1. Profile the probe pass under load. (done)
@@ -133,10 +170,21 @@ steadily. Bring it down without losing what it shows.
    Measured: no (above). (done)
 6. Prototype: GTK draws runs of `Band`/`Graph` with `ot-paint::ChartRaster`
    into a texture instead of Cairo. Measured: ~1.5x faster rasterizing. (done)
-7. **Report to the user and ask** (current): which desktop/toolkit (GTK or Qt)
-   and GPU; on-machine numbers; whether a WSLg run (window on their desktop) is
-   OK; which lever to build (GPU chart drawing like Windows, `ChartRaster` as a
-   texture, or both).
+7. Reported; user answered (KDE/Qt, Radeon 6000, WSLg OK). (done)
+8. **Qt acceleration** (current):
+   a. Measure today's Qt cost on Xvfb (raster `QPainter` is CPU-only, so Xvfb is
+      representative): List and History views.
+   b. Options, to measure before choosing: (1) damage-limited repaints (host
+      passes `damage_since` rects; Qt repaints only those, replaying only the
+      commands that touch them); (2) `QOpenGLWidget` canvas, `QPainter` on the
+      GPU (fills by stencil, glyph cache; antialiasing needs MSAA); (3) a QRhi
+      chart shader like Windows' Direct3D renderer (Qt 6.6+; 22.04 has 6.2).
+   c. (current, 2026-10-25) Prototypes (1) and (2) rebuilt on `c11cd91` in the
+      scratch worktree (`%TEMP%\ot-linux\proto3.py`; env `OT_SCRATCH_DAMAGE`,
+      `OT_SCRATCH_GL`, `OT_SCRATCH_GL_SAMPLES`). `gui-suite7.sh` runs them on
+      Xvfb (`x-*`) and on WSLg's GPU (`g-*`, `gui-measure-wslg.sh`), two rounds,
+      into `%TEMP%\ot-linux\gui\suite7.txt`.
+   d. Report numbers, recommend, build the chosen one properly.
 
 ## Progress log
 
@@ -148,6 +196,8 @@ steadily. Bring it down without losing what it shows.
 - [x] Fewer-points variants and History view: no gain.
 - [x] ChartRaster-as-texture prototype measured (and Cairo-to-image on equal
   terms).
+- [x] Qt prototypes ported onto `c11cd91` and built.
+- [ ] suite7: Qt today vs damage vs OpenGL (running).
 - [ ] On-machine numbers from the user.
 - [ ] GUI idle cost, if it is the bigger part.
 
