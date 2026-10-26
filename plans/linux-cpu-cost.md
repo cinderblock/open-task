@@ -157,6 +157,26 @@ steadily. Bring it down without losing what it shows.
   active one, so compare WSLg runs per frame (`frames` log line), and don't
   `windowactivate` (it steals the user's focus).
 
+- **suite7 round 1** (2026-10-25 ~7:05-7:30 PM PDT, quiet WSL, Qt on
+  `c11cd91` + prototypes). Frame rates differ between runs (none reach 60), so
+  compare CPU per frame:
+
+  | Run | CPU | fps | CPU per frame |
+  | --- | --- | --- | --- |
+  | Xvfb History, today | 48.7 % | 37 | 13.2 ms |
+  | Xvfb History, damage-limited | 32.6 % | 45 | 7.3 ms |
+  | Xvfb List, today | 22.6 % | 25 | 9.1 ms |
+  | Xvfb List, damage-limited | 8.1 % | 27 | 3.0 ms |
+  | WSLg History, today | 56.2 % | 30 | 18.7 ms |
+  | WSLg History, damage-limited | 25.5 % | 26 | 9.9 ms |
+  | WSLg History, OpenGL (D3D12 on Intel UHD) | 30.6 % | 21 | 14.6 ms |
+
+  Damage-limited roughly halves the per-frame cost (a third on List).
+  `QOpenGLWidget` saves ~20 % a frame and runs at a lower frame rate; MSAA was
+  asked for but the context reported 0 samples. The first OpenGL run (no MSAA)
+  was lost: `import -window` on the GL window hung, holding WSLg's X server, and
+  the app stopped; the screenshot step is removed from the WSLg script.
+
 ## Plan / steps
 
 1. Profile the probe pass under load. (done)
@@ -184,7 +204,9 @@ steadily. Bring it down without losing what it shows.
       `OT_SCRATCH_GL`, `OT_SCRATCH_GL_SAMPLES`). `gui-suite7.sh` runs them on
       Xvfb (`x-*`) and on WSLg's GPU (`g-*`, `gui-measure-wslg.sh`), two rounds,
       into `%TEMP%\ot-linux\gui\suite7.txt`.
-   d. Report numbers, recommend, build the chosen one properly.
+   d. Report numbers, recommend, build the chosen one properly. Round 1
+      reported to the user 2026-10-25 7:30 PM PDT: damage-limited wins,
+      OpenGL does not; recommended building damage-limited repaints.
 
 ## Progress log
 
