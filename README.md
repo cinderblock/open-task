@@ -544,7 +544,8 @@ it, `scripts/build-linux.sh --release` (after `scripts/linux-deps.sh` for the
 build dependencies); a plain `cargo build` also works and finds the plugins beside
 the binary.
 
-Everything comes from `/proc` and `/sys`, with no daemon and no kernel module:
+Everything comes from `/proc` and `/sys`, with no daemon and no kernel module, plus
+the library NVIDIA's driver installs for its own GPUs:
 
 - CPU load per logical processor, clocks, topology, caches, and P- and E-cores on
   Intel hybrids.
@@ -561,17 +562,24 @@ Everything comes from `/proc` and `/sys`, with no daemon and no kernel module:
 - Each GPU's load by engine and each process's share of it, with its memory, from
   the kernel's DRM client usage stats (`/proc/<pid>/fdinfo`, kernel 5.19 or later):
   Intel (i915, Xe), AMD (amdgpu) and most open drivers. On AMD the driver's own
-  busy reading and memory in use count as well. NVIDIA's own driver publishes no
-  such stats, so its GPUs are not shown yet.
+  busy reading and memory in use count as well.
+- NVIDIA GPUs the same way, through NVML (`libnvidia-ml.so.1`, which comes with the
+  driver and is loaded only when an NVIDIA GPU is there): their load, by 3D/Compute,
+  video encode and decode, JPEG and optical flow, dedicated memory, and each
+  process's share and memory, with or without `nvidia-drm`, beside any other GPU.
+  NVML has no figure for shared memory, so that reading stays empty. A laptop's GPU
+  is left to sleep: open-task lets go of it when it is idle and does not touch it
+  while it is powered down, so it reads 0 % then.
 
 As an ordinary user, the kernel hides another user's disk I/O and sockets, and
 which files it has open, so those processes show none and their connections no
 owner; run it with `sudo` to see everything. (How many files they have open it
 tells anyone, from Linux 6.2.) The same goes for their GPU use, which as an
 ordinary user is part of "Not in a process" where the driver measures the whole
-GPU, and missing where it does not.
+GPU, and missing where it does not. NVIDIA's are the exception: NVML names every
+user's processes.
 
-Not on Linux yet: NVIDIA GPUs, CPU sampling (`--sample`), the full list of services,
+Not on Linux yet: CPU sampling (`--sample`), the full list of services,
 installed apps, program icons in the table, the notification-area icon, running as
 root from the window, the window crosshair, and self-update. The settings live in
 `$XDG_CONFIG_HOME/open-task/settings` (normally `~/.config/open-task/settings`).

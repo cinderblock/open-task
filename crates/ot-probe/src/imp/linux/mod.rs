@@ -1,4 +1,5 @@
-//! The Linux backend: `/proc` and `/sys`, plus a few syscalls through `libc`.
+//! The Linux backend: `/proc` and `/sys`, plus a few syscalls through `libc`, and
+//! libraries loaded at run time where they are there (`sessions`, `nvml`).
 //!
 //! See `plans/linux-probe.md` for how each Windows concept maps onto what Linux
 //! exposes.
@@ -10,6 +11,7 @@ mod fs;
 mod gpu;
 mod inventory;
 mod net;
+mod nvml;
 mod power;
 mod process;
 mod sessions;

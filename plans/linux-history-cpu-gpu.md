@@ -73,9 +73,7 @@ User's picks, 2026-10-20:
      `per_process_gpu`.
 3. Docs: README Linux section and cycles paragraph, `plans/linux-probe.md`. (done)
 4. **Verify on a real Linux GPU** (needs the user). (current)
-5. Later: NVIDIA via NVML (`dlopen` `libnvidia-ml.so.1`,
-   `nvmlDeviceGetProcessUtilization`, `nvmlDeviceGetComputeRunningProcesses` /
-   `GraphicsRunningProcesses`).
+5. NVIDIA via NVML: done in `plans/linux-nvml.md`.
 
 ## Findings / gotchas
 
@@ -107,7 +105,7 @@ User's picks, 2026-10-20:
 - [x] Docs (README, linux-probe plan)
 - [ ] Run on a real Linux machine with an Intel or AMD GPU: Performance page GPU
   graph, History > GPU, the GPU columns; measure the probe's cost a pass
-- [ ] NVIDIA (NVML), if wanted
+- [x] NVIDIA (NVML): `plans/linux-nvml.md`
 
 ## Open questions for the user
 
