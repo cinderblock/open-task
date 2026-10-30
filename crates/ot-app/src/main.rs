@@ -797,6 +797,52 @@ fn print_devices(snap: &ot_core::Snapshot) {
     }
 }
 
+/// Each graphics adapter, its busiest engines, and who is using it.
+fn print_gpus(snap: &ot_core::Snapshot) {
+    for g in snap.gpus.iter().filter(|g| !g.info.software) {
+        let engines: Vec<String> = g
+            .engines
+            .iter()
+            .take(3)
+            .map(|e| format!("{} {:.0}%", e.name, e.usage.get()))
+            .collect();
+        out!(
+            "  {:<16} {:>5.1}%  dedicated {}{}  {}  [{}]",
+            g.info.name,
+            g.utilization.get(),
+            human(g.dedicated_used),
+            g.info
+                .dedicated_total
+                .map(|t| format!("/{}", human(t)))
+                .unwrap_or_default(),
+            g.info.adapter,
+            engines.join(", "),
+        );
+    }
+    let mut users: Vec<_> = snap
+        .processes
+        .iter()
+        .filter(|p| p.gpu.is_some() || p.gpu_dedicated.get() > 0)
+        .collect();
+    users.sort_by(|a, b| {
+        let by_gpu =
+            |p: &ot_model::process::ProcessSample| p.gpu.map_or(0.0, ot_model::Percent::get);
+        by_gpu(b)
+            .total_cmp(&by_gpu(a))
+            .then(b.gpu_dedicated.cmp(&a.gpu_dedicated))
+    });
+    for p in users.iter().take(8) {
+        out!(
+            "    pid {:>7}  {:>5.1}%  dedicated {:>8}  {}  {}",
+            p.key().pid,
+            p.gpu.map_or(0.0, ot_model::Percent::get),
+            human(p.gpu_dedicated),
+            p.gpu_engine.as_deref().unwrap_or("-"),
+            p.name(),
+        );
+    }
+}
+
 fn print_snapshot(snap: &ot_core::Snapshot) {
     let mem = &snap.memory;
     out!(
@@ -826,6 +872,7 @@ fn print_snapshot(snap: &ot_core::Snapshot) {
         .collect();
     out!("  cores: {}", cores.join(" "));
     print_devices(snap);
+    print_gpus(snap);
 
     let mut procs: Vec<_> = snap.processes.iter().collect();
     procs.sort_by(|a, b| b.cpu.get().total_cmp(&a.cpu.get()));
