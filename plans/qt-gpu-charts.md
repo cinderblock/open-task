@@ -214,8 +214,9 @@ a native driver does not have, and the native control is D3D11 on an iGPU. So:
 3. Paired A/B, decision rule: build. (done)
 4. Built: `af34120` (shapes moved), `e59ebc5` (the feature), `644e23f` (the trial
    process). (done)
-5. **Current: the user's call.** Not merged, pushed or released. See the open
-   questions.
+5. Merged: PR #1, `8b00ceb`, 2026-10-30 4:31 PM PDT (23:31Z), user's yes, all six CI
+   jobs green. Not released: `v0.19.0` is the latest and does not have this.
+6. **Current: wait for the user's machine.** See the open question.
 
 ### The design as built
 
@@ -252,8 +253,9 @@ a native driver does not have, and the native control is D3D11 on an iGPU. So:
 - [x] fmt, tests and clippy on Windows and in WSL at `644e23f`.
 - [x] Output checked against the CPU path: same-frame parity at scale 1 and 2, and
   by eye at both.
-- [ ] Qt 6.2: the plugin's new code has only been built on 6.4.2. CI's `ubuntu:22.04`
-  will be the first build there, and its smoke test the first run.
+- [x] Qt 6.2.4: CI's `ubuntu:22.04` jobs, x64 and arm64, built the plugin, passed
+  clippy and tests, and in the smoke test logged "chart drawing: OpenGL" and drew a
+  chart, on llvmpipe, forced. Wired to the merged tree, so with NVML and v0.19.0.
 - [ ] A real Radeon; KDE Wayland; anything on native Mesa.
 
 **Not verified anywhere here:** a Radeon, Mesa's native drivers, Wayland (the
@@ -266,9 +268,7 @@ is certain.
 
 ## Open questions for the user
 
-1. Merge? Recommended: push the branch so CI proves Qt 6.2, and merge. It is
-   opt-in, and the default path is untouched for everyone who does not pick it.
-2. On the Radeon, with the build: `OT_CHARTS=cpu OT_FRAME_STATS=1 open-task
+1. On the Radeon, with a build of `master`: `OT_CHARTS=cpu OT_FRAME_STATS=1 open-task
    --view history` and then `OT_CHARTS=gpu OT_FRAME_STATS=1 OT_CHARTS_CHECK=1 ...`,
    each past 5 minutes, watching `top` and `/sys/class/drm/card*/device/gpu_busy_percent`.
    That is the only number that can change the default.
