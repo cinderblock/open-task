@@ -45,20 +45,6 @@ Matters because a button that only ever fails is worse than none.
 `Capabilities` (`tray`, `switch_to`, `updates`, ...) is the place to say so; a
 few more fields and the views asking them would hide these too.
 
-## WSL: worktrees share one cargo build dir, and a green build can be another's code
-
-Seen 2026-10-30 ~9:40 AM PDT (16:40Z), `linux-nvml` beside `qt-gpu-charts`. WSL's
-`~/.cargo/config.toml` has `build-dir = "{cargo-cache-home}/build"`, with no
-per-workspace part. Cargo's artifact names match across worktrees of one repo
-(`ot_probe-d481073b63f97911` in both), and cdylibs have no hash at all. From
-`linux-nvml`, `build-linux.sh --release` printed `Finished`, yet the binary held no
-NVML code (`grep -c libnvidia-ml` gave 0) and its Qt plugin failed with `the plugin's
-table is too short`. With `CARGO_BUILD_BUILD_DIR` set to a private directory the same
-source was right. To see it: build two worktrees that differ, one after the other.
-
-Matters because it gives a wrong binary with no error: a measurement or a smoke test
-of the wrong code, in either worktree.
-
 ## Linux: when one embedded plugin is rejected, the next load gets the same plugin
 
 Seen 2026-10-30, the same run: `Qt: the plugin's table is too short` was followed by
