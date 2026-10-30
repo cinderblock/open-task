@@ -31,8 +31,21 @@
 //! Adapters are the devices behind `/sys/class/drm/card*` and `renderD*`, named
 //! from the PCI ID database where they are PCI devices. Firmware framebuffers,
 //! virtual and USB display drivers are listed as software adapters, as Windows
-//! lists its Basic Render Driver; NVIDIA's own driver publishes no client stats
-//! and is left out (NVML would be the way).
+//! lists its Basic Render Driver.
+//!
+//! NVIDIA's own driver publishes no client stats, so its adapters are read through
+//! NVML ([`super::nvml`]) instead, with or without a device node. A GPU is its PCI
+//! slot, so one with `nvidia-drm` nodes is still one adapter, and nouveau, a DRM
+//! driver like the others, is not NVML's to read. Without the library such a GPU is
+//! left out.
+//!
+//! Asking NVML about a GPU keeps it awake: the driver powers a laptop's GPU down
+//! after about 10 s with nothing using it, and a question a second means never.
+//! Runtime D3 is on by default on Ampere and later notebooks, so there NVML is shut
+//! down when the GPU is idle, and nothing touches it while the kernel says it is
+//! `suspended`, which costs a read of `power/runtime_status`. Once it has slept, it
+//! waking up is the sign that something is using it. If it has not gone to sleep
+//! after [`REST_PASSES`] (something else holds it up), NVML looks again.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -46,6 +59,7 @@ use ot_model::units::{Bytes, Percent};
 use ot_model::ProcessKey;
 
 use super::fs;
+use super::nvml::{self, Device, Library, Reading, ENGINES};
 
 /// Device drivers that are not graphics hardware: firmware framebuffers, virtual
 /// devices (`vgem` and `vkms` sit on the faux bus), and USB display adapters.
@@ -63,13 +77,20 @@ const SOFTWARE_DRIVERS: &[&str] = &[
     "gud",
     "gm12u320",
 ];
-/// Drivers that publish no client stats, whose adapters are left out.
-const UNREAD_DRIVERS: &[&str] = &["nvidia"];
+/// The driver that publishes no client stats. Its adapters are read through NVML.
+const NVIDIA_DRIVER: &str = "nvidia";
+/// Where the kernel lists the devices bound to that driver.
+const NVIDIA_PCI: &str = "bus/pci/drivers/nvidia";
 /// A process's open files are listed again at least this often, in passes.
 /// A process whose count of open files changed is listed again at most this often.
 const CHANGED_PASSES: u64 = 3;
 /// Unknown device nodes are looked for again at most this often, in passes.
 const DISCOVER_PASSES: u64 = 10;
+/// How long NVML leaves an idle GPU alone for it to go to sleep, in passes. The
+/// driver takes about 10 s.
+const REST_PASSES: u64 = 30;
+/// A GPU NVML would not connect to is tried again this often, in passes.
+const ATTACH_PASSES: u64 = 60;
 /// Where the PCI ID database is kept, by distribution.
 const PCI_IDS: &[&str] = &[
     "/usr/share/hwdata/pci.ids",
@@ -90,6 +111,42 @@ struct Adapter {
     /// The clients' memory this pass, in bytes.
     dedicated: u64,
     shared: u64,
+    /// How NVML reads it, for an NVIDIA adapter.
+    nvidia: Option<Nvidia>,
+}
+
+/// An NVIDIA adapter's connection to NVML.
+#[derive(Debug)]
+struct Nvidia {
+    /// `0000:01:00.0`.
+    slot: String,
+    /// The kernel's `power/runtime_status` for the device.
+    status_file: PathBuf,
+    device: Option<Box<dyn Device>>,
+    /// The driver powers this GPU down when it is idle.
+    may_sleep: bool,
+    /// Seen asleep since NVML let go of it.
+    slept: bool,
+    /// NVML is left alone until this pass, unless the GPU slept and woke.
+    rest_until: u64,
+    /// NVML would not connect, so there is nothing to show.
+    unreachable: bool,
+}
+
+impl Nvidia {
+    fn new(device: &Path) -> Self {
+        Self {
+            slot: device
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            status_file: device.join("power/runtime_status"),
+            device: None,
+            may_sleep: false,
+            slept: false,
+            rest_until: 0,
+            unreachable: false,
+        }
+    }
 }
 
 /// What a GPU device node is of.
@@ -97,8 +154,8 @@ struct Adapter {
 enum Node {
     /// The adapter at this index.
     Gpu(usize),
-    /// An adapter left out, whose clients cannot be read.
-    LeftOut,
+    /// An adapter whose clients cannot be read from `fdinfo`.
+    Unread,
 }
 
 /// What tells two clients apart: the driver's client id where it gives one, else
@@ -309,6 +366,8 @@ fn display_name(raw: &str) -> &str {
         "video-enhance" | "vecs" | "vpe" => "Video Processing",
         "compute" | "ccs" => "Compute",
         "jpeg" => "JPEG",
+        "sm" => "3D/Compute",
+        "ofa" => "Optical Flow",
         _ => raw,
     }
 }
@@ -321,6 +380,13 @@ pub(super) struct GpuProbe {
     adapters: Vec<Adapter>,
     /// What each device node (`renderD128`) is of.
     nodes: HashMap<String, Node>,
+    /// Some adapter has clients to find in `/proc`.
+    drm_clients: bool,
+    /// NVML, where there is an NVIDIA GPU and the library for it.
+    library: Option<Box<dyn Library>>,
+    reading: Reading,
+    /// Where each process is in the pass's list, for NVML's pids.
+    pids: HashMap<u32, usize>,
     clients: HashMap<ClientKey, Client>,
     files: HashMap<ProcessKey, Files>,
     /// Engine display names by the driver's name, interned.
@@ -339,15 +405,26 @@ pub(super) struct GpuProbe {
 impl GpuProbe {
     /// Find the adapters. `None` when there is no graphics hardware to watch.
     pub(super) fn new() -> Option<Self> {
-        Self::at(Path::new("/proc"), Path::new("/sys"))
+        let sys = Path::new("/sys");
+        // The library is large, so only with a GPU for it to talk to.
+        let library = if nvidia_slots(sys).is_empty() {
+            None
+        } else {
+            nvml::load()
+        };
+        Self::at(Path::new("/proc"), sys, library)
     }
 
-    fn at(proc_root: &Path, sys_root: &Path) -> Option<Self> {
+    fn at(proc_root: &Path, sys_root: &Path, library: Option<Box<dyn Library>>) -> Option<Self> {
         let mut probe = Self {
             proc_root: proc_root.to_owned(),
             sys_root: sys_root.to_owned(),
             adapters: Vec::new(),
             nodes: HashMap::new(),
+            drm_clients: false,
+            library,
+            reading: Reading::default(),
+            pids: HashMap::new(),
             clients: HashMap::new(),
             files: HashMap::new(),
             engine_names: HashMap::new(),
@@ -394,15 +471,18 @@ impl GpuProbe {
             a.dedicated = 0;
             a.shared = 0;
         }
-        for (i, p) in processes.iter_mut().enumerate() {
-            // No open files, or not this user's to read.
-            if p.handles > 0 {
-                self.read_process(i, p, wall);
+        if self.drm_clients {
+            for (i, p) in processes.iter_mut().enumerate() {
+                // No open files, or not this user's to read.
+                if p.handles > 0 {
+                    self.read_process(i, p, wall);
+                }
             }
         }
         let pass = self.pass;
         self.files.retain(|_, f| f.seen == pass);
         self.clients.retain(|_, c| c.seen == pass);
+        self.read_nvidia(processes);
         self.publish(out);
         self.attribute(processes);
     }
@@ -429,7 +509,7 @@ impl GpuProbe {
         for &fd in &files.fds {
             let adapter = match self.node_of(key.pid, fd) {
                 Some(Node::Gpu(adapter)) => adapter,
-                Some(Node::LeftOut) => continue,
+                Some(Node::Unread) => continue,
                 None => {
                     files.stale = true;
                     continue;
@@ -559,8 +639,8 @@ impl GpuProbe {
         }
     }
 
-    /// Which of a process's open files are on a GPU's device node. False when
-    /// this user may not list them.
+    /// Which of a process's open files are clients of a GPU that can be read that
+    /// way. False when this user may not list them.
     fn list_files(&mut self, pid: u32, fds: &mut Vec<u32>) -> bool {
         fds.clear();
         self.set_path(pid, "fd", u32::MAX);
@@ -572,7 +652,7 @@ impl GpuProbe {
             let Some(fd) = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
                 continue;
             };
-            if self.node_of(pid, fd).is_some() {
+            if matches!(self.node_of(pid, fd), Some(Node::Gpu(_))) {
                 fds.push(fd);
             }
         }
@@ -641,23 +721,42 @@ impl GpuProbe {
                 None => devices.push((device, order, vec![name])),
             }
         }
+        // NVIDIA's GPUs need no device node: a compute server may not load nvidia-drm.
+        if self.library.is_some() {
+            for slot in nvidia_slots(&self.sys_root) {
+                let path = self.sys_root.join(NVIDIA_PCI).join(slot);
+                let Ok(device) = std::fs::canonicalize(path) else {
+                    continue;
+                };
+                if !devices.iter().any(|d| d.0 == device) {
+                    devices.push((device, u32::MAX, Vec::new()));
+                }
+            }
+        }
         devices.sort_by_key(|d| d.1);
 
-        let old = std::mem::take(&mut self.adapters);
+        let mut old = std::mem::take(&mut self.adapters);
         self.nodes.clear();
         for (device, _, names) in devices {
             let driver = std::fs::read_link(device.join("driver"))
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_default();
-            if UNREAD_DRIVERS.contains(&driver.as_str()) {
+            let is_nvidia = driver == NVIDIA_DRIVER;
+            if is_nvidia && self.library.is_none() {
                 for n in names {
-                    self.nodes.insert(n, Node::LeftOut);
+                    self.nodes.insert(n, Node::Unread);
                 }
                 continue;
             }
             let index = self.adapters.len();
             let id = fnv1a(device.as_os_str().as_encoded_bytes());
+            let nvidia = is_nvidia.then(|| {
+                old.iter_mut()
+                    .find(|a| a.info.id == id)
+                    .and_then(|a| a.nvidia.take())
+                    .unwrap_or_else(|| Nvidia::new(&device))
+            });
             let info = match old.iter().find(|a| a.info.id == id) {
                 Some(a) if a.info.name == format!("GPU {index}") => Arc::clone(&a.info),
                 _ => Arc::new(self.info(id, index, &device, &driver)),
@@ -674,11 +773,18 @@ impl GpuProbe {
                 engines: Vec::new(),
                 dedicated: 0,
                 shared: 0,
+                nvidia,
             });
+            let node = if is_nvidia {
+                Node::Unread
+            } else {
+                Node::Gpu(index)
+            };
             for n in names {
-                self.nodes.insert(n, Node::Gpu(index));
+                self.nodes.insert(n, node);
             }
         }
+        self.drm_clients = self.adapters.iter().any(|a| a.nvidia.is_none());
     }
 
     /// An adapter's facts.
@@ -726,9 +832,130 @@ impl GpuProbe {
         }
     }
 
+    /// Read the NVIDIA adapters into their sums, [`Self::uses`] and the processes'
+    /// memory.
+    fn read_nvidia(&mut self, processes: &mut [ProcessSample]) {
+        self.pids.clear();
+        for adapter in 0..self.adapters.len() {
+            if !self.connect(adapter) {
+                continue;
+            }
+            let Some(n) = self.adapters[adapter].nvidia.as_mut() else {
+                continue;
+            };
+            if let Some(device) = n.device.as_mut() {
+                device.read(&mut self.reading);
+            }
+            // Asked about every pass, it could never sleep.
+            if n.may_sleep && self.reading.idle() {
+                n.device = None;
+                n.slept = false;
+                n.rest_until = self.pass + REST_PASSES;
+            }
+            if self.pids.is_empty() {
+                let pids = processes.iter().enumerate();
+                self.pids.extend(pids.map(|(i, p)| (p.key().pid, i)));
+            }
+            self.count_nvidia(adapter, processes);
+        }
+    }
+
+    /// Whether NVML can be asked about this adapter this pass, connecting if it has
+    /// to and may.
+    fn connect(&mut self, adapter: usize) -> bool {
+        let a = &mut self.adapters[adapter];
+        let Some(n) = a.nvidia.as_mut() else {
+            return false;
+        };
+        if n.device.is_some() {
+            return true;
+        }
+        // Any call to NVML would wake it, connecting first of all.
+        let status = fs::read_trimmed(&n.status_file);
+        if matches!(status.as_deref(), Some("suspended" | "suspending")) {
+            n.slept = true;
+            return false;
+        }
+        if !n.slept && self.pass < n.rest_until {
+            return false;
+        }
+        n.slept = false;
+        let Some(library) = self.library.as_ref() else {
+            return false;
+        };
+        let Some(mut device) = library.attach(&n.slot) else {
+            n.unreachable = true;
+            n.rest_until = self.pass + ATTACH_PASSES;
+            return false;
+        };
+        n.unreachable = false;
+        let power = self.proc_root.join("driver/nvidia/gpus");
+        n.may_sleep = std::fs::read_to_string(power.join(&n.slot).join("power"))
+            .is_ok_and(|s| runtime_d3_enabled(&s));
+        let facts = device.facts();
+        n.device = Some(device);
+        let named = facts.name.as_ref().is_none_or(|f| *f == a.info.adapter);
+        let sized = facts
+            .memory_total
+            .is_none_or(|t| a.info.dedicated_total == Some(Bytes(t)));
+        if !named || !sized {
+            let mut info = GpuInfo::clone(&a.info);
+            info.adapter = facts.name.unwrap_or(info.adapter);
+            info.dedicated_total = facts.memory_total.map(Bytes).or(info.dedicated_total);
+            a.info = Arc::new(info);
+        }
+        true
+    }
+
+    /// Add what NVML just read to an adapter's sums and the processes.
+    fn count_nvidia(&mut self, adapter: usize, processes: &mut [ProcessSample]) {
+        let reading = &self.reading;
+        let mut sums = [0.0; ENGINES.len()];
+        for u in &reading.uses {
+            let proc = self.pids.get(&u.pid).copied();
+            for (i, &share) in u.shares.iter().enumerate() {
+                if share == 0 {
+                    continue;
+                }
+                let share = f64::from(share);
+                sums[i] += share;
+                // Not in the process list: gone already, or in another PID namespace.
+                if let Some(proc) = proc {
+                    self.uses.push(Use {
+                        proc,
+                        adapter,
+                        engine: intern(&mut self.engine_names, ENGINES[i]),
+                        share,
+                    });
+                }
+            }
+        }
+        let a = &mut self.adapters[adapter];
+        for (i, load) in reading.engines.iter().enumerate() {
+            // Sampled apart, the processes can add up to a little more.
+            let load = load.unwrap_or(0.0).max(sums[i]);
+            if load > 0.0 {
+                a.engines
+                    .push((intern(&mut self.engine_names, ENGINES[i]), load));
+            }
+        }
+        let mut total = 0;
+        for &(pid, bytes) in &reading.memory {
+            total += bytes;
+            if let Some(&proc) = self.pids.get(&pid) {
+                let p = &mut processes[proc];
+                p.gpu_dedicated = Bytes(p.gpu_dedicated.get() + bytes);
+            }
+        }
+        a.dedicated = reading.memory_used.unwrap_or(total);
+    }
+
     /// Turn this pass's sums into samples, `GPU 0` first.
     fn publish(&mut self, out: &mut Vec<GpuSample>) {
         for a in &mut self.adapters {
+            if a.nvidia.as_ref().is_some_and(|n| n.unreachable) {
+                continue;
+            }
             a.engines
                 .sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
             let busiest = a.engines.first().map_or(0.0, |e| e.1);
@@ -781,6 +1008,31 @@ impl GpuProbe {
             p.gpu_engine = Some(Arc::clone(label));
         }
     }
+}
+
+/// The PCI slots the NVIDIA driver is bound to, in order. Reading this touches no
+/// GPU.
+fn nvidia_slots(sys_root: &Path) -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir(sys_root.join(NVIDIA_PCI)) else {
+        return Vec::new();
+    };
+    let mut slots: Vec<String> = dir
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        // Beside them are `bind`, `module`, `uevent` and the like.
+        .filter(|name| name.contains(':'))
+        .collect();
+    slots.sort();
+    slots
+}
+
+/// Whether the driver's `power` file says it powers the GPU down when idle:
+/// `Runtime D3 status:          Enabled (fine-grained)`.
+fn runtime_d3_enabled(power: &str) -> bool {
+    power
+        .lines()
+        .find_map(|l| l.strip_prefix("Runtime D3 status:"))
+        .is_some_and(|status| status.trim_start().starts_with("Enabled"))
 }
 
 /// A client's dedicated and shared memory, in bytes: in each region the best
@@ -872,9 +1124,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::nvml::{Facts, ProcessUse};
     use super::*;
     use ot_model::process::ProcessStatic;
     use std::os::unix::fs::symlink;
+    use std::sync::Mutex;
 
     fn names(buf: &[u8], info: &FdInfo) -> Vec<(String, CounterKind, u64)> {
         info.counters
@@ -1026,8 +1280,132 @@ mod tests {
             std::fs::write(dir.join(format!("fdinfo/{fd}")), fdinfo).unwrap();
         }
 
+        /// Add an NVIDIA GPU in `slot`, with these device nodes, and the driver's
+        /// runtime D3 status.
+        fn nvidia(&self, slot: &str, nodes: &[&str], runtime_d3: &str) {
+            let sys = self.root.join("sys");
+            let dir = sys.join("devices/pci0000:00").join(slot);
+            let drivers = sys.join(NVIDIA_PCI);
+            std::fs::create_dir_all(dir.join("power")).unwrap();
+            std::fs::create_dir_all(&drivers).unwrap();
+            symlink(&drivers, dir.join("driver")).unwrap();
+            symlink(&dir, drivers.join(slot)).unwrap();
+            std::fs::write(drivers.join("uevent"), "").unwrap();
+            std::fs::write(dir.join("vendor"), "0x10de\n").unwrap();
+            std::fs::write(dir.join("device"), "0x2684\n").unwrap();
+            for node in nodes {
+                let node = sys.join("class/drm").join(node);
+                std::fs::create_dir_all(&node).unwrap();
+                symlink(&dir, node.join("device")).unwrap();
+            }
+            self.set_status(slot, "active");
+            let power = self.root.join("proc/driver/nvidia/gpus").join(slot);
+            std::fs::create_dir_all(&power).unwrap();
+            std::fs::write(
+                power.join("power"),
+                format!("Runtime D3 status:          {runtime_d3}\nVideo Memory: Active\n"),
+            )
+            .unwrap();
+        }
+
+        fn set_status(&self, slot: &str, status: &str) {
+            let dir = self.root.join("sys/devices/pci0000:00").join(slot);
+            std::fs::write(dir.join("power/runtime_status"), format!("{status}\n")).unwrap();
+        }
+
         fn probe(&self) -> GpuProbe {
-            GpuProbe::at(&self.root.join("proc"), &self.root.join("sys")).expect("an adapter")
+            GpuProbe::at(&self.root.join("proc"), &self.root.join("sys"), None).expect("an adapter")
+        }
+
+        fn probe_with(&self, nvml: &FakeNvml) -> GpuProbe {
+            let library: Box<dyn Library> = Box::new(nvml.clone());
+            GpuProbe::at(
+                &self.root.join("proc"),
+                &self.root.join("sys"),
+                Some(library),
+            )
+            .expect("an adapter")
+        }
+    }
+
+    /// What the fake NVML says of its GPU, and what was asked of it.
+    #[derive(Debug, Default)]
+    struct FakeGpu {
+        refuse: bool,
+        attaches: u32,
+        drops: u32,
+        reads: u32,
+        slots: Vec<String>,
+        engines: [Option<f64>; ENGINES.len()],
+        memory_used: Option<u64>,
+        memory: Vec<(u32, u64)>,
+        uses: Vec<ProcessUse>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeNvml(Arc<Mutex<FakeGpu>>);
+
+    impl FakeNvml {
+        /// A GPU with something running on it.
+        fn busy() -> Self {
+            let nvml = Self::default();
+            nvml.set(|g| {
+                g.engines[0] = Some(30.0);
+                g.memory = vec![(10, 1 << 30)];
+            });
+            nvml
+        }
+
+        fn set<R>(&self, f: impl FnOnce(&mut FakeGpu) -> R) -> R {
+            f(&mut self.0.lock().unwrap())
+        }
+
+        /// Nothing running, as an idle GPU answers.
+        fn go_idle(&self) {
+            self.set(|g| {
+                g.engines = [Some(0.0); ENGINES.len()];
+                g.memory.clear();
+                g.uses.clear();
+            });
+        }
+    }
+
+    impl Library for FakeNvml {
+        fn attach(&self, slot: &str) -> Option<Box<dyn Device>> {
+            self.set(|g| {
+                g.attaches += 1;
+                g.slots.push(slot.to_owned());
+                !g.refuse
+            })
+            .then(|| Box::new(FakeDevice(self.clone())) as Box<dyn Device>)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeDevice(FakeNvml);
+
+    impl Device for FakeDevice {
+        fn facts(&mut self) -> Facts {
+            Facts {
+                name: Some("NVIDIA GeForce RTX 4090".into()),
+                memory_total: Some(24 << 30),
+            }
+        }
+
+        fn read(&mut self, out: &mut Reading) {
+            self.0.set(|g| {
+                g.reads += 1;
+                out.engines = g.engines;
+                out.memory_used = g.memory_used;
+                out.memory.clone_from(&g.memory);
+                out.uses.clone_from(&g.uses);
+            });
+        }
+    }
+
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            self.0.set(|g| g.drops += 1);
         }
     }
 
@@ -1178,6 +1556,317 @@ mod tests {
         assert_eq!(out[1].utilization, Percent::ZERO);
     }
 
+    #[test]
+    fn an_nvidia_gpu_reads_through_nvml_beside_a_drm_one() {
+        let t = Tree::new("nvidia");
+        t.nvidia(
+            "0000:01:00.0",
+            &["card2", "renderD130"],
+            "Disabled by default",
+        );
+        // The game draws on the Radeon, and has the GeForce's node open too.
+        t.file(10, 5, "/dev/dri/renderD128", &client(1, 0, 0, 1024));
+        t.file(10, 6, "/dev/dri/renderD130", "pos:\t0\n");
+        let nvml = FakeNvml::default();
+        nvml.set(|g| {
+            g.engines = [Some(44.0), Some(60.0), Some(50.0), Some(0.0), None];
+            g.memory_used = Some(5 << 30);
+            g.memory = vec![(10, 3 << 30), (20, 1 << 30), (99, 1 << 20)];
+            g.uses = vec![
+                ProcessUse {
+                    pid: 10,
+                    shares: [40, 60, 0],
+                },
+                ProcessUse {
+                    pid: 20,
+                    shares: [5, 0, 50],
+                },
+                // Not one of the processes: its load still counts.
+                ProcessUse {
+                    pid: 99,
+                    shares: [3, 0, 0],
+                },
+            ];
+        });
+        let mut p = t.probe_with(&nvml);
+        let mut procs = vec![process(10, 2), process(20, 0)];
+        let mut out = Vec::new();
+        p.sample_over(&mut procs, &mut out, 1.0);
+        assert_eq!(nvml.set(|g| g.slots.clone()), ["0000:01:00.0"]);
+        assert_eq!(out.len(), 3, "one adapter, for its two nodes");
+        let gpu = &out[2];
+        assert_eq!(gpu.info.name, "GPU 2");
+        assert_eq!(gpu.info.adapter, "NVIDIA GeForce RTX 4090");
+        assert_eq!(gpu.info.dedicated_total, Some(Bytes(24 << 30)));
+        assert_eq!(
+            gpu.info.location.as_deref(),
+            Some("PCI bus 1, device 0, function 0")
+        );
+        assert!(!gpu.info.software);
+        // The processes' 48 % tops up the whole device's 44; the busiest engine is
+        // the GPU's utilization, as on Windows.
+        let engines: Vec<_> = gpu
+            .engines
+            .iter()
+            .map(|e| (&*e.name, e.usage.get()))
+            .collect();
+        assert_eq!(
+            engines,
+            [
+                ("Video Encode", 60.0),
+                ("Video Decode", 50.0),
+                ("3D/Compute", 48.0)
+            ]
+        );
+        assert!((gpu.utilization.get() - 60.0).abs() < 1e-3);
+        assert_eq!(gpu.dedicated_used, Bytes(5 << 30));
+        assert_eq!(gpu.shared_used, Bytes::ZERO);
+
+        let game = &procs[0];
+        assert_eq!(
+            game.gpu_dedicated,
+            Bytes((3 << 30) + (1 << 20)),
+            "NVML's, and the Radeon's from fdinfo"
+        );
+        assert_eq!(game.gpu, Some(Percent(60.0)));
+        assert_eq!(game.gpu_engine.as_deref(), Some("GPU 2 - Video Encode"));
+        assert!((game.gpu_share.get() - 60.0).abs() < 1e-3);
+        let other = &procs[1];
+        assert_eq!(other.gpu_dedicated, Bytes(1 << 30));
+        assert_eq!(other.gpu, Some(Percent(50.0)));
+        assert_eq!(other.gpu_engine.as_deref(), Some("GPU 2 - Video Decode"));
+        assert_eq!(other.gpu_share, Percent::ZERO, "not on the busiest engine");
+
+        // Only the Radeon's client was kept among the game's files.
+        assert_eq!(p.files[&ProcessKey::new(10, 1)].fds, [5]);
+        assert_eq!(p.nodes.get("renderD130"), Some(&Node::Unread));
+    }
+
+    #[test]
+    fn memory_falls_back_on_the_processes_sum() {
+        let t = Tree::new("nvidia-sum");
+        t.nvidia("0000:01:00.0", &["card2"], "Disabled by default");
+        let nvml = FakeNvml::busy();
+        let mut p = t.probe_with(&nvml);
+        let mut out = Vec::new();
+        p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        assert_eq!(out[2].dedicated_used, Bytes(1 << 30));
+    }
+
+    #[test]
+    fn an_nvidia_gpu_needs_no_device_node() {
+        let t = Tree::new("nvidia-nodeless");
+        t.nvidia("0000:41:00.0", &[], "Not Supported");
+        t.nvidia("0000:01:00.0", &[], "Not Supported");
+        let nvml = FakeNvml::busy();
+        let mut p = t.probe_with(&nvml);
+        let names: Vec<_> = p.adapters.iter().map(|a| a.info.name.clone()).collect();
+        assert_eq!(names, ["GPU 0", "GPU 1", "GPU 2", "GPU 3"]);
+        let mut out = Vec::new();
+        p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        assert_eq!(
+            nvml.set(|g| g.slots.clone()),
+            ["0000:01:00.0", "0000:41:00.0"],
+            "after the cards, in slot order"
+        );
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[2].info.adapter, "NVIDIA GeForce RTX 4090");
+    }
+
+    #[test]
+    fn an_nvidia_only_machine_walks_no_processes() {
+        let t = Tree::new("nvidia-only");
+        std::fs::remove_dir_all(t.root.join("sys/class/drm")).unwrap();
+        std::fs::create_dir_all(t.root.join("sys/class/drm")).unwrap();
+        t.nvidia(
+            "0000:01:00.0",
+            &["card0", "renderD128"],
+            "Disabled by default",
+        );
+        t.file(10, 6, "/dev/dri/renderD128", "pos:\t0\n");
+        let nvml = FakeNvml::busy();
+        let mut p = t.probe_with(&nvml);
+        let mut out = Vec::new();
+        p.sample_over(&mut [process(10, 1)], &mut out, 1.0);
+        assert_eq!(out.len(), 1);
+        assert!(p.files.is_empty());
+    }
+
+    #[test]
+    fn without_the_library_an_nvidia_gpu_is_left_out() {
+        let t = Tree::new("nvidia-absent");
+        t.nvidia(
+            "0000:01:00.0",
+            &["card2", "renderD130"],
+            "Disabled by default",
+        );
+        let p = t.probe();
+        assert_eq!(p.adapters.len(), 2);
+        assert_eq!(p.nodes.get("renderD130"), Some(&Node::Unread));
+
+        // On its own, it is no GPU to watch at all.
+        let t = Tree::new("nvidia-absent-alone");
+        std::fs::remove_dir_all(t.root.join("sys/class/drm")).unwrap();
+        std::fs::create_dir_all(t.root.join("sys/class/drm")).unwrap();
+        t.nvidia("0000:01:00.0", &["card0"], "Disabled by default");
+        assert!(GpuProbe::at(&t.root.join("proc"), &t.root.join("sys"), None).is_none());
+    }
+
+    #[test]
+    fn nouveau_is_not_nvmls() {
+        let t = Tree::new("nouveau");
+        let sys = t.root.join("sys");
+        let dir = sys.join("devices/pci0000:00/0000:01:00.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(sys.join("bus/drivers/nouveau")).unwrap();
+        symlink(sys.join("bus/drivers/nouveau"), dir.join("driver")).unwrap();
+        std::fs::write(dir.join("vendor"), "0x10de\n").unwrap();
+        std::fs::write(dir.join("device"), "0x2684\n").unwrap();
+        std::fs::create_dir_all(sys.join("class/drm/renderD130")).unwrap();
+        symlink(&dir, sys.join("class/drm/renderD130/device")).unwrap();
+
+        let nvml = FakeNvml::busy();
+        let mut p = t.probe_with(&nvml);
+        let mut out = Vec::new();
+        p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        assert_eq!(out.len(), 3);
+        assert_eq!(nvml.set(|g| g.attaches), 0);
+        assert_eq!(p.nodes.get("renderD130"), Some(&Node::Gpu(2)));
+    }
+
+    #[test]
+    fn a_gpu_that_can_sleep_is_left_to() {
+        let slot = "0000:01:00.0";
+        let t = Tree::new("nvidia-sleep");
+        t.nvidia(slot, &["card2"], "Enabled (fine-grained)");
+        t.set_status(slot, "suspended");
+        let nvml = FakeNvml::default();
+        nvml.go_idle();
+        let mut p = t.probe_with(&nvml);
+        let mut out = Vec::new();
+        let pass = |p: &mut GpuProbe, out: &mut Vec<GpuSample>| {
+            p.sample_over(&mut [process(10, 0)], out, 1.0);
+        };
+
+        // Asleep from the start: shown, from what the kernel knows, and not touched.
+        for _ in 0..5 {
+            pass(&mut p, &mut out);
+        }
+        assert_eq!(nvml.set(|g| g.attaches), 0);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2].utilization, Percent::ZERO);
+        assert_eq!(out[2].info.dedicated_total, None);
+
+        // Something wakes it and runs: read every pass, without letting go.
+        t.set_status(slot, "active");
+        nvml.set(|g| {
+            g.engines[0] = Some(30.0);
+            g.memory = vec![(10, 1 << 30)];
+        });
+        for _ in 0..3 {
+            pass(&mut p, &mut out);
+        }
+        assert_eq!(nvml.set(|g| (g.attaches, g.reads)), (1, 3));
+        assert_eq!(out[2].info.dedicated_total, Some(Bytes(24 << 30)));
+        assert!((out[2].utilization.get() - 30.0).abs() < 1e-3);
+
+        // It finishes: NVML lets go on the first idle pass, so it can sleep.
+        nvml.go_idle();
+        pass(&mut p, &mut out);
+        assert_eq!(nvml.set(|g| (g.reads, g.drops)), (4, 1));
+        // Still up while the driver waits: left alone.
+        pass(&mut p, &mut out);
+        t.set_status(slot, "suspended");
+        pass(&mut p, &mut out);
+        assert_eq!(nvml.set(|g| g.attaches), 1);
+
+        // Once it has slept, waking means someone is using it: straight away.
+        t.set_status(slot, "active");
+        pass(&mut p, &mut out);
+        assert_eq!(nvml.set(|g| g.attaches), 2);
+
+        // Idle again, and this time something else holds it up: a look now and
+        // then, not one a second.
+        assert_eq!(nvml.set(|g| g.drops), 2);
+        for _ in 0..REST_PASSES - 1 {
+            pass(&mut p, &mut out);
+        }
+        assert_eq!(nvml.set(|g| g.attaches), 2);
+        pass(&mut p, &mut out);
+        assert_eq!(nvml.set(|g| (g.attaches, g.drops)), (3, 3));
+    }
+
+    #[test]
+    fn a_gpu_that_cannot_sleep_stays_connected() {
+        let t = Tree::new("nvidia-desktop");
+        t.nvidia("0000:01:00.0", &["card2"], "Disabled by default");
+        let nvml = FakeNvml::default();
+        nvml.go_idle();
+        let mut p = t.probe_with(&nvml);
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        }
+        assert_eq!(nvml.set(|g| (g.attaches, g.reads, g.drops)), (1, 3, 0));
+    }
+
+    #[test]
+    fn a_gpu_nvml_refuses_is_not_shown_and_is_tried_again() {
+        let t = Tree::new("nvidia-refused");
+        t.nvidia("0000:01:00.0", &["card2"], "Disabled by default");
+        let nvml = FakeNvml::busy();
+        nvml.set(|g| g.refuse = true);
+        let mut p = t.probe_with(&nvml);
+        let mut out = Vec::new();
+        for _ in 0..ATTACH_PASSES {
+            p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        }
+        assert_eq!(nvml.set(|g| g.attaches), 1);
+        assert_eq!(out.len(), 2, "the two others");
+
+        nvml.set(|g| g.refuse = false);
+        p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        assert_eq!(nvml.set(|g| g.attaches), 2);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn finding_the_adapters_again_keeps_the_connection() {
+        let t = Tree::new("nvidia-rediscover");
+        t.nvidia("0000:01:00.0", &["card2"], "Disabled by default");
+        let nvml = FakeNvml::busy();
+        let mut p = t.probe_with(&nvml);
+        let mut out = Vec::new();
+        p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        let before = Arc::clone(&out[2].info);
+        p.discover();
+        p.sample_over(&mut [process(10, 0)], &mut out, 1.0);
+        assert_eq!(nvml.set(|g| (g.attaches, g.drops, g.reads)), (1, 0, 2));
+        assert!(Arc::ptr_eq(&before, &out[2].info));
+    }
+
+    #[test]
+    fn the_power_file_says_whether_a_gpu_can_sleep() {
+        let status = |s: &str| runtime_d3_enabled(&format!("Runtime D3 status:          {s}\n"));
+        assert!(status("Enabled (fine-grained)"));
+        assert!(status("Enabled (coarse-grained)"));
+        assert!(!status("Disabled by default"));
+        assert!(!status("Disabled"));
+        assert!(!status("Not Supported"));
+        assert!(!status("?"));
+        assert!(!runtime_d3_enabled("Video Memory: Active\n"));
+    }
+
+    /// What a pass costs on this machine, with its real GPUs. Run on one with an
+    /// NVIDIA GPU: `cargo test -p ot-probe --release real_gpu_cost -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn real_gpu_cost() {
+        let gpu = GpuProbe::new().expect("a GPU here");
+        cost_of(gpu);
+    }
+
     /// What a pass costs against this machine's real processes, with a fake GPU
     /// so the probe runs. Run under load: `cargo test -p ot-probe --release
     /// gpu_cost -- --ignored --nocapture`.
@@ -1185,7 +1874,10 @@ mod tests {
     #[ignore = "a measurement, not a check"]
     fn gpu_cost() {
         let t = Tree::new("cost");
-        let mut gpu = GpuProbe::at(Path::new("/proc"), &t.root.join("sys")).unwrap();
+        cost_of(GpuProbe::at(Path::new("/proc"), &t.root.join("sys"), None).unwrap());
+    }
+
+    fn cost_of(mut gpu: GpuProbe) {
         let mut procs = super::super::process::ProcessProbe::new(1, None, None);
         let (mut out, mut threads, mut gpus) = (Vec::new(), Vec::new(), Vec::new());
         let mut times = Vec::new();
