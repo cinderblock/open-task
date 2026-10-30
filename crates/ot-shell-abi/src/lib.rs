@@ -53,6 +53,11 @@ pub struct DisplayList {
     /// Runs of commands drawn as images, in command order, not overlapping.
     pub rasters: *const Raster,
     pub raster_count: usize,
+    /// Where this frame differs from the last, in whole DIPs, unless `whole`
+    /// (for a plugin with [`feature::PARTIAL_PAINT`]; else always `whole`).
+    pub damage: *const Rect,
+    pub damage_count: usize,
+    pub whole: bool,
 }
 
 impl DisplayList {
@@ -65,12 +70,16 @@ impl DisplayList {
         strings_len: 0,
         rasters: std::ptr::null(),
         raster_count: 0,
+        damage: std::ptr::null(),
+        damage_count: 0,
+        whole: true,
     };
 
-    /// Point at `list`'s commands and arenas, and at `rasters`, which must
-    /// outlive the use of this as much as `list` does.
+    /// Point at `list`'s commands and arenas, at `rasters`, and at `damage`
+    /// (`None` for a whole frame), which must outlive the use of this as much as
+    /// `list` does.
     #[must_use]
-    pub fn of(list: &ot_paint::DisplayList, rasters: &[Raster]) -> Self {
+    pub fn of(list: &ot_paint::DisplayList, rasters: &[Raster], damage: Option<&[Rect]>) -> Self {
         let cmds = list.cmds();
         let points = list.point_arena();
         let strings = list.string_arena();
@@ -83,6 +92,9 @@ impl DisplayList {
             strings_len: strings.len(),
             rasters: rasters.as_ptr(),
             raster_count: rasters.len(),
+            damage: damage.map_or(std::ptr::null(), <[Rect]>::as_ptr),
+            damage_count: damage.map_or(0, <[Rect]>::len),
+            whole: damage.is_none(),
         }
     }
 }
@@ -110,6 +122,7 @@ pub mod event {
 pub mod feature {
     pub const KEEP_ABOVE: u32 = 1;
     pub const ANIMATIONS: u32 = 2;
+    pub const PARTIAL_PAINT: u32 = 4;
 }
 
 /// `OtMouseButton`.
@@ -341,10 +354,19 @@ mod tests {
         check("OT_EVENT_ANIMATIONS", event::ANIMATIONS as usize);
         check("OT_FEATURE_KEEP_ABOVE", feature::KEEP_ABOVE as usize);
         check("OT_FEATURE_ANIMATIONS", feature::ANIMATIONS as usize);
+        check("OT_FEATURE_PARTIAL_PAINT", feature::PARTIAL_PAINT as usize);
         check("sizeof(OtDisplayList)", size_of::<DisplayList>());
         check(
             "offsetof(OtDisplayList, rasters)",
             offset_of!(DisplayList, rasters),
+        );
+        check(
+            "offsetof(OtDisplayList, damage)",
+            offset_of!(DisplayList, damage),
+        );
+        check(
+            "offsetof(OtDisplayList, whole)",
+            offset_of!(DisplayList, whole),
         );
         check("sizeof(OtRaster)", size_of::<Raster>());
         check("offsetof(OtRaster, rect)", offset_of!(Raster, rect));

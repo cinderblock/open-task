@@ -31,6 +31,7 @@ use crate::desktop::{self, LinuxPlatform};
 use crate::frame_stats::FrameLog;
 use crate::keys;
 use crate::loader::{self, Embedded};
+use crate::partial::Frames;
 use crate::prefs::FilePrefs;
 use crate::select::{self, Toolkit};
 use crate::RunError;
@@ -54,6 +55,9 @@ static PLUGIN: AtomicPtr<abi::Plugin> = AtomicPtr::new(std::ptr::null_mut());
 struct State {
     shell: Shell,
     dl: DisplayList,
+    /// The frame before `dl`, for what it changed, when the plugin draws only
+    /// that.
+    frames: Frames,
     /// The charts' images, when the CPU draws them.
     charts: Charts,
     /// The drawing area, in DIPs, as last reported.
@@ -76,6 +80,9 @@ struct Ctx {
     state: RefCell<State>,
     /// The update timer is set once the loop runs.
     armed: Cell<bool>,
+    /// The plugin draws only what each frame changes
+    /// ([`abi::feature::PARTIAL_PAINT`]); known once the loop runs.
+    partial_paint: Cell<bool>,
 }
 
 /// Open the window with the first toolkit that will, and run until it closes.
@@ -141,6 +148,7 @@ pub fn run(
                     dark,
                     shell,
                     dl: DisplayList::new(),
+                    frames: Frames::default(),
                     charts: Charts::from_env(),
                     size: Size::new(INITIAL_SIZE.0, INITIAL_SIZE.1),
                     cursor: Cursor::Arrow,
@@ -150,6 +158,7 @@ pub fn run(
                     frame_log: FrameLog::from_env(),
                 }),
                 armed: Cell::new(false),
+                partial_paint: Cell::new(false),
             }))
         };
         match run_plugin(cx, loaded.plugin) {
@@ -340,21 +349,33 @@ unsafe extern "C" fn on_paint(ctx: *mut c_void, scale: f32, out: *mut AbiList) {
             return;
         };
         let st = &mut *st;
+        let partial = cx.partial_paint.get();
+        if partial {
+            st.frames.keep(&mut st.dl);
+        }
         let painting = std::time::Instant::now();
         st.shell.app_mut().paint(&mut st.dl);
         let painted = painting.elapsed();
+        let damage = if partial {
+            st.frames.damage(&st.dl, scale, st.size)
+        } else {
+            None
+        };
         let charting = std::time::Instant::now();
         let app = st.shell.app();
         let mode = st
             .charts
             .mode(&app.capabilities(), app.settings().chart_drawing);
-        let rasters = st.charts.prepare(&st.dl, mode, scale, st.size);
+        let rasters = st.charts.prepare(&st.dl, mode, scale, st.size, damage);
         if let Some(log) = st.frame_log.as_mut() {
-            log.add(app.last_paint(), painted, charting.elapsed());
+            let drawn = damage.map(|d| {
+                d.iter().map(|r| r.w * r.h).sum::<f32>() / (st.size.w * st.size.h).max(1.0)
+            });
+            log.add(app.last_paint(), painted, charting.elapsed(), drawn);
         }
-        // The list and the images live in the state, unchanged until the plugin
-        // calls in again.
-        *out = AbiList::of(&st.dl, rasters);
+        // The list, the images and the damage live in the state, unchanged until
+        // the plugin calls in again.
+        *out = AbiList::of(&st.dl, rasters, damage);
     });
 }
 
@@ -588,6 +609,8 @@ impl Ctx {
         if !self.armed.replace(true) {
             // SAFETY: a plugin function, called on the UI thread, the window up.
             let features = unsafe { (self.plugin().features)() };
+            self.partial_paint
+                .set(features & abi::feature::PARTIAL_PAINT != 0);
             let caps = capabilities(self.toolkit.get(), features);
             if let Ok(mut st) = self.state.try_borrow_mut() {
                 st.shell.app_mut().set_capabilities(caps);
@@ -945,6 +968,8 @@ mod tests {
         thread_local! {
             pub static CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
             pub static PAINTED: RefCell<usize> = const { RefCell::new(0) };
+            /// Each frame painted: whether whole, and its damage.
+            pub static FRAMES: RefCell<Vec<(bool, Vec<abi::Rect>)>> = const { RefCell::new(Vec::new()) };
             /// Each raster of the frame painted: its commands, rect and size.
             pub static RASTERS: RefCell<Vec<abi::Raster>> = const { RefCell::new(Vec::new()) };
         }
@@ -991,6 +1016,17 @@ mod tests {
                 unsafe { std::slice::from_raw_parts(list.rasters, list.raster_count) }
             };
             RASTERS.with(|r| *r.borrow_mut() = rasters.to_vec());
+            let first = (list.whole, Vec::new());
+            // And again: drawn only where it changed, if at all.
+            let mut again = AbiList::EMPTY;
+            unsafe { (h.paint)(h.ctx, 2.0, &raw mut again) };
+            let damage = if again.damage.is_null() {
+                Vec::new()
+            } else {
+                // SAFETY: as the host left them, valid until the next call in.
+                unsafe { std::slice::from_raw_parts(again.damage, again.damage_count) }.to_vec()
+            };
+            FRAMES.with(|f| *f.borrow_mut() = vec![first, (again.whole, damage)]);
             // Ctrl+N: the Run dialog.
             send(abi::Event {
                 kind: event::KEY,
@@ -1046,7 +1082,7 @@ mod tests {
         }
         unsafe extern "C" fn copy_text(_: *const c_char, _: usize) {}
         unsafe extern "C" fn features() -> u32 {
-            abi::feature::KEEP_ABOVE | abi::feature::ANIMATIONS
+            abi::feature::KEEP_ABOVE | abi::feature::ANIMATIONS | abi::feature::PARTIAL_PAINT
         }
 
         pub static PLUGIN: abi::Plugin = abi::Plugin {
@@ -1106,6 +1142,7 @@ mod tests {
             state: RefCell::new(State {
                 shell,
                 dl: DisplayList::new(),
+                frames: Frames::default(),
                 charts: Charts::default(),
                 size: Size::new(INITIAL_SIZE.0, INITIAL_SIZE.1),
                 cursor: Cursor::Arrow,
@@ -1116,6 +1153,7 @@ mod tests {
                 frame_log: None,
             }),
             armed: Cell::new(false),
+            partial_paint: Cell::new(false),
         };
         run_plugin(&cx, &fake::PLUGIN).expect("ran");
         cx.state.borrow_mut().shell.stop_feed();
@@ -1127,6 +1165,16 @@ mod tests {
             assert_eq!(caps.animations, AnimationSource::Desktop);
             assert_eq!(caps.paths, PathRenderer::Cairo);
             assert!(!st.shell.app().system_animations());
+        }
+        // The plugin draws in part: the first frame whole, the next only where it
+        // changed (the clock may have moved a chart), in whole DIPs.
+        let frames = fake::FRAMES.with(|f| f.borrow().clone());
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].0, "the first frame is whole");
+        if !frames[1].0 {
+            for r in &frames[1].1 {
+                assert_eq!((r.x.fract(), r.w.fract()), (0.0, 0.0), "{r:?}");
+            }
         }
         // The GPU, the default, is the CPU here: any charts came as images, in
         // order, in whole device pixels at the frame's scale. (The first frame

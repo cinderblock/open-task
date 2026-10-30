@@ -37,6 +37,11 @@ steadily. Bring it down without losing what it shows.
   but X forwarding draws without its GPU.
 - User on Qt painting the whole window on the CPU: "this seems suboptimal... any
   acceleration options here?" -> look at acceleration for Qt.
+- 2026-10-25 ~7:35 PM PDT: after round 1 the user asked "OpenGL work for us?";
+  answer: barely; recommended damage-limited repaints. User: "keep going" ->
+  build damage-limited (partial) repaints for Qt properly. OpenGL dropped.
+- 2026-10-30: user: "keep going. commit and publish when you're done": push
+  master, then a release through CI (`v0.18.0`).
 
 - The user asked "how do we make it better?" (2026-10-20): measured cuts to the
   probe are in scope; anything that changes what the app shows or how it
@@ -157,6 +162,38 @@ steadily. Bring it down without losing what it shows.
   active one, so compare WSLg runs per frame (`frames` log line), and don't
   `windowactivate` (it steals the user's focus).
 
+- **The real build, A/B** (`ab-suite.sh`, 2026-10-25 ~8-8:45 PM PDT, Qt, fresh
+  config per run, 22 of 24 runs before the session ended; CPU per frame, which
+  allows for the differing frame rates):
+
+  | | Baseline (`c11cd91`) | Partial, 50 % limit |
+  | --- | --- | --- |
+  | List, Xvfb 1180x760 | 7.0-8.5 ms (18-21 %) | **2.2-2.5 ms** (6-7 %) |
+  | List, WSLg 1280x860 | 7.4-7.6 ms (33 %) | **2.6-2.7 ms** (14 %) |
+  | History, Xvfb 1180x760 | 9.1-10.4 ms | 7.3-8.5 ms |
+  | History, WSLg 1280x860 | 11.2-13.5 ms | 6.0-12.7 ms |
+
+  List: about 1.6 % of the window a frame. History: the big chart is ~45 % of
+  the window, right at the 50 % `WHOLE_AT` copied from Windows, so on Xvfb only
+  ~30 % of frames were partial.
+- **`WHOLE_AT` 0.9, not Windows' 0.5** (`ab-wholeat.sh`, 2026-10-30 ~3:15-3:50 AM
+  PDT, History, 1800x1000, three rounds, CPU per frame):
+
+  | | Baseline | 0.5 | 0.9 |
+  | --- | --- | --- | --- |
+  | WSLg | 9.4 / 9.6 / 14.1 ms | 5.3 / 8.8 / 10.4 ms | **4.1 / 5.6 / 7.0 ms** |
+  | Xvfb | 19.9 / 23.6 / 27.8 ms | 15.1 / 15.6 / 17.7 ms | 9.7 / 17.0 / 17.0 ms |
+
+  At 0.9 every frame is partial. Windows' limit is about replaying the commands
+  once per rectangle; Qt makes one pass over a `QRegion`, so that reason does
+  not apply. Xvfb is within noise of 0.5; WSLg, with a real compositor, is
+  clearly better. Chosen: 0.9.
+- **suite7 round 2 was contaminated:** the app saves the view on exit
+  (`~/.config/open-task/settings`, `Layout=...;view=History`), so after the
+  WSLg runs opened History with `--view history`, later "List" runs started in
+  History (their logs: charts ~2.3 ms, no slides). Fix: every A/B run gets its own
+  `XDG_CONFIG_HOME` (`ab-measure.sh`). The WSL settings file was put back to
+  `view=List`.
 - **suite7 round 1** (2026-10-25 ~7:05-7:30 PM PDT, quiet WSL, Qt on
   `c11cd91` + prototypes). Frame rates differ between runs (none reach 60), so
   compare CPU per frame:
@@ -206,7 +243,35 @@ steadily. Bring it down without losing what it shows.
       into `%TEMP%\ot-linux\gui\suite7.txt`.
    d. Report numbers, recommend, build the chosen one properly. Round 1
       reported to the user 2026-10-25 7:30 PM PDT: damage-limited wins,
-      OpenGL does not; recommended building damage-limited repaints.
+      OpenGL does not; recommended building damage-limited repaints. (done)
+   e. Built, as Windows does it: (done)
+      - ABI (v3, unpublished, extended in place): `OT_FEATURE_PARTIAL_PAINT`;
+        `OtDisplayList.damage`/`damage_count`/`whole`.
+      - Host: `partial.rs` `Frames` keeps the last frame (swap, no copy),
+        `damage_since`, rects out to whole DIPs, whole on first frame / new
+        scale or size / >= 90 % of the window (`WHOLE_AT`). Only for a plugin
+        with the feature (GTK: unchanged).
+      - `Charts::prepare` redraws only images whose run comes within a DIP of
+        the damage (others are stale; the plugin skips them).
+      - Qt: the frame tick and the host's `invalidate` (coalesced, one frame a
+        loop pass) paint, then `repaint(region)` synchronously; `Painter`
+        skips commands whose bounds miss the region. Qt's own partial paint
+        events (uncovered windows) draw a fresh frame there and then ask for a
+        whole one.
+      - `OT_FRAME_STATS` logs `partials` and `partial_drawn_pct`.
+      - Tests: `partial.rs` (2), `charts.rs` (partial redraw), the ABI session
+        test (first frame whole, damage in whole DIPs). fmt, tests, clippy
+        clean in WSL; clippy clean on Windows.
+      - Visual check on Xvfb (List with rows sliding, History at 1180x760 and
+        1800x1000): no stale pixels.
+      - `scripts/linux-gui-smoke.sh` passes for GTK and Qt (its click goes
+        through the `invalidate` path). Workspace fmt, tests and clippy pass
+        on Windows and WSL.
+   f. A/B: above. `c11cd91` binary saved as `~/.cache/ot-ab/open-task-base`.
+      The `invalidate` path was added after `ab-suite.sh`'s binary was built;
+      `ab-wholeat.sh`'s has it. (done)
+   g. (current) Commit, push master, wait for CI, release `v0.18.0` by tag.
+      Remove the scratch worktree.
 
 ## Progress log
 
@@ -219,14 +284,17 @@ steadily. Bring it down without losing what it shows.
 - [x] ChartRaster-as-texture prototype measured (and Cairo-to-image on equal
   terms).
 - [x] Qt prototypes ported onto `c11cd91` and built.
-- [ ] suite7: Qt today vs damage vs OpenGL (running).
-- [ ] On-machine numbers from the user.
-- [ ] GUI idle cost, if it is the bigger part.
+- [x] suite7: Qt today vs damage vs OpenGL (round 1 good, round 2
+  contaminated; enough to choose).
+- [x] Partial repaints for Qt built.
+- [x] A/B of the real build; `WHOLE_AT` measured and set to 0.9.
+- [ ] Release `v0.18.0`.
+- [ ] On-machine numbers from the user, with the release.
+- [x] GUI idle cost: it was the bigger part; partial repaints are the answer
+  under Qt. GTK is unchanged (a later step, if the user wants it).
 
 ## Open questions for the user
 
-0. Which desktop is it (KDE uses the Qt plugin, which draws everything with
-   QPainter on the CPU; others GTK), and which GPU?
 1. On your Linux machine, what do `open-task --headless --passes 10` (the
    `probe cost` column) and `OT_FRAME_STATS=1 open-task` (the log lines every
    5 s) print? And is the 5 % per core (top, htop) or of the whole machine?
@@ -234,4 +302,9 @@ steadily. Bring it down without losing what it shows.
 ## Things not to do
 
 - Don't judge GUI cost from WSL/Xvfb: GSK there is software-rendered.
+- Don't run `import` on a WSLg window: it holds the X server and hangs.
+- Don't compare runs without a fresh `XDG_CONFIG_HOME`: the view is saved on
+  exit and carries over.
+- Don't compare CPU % alone between runs: the frame rate differs, so divide by
+  it.
 - Don't bring back a periodic full relist of every process's fds on one pass.

@@ -8,7 +8,7 @@
 //! uses. With [`ChartDrawing::Native`] there are no images and the plugin draws
 //! the commands with its toolkit's painter (Cairo, `QPainter`).
 
-use ot_paint::{find_runs, ChartRaster, ChartRun, DisplayList, RunScratch, Size};
+use ot_paint::{find_runs, ChartRaster, ChartRun, DisplayList, Rect, RunScratch, Size};
 use ot_shell_abi as abi;
 use ot_ui::{Capabilities, ChartDrawing};
 
@@ -53,12 +53,17 @@ impl Charts {
     /// Draw `dl`'s chart runs for a window `size` DIPs across at `scale` device
     /// pixels a DIP, when `mode` is the CPU; the images for the plugin, valid
     /// until the next call. None for any other mode.
+    ///
+    /// With `damage`, for a plugin that draws only that, a run that misses it
+    /// keeps the image it had: the plugin will not draw it, and drawing a chart
+    /// is the costliest part of a frame where only another chart moved.
     pub fn prepare(
         &mut self,
         dl: &DisplayList,
         mode: ChartDrawing,
         scale: f32,
         size: Size,
+        damage: Option<&[Rect]>,
     ) -> &[abi::Raster] {
         self.out.clear();
         if mode != ChartDrawing::Cpu || !scale.is_finite() || scale <= 0.0 {
@@ -73,7 +78,9 @@ impl Charts {
             self.rasters.resize_with(self.runs.len(), ChartRaster::new);
         }
         for (run, raster) in self.runs.iter().zip(&mut self.rasters) {
-            raster.draw_run(dl, run, scale, &mut self.scratch);
+            if damage.is_none_or(|d| reaches(run.dip, d)) {
+                raster.draw_run(dl, run, scale, &mut self.scratch);
+            }
         }
         // Every run goes to the plugin, an empty one too (its commands are
         // outside the window or their clip): drawing it as nothing is right.
@@ -89,6 +96,15 @@ impl Charts {
         }
         &self.out
     }
+}
+
+/// Whether `area` comes within a DIP of any of `damage`: the plugin's clip to
+/// the damage is rounded out to whole pixels, so an image just outside it could
+/// show a sliver.
+fn reaches(area: Rect, damage: &[Rect]) -> bool {
+    damage
+        .iter()
+        .any(|d| !area.intersect(&d.inset(-1.0, -1.0)).is_empty())
 }
 
 #[cfg(test)]
@@ -125,7 +141,9 @@ mod tests {
         let dl = frame();
         let mut charts = Charts::default();
         let size = Size::new(400.0, 300.0);
-        let out = charts.prepare(&dl, ChartDrawing::Cpu, 2.0, size).to_vec();
+        let out = charts
+            .prepare(&dl, ChartDrawing::Cpu, 2.0, size, None)
+            .to_vec();
         assert_eq!(out.len(), 2);
         assert_eq!((out[0].first, out[0].end), (2, 4));
         assert_eq!((out[1].first, out[1].end), (5, 6));
@@ -141,8 +159,36 @@ mod tests {
 
         // Native: the plugin draws the commands; no images.
         assert!(charts
-            .prepare(&dl, ChartDrawing::Native, 2.0, size)
+            .prepare(&dl, ChartDrawing::Native, 2.0, size, None)
             .is_empty());
+    }
+
+    #[test]
+    fn a_partial_frame_redraws_only_the_images_the_damage_reaches() {
+        let dl = frame();
+        let mut charts = Charts::default();
+        let size = Size::new(400.0, 300.0);
+        charts.prepare(&dl, ChartDrawing::Cpu, 1.0, size, None);
+        let drawn = |c: &Charts, i: usize| c.rasters[i].pixels().iter().any(|&b| b != 0);
+        assert!(drawn(&charts, 0) && drawn(&charts, 1));
+
+        // Blank both images, then damage only the second run's area.
+        for r in &mut charts.rasters {
+            *r = ChartRaster::new();
+        }
+        let damage = [Rect::new(18.0, 98.0, 14.0, 25.0)];
+        let out = charts
+            .prepare(&dl, ChartDrawing::Cpu, 1.0, size, Some(&damage))
+            .to_vec();
+        // Both runs still go to the plugin, which skips the first's commands.
+        assert_eq!(out.len(), 2);
+        assert!(!drawn(&charts, 0), "the first run missed the damage");
+        assert!(drawn(&charts, 1));
+
+        // Damage a DIP short of the first run's clip still redraws it.
+        let near = [Rect::new(110.5, 20.0, 5.0, 5.0)];
+        charts.prepare(&dl, ChartDrawing::Cpu, 1.0, size, Some(&near));
+        assert!(drawn(&charts, 0));
     }
 
     #[test]

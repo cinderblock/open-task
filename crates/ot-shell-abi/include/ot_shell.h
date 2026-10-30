@@ -188,6 +188,15 @@ typedef struct OtDisplayList {
     /* Runs of commands drawn as images, in command order, not overlapping. */
     const OtRaster *rasters;
     size_t raster_count;
+    /* For a plugin with OT_FEATURE_PARTIAL_PAINT: where this frame differs from
+     * the one painted before it, as rectangles in whole DIPs (none when nothing
+     * did), unless `whole`: the first frame, a new scale or size, or too much
+     * changed to be worth drawing in part. Images of chart runs that miss the
+     * damage are not redrawn, so outside it their pixels are stale. Without the
+     * feature, always `whole` and no rectangles. */
+    const OtRect *damage;
+    size_t damage_count;
+    bool whole;
 } OtDisplayList;
 
 /* ---- Input: plugin to host ---------------------------------------------- */
@@ -345,7 +354,10 @@ enum OtFeature {
     OT_FEATURE_KEEP_ABOVE = 1,
     /* The plugin reads the desktop's animation setting and sends
      * OT_EVENT_ANIMATIONS. */
-    OT_FEATURE_ANIMATIONS = 2
+    OT_FEATURE_ANIMATIONS = 2,
+    /* The window keeps the last frame drawn, and the plugin draws only
+     * OtDisplayList.damage of each frame over it (all of a `whole` one). */
+    OT_FEATURE_PARTIAL_PAINT = 4
 };
 
 typedef struct OtPlugin {

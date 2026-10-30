@@ -21,6 +21,10 @@ pub struct FrameLog {
     worst: Duration,
     /// Drawing the charts' images (the CPU choice of chart drawing).
     charts: Duration,
+    /// Frames the plugin draws only in part, and the share of the window that
+    /// is, summed over them.
+    partials: u32,
+    drawn: f32,
 }
 
 impl FrameLog {
@@ -37,12 +41,15 @@ impl FrameLog {
             paint: Duration::ZERO,
             worst: Duration::ZERO,
             charts: Duration::ZERO,
+            partials: 0,
+            drawn: 0.0,
         })
     }
 
-    /// One frame: what kind the view made, how long making it took, and how
-    /// long drawing its charts' images took.
-    pub fn add(&mut self, kind: PaintKind, paint: Duration, charts: Duration) {
+    /// One frame: what kind the view made, how long making it took, how long
+    /// drawing its charts' images took, and the share of the window the plugin
+    /// is to draw when that is not all of it.
+    pub fn add(&mut self, kind: PaintKind, paint: Duration, charts: Duration, drawn: Option<f32>) {
         self.frames += 1;
         match kind {
             PaintKind::Tick => self.ticks += 1,
@@ -52,6 +59,10 @@ impl FrameLog {
         self.paint += paint;
         self.worst = self.worst.max(paint);
         self.charts += charts;
+        if let Some(d) = drawn {
+            self.partials += 1;
+            self.drawn += d;
+        }
         let elapsed = self.since.elapsed();
         if elapsed >= PERIOD {
             let per_frame = self.paint.checked_div(self.frames).unwrap_or_default();
@@ -68,6 +79,9 @@ impl FrameLog {
                     .checked_div(self.frames)
                     .unwrap_or_default()
                     .as_micros(),
+                partials = self.partials,
+                partial_drawn_pct =
+                    format!("{:.1}", 100.0 * self.drawn / self.partials.max(1) as f32),
                 "frames"
             );
             *self = Self {
@@ -79,6 +93,8 @@ impl FrameLog {
                 paint: Duration::ZERO,
                 worst: Duration::ZERO,
                 charts: Duration::ZERO,
+                partials: 0,
+                drawn: 0.0,
             };
         }
     }

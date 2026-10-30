@@ -111,7 +111,8 @@ spike draws at about two thirds of its height; the readout gives the value measu
 The range band's edges pass through every lowest and highest value, so a spike keeps
 its height there, and the stacked History and port charts use the same curve. A
 frame where only the clock moved repaints just the charts, and only the parts of
-the window that changed are redrawn; behind other windows the charts move at half
+the window that changed are redrawn (on Linux under Qt too; GTK 4 redraws its
+window whole); behind other windows the charts move at half
 the display's rate, and not at all when the window is minimized or on another
 virtual desktop. **Chart drawing** under **Charts** chooses what draws the charts'
 lines and filled areas: **GPU** (the default), Direct3D shaders that work out each
@@ -761,7 +762,8 @@ cost: frames a second by kind (charts only, rows sliding, whole), how many were 
 in part and how much of the window, the time to build, diff, draw, copy and present
 a frame, and the process's CPU. `OT_CHARTS=gpu`, `cpu` or `d2d` overrides the **Chart
 drawing** setting, for comparing them; on Linux, `cpu` or `native` (Cairo or QPainter),
-and the frame log there says how long the CPU took to draw the charts. `cargo build --profile profiling` is the release build
+and the frame log there says how long the CPU took to draw the charts and, under
+Qt, how many frames were drawn in part and how much of the window. `cargo build --profile profiling` is the release build
 with symbols kept, for a sampling profiler such as WPR or xperf.
 
 Two environment variables help with drawing faults on Windows. With

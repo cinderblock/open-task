@@ -32,6 +32,8 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPaintEvent>
+#include <QRegion>
 #include <QPointer>
 #include <QStaticText>
 #include <QStyle>
@@ -167,8 +169,21 @@ struct CachedText {
 class Painter {
 public:
     // `dpr` is the scale the frame was asked for, which the host's images are at.
-    void draw(QPainter &p, const OtDisplayList &list, const QWidget *widget, qreal dpr) {
+    // With `only`, the part of the window being drawn over the last frame:
+    // commands that cannot reach it are skipped (clips and clears never are),
+    // and the painter is clipped to it.
+    void draw(QPainter &p, const OtDisplayList &list, const QWidget *widget, qreal dpr,
+              const QRegion *only = nullptr) {
         ++frame_;
+        const QRect area = only ? only->boundingRect() : QRect();
+        // Whether what a command can paint, `b` grown by `pad`, misses `only`.
+        // The pads are the host's (DisplayList::bounds): a DIP of antialiased
+        // fringe, and half a stroke's width.
+        auto misses = [&](const QRectF &b, qreal pad) {
+            if (!only) return false;
+            const QRect r = b.adjusted(-pad, -pad, pad, pad).toAlignedRect();
+            return !area.intersects(r) || !only->intersects(r);
+        };
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setRenderHint(QPainter::TextAntialiasing, true);
         const OtDrawCmd *cmds = list.cmds;
@@ -180,7 +195,8 @@ public:
             while (next < rasters && list.rasters[next].first < i) ++next;
             if (next < rasters && list.rasters[next].first == i) {
                 const OtRaster &r = list.rasters[next++];
-                drawRaster(p, r, dpr);
+                // An image the damage misses was not redrawn: it is stale.
+                if (!misses(rectf(r.rect), 0)) drawRaster(p, r, dpr);
                 i = std::max<size_t>(r.end, i + 1) - 1;
                 continue;
             }
@@ -194,10 +210,12 @@ public:
                 break;
             }
             case OT_CMD_FILL_RECT:
+                if (misses(rectf(c.u.fill_rect.rect), 1)) break;
                 p.fillRect(rectf(c.u.fill_rect.rect), color(c.u.fill_rect.color));
                 break;
             case OT_CMD_FILL_ROUND_RECT: {
                 const auto &f = c.u.fill_round_rect;
+                if (misses(rectf(f.rect), 1)) break;
                 p.setPen(Qt::NoPen);
                 p.setBrush(color(f.color));
                 p.drawRoundedRect(rectf(f.rect), f.radius, f.radius);
@@ -205,16 +223,22 @@ public:
             }
             case OT_CMD_STROKE_RECT: {
                 const auto &s = c.u.stroke_rect;
+                if (misses(rectf(s.rect), s.width / 2 + 1)) break;
                 stroke(p, s.rect, 0, s.color, s.width);
                 break;
             }
             case OT_CMD_STROKE_ROUND_RECT: {
                 const auto &s = c.u.stroke_round_rect;
+                if (misses(rectf(s.rect), s.width / 2 + 1)) break;
                 stroke(p, s.rect, s.radius, s.color, s.width);
                 break;
             }
             case OT_CMD_LINE: {
                 const auto &l = c.u.line;
+                if (misses(QRectF(QPointF(l.from.x, l.from.y), QPointF(l.to.x, l.to.y)).normalized(),
+                           l.width / 2 + 1)) {
+                    break;
+                }
                 p.setPen(pen(l.color, l.width));
                 p.drawLine(QPointF(l.from.x, l.from.y), QPointF(l.to.x, l.to.y));
                 break;
@@ -225,7 +249,7 @@ public:
                 const OtColor col = c.tag == OT_CMD_GRAPH ? c.u.graph.color : c.u.polyline.color;
                 const float w = c.tag == OT_CMD_GRAPH ? c.u.graph.width : c.u.polyline.width;
                 const QPolygonF poly = polygon(list, s, false);
-                if (poly.size() < 2) break;
+                if (poly.size() < 2 || misses(poly.boundingRect(), w / 2 + 1)) break;
                 p.setPen(pen(col, w));
                 p.setBrush(Qt::NoBrush);
                 p.drawPolyline(poly);
@@ -233,7 +257,7 @@ public:
             }
             case OT_CMD_FILL_POLYGON: {
                 const QPolygonF poly = polygon(list, c.u.fill_polygon.points, false);
-                if (poly.size() < 3) break;
+                if (poly.size() < 3 || misses(poly.boundingRect(), 1)) break;
                 p.setPen(Qt::NoPen);
                 p.setBrush(color(c.u.fill_polygon.color));
                 p.drawPolygon(poly);
@@ -245,17 +269,26 @@ public:
                 const QPolygonF bottom = polygon(list, c.u.band.bottom, true);
                 if (poly.size() < 2 || bottom.size() < 2) break;
                 poly += bottom;
+                if (misses(poly.boundingRect(), 1)) break;
                 p.setPen(Qt::NoPen);
                 p.setBrush(color(c.u.band.color));
                 p.drawPolygon(poly);
                 break;
             }
             case OT_CMD_TEXT:
+                // Drawn clipped to its rect.
+                if (misses(rectf(c.u.text.rect), 1)) break;
                 drawText(p, list, c.u.text, widget);
                 break;
-            case OT_CMD_ICON:
-                drawIcon(p, c.u.icon.icon, c.u.icon.rect, c.u.icon.size, c.u.icon.color, widget);
+            case OT_CMD_ICON: {
+                // The glyph is centred on the rect and may be bigger than it.
+                const auto &i = c.u.icon;
+                const QRectF r = rectf(i.rect);
+                const QRectF glyph(r.center() - QPointF(i.size / 2, i.size / 2), QSizeF(i.size, i.size));
+                if (misses(r.united(glyph), 1)) break;
+                drawIcon(p, i.icon, i.rect, i.size, i.color, widget);
                 break;
+            }
             case OT_CMD_IMAGE:
                 // Program icons are not loaded on Linux yet.
                 break;
@@ -444,21 +477,36 @@ public:
 
     bool allow_close = false;
 
+    // The host wants a new frame (its invalidate): drawn as the animation's are,
+    // once the event loop is free, so a burst of requests makes one frame.
+    void request_frame() {
+        if (frame_requested_) return;
+        frame_requested_ = true;
+        QTimer::singleShot(0, this, [this] {
+            frame_requested_ = false;
+            draw_frame();
+        });
+    }
+
 protected:
-    void paintEvent(QPaintEvent *) override {
+    void paintEvent(QPaintEvent *e) override {
         if (!g_has_host) return;
-        OtDisplayList list{};
+        // The frame draw_frame() is drawing where it changed; else a new one,
+        // drawn where Qt asks (all of it, unless part of the window was
+        // uncovered).
+        const bool ours = has_frame_;
+        has_frame_ = false;
+        OtDisplayList list = frame_;
         const qreal dpr = devicePixelRatioF();
-        g_host.paint(g_host.ctx, static_cast<float>(dpr), &list);
+        if (!ours) g_host.paint(g_host.ctx, static_cast<float>(dpr), &list);
+        const bool whole = e->region().contains(rect());
         QPainter p(this);
-        painter_.draw(p, list, this, dpr);
+        painter_.draw(p, list, this, dpr, whole ? nullptr : &e->region());
         p.end();
-        // While something moves, a timer asks for the next frame, at the display's
-        // rate when the window is active and half of it in the background.
-        if (g_host.animating(g_host.ctx)) {
-            frames_.setInterval(isActiveWindow() ? 16 : 33);
-            if (!frames_.isActive()) frames_.start();
-        }
+        // Part of a new frame over the last: the next frame's damage, measured
+        // from this one, would miss what the rest of the window still shows.
+        if (!ours && !whole) update();
+        keep_animating();
     }
 
     void resizeEvent(QResizeEvent *e) override {
@@ -605,14 +653,55 @@ private:
 
     void tick() {
         if (g_has_host && g_host.animating(g_host.ctx)) {
-            update();
+            draw_frame();
         } else {
             frames_.stop();
         }
     }
 
+    // While something moves, a timer asks for the next frame, at the display's
+    // rate when the window is active and half of it in the background.
+    void keep_animating() {
+        if (g_host.animating(g_host.ctx)) {
+            frames_.setInterval(isActiveWindow() ? 16 : 33);
+            if (!frames_.isActive()) frames_.start();
+        }
+    }
+
+    // The next frame, drawn only where it differs from the last (the host's
+    // damage; OT_FEATURE_PARTIAL_PAINT), over what the window keeps.
+    void draw_frame() {
+        if (!g_has_host) return;
+        OtDisplayList list{};
+        g_host.paint(g_host.ctx, static_cast<float>(devicePixelRatioF()), &list);
+        QRegion region;
+        if (list.whole) {
+            region = rect();
+        } else {
+            // Whole DIPs, so exact as integers.
+            for (size_t i = 0; i < list.damage_count; ++i) {
+                const OtRect &r = list.damage[i];
+                region += QRect(static_cast<int>(r.x), static_cast<int>(r.y), static_cast<int>(r.w),
+                                static_cast<int>(r.h));
+            }
+        }
+        if (region.isEmpty()) { // nothing changed
+            keep_animating();
+            return;
+        }
+        // Drawn now, before anything else calls into the host and ends the
+        // list's life.
+        frame_ = list;
+        has_frame_ = true;
+        repaint(region);
+        has_frame_ = false;
+    }
+
     Painter painter_;
     QTimer frames_;
+    OtDisplayList frame_{};
+    bool has_frame_ = false;
+    bool frame_requested_ = false;
 };
 
 // ---- Dialogs -------------------------------------------------------------
@@ -842,7 +931,7 @@ void wake() {
 }
 
 void invalidate() {
-    if (g_canvas) g_canvas->update();
+    if (g_canvas) g_canvas->request_frame();
 }
 
 void set_title(const char *t, size_t n) {
@@ -957,7 +1046,8 @@ void run_dialog_c(uint64_t token, const char *initial, size_t n) { run_dialog(to
 void copy_text(const char *t, size_t n) { QGuiApplication::clipboard()->setText(text(t, n)); }
 
 uint32_t features() {
-    uint32_t f = 0;
+    // A widget's backing store keeps what was drawn, on X11 and Wayland both.
+    uint32_t f = OT_FEATURE_PARTIAL_PAINT;
     // Qt::WindowStaysOnTopHint is an X11 hint; Wayland has no way to ask.
     if (QGuiApplication::platformName() == QLatin1String("xcb")) f |= OT_FEATURE_KEEP_ABOVE;
     return f;

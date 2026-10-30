@@ -25,6 +25,8 @@ mod host;
 pub mod keys;
 #[cfg(target_os = "linux")]
 pub mod loader;
+#[cfg(target_os = "linux")]
+mod partial;
 pub mod prefs;
 pub mod select;
 
