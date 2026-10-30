@@ -282,9 +282,13 @@ steadily. Bring it down without losing what it shows.
      keep its pixels, but watch for stale pixels or flicker. `QT_QPA_PLATFORM=xcb`
      is the way to tell a Wayland fault from any other.
    - Not tested on real hardware: the DRM GPU probe (fake trees only).
-   - Option (3), a QRhi chart shader, was never measured: Windows' Direct3D
+   - Option (3), a chart shader, was never measured here: Windows' Direct3D
      renderer got 4x from this, and chart rasterizing is what is left on History.
-     Needs Qt 6.6+, and the user's say-so.
+     Handed off 2026-10-30: thread "Linux: GPU chart shader for Qt", branch
+     `qt-gpu-charts`, plan `plans/qt-gpu-charts.md` (measure first; may end in a
+     measured no).
+   - NVIDIA: thread "Linux: NVIDIA GPUs via NVML", branch `linux-nvml`, plan
+     `plans/linux-nvml.md`.
 
 ## Progress log
 
