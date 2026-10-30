@@ -15,7 +15,7 @@ use std::mem::{offset_of, size_of};
 pub use ot_paint::{Color, DrawCmd, Point, Rect, Span, TextCmd, TextStyle};
 
 /// Bumped on any change to the header.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// The symbol a plugin exports: `const OtPlugin *ot_shell_plugin(void)`.
 pub const PLUGIN_SYMBOL: &[u8] = b"ot_shell_plugin\0";
@@ -123,6 +123,7 @@ pub mod feature {
     pub const KEEP_ABOVE: u32 = 1;
     pub const ANIMATIONS: u32 = 2;
     pub const PARTIAL_PAINT: u32 = 4;
+    pub const OFFSCREEN_GL: u32 = 8;
 }
 
 /// `OtMouseButton`.
@@ -307,6 +308,8 @@ pub struct Plugin {
     pub run_dialog: unsafe extern "C" fn(token: u64, initial: *const c_char, len: usize),
     pub copy_text: unsafe extern "C" fn(text: *const c_char, len: usize),
     pub features: unsafe extern "C" fn() -> u32,
+    pub gl_make_current: unsafe extern "C" fn() -> bool,
+    pub gl_proc: unsafe extern "C" fn(name: *const c_char) -> *const c_void,
 }
 
 // The header asserts the same numbers; a change on one side alone fails to build.
@@ -335,6 +338,7 @@ mod tests {
     use std::fmt::Write as _;
 
     /// `assert(offsetof(T, f) == n)` lines for C, from this side's layout.
+    #[allow(clippy::too_many_lines)]
     fn c_checks() -> String {
         let mut c = String::new();
         let mut check = |what: &str, value: usize| {
@@ -355,6 +359,7 @@ mod tests {
         check("OT_FEATURE_KEEP_ABOVE", feature::KEEP_ABOVE as usize);
         check("OT_FEATURE_ANIMATIONS", feature::ANIMATIONS as usize);
         check("OT_FEATURE_PARTIAL_PAINT", feature::PARTIAL_PAINT as usize);
+        check("OT_FEATURE_OFFSCREEN_GL", feature::OFFSCREEN_GL as usize);
         check("sizeof(OtDisplayList)", size_of::<DisplayList>());
         check(
             "offsetof(OtDisplayList, rasters)",
@@ -383,6 +388,7 @@ mod tests {
             offset_of!(Plugin, copy_text),
         );
         check("offsetof(OtPlugin, features)", offset_of!(Plugin, features));
+        check("offsetof(OtPlugin, gl_proc)", offset_of!(Plugin, gl_proc));
         check("sizeof(OtTextCmd)", size_of::<TextCmd>());
         check("offsetof(OtTextCmd, style)", offset_of!(TextCmd, style));
         check("offsetof(OtTextCmd, halign)", offset_of!(TextCmd, halign));

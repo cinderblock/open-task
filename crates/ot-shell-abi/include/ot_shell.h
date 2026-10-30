@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define OT_SHELL_ABI_VERSION 3u
+#define OT_SHELL_ABI_VERSION 4u
 
 /* ---- Drawing: the layout of crates/ot-paint ---------------------------- */
 
@@ -357,7 +357,11 @@ enum OtFeature {
     OT_FEATURE_ANIMATIONS = 2,
     /* The window keeps the last frame drawn, and the plugin draws only
      * OtDisplayList.damage of each frame over it (all of a `whole` one). */
-    OT_FEATURE_PARTIAL_PAINT = 4
+    OT_FEATURE_PARTIAL_PAINT = 4,
+    /* The plugin can give the host an offscreen OpenGL context (3.3 core or
+     * ES 3.0) to draw charts in: OtPlugin.gl_make_current, gl_proc. Whether
+     * one can be made is only known by asking. */
+    OT_FEATURE_OFFSCREEN_GL = 8
 };
 
 typedef struct OtPlugin {
@@ -402,6 +406,12 @@ typedef struct OtPlugin {
     /* OtFeature bits. Valid once run() has connected to the display; the host
      * asks from its callbacks. */
     uint32_t (*features)(void);
+    /* Make the offscreen context current, making it the first time; false when
+     * there is none or it was lost. For a plugin without
+     * OT_FEATURE_OFFSCREEN_GL, always false. */
+    bool (*gl_make_current)(void);
+    /* The current context's function of this NUL-terminated name, or NULL. */
+    void *(*gl_proc)(const char *name);
 } OtPlugin;
 
 typedef const OtPlugin *(*OtShellPluginFn)(void);

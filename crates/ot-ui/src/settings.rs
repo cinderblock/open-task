@@ -1399,7 +1399,8 @@ fn drawing_detail(drawing: ChartDrawing, paths: PathRenderer) -> &'static str {
             "Direct3D shaders on the graphics card work out every pixel: the least CPU."
         }
         (ChartDrawing::Gpu, PathRenderer::Cairo | PathRenderer::QPainter) => {
-            "Shaders on the graphics card work out every pixel: the least CPU."
+            "Shaders on the graphics card work out big charts' pixels, for the toolkit \
+             to show as an image: less CPU, more work for the card."
         }
         (ChartDrawing::Cpu, PathRenderer::Direct2D) => {
             "open-task's own rasterizer for chart shapes, on the CPU: much less than \

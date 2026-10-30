@@ -8,7 +8,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ot_shell_core::settings_store::{self, LAYOUT};
-use ot_ui::{Settings, ViewLayout};
+use ot_ui::{ChartDrawing, Settings, ViewLayout};
+
+/// Present when the user picked GPU chart drawing here. The saved chart drawing
+/// cannot say so: every save writes it, and the shared default is the GPU, which
+/// Linux did not have, so a saved GPU has meant "never chose", and the default
+/// on Linux is the CPU.
+const CHOSE_GPU: &str = "ChartDrawingGpuChosen";
 
 /// The settings file, for `ot_shell_core`.
 #[derive(Debug)]
@@ -65,13 +71,22 @@ impl FilePrefs {
 impl ot_shell_core::Prefs for FilePrefs {
     fn load(&self) -> Settings {
         let values = self.read();
-        settings_store::decode(|name| values.get(name)?.trim().parse().ok())
+        let mut settings = settings_store::decode(|name| values.get(name)?.trim().parse().ok());
+        if settings.chart_drawing == ChartDrawing::Gpu && !values.contains_key(CHOSE_GPU) {
+            settings.chart_drawing = ChartDrawing::Cpu;
+        }
+        settings
     }
 
     fn save(&self, settings: &Settings) {
         self.update(|values| {
             for (name, value) in settings_store::encode(settings) {
                 values.insert(name.to_owned(), value.to_string());
+            }
+            if settings.chart_drawing == ChartDrawing::Gpu {
+                values.insert(CHOSE_GPU.to_owned(), "1".to_owned());
+            } else {
+                values.remove(CHOSE_GPU);
             }
         });
     }
@@ -123,16 +138,53 @@ mod tests {
     fn settings_and_layout_share_the_file() {
         let dir = std::env::temp_dir().join(format!("ot-prefs-{}", std::process::id()));
         let prefs = FilePrefs::at(dir.join("open-task").join("settings"));
-        assert_eq!(prefs.load(), Settings::default());
+        let s = Settings {
+            chart_drawing: ChartDrawing::Cpu,
+            ..Settings::default()
+        };
+        assert_eq!(prefs.load(), s);
         let s = Settings {
             always_on_top: true,
-            ..Settings::default()
+            ..s
         };
         prefs.save(&s);
         let layout = ot_ui::App::new(ot_ui::Theme::dark()).view_layout();
         prefs.save_layout(&layout);
         assert_eq!(prefs.load(), s, "the layout did not overwrite the settings");
         assert_eq!(prefs.load_layout(), Some(layout));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_gpu_is_used_only_when_it_was_picked_here() {
+        let dir = std::env::temp_dir().join(format!("ot-prefs-gpu-{}", std::process::id()));
+        let path = dir.join("settings");
+        let prefs = FilePrefs::at(path.clone());
+        std::fs::create_dir_all(&dir).expect("a directory");
+
+        // What every earlier build saved for someone who never chose: the shared
+        // default, the GPU, which Linux did not have.
+        std::fs::write(&path, "ChartDrawing=0\n").expect("a file");
+        assert_eq!(prefs.load().chart_drawing, ChartDrawing::Cpu);
+
+        // Saved again, it stays the CPU.
+        prefs.save(&prefs.load());
+        assert_eq!(prefs.load().chart_drawing, ChartDrawing::Cpu);
+
+        // Picked, it stays picked; picked away from, it goes.
+        let settings = Settings {
+            chart_drawing: ChartDrawing::Gpu,
+            ..prefs.load()
+        };
+        prefs.save(&settings);
+        assert_eq!(prefs.load().chart_drawing, ChartDrawing::Gpu);
+        let settings = Settings {
+            chart_drawing: ChartDrawing::Native,
+            ..settings
+        };
+        prefs.save(&settings);
+        assert_eq!(prefs.load().chart_drawing, ChartDrawing::Native);
+        assert!(!prefs.read().contains_key(CHOSE_GPU));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

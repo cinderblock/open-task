@@ -2,6 +2,19 @@
 
 Problems noticed while working on something else, left for a thread of their own.
 
+## Linux: a chart's image is drawn whole when only part of it changed
+
+Seen 2026-10-30 (`plans/qt-gpu-charts.md`). Once History has run a few minutes,
+`partial_drawn_pct` falls to about 25-30 % of the window at 1800x1000: the log
+time axis leaves the older part of the plot still. But `Charts::prepare`
+(`ot-shell-linux/src/charts.rs`) redraws a run's whole image whenever the damage
+touches it, on the CPU and the GPU alike, and that image is about half of a
+mature History frame's CPU (4.2 of 8.3 ms). Drawing, and reading back, only the
+columns the damage covers should save much of it, for every Linux user, with no
+GPU involved. `ChartRaster` has no clip to do that with today.
+
+Matters because it is the largest cost left on the History view that is ours.
+
 ## The build label can name an older commit and miss `-dirty`
 
 Seen 2026-10-12: `target\debug\open-task.exe`, built at 17:15 from `master` at

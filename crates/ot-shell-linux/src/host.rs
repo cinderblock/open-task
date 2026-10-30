@@ -23,9 +23,10 @@ use ot_shell_core::{
     ShellOptions, Start, ThemePreference,
 };
 use ot_ui::{
-    AnimationSource, Capabilities, Cursor, MouseButton, PathRenderer, TaskManager, UiEvent,
+    AnimationSource, Capabilities, Cursor, MouseButton, Page, PathRenderer, TaskManager, UiEvent,
 };
 
+use crate::chart_gl::GlAccess;
 use crate::charts::{self, Charts};
 use crate::desktop::{self, LinuxPlatform};
 use crate::frame_stats::FrameLog;
@@ -128,7 +129,7 @@ pub fn run(
             if let Ok(mut st) = cx.state.try_borrow_mut() {
                 st.shell
                     .app_mut()
-                    .set_capabilities(capabilities(toolkit, 0));
+                    .set_capabilities(capabilities(toolkit, 0, charts::OFFERED));
             }
             cx
         } else {
@@ -138,7 +139,7 @@ pub fn run(
                 config,
                 options,
                 dark,
-                capabilities(toolkit, 0),
+                capabilities(toolkit, 0, charts::OFFERED),
                 Box::new(FilePrefs::standard()),
             )?;
             ctx.insert(Box::new(Ctx {
@@ -178,8 +179,13 @@ pub fn run(
 }
 
 /// What the shell can do under `toolkit`, whose plugin reports `features`
-/// ([`abi::feature`] bits; 0 until its window is up).
-fn capabilities(toolkit: Toolkit, features: u32) -> Capabilities {
+/// ([`abi::feature`] bits; 0 until its window is up), drawing charts in any of
+/// `chart_drawings`.
+fn capabilities(
+    toolkit: Toolkit,
+    features: u32,
+    chart_drawings: &'static [ot_ui::ChartDrawing],
+) -> Capabilities {
     Capabilities {
         system: "Linux",
         animations: if features & abi::feature::ANIMATIONS != 0 {
@@ -187,7 +193,7 @@ fn capabilities(toolkit: Toolkit, features: u32) -> Capabilities {
         } else {
             AnimationSource::Unknown
         },
-        chart_drawings: charts::OFFERED,
+        chart_drawings,
         paths: match toolkit {
             Toolkit::Gtk => PathRenderer::Cairo,
             Toolkit::Qt => PathRenderer::QPainter,
@@ -349,6 +355,16 @@ unsafe extern "C" fn on_paint(ctx: *mut c_void, scale: f32, out: *mut AbiList) {
             return;
         };
         let st = &mut *st;
+        // OpenGL only for someone who may use it: the choice says so, or the
+        // Settings page is about to offer it.
+        let app = st.shell.app();
+        if st
+            .charts
+            .wants_gl(app.settings().chart_drawing, app.page() == Page::Settings)
+        {
+            st.charts.start_gl();
+        }
+        offer_charts(st);
         let partial = cx.partial_paint.get();
         if partial {
             st.frames.keep(&mut st.dl);
@@ -377,6 +393,18 @@ unsafe extern "C" fn on_paint(ctx: *mut c_void, scale: f32, out: *mut AbiList) {
         // the plugin calls in again.
         *out = AbiList::of(&st.dl, rasters, damage);
     });
+}
+
+/// Keep the Settings page's chart drawing choices to what [`Charts`] has now.
+fn offer_charts(st: &mut State) {
+    let caps = st.shell.app().capabilities();
+    let offered = st.charts.offered();
+    if caps.chart_drawings != offered {
+        st.shell.app_mut().set_capabilities(Capabilities {
+            chart_drawings: offered,
+            ..caps
+        });
+    }
 }
 
 unsafe extern "C" fn on_animating(ctx: *mut c_void) -> bool {
@@ -611,8 +639,14 @@ impl Ctx {
             let features = unsafe { (self.plugin().features)() };
             self.partial_paint
                 .set(features & abi::feature::PARTIAL_PAINT != 0);
-            let caps = capabilities(self.toolkit.get(), features);
+            let caps = capabilities(self.toolkit.get(), features, charts::OFFERED);
             if let Ok(mut st) = self.state.try_borrow_mut() {
+                if features & abi::feature::OFFSCREEN_GL != 0 {
+                    st.charts.connect(GlAccess {
+                        make_current: self.plugin().gl_make_current,
+                        proc_address: self.plugin().gl_proc,
+                    });
+                }
                 st.shell.app_mut().set_capabilities(caps);
             }
             // Scheduled checks only where the updater works; where it does not,
@@ -1081,6 +1115,12 @@ mod tests {
             note("run dialog");
         }
         unsafe extern "C" fn copy_text(_: *const c_char, _: usize) {}
+        unsafe extern "C" fn gl_make_current() -> bool {
+            false
+        }
+        unsafe extern "C" fn gl_proc(_: *const std::ffi::c_char) -> *const c_void {
+            std::ptr::null()
+        }
         unsafe extern "C" fn features() -> u32 {
             abi::feature::KEEP_ABOVE | abi::feature::ANIMATIONS | abi::feature::PARTIAL_PAINT
         }
@@ -1108,6 +1148,8 @@ mod tests {
             run_dialog,
             copy_text,
             features,
+            gl_make_current,
+            gl_proc,
         };
     }
 
@@ -1132,7 +1174,7 @@ mod tests {
             },
             &options,
             true,
-            capabilities(Toolkit::Gtk, 0),
+            capabilities(Toolkit::Gtk, 0, charts::OFFERED),
             Box::new(FilePrefs::at(dir.join("settings"))),
         )
         .expect("shell");
