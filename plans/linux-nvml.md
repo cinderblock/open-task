@@ -35,7 +35,8 @@ History view's GPU chart work. Until now they were left out on purpose
 
 - Load `libnvidia-ml.so.1` at run time; no new NEEDED entry. Its absence means no
   NVIDIA GPU here, quietly.
-- Don't merge, push or release until the user asks.
+- Don't merge, push or release until the user asks. (They asked: released as
+  v0.19.0, 2026-10-30.)
 
 Mine, on the evidence below:
 
@@ -70,7 +71,13 @@ Mine, on the evidence below:
 2. Binding, a fake layer, wiring into `GpuProbe`. (done)
 3. Tests, clippy, smoke test, run on sentinel. (done)
 4. README, plans, commit. (done)
-5. **Wait for the user** (current): merge, push and release are theirs to ask for.
+5. Merged, pushed, released as v0.19.0 by tag (`99e782a`, 2026-10-30 3:34 PM PDT
+   (22:34Z)): CI green on the commit before tagging, all 8 release jobs green with
+   the workflow's own GUI smoke test, 11 assets. The published x86_64 binary, its
+   checksum matching: `libnvidia-ml` in it, and on sentinel it reads the RTX 4090
+   beside the Radeon (61 %, 7.6G/24.0G, `stitchd` on Video Encode; `nvidia-smi` 61 %,
+   7784 MiB) at a probe cost of 19.7 ms mean, 21.9 ms worst over 10 passes. (done)
+6. **Wait for a laptop** (current): the runtime D3 path has only run against fakes.
 
 ## Findings / gotchas
 
@@ -78,7 +85,9 @@ Mine, on the evidence below:
   kernel 7.0.0-38, NVIDIA **open** kernel modules 595.91.07, persistence mode off,
   and a second GPU: the 7900X3D's iGPU on `amdgpu` (`card1`, `renderD129`). The
   RTX 4090 is `card0`, `renderD128`, driver `nvidia`, `0000:01:00.0`. So it tests
-  the mixed case too. (Left unchanged: the ops repo is out of bounds here.)
+  the mixed case too. `servers/sentinel/README.md` already had the OS right; the
+  table in `servers/README.md` did not. Both edited in the ops checkout at the
+  user's request (2026-10-30). Not committed: ops needs a yes for each commit.
 - **fdinfo has nothing for NVIDIA.** Open modules, on sentinel: `/dev/dri/card0`
   and `/dev/nvidia0` both show only `pos`, `flags`, `mnt_id`, `ino`. In the
   source, `nv_drm_fops` (`kernel-open/nvidia-drm/nvidia-drm-drv.c`) sets no
@@ -232,14 +241,21 @@ Mine, on the evidence below:
 - [x] Sentinel A/B against v0.18.0; all 74 probe tests pass there with the real
   library. Nothing left behind: temp directories removed, no process running.
 - [x] Real data through the window: Performance and History, by replay.
+- [x] Merged, pushed, released as v0.19.0; the published binary checked on sentinel.
+- [x] Ops docs edited, not committed.
+- [ ] A real laptop: the runtime D3 path.
 
 ## Open questions for the user
 
-1. Merge, push, release: yours to ask for.
-2. A laptop with an NVIDIA GPU, if there is one to try: does the GPU reach
+1. A laptop with an NVIDIA GPU, if there is one to try: does the GPU reach
    `suspended` with open-task running? (`cat /sys/bus/pci/devices/*/power/runtime_status`)
-3. `ot-probe` could drop `GetSamples` for 1.5 ms a pass. Recommendation: keep it,
+2. `ot-probe` could drop `GetSamples` for 1.5 ms a pass. Recommendation: keep it,
    unless bursty load turns out not to need it.
+3. Commit the two ops doc lines? Recommendation: yes.
+4. Should `qt-gpu-charts` recheck its A/B numbers, given the shared build dir?
+   Recommendation: yes, with `grep` for a string only its build holds, since this
+   worktree's binary held none of its own code without any error. The build dir
+   itself is being fixed in its own thread (`wsl-cargo-build-dir`).
 
 ## Things not to do
 
