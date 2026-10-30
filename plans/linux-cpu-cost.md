@@ -270,8 +270,21 @@ steadily. Bring it down without losing what it shows.
    f. A/B: above. `c11cd91` binary saved as `~/.cache/ot-ab/open-task-base`.
       The `invalidate` path was added after `ab-suite.sh`'s binary was built;
       `ab-wholeat.sh`'s has it. (done)
-   g. (current) Commit, push master, wait for CI, release `v0.18.0` by tag.
-      Remove the scratch worktree.
+   g. Committed (`68abffa`), CI green, released `v0.18.0` by tag (`2105699`,
+      2026-10-30 ~4 AM PDT): all 8 release jobs and CI green, 11 assets,
+      checksums match, and the published x86_64 binary passes
+      `linux-gui-smoke.sh` with GTK and Qt. Scratch worktree removed. (done)
+9. **Wait for the user's machine** (current): KDE, Radeon 6000. Linux has no
+   self-update yet, so they take the release's AppImage or tarball by hand.
+   - **Not tested anywhere:** partial repaints under Qt on Wayland, the likely
+     session on KDE. All runs here were `xcb` (Xvfb, WSLg's XWayland), because
+     WSLg's Wayland would not give Qt a GPU. Qt's Wayland backing store should
+     keep its pixels, but watch for stale pixels or flicker. `QT_QPA_PLATFORM=xcb`
+     is the way to tell a Wayland fault from any other.
+   - Not tested on real hardware: the DRM GPU probe (fake trees only).
+   - Option (3), a QRhi chart shader, was never measured: Windows' Direct3D
+     renderer got 4x from this, and chart rasterizing is what is left on History.
+     Needs Qt 6.6+, and the user's say-so.
 
 ## Progress log
 
@@ -288,8 +301,8 @@ steadily. Bring it down without losing what it shows.
   contaminated; enough to choose).
 - [x] Partial repaints for Qt built.
 - [x] A/B of the real build; `WHOLE_AT` measured and set to 0.9.
-- [ ] Release `v0.18.0`.
-- [ ] On-machine numbers from the user, with the release.
+- [x] Release `v0.18.0`.
+- [ ] On-machine numbers from the user, with the release; a look under Wayland.
 - [x] GUI idle cost: it was the bigger part; partial repaints are the answer
   under Qt. GTK is unchanged (a later step, if the user wants it).
 
