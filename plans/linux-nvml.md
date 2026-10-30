@@ -15,9 +15,9 @@ History view's GPU chart work. Until now they were left out on purpose
   `CARGO_TARGET_DIR=~/.cache/open-task-target-nvml` (a parallel thread uses the
   main target dir and takes CPU measurements in WSL: keep compiles to what is
   needed).
-- **Also set `CARGO_BUILD_BUILD_DIR=~/.cache/open-task-target-nvml/build-private`:**
-  WSL's cargo config has one `build-dir` for every worktree, and it handed this
-  worktree another's artifacts (see Findings).
+- This work also set `CARGO_BUILD_BUILD_DIR`, because the cargo config's one
+  `build-dir` handed this worktree another's artifacts (see Findings). No longer
+  needed: the config now has one per workspace (`plans/wsl-cargo-build-dir.md`).
 - Heavy work goes through `node ~/.claude/bin/cpu-slots.mjs run --slots N`. Claiming
   4 of 4 next to a long A/B suite that holds 2 waited 30 minutes without starting:
   claim 2 with `CARGO_BUILD_JOBS=2`, in the background with a long timeout.
@@ -64,6 +64,9 @@ Mine, on the evidence below:
 - **Let a sleeping laptop GPU sleep** (see Findings): never touch NVML while
   `power/runtime_status` says `suspended`, and on a GPU with runtime D3 enabled,
   shut NVML down when the GPU is idle so it can go to sleep.
+- **`GetSamples` stays,** at 1.5 ms a pass: a utilization snapshot alone can miss
+  what happened between two ticks. Bursty load was never measured, so this is the
+  default holding, not a proven gain.
 
 ## Plan / steps
 
@@ -77,7 +80,8 @@ Mine, on the evidence below:
    checksum matching: `libnvidia-ml` in it, and on sentinel it reads the RTX 4090
    beside the Radeon (61 %, 7.6G/24.0G, `stitchd` on Video Encode; `nvidia-smi` 61 %,
    7784 MiB) at a probe cost of 19.7 ms mean, 21.9 ms worst over 10 passes. (done)
-6. **Wait for a laptop** (current): the runtime D3 path has only run against fakes.
+6. Closed 2026-10-30 at the user's word. What only a laptop can show moved to
+   `ISSUES.md`: the runtime D3 path has only run against fakes. (done)
 
 ## Findings / gotchas
 
@@ -87,7 +91,8 @@ Mine, on the evidence below:
   RTX 4090 is `card0`, `renderD128`, driver `nvidia`, `0000:01:00.0`. So it tests
   the mixed case too. `servers/sentinel/README.md` already had the OS right; the
   table in `servers/README.md` did not. Both edited in the ops checkout at the
-  user's request (2026-10-30). Not committed: ops needs a yes for each commit.
+  user's request (2026-10-30), committed at their yes as `a6277da` on ops' local
+  `master`. Not pushed: the yes covered the commit, and ops asks for each.
 - **fdinfo has nothing for NVIDIA.** Open modules, on sentinel: `/dev/dri/card0`
   and `/dev/nvidia0` both show only `pos`, `flags`, `mnt_id`, `ino`. In the
   source, `nv_drm_fops` (`kernel-open/nvidia-drm/nvidia-drm-drv.c`) sets no
@@ -177,7 +182,13 @@ Mine, on the evidence below:
   passes the smoke test with both toolkits, and `grep -c libnvidia-ml` is 1. The
   test binary's name is `ot_probe-d481073b63f97911` in both directories, so two
   worktrees really do share artifact names. Logged in `ISSUES.md`. Check a binary
-  before measuring it: `grep -c libnvidia-ml`.
+  before measuring it: `grep -c libnvidia-ml`. Later found and fixed in
+  `plans/wsl-cargo-build-dir.md`: the setting comes from the Windows config, which
+  cargo reads from WSL too, and cargo goes by mtime, so the older checkout takes
+  the newer one's binary. The same thread checked `qt-gpu-charts`: its 1:33 PM PDT
+  (20:33Z) release binary holds its own chart code and no NVML, and the 9:10 AM PDT
+  (16:10Z) A/B baseline holds neither. Those two files are clean; earlier binaries
+  were overwritten, so nothing more can be checked, and its numbers were not re-run.
 - **The real A/B on sentinel** (2026-10-30 10:50 AM PDT (17:50Z), 30 passes twice
   each, 454-478 processes, not root, binary checked to hold NVML):
 
@@ -242,26 +253,20 @@ Mine, on the evidence below:
   library. Nothing left behind: temp directories removed, no process running.
 - [x] Real data through the window: Performance and History, by replay.
 - [x] Merged, pushed, released as v0.19.0; the published binary checked on sentinel.
-- [x] Ops docs edited, not committed.
-- [ ] A real laptop: the runtime D3 path.
+- [x] Ops docs edited and committed (`a6277da`), not pushed.
+- [x] `qt-gpu-charts` binaries checked for this worktree's code: none found.
+- [x] Moved to `ISSUES.md`: a real laptop, for the runtime D3 path.
 
 ## Open questions for the user
 
-1. A laptop with an NVIDIA GPU, if there is one to try: does the GPU reach
-   `suspended` with open-task running? (`cat /sys/bus/pci/devices/*/power/runtime_status`)
-2. `ot-probe` could drop `GetSamples` for 1.5 ms a pass. Recommendation: keep it,
-   unless bursty load turns out not to need it.
-3. Commit the two ops doc lines? Recommendation: yes.
-4. Should `qt-gpu-charts` recheck its A/B numbers, given the shared build dir?
-   Recommendation: yes, with `grep` for a string only its build holds, since this
-   worktree's binary held none of its own code without any error. The build dir
-   itself is being fixed in its own thread (`wsl-cargo-build-dir`).
+None. The laptop check is an `ISSUES.md` entry now.
 
 ## Things not to do
 
-- Don't change the ops repo or anything on sentinel.
+- Don't change anything on sentinel, and nothing in ops without a yes for that
+  change.
 - Don't call process utilization with a buffer under 72 entries.
 - Don't call any NVML function, `nvmlInit` included, while the GPU is `suspended`.
 - Don't add a pid's memory across the compute, graphics and MPS lists.
-- Don't build in WSL without a private `build-dir`, and don't trust `Finished`.
+- Don't trust `Finished` alone: check a binary holds your code before measuring it.
 - Don't claim all 4 slots beside a long holder of 2: it never starts.

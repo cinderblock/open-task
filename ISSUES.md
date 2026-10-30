@@ -67,3 +67,16 @@ two load from `/proc/self/fd/<n>` with the same `n` (`ot-shell-linux/src/loader.
 `open_bytes`), which looks like the same library to `dlopen`.
 
 Matters only if a plugin is rejected after loading, so the fallback hides a real one.
+
+## Linux: letting a laptop's NVIDIA GPU sleep has only run against fakes
+
+Seen 2026-10-30, v0.19.0 (`plans/linux-nvml.md`). `GpuProbe::read_nvidia`
+(`crates/ot-probe/src/imp/linux/gpu.rs`) never touches NVML while the GPU is
+`suspended`, and on a GPU with runtime D3 enabled it shuts NVML down when idle.
+The tests cover that with a fake NVML, but sentinel's RTX 4090 has runtime D3
+disabled, so no real GPU has been through it. To check, on a laptop with an NVIDIA
+GPU and open-task running: `cat /sys/bus/pci/devices/*/power/runtime_status` should
+reach `suspended`.
+
+Matters because a probe that keeps a laptop's GPU awake drains its battery, for a
+number nobody may be looking at.
