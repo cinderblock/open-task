@@ -67,6 +67,11 @@ fn main() {
     let launcher = ot_shell_win::launcher::Launcher::adopt();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The GPU chart drawing's trial, started by the app itself.
+    #[cfg(target_os = "linux")]
+    if args.iter().any(|a| a == ot_shell_linux::charts::TRIAL_ARG) {
+        std::process::exit(ot_shell_linux::gl_trial(embedded::EMBEDDED));
+    }
     let version = args.iter().any(|a| a == "--version" || a == "-V");
     let check_update = args.iter().any(|a| a == "--check-update");
     let sample = arg_value(&args, "--sample").and_then(|s| s.parse::<u32>().ok());

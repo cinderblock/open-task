@@ -120,7 +120,15 @@ pixel's coverage on the graphics card; **CPU**, open-task's own rasterizer for
 chart shapes; or **Direct2D**, Windows' general path renderer, which antialiases on
 the CPU and costs the most once a chart is full. The three look the same. On Linux
 the choice is **CPU** (the default there) or the toolkit's own painter: **Cairo**
-under GTK, **QPainter** under Qt.
+under GTK, **QPainter** under Qt. Under Qt, once a graphics card's OpenGL driver has
+shown it can draw them, **GPU** is on offer too: OpenGL shaders draw the big charts
+and read the result back as an image for Qt to show, while small ones, which would
+not repay the trip, stay on the CPU. It trades CPU time for work on the graphics
+card and takes about 100 MB more memory, the graphics driver's, so it stays off
+until picked. A short-lived process tries the driver first, when Settings opens or
+a saved choice asks for it, so a driver that crashes or hangs cannot take the app
+with it. Without a usable driver, or on a software one such as llvmpipe, the choice
+is not shown, and a saved GPU draws on the CPU.
 The first sample is on screen a quarter of a second after start, drawn across the
 interval it measured. Recent history is drawn sample by sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point
@@ -615,9 +623,9 @@ class: tens of megabytes, not hundreds.
 | `ot-update` | Self-updater: finds signed releases, downloads, verifies and installs them. |
 | `ot-shell-core` | What every shell shares: the app with its feed, updater and worker threads, and every effect that needs no window. A shell reports input to it and carries out the menus, questions and platform actions it hands back. |
 | `ot-shell-abi` | The C ABI between the Linux host and its toolkit plugins: a header and its Rust mirror. The display list crosses it as is (`ot-paint` is `#[repr(C)]`). |
-| `ot-shell-linux` | Linux shell host: picks a toolkit, loads its plugin from inside the binary (`memfd_create`, `dlopen`), and drives it, drawing the charts itself when the CPU draws them. Links no toolkit itself. |
+| `ot-shell-linux` | Linux shell host: picks a toolkit, loads its plugin from inside the binary (`memfd_create`, `dlopen`), and drives it, drawing the charts itself on the CPU or, in a context the plugin gives it, with OpenGL shaders. Links no toolkit itself. |
 | `ot-shell-gtk` | GTK 4 plugin: the window drawn with GSK and Pango, and the dialogs. |
-| `ot-shell-qt` | Qt 6 plugin (C++): the window drawn with `QPainter`, and the dialogs. |
+| `ot-shell-qt` | Qt 6 plugin (C++): the window drawn with `QPainter`, the dialogs, and an offscreen OpenGL context for GPU chart drawing. |
 | `ot-shell-win` | Windows shell: Win32 window, DirectComposition swap chain, Direct2D + DirectWrite renderer. |
 | `ot-app` | The binary. |
 
@@ -769,9 +777,12 @@ For performance work, `OT_FRAME_STATS=1` logs every five seconds what the frames
 cost: frames a second by kind (charts only, rows sliding, whole), how many were drawn
 in part and how much of the window, the time to build, diff, draw, copy and present
 a frame, and the process's CPU. `OT_CHARTS=gpu`, `cpu` or `d2d` overrides the **Chart
-drawing** setting, for comparing them; on Linux, `cpu` or `native` (Cairo or QPainter),
-and the frame log there says how long the CPU took to draw the charts and, under
-Qt, how many frames were drawn in part and how much of the window. `cargo build --profile profiling` is the release build
+drawing** setting, for comparing them; on Linux, `gpu`, `cpu` or `native` (Cairo or
+QPainter), and the frame log there says how long drawing the charts took and, under
+Qt, how many frames were drawn in part and how much of the window. On Linux
+`OT_CHARTS=gpu` also takes a software renderer, for testing, and with
+`OT_CHARTS_CHECK=1` the log compares the GPU's images with the CPU's now and then
+(`worst`, out of 255). `cargo build --profile profiling` is the release build
 with symbols kept, for a sampling profiler such as WPR or xperf.
 
 Two environment variables help with drawing faults on Windows. With

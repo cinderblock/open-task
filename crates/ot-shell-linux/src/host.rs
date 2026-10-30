@@ -23,9 +23,10 @@ use ot_shell_core::{
     ShellOptions, Start, ThemePreference,
 };
 use ot_ui::{
-    AnimationSource, Capabilities, Cursor, MouseButton, PathRenderer, TaskManager, UiEvent,
+    AnimationSource, Capabilities, Cursor, MouseButton, Page, PathRenderer, TaskManager, UiEvent,
 };
 
+use crate::chart_gl::GlAccess;
 use crate::charts::{self, Charts};
 use crate::desktop::{self, LinuxPlatform};
 use crate::frame_stats::FrameLog;
@@ -128,7 +129,7 @@ pub fn run(
             if let Ok(mut st) = cx.state.try_borrow_mut() {
                 st.shell
                     .app_mut()
-                    .set_capabilities(capabilities(toolkit, 0));
+                    .set_capabilities(capabilities(toolkit, 0, charts::OFFERED));
             }
             cx
         } else {
@@ -138,7 +139,7 @@ pub fn run(
                 config,
                 options,
                 dark,
-                capabilities(toolkit, 0),
+                capabilities(toolkit, 0, charts::OFFERED),
                 Box::new(FilePrefs::standard()),
             )?;
             ctx.insert(Box::new(Ctx {
@@ -177,9 +178,53 @@ pub fn run(
     Err(RunError::NoToolkit(failures))
 }
 
+/// The GPU's trial: only Qt's plugin has a context to try.
+pub fn gl_trial(embedded: &[loader::Embedded]) -> i32 {
+    let loaded = loader::source(Toolkit::Qt, embedded)
+        .ok_or_else(|| "Qt is not in this build".to_owned())
+        .and_then(|source| source.load(Toolkit::Qt));
+    match loaded {
+        // SAFETY: the plugin's function, on this, the only thread using Qt; the
+        // context is the plugin's table, which lives as long as the process.
+        Ok(l) => unsafe {
+            (l.plugin.gl_trial)(trial_body, std::ptr::from_ref(l.plugin).cast_mut().cast())
+        },
+        Err(why) => {
+            println!("{why}");
+            1
+        }
+    }
+}
+
+/// What the trial does once Qt is up. `ctx` is the plugin's table.
+unsafe extern "C" fn trial_body(ctx: *mut c_void) -> i32 {
+    // SAFETY: as `gl_trial` passes it.
+    let plugin = unsafe { &*ctx.cast::<abi::Plugin>() };
+    let access = GlAccess {
+        make_current: plugin.gl_make_current,
+        proc_address: plugin.gl_proc,
+    };
+    // SAFETY: the plugin's functions, on the thread it called back on.
+    match unsafe { charts::prove(access) } {
+        Ok(renderer) => {
+            println!("{renderer}");
+            0
+        }
+        Err(why) => {
+            println!("{why}");
+            1
+        }
+    }
+}
+
 /// What the shell can do under `toolkit`, whose plugin reports `features`
-/// ([`abi::feature`] bits; 0 until its window is up).
-fn capabilities(toolkit: Toolkit, features: u32) -> Capabilities {
+/// ([`abi::feature`] bits; 0 until its window is up), drawing charts in any of
+/// `chart_drawings`.
+fn capabilities(
+    toolkit: Toolkit,
+    features: u32,
+    chart_drawings: &'static [ot_ui::ChartDrawing],
+) -> Capabilities {
     Capabilities {
         system: "Linux",
         animations: if features & abi::feature::ANIMATIONS != 0 {
@@ -187,7 +232,7 @@ fn capabilities(toolkit: Toolkit, features: u32) -> Capabilities {
         } else {
             AnimationSource::Unknown
         },
-        chart_drawings: charts::OFFERED,
+        chart_drawings,
         paths: match toolkit {
             Toolkit::Gtk => PathRenderer::Cairo,
             Toolkit::Qt => PathRenderer::QPainter,
@@ -349,6 +394,17 @@ unsafe extern "C" fn on_paint(ctx: *mut c_void, scale: f32, out: *mut AbiList) {
             return;
         };
         let st = &mut *st;
+        // A trial of the GPU only for someone who may use it: the choice says
+        // so, or the Settings page is about to offer it.
+        let app = st.shell.app();
+        if st
+            .charts
+            .wants_trial(app.settings().chart_drawing, app.page() == Page::Settings)
+        {
+            st.charts.start_trial(cx.plugin().wake);
+        }
+        st.charts.trial_result();
+        offer_charts(st);
         let partial = cx.partial_paint.get();
         if partial {
             st.frames.keep(&mut st.dl);
@@ -377,6 +433,18 @@ unsafe extern "C" fn on_paint(ctx: *mut c_void, scale: f32, out: *mut AbiList) {
         // the plugin calls in again.
         *out = AbiList::of(&st.dl, rasters, damage);
     });
+}
+
+/// Keep the Settings page's chart drawing choices to what [`Charts`] has now.
+fn offer_charts(st: &mut State) {
+    let caps = st.shell.app().capabilities();
+    let offered = st.charts.offered();
+    if caps.chart_drawings != offered {
+        st.shell.app_mut().set_capabilities(Capabilities {
+            chart_drawings: offered,
+            ..caps
+        });
+    }
 }
 
 unsafe extern "C" fn on_animating(ctx: *mut c_void) -> bool {
@@ -611,8 +679,14 @@ impl Ctx {
             let features = unsafe { (self.plugin().features)() };
             self.partial_paint
                 .set(features & abi::feature::PARTIAL_PAINT != 0);
-            let caps = capabilities(self.toolkit.get(), features);
+            let caps = capabilities(self.toolkit.get(), features, charts::OFFERED);
             if let Ok(mut st) = self.state.try_borrow_mut() {
+                if features & abi::feature::OFFSCREEN_GL != 0 {
+                    st.charts.connect(GlAccess {
+                        make_current: self.plugin().gl_make_current,
+                        proc_address: self.plugin().gl_proc,
+                    });
+                }
                 st.shell.app_mut().set_capabilities(caps);
             }
             // Scheduled checks only where the updater works; where it does not,
@@ -625,6 +699,19 @@ impl Ctx {
             if let Ok(settings) = settings {
                 self.carry_out(vec![Out::Settings(settings)]);
             }
+        }
+        // The GPU's trial may be why this woke: if what is on offer changed, a
+        // Settings page needs to show it.
+        let offered = self.state.try_borrow_mut().is_ok_and(|mut st| {
+            let changed = st.charts.trial_result();
+            if changed {
+                offer_charts(&mut st);
+            }
+            changed
+        });
+        if offered {
+            // SAFETY: a plugin function, called on the UI thread.
+            unsafe { (self.plugin().invalidate)() };
         }
         self.with_shell(Shell::drain);
     }
@@ -1081,6 +1168,18 @@ mod tests {
             note("run dialog");
         }
         unsafe extern "C" fn copy_text(_: *const c_char, _: usize) {}
+        unsafe extern "C" fn gl_make_current() -> bool {
+            false
+        }
+        unsafe extern "C" fn gl_proc(_: *const std::ffi::c_char) -> *const c_void {
+            std::ptr::null()
+        }
+        unsafe extern "C" fn gl_trial(
+            _: unsafe extern "C" fn(*mut c_void) -> i32,
+            _: *mut c_void,
+        ) -> i32 {
+            1
+        }
         unsafe extern "C" fn features() -> u32 {
             abi::feature::KEEP_ABOVE | abi::feature::ANIMATIONS | abi::feature::PARTIAL_PAINT
         }
@@ -1108,6 +1207,9 @@ mod tests {
             run_dialog,
             copy_text,
             features,
+            gl_make_current,
+            gl_proc,
+            gl_trial,
         };
     }
 
@@ -1132,7 +1234,7 @@ mod tests {
             },
             &options,
             true,
-            capabilities(Toolkit::Gtk, 0),
+            capabilities(Toolkit::Gtk, 0, charts::OFFERED),
             Box::new(FilePrefs::at(dir.join("settings"))),
         )
         .expect("shell");

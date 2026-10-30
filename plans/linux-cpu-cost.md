@@ -184,6 +184,10 @@ steadily. Bring it down without losing what it shows.
   | WSLg | 9.4 / 9.6 / 14.1 ms | 5.3 / 8.8 / 10.4 ms | **4.1 / 5.6 / 7.0 ms** |
   | Xvfb | 19.9 / 23.6 / 27.8 ms | 15.1 / 15.6 / 17.7 ms | 9.7 / 17.0 / 17.0 ms |
 
+  (Correction, 2026-10-30, `plans/qt-gpu-charts.md`: the WSLg row was very likely
+  at 1180x760, not 1800x1000. The script resized a hidden Qt window there. Xvfb's
+  row is right. The comparison between the columns still stands.)
+
   At 0.9 every frame is partial. Windows' limit is about replaying the commands
   once per rectangle; Qt makes one pass over a `QRegion`, so that reason does
   not apply. Xvfb is within noise of 0.5; WSLg, with a real compositor, is
@@ -282,11 +286,8 @@ steadily. Bring it down without losing what it shows.
      keep its pixels, but watch for stale pixels or flicker. `QT_QPA_PLATFORM=xcb`
      is the way to tell a Wayland fault from any other.
    - Not tested on real hardware: the DRM GPU probe (fake trees only).
-   - Option (3), a chart shader, was never measured here: Windows' Direct3D
-     renderer got 4x from this, and chart rasterizing is what is left on History.
-     Handed off 2026-10-30: thread "Linux: GPU chart shader for Qt", branch
-     `qt-gpu-charts`, plan `plans/qt-gpu-charts.md` (measure first; may end in a
-     measured no).
+   - Option (3), a chart shader: built as a raw OpenGL renderer that needs no
+     newer Qt, opt-in; see `plans/qt-gpu-charts.md`.
    - NVIDIA: thread "Linux: NVIDIA GPUs via NVML", branch `linux-nvml`, plan
      `plans/linux-nvml.md`.
 

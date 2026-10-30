@@ -15,6 +15,7 @@
 //!
 //! On other platforms only [`select`] and the stubs compile.
 
+pub mod chart_gl;
 pub mod charts;
 #[cfg(target_os = "linux")]
 pub mod desktop;
@@ -50,6 +51,16 @@ pub enum RunError {
     /// Internal: a second start was attempted without a probe.
     #[error("the probe was already used")]
     Spent,
+}
+
+/// [`charts::TRIAL_ARG`]: be the GPU's trial, a process with nothing else to do,
+/// and print what came of it. The exit status for the process.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn gl_trial(embedded: &[Embedded]) -> i32 {
+    // SAFETY: a plain request: not to outlive the app if it goes first.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+    host::gl_trial(embedded)
 }
 
 /// Whether this session can show a window: a Wayland or X11 display to open

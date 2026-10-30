@@ -359,6 +359,22 @@ unsafe extern "C" fn copy_text(t: *const c_char, len: usize) {
     with_ui(|ui| WidgetExt::clipboard(&ui.canvas).set_text(&t));
 }
 
+// No offscreen context: GPU chart drawing is Qt's for now.
+unsafe extern "C" fn gl_make_current() -> bool {
+    false
+}
+
+unsafe extern "C" fn gl_proc(_: *const std::ffi::c_char) -> *const std::ffi::c_void {
+    std::ptr::null()
+}
+
+unsafe extern "C" fn gl_trial(
+    _: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+    _: *mut std::ffi::c_void,
+) -> i32 {
+    1
+}
+
 unsafe extern "C" fn features() -> u32 {
     // No keep-above: GTK 4 has no way to ask for it.
     abi::feature::ANIMATIONS
@@ -387,4 +403,7 @@ pub static PLUGIN: abi::Plugin = abi::Plugin {
     run_dialog,
     copy_text,
     features,
+    gl_make_current,
+    gl_proc,
+    gl_trial,
 };

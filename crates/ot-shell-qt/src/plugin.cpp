@@ -4,7 +4,9 @@
 // widget (Canvas) that asks the host for a frame and draws it with QPainter (a
 // run of chart shapes the host drew itself comes as an image, drawn in its place);
 // input becomes the ABI's events; menus and dialogs are shown without blocking
-// (QMenu::popup, QDialog::open) and answer through the host's callbacks.
+// (QMenu::popup, QDialog::open) and answer through the host's callbacks. For a
+// host that draws charts on the GPU, an offscreen OpenGL context, and no more:
+// the shaders are the host's, and their results come here as images.
 //
 // Built against the oldest supported Qt (6.2): nothing newer is called, and Qt
 // keeps binary compatibility within a major version.
@@ -30,6 +32,10 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
+#ifndef QT_NO_OPENGL
+#include <QOffscreenSurface>
+#include <QOpenGLContext>
+#endif
 #include <QPainter>
 #include <QPainterPath>
 #include <QPaintEvent>
@@ -833,6 +839,69 @@ void run_dialog(uint64_t token, const QString &initial) {
     entry->selectAll();
 }
 
+// ---- OpenGL for the host -------------------------------------------------
+
+#ifndef QT_NO_OPENGL
+std::unique_ptr<QOpenGLContext> g_gl;
+std::unique_ptr<QOffscreenSurface> g_gl_surface;
+bool g_gl_failed = false;
+
+// Nothing else in the window uses OpenGL: this is a context of its own, which
+// costs nothing until the host first asks for it.
+bool make_gl() {
+    QSurfaceFormat format;
+    if (QOpenGLContext::openGLModuleType() == QOpenGLContext::LibGLES) {
+        format.setRenderableType(QSurfaceFormat::OpenGLES);
+        format.setVersion(3, 0);
+    } else {
+        format.setRenderableType(QSurfaceFormat::OpenGL);
+        format.setVersion(3, 3);
+        format.setProfile(QSurfaceFormat::CoreProfile);
+    }
+    auto context = std::make_unique<QOpenGLContext>();
+    context->setFormat(format);
+    if (!context->create()) {
+        log(OT_LOG_WARN, QStringLiteral("no OpenGL context for chart drawing"));
+        return false;
+    }
+    auto surface = std::make_unique<QOffscreenSurface>();
+    surface->setFormat(context->format());
+    surface->create();
+    if (!surface->isValid()) {
+        log(OT_LOG_WARN, QStringLiteral("no offscreen surface for chart drawing"));
+        return false;
+    }
+    g_gl = std::move(context);
+    g_gl_surface = std::move(surface);
+    return true;
+}
+#endif
+
+void release_gl() {
+#ifndef QT_NO_OPENGL
+    if (g_gl) g_gl->doneCurrent();
+    g_gl.reset();
+    g_gl_surface.reset();
+#endif
+}
+
+bool gl_make_current() {
+#ifndef QT_NO_OPENGL
+    if (!g_gl && !g_gl_failed) g_gl_failed = !make_gl();
+    return g_gl && g_gl->makeCurrent(g_gl_surface.get());
+#else
+    return false;
+#endif
+}
+
+void *gl_proc(const char *name) {
+#ifndef QT_NO_OPENGL
+    if (g_gl) return reinterpret_cast<void *>(g_gl->getProcAddress(name));
+#endif
+    (void)name;
+    return nullptr;
+}
+
 // ---- The function table ------------------------------------------------
 
 const char *toolkit() {
@@ -917,6 +986,7 @@ int32_t run(const OtHost *host, const OtStartup *startup, char *error, size_t er
     canvas.setFocus();
     const int r = app.exec();
     g_running.store(false);
+    release_gl();
     for (auto &t : g_timers) delete t.second.data();
     g_timers.clear();
     g_canvas = nullptr;
@@ -1045,9 +1115,27 @@ void run_dialog_c(uint64_t token, const char *initial, size_t n) { run_dialog(to
 
 void copy_text(const char *t, size_t n) { QGuiApplication::clipboard()->setText(text(t, n)); }
 
+// Qt up, no window: a process that only tries the context.
+int32_t gl_trial(int32_t (*body)(void *), void *ctx) {
+    if (qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY") && qEnvironmentVariableIsEmpty("DISPLAY") &&
+        qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
+        return 1;
+    }
+    static int argc = 1;
+    static char name[] = "open-task";
+    static char *argv[] = {name, nullptr};
+    QGuiApplication app(argc, argv);
+    const int32_t r = body(ctx);
+    release_gl();
+    return r;
+}
+
 uint32_t features() {
     // A widget's backing store keeps what was drawn, on X11 and Wayland both.
     uint32_t f = OT_FEATURE_PARTIAL_PAINT;
+#ifndef QT_NO_OPENGL
+    f |= OT_FEATURE_OFFSCREEN_GL;
+#endif
     // Qt::WindowStaysOnTopHint is an X11 hint; Wayland has no way to ask.
     if (QGuiApplication::platformName() == QLatin1String("xcb")) f |= OT_FEATURE_KEEP_ABOVE;
     return f;
@@ -1076,6 +1164,9 @@ const OtPlugin PLUGIN = {
     run_dialog_c,
     copy_text,
     features,
+    gl_make_current,
+    gl_proc,
+    gl_trial,
 };
 
 } // namespace
