@@ -22,8 +22,9 @@
 //! reading RGBA, which every driver does without converting, gives the image's BGRA.
 //!
 //! OpenGL 3.3 core or ES 3.0, so it runs on every Qt the plugin supports. Loading
-//! the driver costs memory and a moment, so [`ChartGl::start`] is only called for
-//! someone who may use this ([`crate::charts`]).
+//! a driver takes a hundred megabytes, so [`ChartGl::start`] is only called in the
+//! app for someone who picked this, and after a process of its own has tried
+//! it ([`crate::charts`]).
 //!
 //! [`abi::Raster`]: ot_shell_abi::Raster
 
@@ -288,6 +289,7 @@ pub struct GlLost(pub String);
 pub struct ChartGl {
     api: Api,
     access: GlAccess,
+    renderer: String,
     program: u32,
     size_at: i32,
     framebuffer: u32,
@@ -385,6 +387,7 @@ impl ChartGl {
             Ok(Self {
                 api,
                 access,
+                renderer: name,
                 program,
                 size_at,
                 framebuffer,
@@ -402,6 +405,12 @@ impl ChartGl {
                 flat: Vec::new(),
             })
         }
+    }
+
+    /// What the driver calls the GPU.
+    #[must_use]
+    pub fn renderer(&self) -> &str {
+        &self.renderer
     }
 
     /// Hand the shapes of every run this frame draws to the GPU, before any

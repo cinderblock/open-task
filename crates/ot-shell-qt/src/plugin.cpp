@@ -877,6 +877,14 @@ bool make_gl() {
 }
 #endif
 
+void release_gl() {
+#ifndef QT_NO_OPENGL
+    if (g_gl) g_gl->doneCurrent();
+    g_gl.reset();
+    g_gl_surface.reset();
+#endif
+}
+
 bool gl_make_current() {
 #ifndef QT_NO_OPENGL
     if (!g_gl && !g_gl_failed) g_gl_failed = !make_gl();
@@ -978,11 +986,7 @@ int32_t run(const OtHost *host, const OtStartup *startup, char *error, size_t er
     canvas.setFocus();
     const int r = app.exec();
     g_running.store(false);
-#ifndef QT_NO_OPENGL
-    if (g_gl) g_gl->doneCurrent();
-    g_gl.reset();
-    g_gl_surface.reset();
-#endif
+    release_gl();
     for (auto &t : g_timers) delete t.second.data();
     g_timers.clear();
     g_canvas = nullptr;
@@ -1111,6 +1115,21 @@ void run_dialog_c(uint64_t token, const char *initial, size_t n) { run_dialog(to
 
 void copy_text(const char *t, size_t n) { QGuiApplication::clipboard()->setText(text(t, n)); }
 
+// Qt up, no window: a process that only tries the context.
+int32_t gl_trial(int32_t (*body)(void *), void *ctx) {
+    if (qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY") && qEnvironmentVariableIsEmpty("DISPLAY") &&
+        qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
+        return 1;
+    }
+    static int argc = 1;
+    static char name[] = "open-task";
+    static char *argv[] = {name, nullptr};
+    QGuiApplication app(argc, argv);
+    const int32_t r = body(ctx);
+    release_gl();
+    return r;
+}
+
 uint32_t features() {
     // A widget's backing store keeps what was drawn, on X11 and Wayland both.
     uint32_t f = OT_FEATURE_PARTIAL_PAINT;
@@ -1147,6 +1166,7 @@ const OtPlugin PLUGIN = {
     features,
     gl_make_current,
     gl_proc,
+    gl_trial,
 };
 
 } // namespace

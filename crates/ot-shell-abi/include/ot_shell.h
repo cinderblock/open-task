@@ -412,6 +412,10 @@ typedef struct OtPlugin {
     bool (*gl_make_current)(void);
     /* The current context's function of this NUL-terminated name, or NULL. */
     void *(*gl_proc)(const char *name);
+    /* For a process of its own, in place of run(): bring the toolkit up with no
+     * window, so that gl_make_current works, call body(ctx), and return what it
+     * returns; nonzero if the toolkit cannot start. */
+    int32_t (*gl_trial)(int32_t (*body)(void *ctx), void *ctx);
 } OtPlugin;
 
 typedef const OtPlugin *(*OtShellPluginFn)(void);

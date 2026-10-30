@@ -368,6 +368,13 @@ unsafe extern "C" fn gl_proc(_: *const std::ffi::c_char) -> *const std::ffi::c_v
     std::ptr::null()
 }
 
+unsafe extern "C" fn gl_trial(
+    _: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+    _: *mut std::ffi::c_void,
+) -> i32 {
+    1
+}
+
 unsafe extern "C" fn features() -> u32 {
     // No keep-above: GTK 4 has no way to ask for it.
     abi::feature::ANIMATIONS
@@ -398,4 +405,5 @@ pub static PLUGIN: abi::Plugin = abi::Plugin {
     features,
     gl_make_current,
     gl_proc,
+    gl_trial,
 };

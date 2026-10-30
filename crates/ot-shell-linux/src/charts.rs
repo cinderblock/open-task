@@ -12,9 +12,19 @@
 //!
 //! The GPU is offered only once it has been tried: a context, a renderer that is
 //! not software, the shaders, and a test drawing that matches the rasterizer's
-//! ([`Charts::start_gl`]). That loads the graphics driver, so it waits until
-//! someone may use it. If it fails, then or later, the frame is drawn on the CPU and
-//! the choice goes from the Settings page.
+//! ([`prove`]). The trial is a process of its own ([`TRIAL_ARG`]), started when the
+//! Settings page opens or a saved choice asks for the GPU. Loading a graphics driver
+//! takes about 100 MB, on top of the 40 the whole app uses, which nobody should pay
+//! for opening Settings; and a driver that crashes or hangs takes only the trial
+//! with it, which matters in a task manager and for a choice saved across runs. The
+//! app loads the driver itself only for someone who has picked the GPU
+//! ([`ChartGl::start`]). If it fails then, or later, the frame is drawn on the CPU
+//! and the choice goes from the Settings page.
+
+use std::io::Read as _;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use ot_paint::chart_shapes::Shapes;
 use ot_paint::{
@@ -46,12 +56,23 @@ const TOLERANCE: u8 = 8;
 /// `OT_CHARTS_CHECK`: compare the GPU's images with the rasterizer's this often.
 const CHECK_EVERY: u32 = 240;
 
+/// The argument that makes this program the trial, and nothing else.
+pub const TRIAL_ARG: &str = "--try-gl";
+
+/// How long a trial may take. Generous: the first context through WSL's D3D12
+/// layer takes 15 s, and a shader cache can be cold. Past this the driver has hung.
+const TRIAL_LIMIT: Duration = Duration::from_secs(40);
+
 /// Where the GPU stands.
 #[derive(Debug, Default)]
 enum Gpu {
-    /// The plugin has no context to give, or none has been tried yet.
+    /// The plugin has no context to give, or nobody has wanted one yet.
     #[default]
     Untried,
+    /// A trial is running: its result comes here.
+    Trying(Receiver<Result<String, String>>),
+    /// The trial passed; the app has not loaded the driver.
+    Proved,
     Running(Box<ChartGl>),
     /// Tried, and it will not do, for the rest of the run.
     Refused,
@@ -110,70 +131,82 @@ impl Charts {
         self.access = Some(access);
     }
 
-    /// Whether it is time for [`Charts::start_gl`]: not tried yet, and either
-    /// `saved` or `OT_CHARTS` asks for the GPU or the choice is about to be shown
-    /// (`offering`).
+    /// Whether it is time for a trial: the plugin has a context to give, none has
+    /// been tried, and either `saved` or `OT_CHARTS` asks for the GPU or the choice
+    /// is about to be shown (`offering`).
     #[must_use]
-    pub fn wants_gl(&self, saved: ChartDrawing, offering: bool) -> bool {
+    pub fn wants_trial(&self, saved: ChartDrawing, offering: bool) -> bool {
         self.access.is_some()
             && matches!(self.gpu, Gpu::Untried)
             && (offering || self.forced.unwrap_or(saved) == ChartDrawing::Gpu)
     }
 
-    /// Try the GPU. `OT_CHARTS=gpu` also takes a software renderer, for testing.
-    pub fn start_gl(&mut self) {
-        let Some(access) = self.access else {
-            return;
-        };
-        let software = self.forced == Some(ChartDrawing::Gpu);
-        // SAFETY: the plugin's functions, on its UI thread, where this runs.
-        let started = unsafe { ChartGl::start(access, software) }
-            .and_then(|gl| self.proved(gl).map(Box::new));
-        self.gpu = match started {
-            Ok(gl) => Gpu::Running(gl),
-            Err(why) => {
-                tracing::warn!(%why, "no GPU chart drawing; drawing charts on the CPU");
+    /// Start the trial, in the background. `wake` is called, from another thread,
+    /// when its result is in for [`Charts::trial_result`].
+    pub fn start_trial(&mut self, wake: unsafe extern "C" fn()) {
+        let (send, receive) = mpsc::channel();
+        let waiter = std::thread::Builder::new()
+            .name("ot-gl-trial".to_owned())
+            .spawn(move || {
+                let _ = send.send(run_trial());
+                // SAFETY: the plugin's wake, which any thread may call.
+                unsafe { wake() };
+            });
+        self.gpu = match waiter {
+            Ok(_) => Gpu::Trying(receive),
+            Err(e) => {
+                tracing::warn!(error = %e, "no GPU chart drawing: no thread for the trial");
                 Gpu::Refused
             }
         };
     }
 
-    /// `gl`, once it has drawn a test image close to the rasterizer's.
-    fn proved(&mut self, mut gl: ChartGl) -> Result<ChartGl, String> {
-        let p = Point::new;
-        let mut dl = DisplayList::new();
-        let color = Color::hex(0x39_87_E5).with_alpha(0.9);
-        dl.band(
-            [p(0.0, 20.0), p(64.0, 4.0)],
-            [p(0.0, 30.0), p(64.0, 30.0)],
-            color,
-        );
-        dl.graph(
-            [p(0.0, 18.0), p(30.0, 26.0), p(64.0, 2.0)],
-            Color::WHITE,
-            1.5,
-        );
-        let mut runs = Vec::new();
-        find_runs(&dl, 1.0, (64, 32), &mut runs);
-        let run = runs.first().ok_or("no test drawing")?;
-        let mut shapes = Shapes::default();
-        let range = shapes.add_run(&dl, run, 1.0);
-        let mut image = Vec::new();
-        gl.upload(&shapes)
-            .and_then(|()| gl.draw(range, run.px.w, run.px.h, &mut image))
-            .map_err(|e| e.0)?;
-        let mut raster = ChartRaster::new();
-        raster.draw_run(&dl, run, 1.0, &mut self.scratch);
-        match worst_difference(raster.pixels(), &image) {
-            d if d <= TOLERANCE => Ok(gl),
-            d => Err(format!("its test drawing is {d}/255 off the rasterizer's")),
+    /// Take the trial's result if it has come. True when that changed what is on
+    /// offer.
+    pub fn trial_result(&mut self) -> bool {
+        let Gpu::Trying(result) = &self.gpu else {
+            return false;
+        };
+        match result.try_recv() {
+            Ok(Ok(renderer)) => {
+                tracing::info!(%renderer, "the GPU can draw charts");
+                self.gpu = Gpu::Proved;
+                true
+            }
+            Ok(Err(why)) => {
+                tracing::warn!(%why, "no GPU chart drawing");
+                self.gpu = Gpu::Refused;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.gpu = Gpu::Refused;
+                true
+            }
         }
+    }
+
+    /// Load the driver in this process, for someone who has picked the GPU.
+    fn start_gl(&mut self) {
+        let Some(access) = self.access else {
+            self.gpu = Gpu::Refused;
+            return;
+        };
+        // SAFETY: the plugin's functions, on its UI thread, where this runs. The
+        // trial has said what is good enough, so nothing is refused here for it.
+        self.gpu = match unsafe { ChartGl::start(access, true) } {
+            Ok(gl) => Gpu::Running(Box::new(gl)),
+            Err(why) => {
+                tracing::warn!(%why, "GPU chart drawing did not start; drawing charts on the CPU");
+                Gpu::Refused
+            }
+        };
     }
 
     /// The ways of drawing charts on offer now.
     #[must_use]
     pub fn offered(&self) -> &'static [ChartDrawing] {
-        if matches!(self.gpu, Gpu::Running(_)) {
+        if matches!(self.gpu, Gpu::Proved | Gpu::Running(_)) {
             OFFERED_WITH_GPU
         } else {
             OFFERED
@@ -215,6 +248,9 @@ impl Charts {
         if self.rasters.len() < count {
             self.rasters.resize_with(count, ChartRaster::new);
             self.images.resize_with(count, GpuImage::default);
+        }
+        if mode == ChartDrawing::Gpu && matches!(self.gpu, Gpu::Proved) {
+            self.start_gl();
         }
         let gpu = mode == ChartDrawing::Gpu && matches!(self.gpu, Gpu::Running(_));
         self.shapes.clear();
@@ -301,6 +337,86 @@ impl Charts {
                 );
             }
         }
+    }
+}
+
+/// Run the trial: this program again, as [`TRIAL_ARG`]. What it printed, as the
+/// renderer's name or why not.
+fn run_trial() -> Result<String, String> {
+    // Not the path it was started from, which an update may have replaced.
+    let mut child = Command::new("/proc/self/exe")
+        .arg(TRIAL_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("the trial did not start: {e}"))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > TRIAL_LIMIT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("the driver did not answer in {TRIAL_LIMIT:?}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(format!("the trial was lost: {e}")),
+        }
+    };
+    let mut said = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut said);
+    }
+    let said = said.trim().to_owned();
+    match status.code() {
+        Some(0) => Ok(said),
+        Some(_) if !said.is_empty() => Err(said),
+        _ => Err(format!("the trial failed: {status}")),
+    }
+}
+
+/// The trial's work, in its own process, with the plugin's context at hand: start
+/// the renderer, as this run's settings allow (`OT_CHARTS=gpu` also takes a software
+/// renderer, for testing), and have it draw a test image close to the rasterizer's.
+/// The renderer's name, or why not.
+///
+/// # Errors
+/// Why the GPU will not do, in words.
+///
+/// # Safety
+/// `access` must be the plugin's, called on its UI thread.
+pub unsafe fn prove(access: GlAccess) -> Result<String, String> {
+    let software = Charts::from_env().forced == Some(ChartDrawing::Gpu);
+    // SAFETY: the caller's promise.
+    let mut gl = unsafe { ChartGl::start(access, software) }?;
+    let p = Point::new;
+    let mut dl = DisplayList::new();
+    let color = Color::hex(0x39_87_E5).with_alpha(0.9);
+    dl.band(
+        [p(0.0, 20.0), p(64.0, 4.0)],
+        [p(0.0, 30.0), p(64.0, 30.0)],
+        color,
+    );
+    dl.graph(
+        [p(0.0, 18.0), p(30.0, 26.0), p(64.0, 2.0)],
+        Color::WHITE,
+        1.5,
+    );
+    let mut runs = Vec::new();
+    find_runs(&dl, 1.0, (64, 32), &mut runs);
+    let run = runs.first().ok_or("no test drawing")?;
+    let mut shapes = Shapes::default();
+    let range = shapes.add_run(&dl, run, 1.0);
+    let mut image = Vec::new();
+    gl.upload(&shapes)
+        .and_then(|()| gl.draw(range, run.px.w, run.px.h, &mut image))
+        .map_err(|e| e.0)?;
+    let mut raster = ChartRaster::new();
+    raster.draw_run(&dl, run, 1.0, &mut RunScratch::default());
+    match worst_difference(raster.pixels(), &image) {
+        d if d <= TOLERANCE => Ok(gl.renderer().to_owned()),
+        d => Err(format!("its test drawing is {d}/255 off the rasterizer's")),
     }
 }
 
@@ -427,45 +543,81 @@ mod tests {
     fn the_gpu_is_tried_only_for_someone_who_may_use_it() {
         let mut charts = Charts::default();
         assert!(
-            !charts.wants_gl(ChartDrawing::Gpu, true),
+            !charts.wants_trial(ChartDrawing::Gpu, true),
             "the plugin has no context to give"
         );
         charts.connect(NO_GL);
-        assert!(!charts.wants_gl(ChartDrawing::Cpu, false), "the CPU's user");
         assert!(
-            charts.wants_gl(ChartDrawing::Cpu, true),
+            !charts.wants_trial(ChartDrawing::Cpu, false),
+            "the CPU's user"
+        );
+        assert!(
+            charts.wants_trial(ChartDrawing::Cpu, true),
             "Settings is opening"
         );
         assert!(
-            charts.wants_gl(ChartDrawing::Gpu, false),
+            charts.wants_trial(ChartDrawing::Gpu, false),
             "the saved choice"
         );
         let forced = Charts {
             forced: Some(ChartDrawing::Gpu),
             ..Charts::default()
         };
-        assert!(!forced.wants_gl(ChartDrawing::Cpu, false), "no plugin yet");
+        assert!(
+            !forced.wants_trial(ChartDrawing::Cpu, false),
+            "no plugin yet"
+        );
         let mut forced = forced;
         forced.connect(NO_GL);
-        assert!(forced.wants_gl(ChartDrawing::Cpu, false), "OT_CHARTS");
+        assert!(forced.wants_trial(ChartDrawing::Cpu, false), "OT_CHARTS");
+    }
+
+    /// A trial that has finished with `result`.
+    fn after_trial(result: Result<String, String>) -> Charts {
+        let (send, receive) = mpsc::channel();
+        send.send(result).expect("the receiver is here");
+        let mut charts = Charts {
+            gpu: Gpu::Trying(receive),
+            ..Charts::default()
+        };
+        charts.connect(NO_GL);
+        assert_eq!(charts.offered(), OFFERED, "not while it runs");
+        assert!(charts.trial_result(), "what is on offer may change");
+        assert!(!charts.trial_result(), "once");
+        charts
     }
 
     #[test]
-    fn with_no_context_the_gpu_is_not_offered_or_tried_again() {
-        let mut charts = Charts::default();
-        charts.connect(NO_GL);
-        assert_eq!(charts.offered(), OFFERED);
-        charts.start_gl();
-        assert_eq!(charts.offered(), OFFERED);
-        assert!(!charts.wants_gl(ChartDrawing::Gpu, true));
-        // Asked for anyway, the CPU draws.
+    fn a_passed_trial_offers_the_gpu_and_a_failed_one_does_not() {
+        assert_eq!(
+            after_trial(Ok("A GPU".to_owned())).offered(),
+            OFFERED_WITH_GPU
+        );
+        let refused = after_trial(Err("no".to_owned()));
+        assert_eq!(refused.offered(), OFFERED);
+        assert!(!refused.wants_trial(ChartDrawing::Gpu, true), "not again");
+    }
+
+    #[test]
+    fn the_driver_loads_only_when_the_gpu_is_drawn_with_and_failing_there_is_the_cpu() {
+        let mut charts = after_trial(Ok("A GPU".to_owned()));
         let dl = frame();
+        let size = Size::new(400.0, 300.0);
+        charts.prepare(&dl, ChartDrawing::Cpu, 1.0, size, None);
+        assert!(
+            matches!(charts.gpu, Gpu::Proved),
+            "the CPU's user pays nothing"
+        );
+
+        // The context that passed the trial is not there for the app: the frame
+        // still comes, on the CPU, and the choice goes.
         let out = charts
-            .prepare(&dl, ChartDrawing::Gpu, 1.0, Size::new(400.0, 300.0), None)
+            .prepare(&dl, ChartDrawing::Gpu, 1.0, size, None)
             .to_vec();
         assert_eq!(out.len(), 2);
         assert!(!out[0].pixels.is_null());
         assert!(charts.images.iter().all(|i| !i.current));
+        assert_eq!(charts.offered(), OFFERED);
     }
 
     #[test]

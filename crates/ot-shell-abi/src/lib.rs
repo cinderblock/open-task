@@ -310,6 +310,10 @@ pub struct Plugin {
     pub features: unsafe extern "C" fn() -> u32,
     pub gl_make_current: unsafe extern "C" fn() -> bool,
     pub gl_proc: unsafe extern "C" fn(name: *const c_char) -> *const c_void,
+    pub gl_trial: unsafe extern "C" fn(
+        body: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
+        ctx: *mut c_void,
+    ) -> i32,
 }
 
 // The header asserts the same numbers; a change on one side alone fails to build.
@@ -389,6 +393,7 @@ mod tests {
         );
         check("offsetof(OtPlugin, features)", offset_of!(Plugin, features));
         check("offsetof(OtPlugin, gl_proc)", offset_of!(Plugin, gl_proc));
+        check("offsetof(OtPlugin, gl_trial)", offset_of!(Plugin, gl_trial));
         check("sizeof(OtTextCmd)", size_of::<TextCmd>());
         check("offsetof(OtTextCmd, style)", offset_of!(TextCmd, style));
         check("offsetof(OtTextCmd, halign)", offset_of!(TextCmd, halign));

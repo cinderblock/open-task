@@ -124,8 +124,11 @@ under GTK, **QPainter** under Qt. Under Qt, once a graphics card's OpenGL driver
 shown it can draw them, **GPU** is on offer too: OpenGL shaders draw the big charts
 and read the result back as an image for Qt to show, while small ones, which would
 not repay the trip, stay on the CPU. It trades CPU time for work on the graphics
-card, so it stays off until picked. Without a usable driver, or on a software one
-such as llvmpipe, the choice is not shown, and a saved GPU draws on the CPU.
+card and takes about 100 MB more memory, the graphics driver's, so it stays off
+until picked. A short-lived process tries the driver first, when Settings opens or
+a saved choice asks for it, so a driver that crashes or hangs cannot take the app
+with it. Without a usable driver, or on a software one such as llvmpipe, the choice
+is not shown, and a saved GPU draws on the CPU.
 The first sample is on screen a quarter of a second after start, drawn across the
 interval it measured. Recent history is drawn sample by sample. Older stretches are summarized, with a faint band from the lowest to the
 highest value, so a short spike stays visible after it has been averaged. Point

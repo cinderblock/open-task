@@ -9,6 +9,8 @@
 # 3. With a display (a private Xvfb), each toolkit opens the window, the window
 #    takes a click (the Tree tab) and is still running after it, and a
 #    screenshot of each is left in the screenshot directory.
+# 4. Qt with charts forced onto the GPU draws too: on OpenGL in software where
+#    there is some, or falling back to the CPU where there is none.
 #
 # Needs Xvfb, xdotool and ImageMagick (scripts/linux-deps.sh --test).
 set -euo pipefail
@@ -78,4 +80,21 @@ for toolkit in gtk qt; do
     kill "$app"
     wait "$app" 2> /dev/null || true
 done
+
+echo "== qt window, charts on the GPU"
+log="$shots/qt-gpu.log"
+DISPLAY="$display" QT_QPA_PLATFORM=xcb OT_CHARTS=gpu \
+    "$bin" --toolkit qt --view history > "$log" 2>&1 &
+app=$!
+sleep 8
+kill -0 "$app" 2> /dev/null || { cat "$log"; fail "qt: exited with charts on the GPU"; }
+# It says which: this is the line that shows what the OpenGL path did here.
+sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E 'chart drawing: OpenGL|no GPU chart drawing' || true
+shot="$shots/qt-gpu.png"
+import -display "$display" -window root "$shot"
+spread="$(convert "$shot" -crop 1180x760+0+0 -colorspace Gray -format '%[fx:standard_deviation]' info:)"
+echo "screenshot $shot (grey spread $spread)"
+awk -v s="$spread" 'BEGIN { exit !(s > 0.02) }' || fail "qt: blank with charts on the GPU"
+kill "$app"
+wait "$app" 2> /dev/null || true
 echo "OK"

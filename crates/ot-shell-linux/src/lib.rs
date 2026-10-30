@@ -53,6 +53,16 @@ pub enum RunError {
     Spent,
 }
 
+/// [`charts::TRIAL_ARG`]: be the GPU's trial, a process with nothing else to do,
+/// and print what came of it. The exit status for the process.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn gl_trial(embedded: &[Embedded]) -> i32 {
+    // SAFETY: a plain request: not to outlive the app if it goes first.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+    host::gl_trial(embedded)
+}
+
 /// Whether this session can show a window: a Wayland or X11 display to open
 /// it on.
 #[must_use]
