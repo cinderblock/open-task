@@ -22,6 +22,7 @@
 
 pub mod chart_raster;
 pub mod chart_runs;
+pub mod chart_shapes;
 pub mod color;
 pub mod damage;
 pub mod display;
