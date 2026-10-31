@@ -215,8 +215,14 @@ a native driver does not have, and the native control is D3D11 on an iGPU. So:
 4. Built: `af34120` (shapes moved), `e59ebc5` (the feature), `644e23f` (the trial
    process). (done)
 5. Merged: PR #1, `8b00ceb`, 2026-10-30 4:31 PM PDT (23:31Z), user's yes, all six CI
-   jobs green. Not released: `v0.19.0` is the latest and does not have this.
-6. **Current: wait for the user's machine.** See the open question.
+   jobs green.
+6. Released: `v0.20.0` by tag (`5687b7b`), user's yes, published 2026-10-30 4:58 PM
+   PDT (23:58Z): all 8 release jobs green, 11 assets. The published x86_64 tarball:
+   checksum matches, `SHA256SUMS.minisig` verifies against `minisign.pub`, it passes
+   `linux-gui-smoke.sh` with GTK, Qt, and Qt on the GPU, and on a hidden display
+   draws with `D3D12` at parity 3/255. Only that one of the 9 archives was run.
+7. **Current: wait for the user's machine.** Linux has no self-update yet, so they
+   take the release's AppImage or tarball by hand. See the open question.
 
 ### The design as built
 
@@ -268,7 +274,7 @@ is certain.
 
 ## Open questions for the user
 
-1. On the Radeon, with a build of `master`: `OT_CHARTS=cpu OT_FRAME_STATS=1 open-task
+1. On the Radeon, with `v0.20.0`: `OT_CHARTS=cpu OT_FRAME_STATS=1 open-task
    --view history` and then `OT_CHARTS=gpu OT_FRAME_STATS=1 OT_CHARTS_CHECK=1 ...`,
    each past 5 minutes, watching `top` and `/sys/class/drm/card*/device/gpu_busy_percent`.
    That is the only number that can change the default.
