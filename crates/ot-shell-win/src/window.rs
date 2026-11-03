@@ -38,9 +38,9 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
-    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE,
+    TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -579,6 +579,13 @@ fn seen(hwnd: HWND) -> bool {
     }
 }
 
+/// Whether a modal dialog this window owns is up: it disables the window while
+/// it runs.
+fn under_modal(hwnd: HWND) -> bool {
+    // SAFETY: plain query of a valid window.
+    !unsafe { IsWindowEnabled(hwnd) }.as_bool()
+}
+
 fn repaint(st: &mut State) {
     // Minimized, hidden in the tray or on another virtual desktop: nothing to
     // draw for. Each snapshot still asks for a frame; the first after the window
@@ -639,8 +646,14 @@ fn repaint(st: &mut State) {
     // minimized, hidden in the tray, or on another virtual desktop (cloaked);
     // showing it again paints it. Should `Present` stop waiting anyway, a timer
     // paces the frames rather than letting them spin.
+    //
+    // The timer paces them too while a modal dialog is up (it disables this
+    // window). The dialog manager shows a dialog only once its loop finds the
+    // queue empty, and a window invalidated again as each frame ends always has
+    // a `WM_PAINT` waiting: in the History, which never stops moving, the
+    // confirmation for Delete stayed hidden and the window stayed disabled.
     if seen(st.hwnd) && st.shell.app().animating() {
-        if too_soon {
+        if too_soon || under_modal(st.hwnd) {
             // SAFETY: hwnd is valid; the timer is ours.
             unsafe {
                 SetTimer(Some(st.hwnd), TIMER_FRAME, FRAME_MS, None);
