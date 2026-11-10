@@ -1629,8 +1629,13 @@ impl UsageChart {
         if !self.plot.contains(p) || self.over_legend(p) || self.scale <= 0.0 {
             return None;
         }
-        // Between the two columns around the pointer, as the bands are drawn.
-        let newer = self.points.iter().rposition(|q| q.x >= p.x)?;
+        if self.points.is_empty() {
+            return None;
+        }
+        // Between the two columns around the pointer, as the bands are drawn. Right
+        // of the newest, on a running clock, the bands hold its values out to the
+        // edge: that stretch is the newest column's.
+        let newer = self.points.iter().rposition(|q| q.x >= p.x).unwrap_or(0);
         let near = &self.points[newer];
         let older = self.points.get(newer + 1);
         // Left of the oldest column there is nothing drawn.
@@ -1638,7 +1643,7 @@ impl UsageChart {
             return None;
         }
         let toward_older = match older {
-            Some(far) if near.x > far.x => (near.x - p.x) / (near.x - far.x),
+            Some(far) if near.x > far.x => ((near.x - p.x) / (near.x - far.x)).max(0.0),
             _ => 0.0,
         };
         let far = older.unwrap_or(near);
@@ -2534,6 +2539,30 @@ mod tests {
         assert_eq!(moved.len(), 1, "{moved:?}");
         assert_eq!(c.slots[moved[0]], u.program("p9.exe"));
         assert_eq!(before[moved[0]], u.program("p7.exe"));
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)] // two programs, a chart, a point
+    fn the_hold_past_the_newest_column_is_the_newest_columns() {
+        // On a running clock 800 ms past the newest sample, the newest column has
+        // slid left of the edge and the bands hold its values out to it.
+        let u = session(&["a.exe", "b.exe"], 60, |i, _| if i == 0 { 3 } else { 1 });
+        let mut c = UsageChart::default();
+        let time = TimeAxis {
+            now_ms: Some(u.now_ms() + 800),
+            ..TimeAxis::DEFAULT
+        };
+        c.build(RECT, &u, None, time);
+        let a = band(&c, &u, "a.exe");
+        let newest = c.points[0];
+        assert!(newest.x < c.plot.right() - 2.0, "{newest:?}");
+        // Between the newest column and the edge, a third of the way up a's band.
+        let x = f32::midpoint(newest.x, c.plot.right());
+        let y = c.y(below(&c, &newest, a) + newest.v[a] / 3.0);
+        let _ = c.set_pointer(Some(Point::new(x, y)));
+        c.build(RECT, &u, None, time);
+        assert_eq!(c.hover_band, Some(a));
+        assert_eq!(c.hover_age(), Some(newest.age_ms));
     }
 
     #[test]
