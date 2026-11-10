@@ -103,16 +103,63 @@ impl TimeAxis {
         (self.now_ms.unwrap_or(newest_ms) - at_ms) as f32
     }
 
-    /// Labeled ages, newest first. Those older than the span are skipped.
-    pub const TICKS: [(f32, &'static str); 7] = [
+    /// Labeled ages, newest first. Those older than the span are skipped, and on a
+    /// chart too narrow for them all, the least important ([`Self::TICK_ORDER`])
+    /// give way ([`Self::ticks`]).
+    pub const TICKS: [(f32, &'static str); 11] = [
         (0.0, "now"),
+        (1_000.0, "1s"),
+        (5_000.0, "5s"),
         (10_000.0, "10s"),
+        (20_000.0, "20s"),
         (60_000.0, "1m"),
+        (120_000.0, "2m"),
         (600_000.0, "10m"),
         (3_600_000.0, "1h"),
         (21_600_000.0, "6h"),
         (86_400_000.0, "1d"),
     ];
+
+    /// [`Self::TICKS`] by importance: the decades first, then the marks between.
+    const TICK_ORDER: [usize; 11] = [0, 3, 5, 7, 8, 9, 10, 6, 4, 2, 1];
+
+    /// Which of [`Self::TICKS`] a plot `width` wide marks, as a bit per tick: those
+    /// within the span whose labels fit without crowding the more important ones.
+    /// The grid and the labels both follow it, so every line has its label.
+    #[must_use]
+    pub fn ticks(self, width: f32) -> u16 {
+        let rect = Rect::new(0.0, 0.0, width, 0.0);
+        let mut shown = 0u16;
+        // The labels placed so far, left and right.
+        let mut taken = [(0.0f32, 0.0f32); Self::TICKS.len()];
+        let mut n = 0;
+        for i in Self::TICK_ORDER {
+            let (age, label) = Self::TICKS[i];
+            if age > self.span_ms {
+                continue;
+            }
+            let (left, w) = label_box(rect, self.x(rect, age), tick_label_w(label));
+            let clear = taken[..n]
+                .iter()
+                .all(|&(l, r)| left + w + TICK_GAP <= l || r + TICK_GAP <= left);
+            if clear {
+                taken[n] = (left, left + w);
+                n += 1;
+                shown |= 1 << i;
+            }
+        }
+        shown
+    }
+
+    /// The marked ticks of [`Self::ticks`], newest first.
+    pub fn marked(self, width: f32) -> impl Iterator<Item = (f32, &'static str)> {
+        let shown = self.ticks(width);
+        Self::TICKS
+            .into_iter()
+            .enumerate()
+            .filter(move |&(i, _)| shown & (1 << i) != 0)
+            .map(|(_, t)| t)
+    }
 
     fn scale(self) -> f32 {
         (self.span_ms / self.tau_ms).ln_1p()
@@ -374,7 +421,7 @@ impl Plot {
                 1.0,
             );
         }
-        for (age, _) in TimeAxis::TICKS {
+        for (age, _) in axis.marked(rect.w) {
             if age > 0.0 && age < axis.span_ms {
                 dl.fill_rect(hairline(axis.x(rect, age), rect), style.grid);
             }
@@ -695,18 +742,16 @@ pub fn paint_axis(
     style: TextStyle,
     color: Color,
 ) {
-    for (age, label) in TimeAxis::TICKS {
-        if age <= axis.span_ms {
-            label_at(
-                dl,
-                band,
-                axis.x(plot, age),
-                TICK_LABEL_W,
-                label,
-                style,
-                color,
-            );
-        }
+    for (age, label) in axis.marked(plot.w) {
+        label_at(
+            dl,
+            band,
+            axis.x(plot, age),
+            TICK_LABEL_W,
+            label,
+            style,
+            color,
+        );
     }
 }
 
@@ -767,8 +812,31 @@ pub fn paint_readout(
 }
 
 const TICK_LABEL_W: f32 = 40.0;
+/// About how wide a character of a tick label is in the small UI font (11 DIP,
+/// tabular digits), generously: the text is measured by the backends, not here.
+const TICK_CHAR_W: f32 = 6.6;
+/// The least space between two tick labels.
+const TICK_GAP: f32 = 8.0;
 /// Space between the crosshair and its readout.
 const READOUT_GAP: f32 = 5.0;
+
+/// About how wide a tick label's text is.
+fn tick_label_w(text: &str) -> f32 {
+    text.chars().count() as f32 * TICK_CHAR_W
+}
+
+/// Where text `w` wide lands for [`label_at`] at `x` in `band`: its left and width.
+fn label_box(band: Rect, x: f32, w: f32) -> (f32, f32) {
+    let w = w.min(band.w);
+    let left = if x - TICK_LABEL_W.min(band.w) * 0.5 < band.x {
+        band.x
+    } else if x + TICK_LABEL_W.min(band.w) * 0.5 > band.right() {
+        band.right() - w
+    } else {
+        x - w * 0.5
+    };
+    (left, w)
+}
 
 /// Text centered on `x` in a box `w` wide, or pushed against an edge of `band` (and
 /// aligned to it) where centering would spill out.
@@ -1189,13 +1257,36 @@ mod tests {
             })
             .collect();
         let names: Vec<&str> = texts.iter().map(|t| t.0.as_str()).collect();
-        assert_eq!(names, ["now", "10s", "1m", "10m", "1h"]);
+        assert_eq!(names, ["now", "10s", "1m", "2m", "10m", "1h"]);
         for (_, r, _) in &texts {
             assert!(r.x >= band.x && r.right() <= band.right() + 1e-3, "{r:?}");
         }
         assert_eq!(texts[0].2, HAlign::Right, "now hugs the right edge");
-        assert_eq!(texts[4].2, HAlign::Left, "1h hugs the left edge");
+        assert_eq!(texts[5].2, HAlign::Left, "1h hugs the left edge");
         assert_eq!(texts[2].2, HAlign::Center);
+    }
+
+    #[test]
+    fn a_wide_chart_marks_every_tick_and_a_narrow_one_the_decades() {
+        let names = |w: f32| -> Vec<&str> { AXIS.marked(w).map(|(_, l)| l).collect() };
+        assert_eq!(
+            names(1600.0),
+            ["now", "1s", "5s", "10s", "20s", "1m", "2m", "10m", "1h"]
+        );
+        assert_eq!(names(120.0), ["now", "1m", "10m", "1h"]);
+        // Whatever the width, no two labels crowd each other.
+        for width in [60.0, 120.0, 300.0, 700.0, 1000.0, 1600.0] {
+            let rect = Rect::new(0.0, 0.0, width, 0.0);
+            let mut boxes: Vec<(f32, f32)> = AXIS
+                .marked(width)
+                .map(|(age, label)| label_box(rect, AXIS.x(rect, age), tick_label_w(label)))
+                .collect();
+            boxes.sort_by(|one, other| one.0.total_cmp(&other.0));
+            for pair in boxes.windows(2) {
+                let ((left, w), (next, _)) = (pair[0], pair[1]);
+                assert!(left + w + TICK_GAP <= next + 1e-3, "{width}: {boxes:?}");
+            }
+        }
     }
 
     #[test]

@@ -1934,7 +1934,7 @@ impl UsageChart {
             let y = plot.bottom() - plot.h * (q as f32 / 4.0);
             dl.fill_rect(Rect::new(plot.x, y.floor(), plot.w, 1.0), theme.grid);
         }
-        for (age, _) in TimeAxis::TICKS {
+        for (age, _) in self.time.marked(plot.w) {
             if age > 0.0 && age < self.time.span_ms {
                 let x = self.time.x(plot, age).floor();
                 dl.fill_rect(Rect::new(x, plot.y, 1.0, plot.h), theme.grid);

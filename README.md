@@ -85,7 +85,8 @@ The list scrolls when there are more devices than fit. Every graph on the page, 
 small ones in the list included, shares one hover line.
 
 **Charts:** the CPU and memory graphs share a log-scale time axis, labeled
-`1h 10m 1m 10s now` underneath. The present is on the right edge and the oldest
+`1h 10m 2m 1m 20s 10s 5s 1s now` underneath (a narrow chart keeps the
+decades and drops the marks between). The present is on the right edge and the oldest
 sample held is on the left, so a chart fills its width from a session's first
 second and the axis grows with the history until it reaches the length set on the
 Settings page: **How far charts reach back**, five minutes to a day, five minutes
