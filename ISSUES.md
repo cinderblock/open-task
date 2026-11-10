@@ -2,6 +2,16 @@
 
 Problems noticed while working on something else, left for a thread of their own.
 
+## Windows: our own listening TCP socket reads as state `Unknown`
+
+Seen 2026-11-10 at `e519a9b` on Windows 11 build 26300: `cargo test -p ot-probe --lib
+our_own_sockets` fails every run at `crates/ot-probe/src/imp/windows/connections.rs:384`
+(`left: Unknown, right: Listen`). The socket is found with the right pid; only its
+state is wrong.
+
+Matters because the Network page would show listening ports without their state,
+and `cargo test --workspace` is red until it is fixed.
+
 ## Linux: a chart's image is drawn whole when only part of it changed
 
 Seen 2026-10-30 (`plans/qt-gpu-charts.md`). Once History has run a few minutes,
