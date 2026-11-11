@@ -1,6 +1,7 @@
 # History handoff across an update restart
 
-> **Status:** done, verified end to end; not pushed or released · **Started:** 2026-11-10 · **Branch:** `master` (shared
+> **Status:** done (update path verified end to end; the administrator
+> restart only unit tested); not pushed or released · **Started:** 2026-11-10 · **Branch:** `master` (shared
 > working tree; only this thread's files are staged)
 
 ## Goal
@@ -180,15 +181,28 @@ and the per-user install; the user's Program Files instance was not touched.
 Not exercised end to end: a refused handoff (unit tested), the all-users path
 (same code; the handoff folder is per user either way).
 
+## Follow-ups the user approved
+
+User, 2026-11-10: "Yes. ... wherever is reasonable. History imported is probably
+not that important". Read as yes to both, the second kept low-key (`2395905`):
+
+1. **Run as administrator** hands the history on too. Empyrean's order: the new
+   copy starts while the old one runs. `relaunch_elevated` passes
+   `--handoff-from <pid>`; the old one writes as it closes
+   (`Shell::hand_off_to_restart`); the new one waits up to 3 s
+   (`handoff::TAKEOVER_WAIT`, `handoff::wait_for`) before taking it. Windows only
+   (the Linux relaunch runs as root, whose state folder is another).
+   **Not run end to end:** this session is elevated, so the test app is elevated
+   and Settings does not offer the card; the parts are unit tested
+   (`a_copy_taking_over_waits_for_the_history_but_not_forever`).
+2. **Settings → Updates card** note: "The charts carried on from vX." after an
+   update (not after a same-version restart), or "The charts started empty: why."
+   when a waiting handoff was refused. Shown in the card's note line, which a
+   copy that cannot update itself still uses for that instead.
+
 ## Open questions for the user
 
-1. "Run as administrator" is also a restart that loses the history today. The same
-   handoff would work there (the old instance writes before launching the elevated
-   copy). Out of scope for now; recommendation: a follow-up, since it is small once
-   this lands.
-2. Should the Settings page's Updates card say "History carried over from vX" (or
-   why not) after an update? Recommendation: yes, small; left out for now since the
-   ask was for a log.
+None open.
 
 - The rail's update button is at x = 20 DIP, `gap + 1.5 * ITEM_H` = 68 DIP above
   the client area's bottom (`nav.rs` test); the e2e clicks there with posted

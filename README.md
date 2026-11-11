@@ -411,7 +411,8 @@ open-task run as administrator. From an elevated terminal, `open-task
 switch. Uninstalling always puts Task Manager back if it was starting that copy.
 
 **Run as administrator** (the Settings page, under **Windows**) starts a copy with
-administrator rights and closes this one. That copy reads every process's command
+administrator rights and closes this one, handing it the charts' history the way an
+update does (see [Updates](#updates)). That copy reads every process's command
 line and user, samples CPU, starts and stops services, and reads service tags.
 
 **Window:** **Always on top**, **Hide when minimized** and **Minimize on use** are
@@ -696,7 +697,9 @@ Setup closes it, the old version writes its history to
 it, as it starts. Only a history written in the last five minutes, in a format the new
 version reads, is used. Otherwise the new version starts with empty charts, as it
 would have anyway, and `handoff.log` in the same folder says why. Writing it never
-holds up the update: the closing app waits for it for two seconds at most.
+holds up the update: the closing app waits for it for two seconds at most. The
+Updates card on the Settings page says which version the charts carried on from, or
+why they started empty.
 
 By default open-task checks when it starts and then once a day, and only says so.
 Settings has three switches, each building on the one before: **Check for updates
