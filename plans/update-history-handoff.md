@@ -1,6 +1,6 @@
 # History handoff across an update restart
 
-> **Status:** in progress · **Started:** 2026-11-10 · **Branch:** `master` (shared
+> **Status:** done, verified end to end; not pushed or released · **Started:** 2026-11-10 · **Branch:** `master` (shared
 > working tree; only this thread's files are staged)
 
 ## Goal
@@ -114,19 +114,19 @@ to the plain behaviour (here: start fresh, the update unaffected).
 ## Plan / steps
 
 1. [x] Read how updates and restarts work today; read Empyrean's handover.
-2. [ ] **Current step.** `ot-core::handoff`: DTOs, export from `Timeline`/`Usage`,
+2. [x] `ot-core::handoff`: DTOs, export from `Timeline`/`Usage`,
    validated restore, file framing (header + lz4 + postcard), tests: continuity
    (a restored copy fed the same later snapshots matches one that never stopped),
    rejection (unknown format, corrupt, truncated, out-of-range ids), golden bytes.
-3. [ ] `ot-ui::App`: `history_for_handoff()` and `adopt_history()`.
-4. [ ] `ot-shell-core::handoff`: paths, atomic write on a worker with a deadline,
+3. [x] `ot-ui::App`: `history_for_handoff()` and `adopt_history()`.
+4. [x] `ot-shell-core::handoff`: paths, atomic write on a worker with a deadline,
    claim, freshness, outcome log; `Shell` wiring (install click → close → write;
    start → claim), tests with a temp dir.
-5. [ ] `ot-shell-win`: nothing new beyond dropping the shell, which waits for the
-   write (check the order after the loop).
-6. [ ] README; checks (fmt on own files, clippy, tests on Windows; Linux build of
+5. [x] `ot-shell-win`: `Platform::local_time` (`clock.rs`) for the log; the
+   loop's end already drops the shell after `stop_feed`, which waits for the write.
+6. [x] README; checks (fmt on own files, clippy, tests on Windows; Linux build of
    the touched crates in WSL).
-7. [ ] End to end: two local builds, a local feed, per-user install, click install,
+7. [x] End to end: two local builds, a local feed, per-user install, click install,
    confirm the new window carries the history (charts not empty, handoff.log says
    adopted). Off the user's screen (private desktop), per CLAUDE.md.
 
@@ -146,10 +146,39 @@ to the plain behaviour (here: start fresh, the update unaffected).
 ## Progress log
 
 - [x] Survey (2026-11-10).
-- [ ] Format + core tests.
-- [ ] App + shell wiring.
-- [ ] README.
-- [ ] End-to-end update.
+- [x] Format + core tests (`c71e9b3`): round trip, a restored copy continuing
+      exactly like the original, cycles across the gap, retention, refusals, 3000
+      damaged payloads, layout pin (`crates/ot-core/testdata/handoff-v1.bin`).
+- [x] App + shell wiring (`a6ccf79`), log says how much history (`ecebb6e`): 9
+      shell tests with a temp dir (once only, stale, future, damaged, unknown
+      format, failed write, stale temps, log trimming, UTC dates).
+- [x] README (`58a400b`).
+- [x] Workspace clippy clean on Windows; ot-core, ot-shell-core, ot-ui clippy
+      clean for `x86_64-unknown-linux-gnu`.
+- [x] End-to-end update, PASS on the first run (scratchpad rig: `e2e\e2e.ps1`, a throwaway minisign key,
+      a local feed on 127.0.0.1:8766, a per-user install, a private desktop
+      `WinSta0\ot-e2e`).
+
+## End-to-end result (2026-11-10 5:27-5:29 PM PST, 01:27-01:29Z)
+
+Release build of `ecebb6e` (plus this plan's edit, hence `-dirty`) with
+`OT_UPDATE_FEED=http://127.0.0.1:8766/releases` and a throwaway key, two Inno
+installers from it (v0.20.3 to install, v0.99.0 offered by the feed), per-user
+install, the app started on the private desktop `WinSta0\ot-e2e`, 90 s of history,
+then one posted click on the update button (the scheduled check had already
+downloaded and verified v0.99.0). Setup started, Restart Manager closed the old
+instance, Setup started the new one. `handoff.log`:
+
+```
+2026-11-10 5:28:51 PM PST (2026-11-11 01:28:51Z)  pid 46776 v0.20.2-4-gecebb6e-dirty: wrote the history for the update to v0.99.0: 1 min 32 s of it, 318 kB, 47 series, 187 programs, in 9 ms
+2026-11-10 5:28:53 PM PST (2026-11-11 01:28:53Z)  pid 32532 v0.20.2-4-gecebb6e-dirty: carried on from v0.20.2-4-gecebb6e-dirty's history, written 1.8 s before by process 46776: 1 min 32 s of it, 47 series, 187 programs
+```
+
+The file was gone afterwards (claimed once). Cleanup restored
+`HKCU\Software\open-task`, the user's v0.20.2 download, removed the handoff folder
+and the per-user install; the user's Program Files instance was not touched.
+Not exercised end to end: a refused handoff (unit tested), the all-users path
+(same code; the handoff folder is per user either way).
 
 ## Open questions for the user
 
@@ -160,6 +189,17 @@ to the plain behaviour (here: start fresh, the update unaffected).
 2. Should the Settings page's Updates card say "History carried over from vX" (or
    why not) after an update? Recommendation: yes, small; left out for now since the
    ask was for a log.
+
+- The rail's update button is at x = 20 DIP, `gap + 1.5 * ITEM_H` = 68 DIP above
+  the client area's bottom (`nav.rs` test); the e2e clicks there with posted
+  messages.
+- The window has `WS_EX_NOREDIRECTIONBITMAP`, so `PrintWindow` cannot capture it
+  on a private desktop: the e2e's evidence is the handoff log, which is why the
+  log lines say how much history crossed over.
+- The e2e must back up and restore `HKCU\Software\open-task` (the test app saves
+  its layout there on close) and the user's
+  `%LOCALAPPDATA%\open-task\updates\open-task-v0.20.2-windows-setup.exe` (the
+  updater prunes old downloads).
 
 ## Things not to do
 
