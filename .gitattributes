@@ -15,5 +15,8 @@
 # Signed test fixtures: the signatures cover these exact bytes.
 crates/ot-update/testdata/** -text
 
+# Pinned handoff files: compared byte for byte.
+crates/ot-core/testdata/*.bin binary
+
 # PawnIO module blobs are signed; the signatures cover these exact bytes.
 crates/ot-probe/pawnio/*.bin binary

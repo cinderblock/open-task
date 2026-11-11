@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod feed;
+pub mod handoff;
 pub mod history;
 pub mod player;
 pub mod record;

@@ -61,6 +61,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ot_model::process::{ProcessSample, ProcessStatic};
 use ot_model::{ProcessKey, Tick};
 
+use crate::handoff::{ListsV1, MachineV1, OpenStepV1, ProcV1, SeenV1, StoredV1, UsageV1};
 use crate::snapshot::Snapshot;
 
 /// A ghost below this many cycles (a fraction of a millisecond of work) is dropped.
@@ -334,6 +335,9 @@ pub struct Usage {
     merged: Vec<(ProgramId, f32)>,
     /// How far back the history reaches, in milliseconds.
     history_ms: i64,
+    /// Carried over from another instance ([`crate::handoff`]) and waiting for
+    /// this one's first snapshot with rates in it.
+    resumed: bool,
     /// Changes whenever anything here does, and no two `Usage`s share one
     /// ([`Usage::revision`]).
     revision: u64,
@@ -385,6 +389,7 @@ impl Usage {
             interval: Lists::default(),
             merged: Vec::new(),
             history_ms: DEFAULT_HISTORY_MS,
+            resumed: false,
             revision: next_revision(),
         }
     }
@@ -465,6 +470,16 @@ impl Usage {
             return;
         }
         self.last_tick = Some(snap.tick);
+        // Carried over from the instance before an update: this one's first pass
+        // has no rates yet (no CPU load), so the stretch across the gap waits for
+        // the next. The cycle counters are the system's, so what each process used
+        // across the gap is exact either way.
+        if self.resumed {
+            if snap.interval.is_zero() {
+                return;
+            }
+            self.resumed = false;
+        }
         self.revision = next_revision();
         let now = snap
             .taken_at
@@ -802,6 +817,246 @@ impl Usage {
             .map(Stored::frame)
             .chain(open)
             .chain(self.coarse.iter().rev().map(Stored::frame))
+    }
+}
+
+// Handing the history to the next instance (`crate::handoff`).
+
+/// More programs than a session ever sees: a file claiming more is damaged.
+const MAX_PROGRAMS: usize = 1 << 20;
+
+fn machine_v1(m: Machine) -> MachineV1 {
+    MachineV1 {
+        cpu_capacity_ms: m.cpu_capacity_ms,
+        cpu_busy_ms: m.cpu_busy_ms,
+        ram: m.ram,
+        ram_in_use: m.ram_in_use,
+        gpu_capacity_ms: m.gpu_capacity_ms,
+        gpu_busy_ms: m.gpu_busy_ms,
+        gpu_dedicated_in_use: m.gpu_dedicated_in_use,
+    }
+}
+
+fn machine_from(m: MachineV1) -> Machine {
+    Machine {
+        cpu_capacity_ms: m.cpu_capacity_ms,
+        cpu_busy_ms: m.cpu_busy_ms,
+        ram: m.ram,
+        ram_in_use: m.ram_in_use,
+        gpu_capacity_ms: m.gpu_capacity_ms,
+        gpu_busy_ms: m.gpu_busy_ms,
+        gpu_dedicated_in_use: m.gpu_dedicated_in_use,
+    }
+}
+
+/// Check one stretch's lists: every program known, each list sorted by program
+/// without repeats, as [`merge`] needs.
+fn lists_from(lists: ListsV1, programs: usize) -> Result<Lists<Vec<(ProgramId, f32)>>, String> {
+    for list in &lists {
+        let sorted = list.windows(2).all(|w| w[0].0 < w[1].0);
+        if !sorted || list.iter().any(|&(g, _)| g as usize >= programs) {
+            return Err("a stretch's programs are out of order or unknown".into());
+        }
+    }
+    Ok(lists)
+}
+
+fn stored_from(s: StoredV1, programs: usize) -> Result<Stored, String> {
+    if s.span_ms < 0 {
+        return Err(format!("a stretch {} ms long", s.span_ms));
+    }
+    Ok(Stored {
+        end_ms: s.end_ms,
+        span_ms: s.span_ms,
+        lists: lists_from(s.lists, programs)?.map(Into::into),
+        machine: machine_from(s.machine),
+    })
+}
+
+/// The processes' fading totals, every one under a known program and listed once.
+fn procs_from(procs: Vec<ProcV1>, programs: usize) -> Result<HashMap<ProcessKey, Entry>, String> {
+    let mut out = HashMap::with_capacity(procs.len());
+    for p in procs {
+        if p.program as usize >= programs || !p.total.is_finite() || p.total < 0.0 {
+            return Err(format!("process {} has no program or no total", p.key.pid));
+        }
+        let entry = Entry {
+            statics: Arc::new(p.statics),
+            last: p.last_cycles,
+            last_cpu: Duration::from_nanos(p.last_cpu_ns),
+            total: p.total,
+            alive: p.alive,
+            program: p.program,
+        };
+        if out.insert(p.key, entry).is_some() {
+            return Err(format!("process {} listed twice", p.key.pid));
+        }
+    }
+    Ok(out)
+}
+
+/// The lineage, every process under a known program and listed once.
+fn seen_from(seen: Vec<SeenV1>, programs: usize) -> Result<HashMap<ProcessKey, Seen>, String> {
+    let mut out = HashMap::with_capacity(seen.len());
+    for s in seen {
+        if s.program as usize >= programs || s.first_ms > s.last_ms {
+            return Err(format!("the lineage of process {} is broken", s.key.pid));
+        }
+        let entry = Seen {
+            parent: s.parent,
+            lost_parent: s.lost_parent,
+            program: s.program,
+            first_ms: s.first_ms,
+            last_ms: s.last_ms,
+        };
+        if out.insert(s.key, entry).is_some() {
+            return Err(format!("process {} seen twice", s.key.pid));
+        }
+    }
+    Ok(out)
+}
+
+impl Usage {
+    pub(crate) fn to_handoff(&self) -> UsageV1 {
+        let stored = |s: &Stored| StoredV1 {
+            end_ms: s.end_ms,
+            span_ms: s.span_ms,
+            lists: s.lists.each_ref().map(|l| l.to_vec()),
+            machine: machine_v1(s.machine),
+        };
+        let mut procs: Vec<ProcV1> = self
+            .procs
+            .iter()
+            .map(|(&key, e)| ProcV1 {
+                key,
+                statics: (*e.statics).clone(),
+                last_cycles: e.last,
+                last_cpu_ns: u64::try_from(e.last_cpu.as_nanos()).unwrap_or(u64::MAX),
+                total: e.total,
+                alive: e.alive,
+                program: e.program,
+            })
+            .collect();
+        // Maps iterate in no set order; sorted, the same history makes the same bytes.
+        procs.sort_unstable_by_key(|p| p.key);
+        let mut seen: Vec<SeenV1> = self
+            .seen
+            .iter()
+            .map(|(&key, s)| SeenV1 {
+                key,
+                parent: s.parent,
+                lost_parent: s.lost_parent,
+                program: s.program,
+                first_ms: s.first_ms,
+                last_ms: s.last_ms,
+            })
+            .collect();
+        seen.sort_unstable_by_key(|s| s.key);
+        UsageV1 {
+            decay: self.decay,
+            history_ms: self.history_ms,
+            now_ms: self.now_ms,
+            first_ms: self.first_ms,
+            trimmed_ms: self.trimmed_ms,
+            programs: self.programs.clone(),
+            procs,
+            seen,
+            raw: self.raw.iter().map(stored).collect(),
+            coarse: self.coarse.iter().map(stored).collect(),
+            open: self.open.as_ref().map(|o| OpenStepV1 {
+                index: o.index,
+                end_ms: o.end_ms,
+                span_ms: o.span_ms,
+                lists: o.lists.clone(),
+                machine: machine_v1(o.machine),
+            }),
+            faded_out: self.faded_out.clone(),
+            faded_out_ms: self.faded_out_ms,
+        }
+    }
+
+    /// The `Usage` `dto` describes, checked so that nothing in it can trip the
+    /// code that reads it. It waits for this process's first snapshot with rates
+    /// (see [`Usage::observe`]), and forgets the tick it last saw: ticks start
+    /// again with each process.
+    pub(crate) fn from_handoff(dto: UsageV1) -> Result<Self, String> {
+        let n = dto.programs.len();
+        if n > MAX_PROGRAMS {
+            return Err(format!("{n} programs"));
+        }
+        let mut program_ids = HashMap::with_capacity(n);
+        for (id, name) in dto.programs.iter().enumerate() {
+            if program_ids.insert(name.clone(), id as ProgramId).is_some() {
+                return Err(format!("program {name:?} listed twice"));
+            }
+        }
+        let procs = procs_from(dto.procs, n)?;
+        let seen = seen_from(dto.seen, n)?;
+
+        let coarse = dto
+            .coarse
+            .into_iter()
+            .map(|s| stored_from(s, n))
+            .collect::<Result<VecDeque<_>, _>>()?;
+        let raw = dto
+            .raw
+            .into_iter()
+            .map(|s| stored_from(s, n))
+            .collect::<Result<VecDeque<_>, _>>()?;
+        let open = match dto.open {
+            Some(o) if o.span_ms < 0 => return Err("an open step of negative length".into()),
+            Some(o) => Some(Open {
+                index: o.index,
+                end_ms: o.end_ms,
+                span_ms: o.span_ms,
+                lists: lists_from(o.lists, n)?,
+                machine: machine_from(o.machine),
+            }),
+            None => None,
+        };
+        // Oldest to newest: the steps, the one being filled, the raw frames.
+        let mut ends = coarse
+            .iter()
+            .map(|s| s.end_ms)
+            .chain(open.as_ref().map(|o| o.end_ms))
+            .chain(raw.iter().map(|s| s.end_ms))
+            .chain([dto.now_ms]);
+        if ends
+            .try_fold(i64::MIN, |last, t| (t >= last).then_some(t))
+            .is_none()
+        {
+            return Err("the history is out of order".into());
+        }
+        if dto.first_ms.is_some_and(|f| f > dto.now_ms) {
+            return Err("the session starts after its newest snapshot".into());
+        }
+        if dto.faded_out.len() > n || dto.faded_out.iter().any(|t| !t.is_finite()) {
+            return Err("the faded-out totals do not match the programs".into());
+        }
+
+        Ok(Self {
+            decay: clamp_decay(dto.decay),
+            sum: procs.values().map(|e: &Entry| e.total).sum(),
+            procs,
+            seen,
+            trimmed_ms: dto.trimmed_ms,
+            now_ms: dto.now_ms,
+            first_ms: dto.first_ms,
+            last_tick: None,
+            programs: dto.programs,
+            program_ids,
+            raw,
+            coarse,
+            open,
+            faded_out: dto.faded_out,
+            faded_out_ms: dto.faded_out_ms,
+            by_program: Vec::new(),
+            interval: Lists::default(),
+            merged: Vec::new(),
+            history_ms: dto.history_ms.max(STEP_MIN_MS),
+            resumed: true,
+            revision: next_revision(),
+        })
     }
 }
 

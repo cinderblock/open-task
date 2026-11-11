@@ -601,9 +601,12 @@ name = "ot-core"
 version = "0.20.2"
 dependencies = [
  "arc-swap",
+ "lz4_flex",
  "ot-model",
  "ot-probe",
  "ot-record",
+ "postcard",
+ "serde",
  "tracing",
 ]
 

@@ -12,13 +12,16 @@
 //! resolution for the pixels it gets. Every tier has a fixed capacity, so a session
 //! that runs for a week has the same memory ceiling as one that runs for a minute.
 
-use std::collections::vec_deque;
+use std::collections::{vec_deque, HashSet};
 use std::iter::Rev;
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ot_model::Tick;
 
+use crate::handoff::{
+    BucketV1, DiskSeriesV1, OpenBucketV1, PairSeriesV1, SeriesV1, TierV1, TimelineV1,
+};
 use crate::history::Ring;
 use crate::snapshot::Snapshot;
 
@@ -642,6 +645,230 @@ impl Timeline {
     #[must_use]
     pub fn last_tick(&self) -> Option<Tick> {
         self.last_tick
+    }
+}
+
+// Handing the history to the next instance (`crate::handoff`).
+
+/// More devices of a kind than any machine has: a file claiming more is damaged.
+const MAX_DEVICES: usize = 4096;
+
+fn bucket_v1(b: &Bucket) -> BucketV1 {
+    BucketV1 {
+        first_ms: b.first_ms,
+        last_ms: b.last_ms,
+        min: b.min,
+        max: b.max,
+        mean: b.mean,
+        count: b.count,
+    }
+}
+
+fn bucket_from(b: BucketV1) -> Result<Bucket, String> {
+    if b.first_ms > b.last_ms || b.count == 0 {
+        return Err(format!(
+            "a bucket from {} to {} of {} samples",
+            b.first_ms, b.last_ms, b.count
+        ));
+    }
+    Ok(Bucket {
+        first_ms: b.first_ms,
+        last_ms: b.last_ms,
+        min: b.min,
+        max: b.max,
+        mean: b.mean,
+        count: b.count,
+    })
+}
+
+/// Whether `times` never go back.
+fn in_order(mut times: impl Iterator<Item = i64>) -> bool {
+    times
+        .try_fold(i64::MIN, |last, t| (t >= last).then_some(t))
+        .is_some()
+}
+
+impl Series {
+    pub(crate) fn to_handoff(&self) -> SeriesV1 {
+        SeriesV1 {
+            raw: self.raw.iter().map(|s| (s.at_unix_ms, s.value)).collect(),
+            tiers: self
+                .tiers
+                .iter()
+                .map(|t| TierV1 {
+                    bucket_ms: t.bucket_ms,
+                    closed: t.closed.iter().map(bucket_v1).collect(),
+                    open: t.open.map(|o| OpenBucketV1 {
+                        index: o.index,
+                        bucket: bucket_v1(&o.bucket),
+                        sum: o.sum,
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    /// A series kept to `retention` holding what `dto` held that fits: the newest
+    /// raw samples, and the newest buckets of each tier of the same width. A tier
+    /// `retention` has and `dto` does not starts empty, as after
+    /// [`Series::set_retention`]. Only `retention` decides what is allocated.
+    pub(crate) fn from_handoff(dto: SeriesV1, retention: &Retention) -> Result<Self, String> {
+        let mut series = Self::new(retention.clone());
+        if !in_order(dto.raw.iter().map(|s| s.0)) {
+            return Err("raw samples out of order".into());
+        }
+        let skip = dto.raw.len().saturating_sub(series.raw.capacity());
+        for (at_unix_ms, value) in dto.raw.into_iter().skip(skip) {
+            series.raw.push(Sample { at_unix_ms, value });
+        }
+        let mut widths = Vec::with_capacity(dto.tiers.len());
+        for t in dto.tiers {
+            if t.bucket_ms < 1 || widths.contains(&t.bucket_ms) {
+                return Err(format!("a tier of {} ms buckets", t.bucket_ms));
+            }
+            widths.push(t.bucket_ms);
+            let closed = t
+                .closed
+                .into_iter()
+                .map(bucket_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            if !in_order(closed.iter().flat_map(|b| [b.first_ms, b.last_ms])) {
+                return Err(format!("{} ms buckets out of order", t.bucket_ms));
+            }
+            let open = match t.open {
+                Some(o) => {
+                    let bucket = bucket_from(o.bucket)?;
+                    let after = closed.last().map_or(i64::MIN, |b| b.last_ms);
+                    if o.index != bucket.first_ms.div_euclid(t.bucket_ms) || bucket.first_ms < after
+                    {
+                        return Err(format!("an open {} ms bucket out of place", t.bucket_ms));
+                    }
+                    Some(Open {
+                        index: o.index,
+                        bucket,
+                        sum: o.sum,
+                    })
+                }
+                None => None,
+            };
+            let Some(tier) = series.tiers.iter_mut().find(|x| x.bucket_ms == t.bucket_ms) else {
+                continue;
+            };
+            let skip = closed.len().saturating_sub(tier.closed.capacity());
+            for b in closed.into_iter().skip(skip) {
+                tier.closed.push(b);
+            }
+            tier.open = open;
+        }
+        Ok(series)
+    }
+}
+
+impl Timeline {
+    pub(crate) fn to_handoff(&self) -> TimelineV1 {
+        TimelineV1 {
+            cpu_total: self.cpu_total.to_handoff(),
+            cores: self.cores.iter().map(Series::to_handoff).collect(),
+            mem_in_use: self.mem_in_use.to_handoff(),
+            disks: self
+                .disks
+                .iter()
+                .map(|d| DiskSeriesV1 {
+                    number: d.number,
+                    active: d.active.to_handoff(),
+                    read: d.read.to_handoff(),
+                    write: d.write.to_handoff(),
+                })
+                .collect(),
+            adapters: self
+                .adapters
+                .iter()
+                .map(|a| PairSeriesV1 {
+                    id: a.id,
+                    a: a.rx.to_handoff(),
+                    b: a.tx.to_handoff(),
+                })
+                .collect(),
+            gpus: self
+                .gpus
+                .iter()
+                .map(|g| PairSeriesV1 {
+                    id: g.id,
+                    a: g.utilization.to_handoff(),
+                    b: g.dedicated.to_handoff(),
+                })
+                .collect(),
+            battery_charge: self.battery_charge.to_handoff(),
+            battery_rate: self.battery_rate.to_handoff(),
+        }
+    }
+
+    /// The timeline `dto` describes, kept to `retention`. It has seen no snapshot
+    /// of this process: ticks start again with each process, so the next one is
+    /// never taken for a repeat.
+    pub(crate) fn from_handoff(dto: TimelineV1, retention: &Retention) -> Result<Self, String> {
+        let many = dto.cores.len() > MAX_DEVICES
+            || dto.disks.len() > MAX_DEVICES
+            || dto.adapters.len() > MAX_DEVICES
+            || dto.gpus.len() > MAX_DEVICES;
+        if many {
+            return Err("more devices than any machine has".into());
+        }
+        let unique = |ids: Vec<u64>| ids.iter().collect::<HashSet<_>>().len() == ids.len();
+        if !unique(dto.disks.iter().map(|d| u64::from(d.number)).collect())
+            || !unique(dto.adapters.iter().map(|a| a.id).collect())
+            || !unique(dto.gpus.iter().map(|g| g.id).collect())
+        {
+            return Err("a device listed twice".into());
+        }
+        let series = |s| Series::from_handoff(s, retention);
+        Ok(Self {
+            cpu_total: series(dto.cpu_total)?,
+            cores: dto
+                .cores
+                .into_iter()
+                .map(series)
+                .collect::<Result<_, _>>()?,
+            mem_in_use: series(dto.mem_in_use)?,
+            disks: dto
+                .disks
+                .into_iter()
+                .map(|d| {
+                    Ok(DiskSeries {
+                        number: d.number,
+                        active: series(d.active)?,
+                        read: series(d.read)?,
+                        write: series(d.write)?,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+            adapters: dto
+                .adapters
+                .into_iter()
+                .map(|a| {
+                    Ok(AdapterSeries {
+                        id: a.id,
+                        rx: series(a.a)?,
+                        tx: series(a.b)?,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+            gpus: dto
+                .gpus
+                .into_iter()
+                .map(|g| {
+                    Ok(GpuSeries {
+                        id: g.id,
+                        utilization: series(g.a)?,
+                        dedicated: series(g.b)?,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+            battery_charge: series(dto.battery_charge)?,
+            battery_rate: series(dto.battery_rate)?,
+            retention: retention.clone(),
+            last_tick: None,
+        })
     }
 }
 
