@@ -664,7 +664,7 @@ impl Card {
     ) -> Option<&'s str> {
         match self {
             Self::Toggle(t) => t.note(settings, cx),
-            Self::Update => cx.update.note(),
+            Self::Update => cx.update.note(scratch).then_some(scratch.as_str()),
             Self::TaskManager => cx.task_manager.note(scratch).then_some(scratch.as_str()),
             Self::Decay
             | Self::Speed
@@ -1798,8 +1798,9 @@ mod tests {
         assert_eq!(state_of(&dl, page.cards[13]), "On");
         assert_eq!(state_of(&dl, page.cards[14]), "Off");
         // A copy that cannot install says so, once, on the update card.
-        let note = update.note().unwrap();
-        assert_eq!(texts(&dl).iter().filter(|t| *t == note).count(), 1);
+        let mut note = String::new();
+        assert!(update.note(&mut note));
+        assert_eq!(texts(&dl).iter().filter(|t| **t == note).count(), 1);
 
         let at = page.cards[13].center();
         let r = click(&mut page, at, &mut s, cx(true, &update));

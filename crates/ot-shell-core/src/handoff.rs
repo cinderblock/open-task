@@ -100,28 +100,29 @@ impl Drop for Pending {
 }
 
 /// Write `timeline` and `usage` to the handoff in `dir`, on a thread of its own,
-/// for the update to `to`. Failures go to the log; they never stop the update.
+/// for `successor` (`the update to v0.21.0`), which the log names. Failures go to
+/// the log; they never stop the update or the restart.
 #[must_use]
 pub fn write(
     dir: PathBuf,
     timeline: Timeline,
     usage: Usage,
     version: &'static str,
-    to: &str,
+    successor: &str,
     platform: Arc<dyn Platform>,
 ) -> Pending {
     let log = Log::new(&dir, version, platform);
     let (tx, done) = mpsc::channel();
     let started = Instant::now();
     let thread_log = log.clone();
-    let to = to.to_owned();
+    let successor = successor.to_owned();
     let spawned = std::thread::Builder::new()
         .name("ot-handoff".into())
         .spawn(move || {
             let log = thread_log;
             match write_now(&dir, &timeline, &usage, version) {
                 Ok(bytes) => log.line(&format!(
-                    "wrote the history for the update to v{to}: {} of it, {}, {} series, \
+                    "wrote the history for {successor}: {} of it, {}, {} series, \
                      {} programs, in {} ms",
                     span(&timeline),
                     size(bytes),
@@ -180,6 +181,28 @@ pub enum Taken {
     },
     /// A handoff was waiting but cannot be used; it is gone now. Why, in words.
     Refused(String),
+}
+
+/// How long a copy started to take over from another ([`wait_for`]) waits for
+/// its history. The other closes as soon as it has started this one, and writes
+/// in milliseconds.
+pub const TAKEOVER_WAIT: Duration = Duration::from_secs(3);
+
+/// Wait for a handoff to appear in `dir`, for at most `timeout`: for a copy that
+/// was started by the one it takes over from, which writes it as it closes. Says
+/// whether one is there.
+#[must_use]
+pub fn wait_for(dir: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if dir.join(FILE).exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Take the handoff waiting in `dir`, if any, reading the timeline into

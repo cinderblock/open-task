@@ -296,7 +296,19 @@ pub(crate) fn shell_start(
 /// Returns whether it started (a declined prompt is `Ok(false)`).
 pub(crate) fn relaunch_elevated(hwnd: HWND) -> Result<bool, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The same arguments, and this process's id, so the new copy waits for the
+    // history this one hands on as it closes (`ot_shell_core::handoff`).
+    let mut args: Vec<String> = Vec::new();
+    let mut given = std::env::args().skip(1);
+    while let Some(a) = given.next() {
+        if a == "--handoff-from" {
+            given.next();
+        } else {
+            args.push(a);
+        }
+    }
+    args.push("--handoff-from".into());
+    args.push(std::process::id().to_string());
     let mut params = String::new();
     for a in &args {
         if !params.is_empty() {

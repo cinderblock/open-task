@@ -115,6 +115,9 @@ pub struct ShellOptions {
     pub version: &'static str,
     /// Play this recording instead of sampling the machine.
     pub replay: Option<String>,
+    /// Started by the copy with this process id to take over from it (as
+    /// administrator): wait a moment for the history it hands on as it closes.
+    pub handoff_from: Option<u32>,
 }
 
 /// Why a shell could not start.
@@ -452,14 +455,18 @@ impl Shell {
         }
         tracing::info!(?installation, "installation");
         app.set_task_manager(task_manager);
-        // The charts of the instance this update replaced, if it handed them on.
-        // A replay shows its recording, and leaves them for a live window.
-        if options.replay.is_none() {
-            carry_on(&mut app, options.version, &platform);
-        }
+        // The charts of the instance this one replaced, if it handed them on. A
+        // replay shows its recording, and leaves them for a live window.
+        let carried = if options.replay.is_none() {
+            carry_on(&mut app, options, &platform)
+        } else {
+            None
+        };
         let updater = start_updater(options.version, &inbox, installation);
         let can_install = updater.as_ref().is_some_and(Updater::can_install);
-        app.set_update(UpdateView::new(options.version, can_install));
+        let mut update = UpdateView::new(options.version, can_install);
+        update.set_handoff(carried);
+        app.set_update(update);
 
         let notify = {
             let inbox = Arc::clone(&inbox);
@@ -774,7 +781,7 @@ impl Shell {
 
     /// An update the user started is closing the app, and Setup will start the
     /// new version: write the history for it to carry on from ([`handoff`]). Not
-    /// for any other close, and not while a replay plays.
+    /// for any other close.
     fn hand_off_history(&mut self) {
         let Some(u) = &self.updater else {
             return;
@@ -782,8 +789,24 @@ impl Shell {
         let ot_update::Status::Installing { version } = u.status() else {
             return;
         };
+        if self.hand_off {
+            self.write_handoff(&format!("the update to v{version}"));
+        }
+    }
+
+    /// A copy of this program has been started to take over (as administrator)
+    /// and was told this one's process id: write the history for it, then close
+    /// this one with [`Shell::set_closing`]`(Closing::Relaunching)`. It waits for
+    /// the history briefly ([`handoff::TAKEOVER_WAIT`]).
+    pub fn hand_off_to_restart(&mut self) {
+        self.write_handoff("the copy taking over as administrator");
+    }
+
+    /// Write the history for `successor`, unless a replay plays or it is written
+    /// already.
+    fn write_handoff(&mut self, successor: &str) {
         let live = matches!(self.feed, Some(Feed::Live(_)));
-        if !self.hand_off || !live || self.handoff.is_some() {
+        if !live || self.handoff.is_some() {
             return;
         }
         let Some(dir) = handoff::dir() else {
@@ -797,7 +820,7 @@ impl Shell {
             timeline.clone(),
             usage.clone(),
             self.version,
-            &version.to_string(),
+            successor,
             Arc::clone(&self.platform),
         ));
     }
@@ -1228,25 +1251,39 @@ fn window_title(elevated: bool, paused: bool) -> String {
     t
 }
 
-/// Carry on from the history the instance before an update handed on, if it did
-/// ([`handoff`]).
-fn carry_on(app: &mut App, version: &'static str, platform: &Arc<dyn Platform>) {
-    let Some(dir) = handoff::dir() else {
-        return;
-    };
+/// Carry on from the history the instance before this one handed on, if it did
+/// ([`handoff`]). What became of it after an update, for the Settings page.
+fn carry_on(app: &mut App, options: &ShellOptions, platform: &Arc<dyn Platform>) -> Option<String> {
+    let dir = handoff::dir()?;
+    if let Some(pid) = options.handoff_from {
+        if !handoff::wait_for(&dir, handoff::TAKEOVER_WAIT) {
+            tracing::warn!(
+                pid,
+                "the copy this one takes over from handed on no history"
+            );
+        }
+    }
     let retention = app.history_retention();
     let taken = handoff::take(
         &dir,
         &retention,
         SystemTime::now(),
-        version,
+        options.version,
         Arc::clone(platform),
     );
-    if let handoff::Taken::History {
-        timeline, usage, ..
-    } = taken
-    {
-        app.adopt_history(timeline, usage);
+    match taken {
+        handoff::Taken::Nothing => None,
+        handoff::Taken::History {
+            meta,
+            timeline,
+            usage,
+        } => {
+            app.adopt_history(timeline, usage);
+            // A restart as administrator is the same version: nothing to say.
+            (meta.app_version != options.version)
+                .then(|| format!("The charts carried on from v{}.", meta.app_version))
+        }
+        handoff::Taken::Refused(why) => Some(format!("The charts started empty: {why}.")),
     }
 }
 

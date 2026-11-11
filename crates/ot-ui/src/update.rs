@@ -36,6 +36,9 @@ pub struct UpdateView {
     short: String,
     status: Status,
     can_install: bool,
+    /// What became of the charts the version before an update handed on, for
+    /// the Settings card ([`UpdateView::set_handoff`]).
+    handoff: Option<String>,
 }
 
 impl Default for UpdateView {
@@ -62,7 +65,14 @@ impl UpdateView {
             short,
             status: Status::Idle,
             can_install,
+            handoff: None,
         }
+    }
+
+    /// Say on the Settings card what became of the charts the instance before
+    /// this one handed on: carried on from, or why not. `None` says nothing.
+    pub fn set_handoff(&mut self, note: Option<String>) {
+        self.handoff = note;
     }
 
     /// Take the updater's latest status. Returns whether anything shown changed.
@@ -201,12 +211,19 @@ impl UpdateView {
         };
     }
 
-    /// A line of its own on the Settings card, when this copy cannot update itself.
-    #[must_use]
-    pub fn note(&self) -> Option<&'static str> {
-        (!self.can_install).then_some(
-            "This copy was not installed by open-task's installer, so it cannot update itself.",
-        )
+    /// A line of its own on the Settings card, written to `out`: when this copy
+    /// cannot update itself, or else what became of the charts across the last
+    /// update. Says whether there is one.
+    pub fn note(&self, out: &mut String) -> bool {
+        out.clear();
+        if !self.can_install {
+            out.push_str(
+                "This copy was not installed by open-task's installer, so it cannot update                  itself.",
+            );
+        } else if let Some(h) = &self.handoff {
+            out.push_str(h);
+        }
+        !out.is_empty()
     }
 
     /// The Settings card's button, and whether it does anything now.
@@ -339,12 +356,17 @@ mod tests {
     #[test]
     fn a_copy_that_cannot_install_opens_the_release_page() {
         let mut u = UpdateView::new("0.2.1-20-gdbfe022", false);
-        assert!(u.note().is_some());
+        let mut note = String::new();
+        assert!(u.note(&mut note));
         u.set_status(Status::Available {
             version: v("0.3.0"),
         });
         assert_eq!(u.action(), Some(UpdateAction::OpenReleasePage));
         assert_eq!(texts(&u).2, "Open page");
-        assert!(UpdateView::new("0.2.1", true).note().is_none());
+        assert!(!UpdateView::new("0.2.1", true).note(&mut note));
+        let mut u = UpdateView::new("0.2.1", true);
+        u.set_handoff(Some("Carried on from v0.2.0's charts.".into()));
+        assert!(u.note(&mut note));
+        assert_eq!(note, "Carried on from v0.2.0's charts.");
     }
 }

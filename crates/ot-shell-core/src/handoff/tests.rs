@@ -95,7 +95,14 @@ fn history(seconds: u64) -> (Timeline, Usage) {
 
 fn hand_on(dir: &Dir) {
     let (timeline, usage) = history(30);
-    let pending = write(dir.0.clone(), timeline, usage, "0.1.0", "0.2.0", platform());
+    let pending = write(
+        dir.0.clone(),
+        timeline,
+        usage,
+        "0.1.0",
+        "the update to v0.2.0",
+        platform(),
+    );
     assert!(pending.wait());
 }
 
@@ -145,6 +152,28 @@ fn the_next_instance_carries_on_once() {
             && lines[1].contains(": 30 s of it,"),
         "{log}"
     );
+}
+
+#[test]
+fn a_copy_taking_over_waits_for_the_history_but_not_forever() {
+    let dir = Dir::new();
+    let started = std::time::Instant::now();
+    assert!(!wait_for(&dir.0, Duration::from_millis(200)));
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    let writer = {
+        let path = dir.0.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let (timeline, usage) = history(5);
+            write(path, timeline, usage, "0.1.0", "a restart", platform()).wait()
+        })
+    };
+    assert!(wait_for(&dir.0, TAKEOVER_WAIT));
+    assert!(writer.join().unwrap());
+    assert!(matches!(
+        take_now(&dir, SystemTime::now()),
+        Taken::History { .. }
+    ));
 }
 
 #[test]
@@ -205,7 +234,14 @@ fn a_failed_write_does_not_hold_up_the_close() {
     // A file where the directory should be.
     fs::write(&dir.0, b"in the way").unwrap();
     let (timeline, usage) = history(5);
-    let pending = write(dir.0.clone(), timeline, usage, "0.1.0", "0.2.0", platform());
+    let pending = write(
+        dir.0.clone(),
+        timeline,
+        usage,
+        "0.1.0",
+        "a test",
+        platform(),
+    );
     assert!(pending.wait());
     drop(pending);
     let _ = fs::remove_file(&dir.0);

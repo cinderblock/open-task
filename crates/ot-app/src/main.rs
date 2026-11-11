@@ -476,6 +476,13 @@ fn run_gui(
         page_given: page.is_some(),
         version: VERSION,
         replay: replay.map(str::to_owned),
+        // Started by "Run as administrator" in another window, which hands its
+        // history on as it closes.
+        handoff_from: arg_value(
+            &std::env::args().skip(1).collect::<Vec<_>>(),
+            "--handoff-from",
+        )
+        .and_then(|s| s.parse().ok()),
     };
     if let Err(e) = ot_shell_win::run(probe, config, &options) {
         fail(&format!("shell failed: {e}"), 1, true);
@@ -518,6 +525,7 @@ fn run_gui(
         page_given: page.is_some(),
         version: VERSION,
         replay: replay.map(str::to_owned),
+        handoff_from: None,
     };
     match ot_shell_linux::run(embedded::EMBEDDED, asked, probe, config, &options) {
         Ok(()) => {}

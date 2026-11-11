@@ -1331,6 +1331,7 @@ fn host_effect(cell: &RefCell<State>, hwnd: HWND, effect: HostEffect) {
             Ok(true) => {
                 tracing::info!("an elevated copy is starting; closing this one");
                 if let Ok(mut st) = cell.try_borrow_mut() {
+                    st.shell.hand_off_to_restart();
                     st.shell.set_closing(Closing::Relaunching);
                 }
                 post_close(hwnd);
