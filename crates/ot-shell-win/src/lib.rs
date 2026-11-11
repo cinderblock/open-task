@@ -30,9 +30,9 @@ mod actions;
 #[cfg(windows)]
 mod chart_gpu;
 #[cfg(windows)]
-mod clock;
-#[cfg(windows)]
 mod charts;
+#[cfg(windows)]
+mod clock;
 #[cfg(windows)]
 mod frame_stats;
 #[cfg(windows)]
