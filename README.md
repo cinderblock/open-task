@@ -686,12 +686,24 @@ installer, which closes open-task, updates it (with an administrator prompt for 
 usual all-users install) and starts the new version. The Settings page has the same
 button with the full version and a sentence on what it is doing.
 
+**The charts carry on across an update.** The new version picks up the history the
+old one gathered: the summary and Performance charts, the Map, the History and the
+Cycles column continue where they left off. The few seconds the update took are one
+stretch across the gap, in which the cycles each process used are exact (they are
+Windows' own counters) and the machine's load is the first one measured after it. As
+Setup closes it, the old version writes its history to
+`%LOCALAPPDATA%\open-task\handoff\history.bin`, and the new one takes it, and removes
+it, as it starts. Only a history written in the last five minutes, in a format the new
+version reads, is used. Otherwise the new version starts with empty charts, as it
+would have anyway, and `handoff.log` in the same folder says why. Writing it never
+holds up the update: the closing app waits for it for two seconds at most.
+
 By default open-task checks when it starts and then once a day, and only says so.
 Settings has three switches, each building on the one before: **Check for updates
 automatically** (on), **Download updates automatically** (off), and **Install updates
 automatically** (off), which installs a downloaded release when you close open-task,
-so the next start is the new version. It never restarts itself to update while you
-use it, since that would throw away the history it has gathered. A check fetches two
+so the next start is the new version; nothing starts after it, so nothing is handed
+on. It never restarts itself to update while you use it. A check fetches two
 small files from github.com, the latest release's signed checksums, and sends nothing
 but the request for them.
 
@@ -809,6 +821,13 @@ something the updater cannot verify.
 To try the updater against a local copy of a release, build with
 `OT_UPDATE_FEED=http://127.0.0.1:8000/releases` and `OT_UPDATE_PUBLIC_KEY` set to a
 throwaway minisign public key; only a binary built that way is affected.
+
+The history an update hands on (`ot_core::handoff`) is a binary format, and the new
+version reads only the format it was built with. Any change to what it holds, the
+`ot-model` process facts included, must bump `ot_core::handoff::FORMAT`: the test
+`the_payload_layout_is_pinned` fails until it is, and
+`OT_BLESS=1 cargo test -p ot-core handoff` pins the new layout
+(`crates/ot-core/testdata/handoff-v<N>.bin`; keep the old files, which must be refused).
 
 ## License
 
