@@ -1,7 +1,8 @@
 # History handoff across an update restart
 
-> **Status:** done (update path verified end to end; the administrator
-> restart only unit tested); not pushed or released · **Started:** 2026-11-10 · **Branch:** `master` (shared
+> **Status:** released in v0.21.0 (2026-11-10 6:50 PM PST, 02:50Z; tag on
+> `901f6f8`). Update path verified end to end; the administrator restart only
+> unit tested · **Started:** 2026-11-10 · **Branch:** `master` (shared
 > working tree; only this thread's files are staged)
 
 ## Goal
