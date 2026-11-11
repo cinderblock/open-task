@@ -1538,6 +1538,30 @@ impl App {
         true
     }
 
+    /// The history the charts are drawn from, to hand to the next instance
+    /// ([`ot_core::handoff`]): the live one, also while the display is paused.
+    #[must_use]
+    pub fn history(&self) -> (&Timeline, &Usage) {
+        (&self.timeline, &self.usage)
+    }
+
+    /// How much of the timeline the settings keep: what a history carried over
+    /// from another instance is read into.
+    #[must_use]
+    pub fn history_retention(&self) -> Retention {
+        Retention::covering(self.settings.history_ms())
+    }
+
+    /// Carry on from the history another instance kept ([`ot_core::handoff`]),
+    /// in place of this one's. The settings here decide how far it reaches and how
+    /// fast the totals fade from now on, as if they had just been changed.
+    pub fn adopt_history(&mut self, timeline: Timeline, usage: Usage) {
+        self.timeline = timeline;
+        self.usage = usage;
+        self.apply_settings();
+        self.full_due = true;
+    }
+
     /// Make `snap` the one on screen. Its history is already in the timeline.
     fn show_snapshot(&mut self, snap: Arc<Snapshot>) {
         self.disk_totals = snap.processes.iter().fold((0, 0), |(r, w), p| {

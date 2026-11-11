@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod handoff;
 mod menu;
 mod report;
 pub mod settings_store;
@@ -32,7 +33,7 @@ pub mod settings_store;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ot_core::{Feed, Player, RecordHeader, Recorder, Recording, Sampler, SamplerConfig};
 use ot_model::ProcessKey;
@@ -144,6 +145,14 @@ pub trait Platform: Send + Sync {
     /// # Errors
     /// Why it could not start, in words for the user.
     fn launch(&self, command_line: &str, directory: Option<&str>) -> Result<(), String>;
+
+    /// `at` in the local time zone, with the zone named, for logs a person reads
+    /// (`2026-11-10 4:30:12 PM PST`). `None` where the platform cannot say; the
+    /// log then has UTC alone.
+    fn local_time(&self, at: SystemTime) -> Option<String> {
+        let _ = at;
+        None
+    }
 }
 
 /// Wakes the host's UI thread from another thread; the host then calls
@@ -376,6 +385,12 @@ pub struct Shell {
     /// repository never produces.
     updater: Option<Updater>,
     closing: Closing,
+    /// The update was started with a click, so Setup starts the new version when
+    /// it is done: the history is handed on as Setup closes this one.
+    hand_off: bool,
+    /// The history being written for the next instance. Dropping the shell waits
+    /// for it, briefly ([`handoff::WRITE_DEADLINE`]).
+    handoff: Option<handoff::Pending>,
     elevated: bool,
     /// The window title as last reported.
     title: String,
@@ -437,6 +452,11 @@ impl Shell {
         }
         tracing::info!(?installation, "installation");
         app.set_task_manager(task_manager);
+        // The charts of the instance this update replaced, if it handed them on.
+        // A replay shows its recording, and leaves them for a live window.
+        if options.replay.is_none() {
+            carry_on(&mut app, options.version, &platform);
+        }
         let updater = start_updater(options.version, &inbox, installation);
         let can_install = updater.as_ref().is_some_and(Updater::can_install);
         app.set_update(UpdateView::new(options.version, can_install));
@@ -477,6 +497,8 @@ impl Shell {
             menu: Vec::new(),
             updater,
             closing: Closing::No,
+            hand_off: false,
+            handoff: None,
             elevated,
             title: window_title(elevated, false),
         };
@@ -645,6 +667,10 @@ impl Shell {
         // Installing as it closed, and Setup ended without closing it (cancelled,
         // or failed): finish closing.
         let installing = matches!(status, ot_update::Status::Installing { .. });
+        if !installing {
+            // Setup was cancelled or failed: nothing will close this one for it.
+            self.hand_off = false;
+        }
         if self.closing == Closing::InstallingUpdate && !installing {
             tracing::info!(?status, "setup did not close the app; closing");
             out.push(Out::Close);
@@ -724,6 +750,10 @@ impl Shell {
     /// new version.
     pub fn close(&mut self) -> CloseOutcome {
         self.prefs.save_layout(&self.app.view_layout());
+        // Setup's Restart Manager closes the app this way.
+        if self.closing == Closing::SessionEnding {
+            self.hand_off_history();
+        }
         if self.closing != Closing::No {
             return CloseOutcome::Close;
         }
@@ -740,6 +770,36 @@ impl Shell {
         self.stop_feed();
         u.install(false);
         CloseOutcome::Hide
+    }
+
+    /// An update the user started is closing the app, and Setup will start the
+    /// new version: write the history for it to carry on from ([`handoff`]). Not
+    /// for any other close, and not while a replay plays.
+    fn hand_off_history(&mut self) {
+        let Some(u) = &self.updater else {
+            return;
+        };
+        let ot_update::Status::Installing { version } = u.status() else {
+            return;
+        };
+        let live = matches!(self.feed, Some(Feed::Live(_)));
+        if !self.hand_off || !live || self.handoff.is_some() {
+            return;
+        }
+        let Some(dir) = handoff::dir() else {
+            tracing::warn!("nowhere to hand the history on to");
+            return;
+        };
+        // A copy, so the writer can work while the window closes.
+        let (timeline, usage) = self.app.history();
+        self.handoff = Some(handoff::write(
+            dir,
+            timeline.clone(),
+            usage.clone(),
+            self.version,
+            &version.to_string(),
+            Arc::clone(&self.platform),
+        ));
     }
 
     /// Stop whatever feeds the window, so nothing posts to it once it is gone.
@@ -1043,7 +1103,7 @@ impl Shell {
 
     /// The update button was pressed. The updater works on its own threads and
     /// reports back through the waker.
-    fn update(&self, action: UpdateAction, out: &mut Vec<Out>) {
+    fn update(&mut self, action: UpdateAction, out: &mut Vec<Out>) {
         let Some(u) = &self.updater else {
             return;
         };
@@ -1051,7 +1111,10 @@ impl Shell {
             // Asked for: download straight away if this copy can install it.
             UpdateAction::Check => u.check(true, u.can_install()),
             UpdateAction::Download => u.download(),
-            UpdateAction::Install => u.install(true),
+            UpdateAction::Install => {
+                u.install(true);
+                self.hand_off = true;
+            }
             UpdateAction::OpenReleasePage => {
                 if let Some(url) = u.release_page() {
                     out.push(Out::Do(HostEffect::OpenUrl(url)));
@@ -1163,6 +1226,28 @@ fn window_title(elevated: bool, paused: bool) -> String {
         t.push_str(" (paused)");
     }
     t
+}
+
+/// Carry on from the history the instance before an update handed on, if it did
+/// ([`handoff`]).
+fn carry_on(app: &mut App, version: &'static str, platform: &Arc<dyn Platform>) {
+    let Some(dir) = handoff::dir() else {
+        return;
+    };
+    let retention = app.history_retention();
+    let taken = handoff::take(
+        &dir,
+        &retention,
+        SystemTime::now(),
+        version,
+        Arc::clone(platform),
+    );
+    if let handoff::Taken::History {
+        timeline, usage, ..
+    } = taken
+    {
+        app.adopt_history(timeline, usage);
+    }
 }
 
 /// The updater, waking the host after every change. It installs updates only if

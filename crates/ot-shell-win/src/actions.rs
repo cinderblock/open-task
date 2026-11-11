@@ -44,6 +44,10 @@ impl ot_shell_core::Platform for WinPlatform {
     fn launch(&self, command_line: &str, directory: Option<&str>) -> Result<(), String> {
         launch(command_line, directory)
     }
+
+    fn local_time(&self, at: std::time::SystemTime) -> Option<String> {
+        crate::clock::local_time(at)
+    }
 }
 
 /// Show a popup menu built from `nodes`, submenus and check marks included,
