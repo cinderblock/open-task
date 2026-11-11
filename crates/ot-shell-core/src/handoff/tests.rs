@@ -137,11 +137,12 @@ fn the_next_instance_carries_on_once() {
         "{log}"
     );
     assert!(
-        lines[0].contains("v0.1.0: wrote the history for the update to v0.2.0"),
+        lines[0].contains("v0.1.0: wrote the history for the update to v0.2.0: 30 s of it,"),
         "{log}"
     );
     assert!(
-        lines[1].contains("v0.2.0: carried on from v0.1.0's history"),
+        lines[1].contains("v0.2.0: carried on from v0.1.0's history")
+            && lines[1].contains(": 30 s of it,"),
         "{log}"
     );
 }

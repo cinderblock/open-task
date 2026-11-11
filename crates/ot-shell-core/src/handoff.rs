@@ -121,8 +121,9 @@ pub fn write(
             let log = thread_log;
             match write_now(&dir, &timeline, &usage, version) {
                 Ok(bytes) => log.line(&format!(
-                    "wrote the history for the update to v{to}: {}, {} series, {} programs, \
-                     in {} ms",
+                    "wrote the history for the update to v{to}: {} of it, {}, {} series, \
+                     {} programs, in {} ms",
+                    span(&timeline),
                     size(bytes),
                     timeline.series_count(),
                     usage.programs(),
@@ -213,10 +214,11 @@ pub fn take(
             );
             log.line(&format!(
                 "carried on from v{}'s history, written {:.1} s before by process {}: \
-                 {} series, {} programs",
+                 {} of it, {} series, {} programs",
                 meta.app_version,
                 ago.as_secs_f64(),
                 meta.pid,
+                span(&timeline),
                 timeline.series_count(),
                 usage.programs()
             ));
@@ -384,6 +386,16 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let y = yoe + era * 400 + i64::from(m <= 2);
     (y, m, d)
+}
+
+/// How far back `timeline` reaches: `12 min 5 s`.
+fn span(timeline: &Timeline) -> String {
+    let s = timeline.span_ms().unwrap_or(0) / 1000;
+    match (s / 3600, s / 60 % 60, s % 60) {
+        (0, 0, s) => format!("{s} s"),
+        (0, m, s) => format!("{m} min {s} s"),
+        (h, m, _) => format!("{h} h {m} min"),
+    }
 }
 
 fn size(bytes: impl TryInto<u64>) -> String {
