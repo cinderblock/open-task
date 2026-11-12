@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ot_core::{ProgramId, Retention, Snapshot, Timeline, Usage};
+use ot_core::{ProgramId, Retention, SeamKind, Snapshot, Timeline, Usage};
 use ot_model::attribution::Attribution;
 use ot_model::cpu::CoreKind;
 use ot_model::process::Priority;
@@ -1553,9 +1553,11 @@ impl App {
     }
 
     /// Carry on from the history another instance kept ([`ot_core::handoff`]),
-    /// in place of this one's. The settings here decide how far it reaches and how
-    /// fast the totals fade from now on, as if they had just been changed.
-    pub fn adopt_history(&mut self, timeline: Timeline, usage: Usage) {
+    /// in place of this one's, marking the restart between them as `seam` on the
+    /// charts. The settings here decide how far it reaches and how fast the totals
+    /// fade from now on, as if they had just been changed.
+    pub fn adopt_history(&mut self, mut timeline: Timeline, usage: Usage, seam: SeamKind) {
+        timeline.add_seam(seam);
         self.timeline = timeline;
         self.usage = usage;
         self.apply_settings();
@@ -2793,6 +2795,7 @@ impl App {
                 .crosshair()
                 .filter(|_| self.charts.pointed())
                 .map(|c| c.age_ms);
+            self.history.set_seams(timeline.seams());
             self.history.build(table_rect, usage, outside, axis);
             fill_chip_head(
                 &mut self.history,
@@ -2816,6 +2819,7 @@ impl App {
         let max = [100.0, snap.memory.total.get() as f32];
         let colors = [theme.cpu, theme.memory];
         let values: [charts::ValueFmt; 2] = [charts::percent_value, charts::bytes_value];
+        self.charts.set_seams_of(timeline);
         self.charts.begin(2, axis);
         for i in 0..2 {
             self.charts
@@ -3898,6 +3902,42 @@ mod tests {
         assert_eq!(app.page(), Page::Processes);
         assert_eq!(app.table.selected, Some(id(13)));
         assert!(!app.select_pid(999));
+    }
+
+    #[test]
+    fn an_adopted_history_marks_the_restart_on_its_charts() {
+        let mut app = by_cpu();
+        // Thirty seconds of history; the test snapshots' clock starts at 0.
+        let mut timeline = Timeline::new(app.history_retention());
+        let start = 0;
+        for t in 0..30 {
+            timeline.cpu_total.push(start + t * 1000, 10.0);
+            timeline.mem_in_use.push(start + t * 1000, 1e6);
+        }
+        let update = SeamKind::Update {
+            from: "0.21.0".into(),
+            to: "0.21.1".into(),
+        };
+        app.adopt_history(timeline, Usage::new(0.05), update);
+        let seams = app.history().0.seams();
+        assert_eq!(seams.len(), 1);
+        assert_eq!((seams[0].from_ms, seams[0].to_ms), (start + 29_000, None));
+
+        // The new instance's first sample, ten seconds on, closes the gap; the
+        // main window's CPU and memory charts mark it.
+        app.set_snapshot(snapshot(40, vec![proc(4, None, 1.0)]));
+        let seams = app.history().0.seams();
+        assert_eq!(seams[0].to_ms, Some(40_000));
+        ready(&mut app);
+        let mut dl = DisplayList::new();
+        app.paint(&mut dl);
+        let (line, _) = charts::seam_colors(&app.theme);
+        let dashes = dl
+            .cmds()
+            .iter()
+            .filter(|c| matches!(c, DrawCmd::FillRect { color, .. } if *color == line))
+            .count();
+        assert!(dashes > 0, "no seam drawn");
     }
 
     #[test]

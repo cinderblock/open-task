@@ -25,7 +25,7 @@
 //! rather than one line through it. The view snaps the pointer to the nearest column of the chart under it and marks
 //! that same age in every chart with [`Plot::paint_crosshair`].
 
-use ot_core::Series;
+use ot_core::{Seam, SeamKind, Series};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, TextStyle, VAlign};
 
 #[derive(Debug, Clone, Copy)]
@@ -730,6 +730,106 @@ const RANGE_ENVELOPE: [f32; 5] = [1.0, 1.4, 1.8, 2.2, 2.6];
 /// A one-DIP vertical line at `x` across `rect`, on whole DIPs so it stays crisp.
 fn hairline(x: f32, rect: Rect) -> Rect {
     Rect::new(x.floor(), rect.y, 1.0, rect.h)
+}
+
+/// A seam's dashes: this long, this far apart (start to start), in DIPs.
+const SEAM_DASH: f32 = 3.0;
+const SEAM_PERIOD: f32 = 6.0;
+/// A gap narrower than this on screen is one dashed line at its middle; a wider
+/// one gets a line at each end and a faint wash between.
+const SEAM_SPLIT_W: f32 = 3.0;
+/// How near a seam, in DIPs, the crosshair counts as on it.
+const SEAM_REACH: f32 = 3.0;
+
+/// Where on `rect` the gap of `seam` lies, left and right: from its first sample
+/// after the restart (the newer, right) to its last before (left), the ages taken
+/// against `newest_ms` as [`TimeAxis::age`] does. Unclamped: off either edge for
+/// a seam scrolling in or out.
+fn seam_span(seam: &Seam, rect: Rect, axis: &TimeAxis, newest_ms: i64) -> (f32, f32) {
+    let left = axis.x_unclamped(rect, axis.age(newest_ms, seam.from_ms));
+    let right = axis.x_unclamped(rect, axis.age(newest_ms, seam.end_ms()));
+    (left.min(right), left.max(right))
+}
+
+/// Mark where restarts joined the record: a dashed hairline down `rect` at each
+/// gap, at both ends of one wide enough to show, with a faint `wash` between.
+/// Clipped to `rect`.
+pub fn paint_seams(
+    dl: &mut DisplayList,
+    rect: Rect,
+    axis: &TimeAxis,
+    newest_ms: i64,
+    seams: &[Seam],
+    (line, wash): (Color, Color),
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let dashed = |dl: &mut DisplayList, x: f32| {
+        if x < rect.x || x > rect.right() {
+            return;
+        }
+        let x = x.floor().min(rect.right() - 1.0);
+        let mut y = rect.y;
+        while y < rect.bottom() {
+            let h = SEAM_DASH.min(rect.bottom() - y);
+            dl.fill_rect(Rect::new(x, y, 1.0, h), line);
+            y += SEAM_PERIOD;
+        }
+    };
+    for seam in seams {
+        let (left, right) = seam_span(seam, rect, axis, newest_ms);
+        if right < rect.x || left > rect.right() {
+            continue;
+        }
+        if right - left < SEAM_SPLIT_W {
+            dashed(dl, f32::midpoint(left, right));
+            continue;
+        }
+        let (l, r) = (left.max(rect.x), right.min(rect.right()));
+        dl.fill_rect(Rect::new(l, rect.y, r - l, rect.h), wash);
+        dashed(dl, left);
+        dashed(dl, right);
+    }
+}
+
+/// The seam the crosshair at `age_ms` is on, if any: within a few DIPs of its
+/// gap. The newest wins where two meet.
+#[must_use]
+pub fn seam_at<'a>(
+    seams: &'a [Seam],
+    rect: Rect,
+    axis: &TimeAxis,
+    newest_ms: i64,
+    age_ms: f32,
+) -> Option<&'a Seam> {
+    if rect.is_empty() {
+        return None;
+    }
+    let x = axis.x(rect, age_ms);
+    seams.iter().rev().find(|s| {
+        let (left, right) = seam_span(s, rect, axis, newest_ms);
+        x >= left - SEAM_REACH && x <= right + SEAM_REACH
+    })
+}
+
+/// What a readout says on a seam, into `out`: `Updated v0.21.0 → v0.21.1`,
+/// `Reinstalled v0.21.0`, or `Restarted as administrator`.
+pub fn seam_label(out: &mut String, seam: &Seam) {
+    out.clear();
+    match &seam.kind {
+        SeamKind::Update { from, to } if from == to => {
+            out.push_str("Reinstalled v");
+            out.push_str(to);
+        }
+        SeamKind::Update { from, to } => {
+            out.push_str("Updated v");
+            out.push_str(from);
+            out.push_str(" \u{2192} v");
+            out.push_str(to);
+        }
+        SeamKind::Elevated => out.push_str("Restarted as administrator"),
+    }
 }
 
 /// The time labels under a chart: each tick centered on its age, the ones at the
@@ -1465,5 +1565,72 @@ mod tests {
         for (x, y) in kept {
             assert!(y <= x && x - y < 0.1, "{x} -> {y}");
         }
+    }
+
+    fn seam(from_ms: i64, to_ms: Option<i64>, kind: SeamKind) -> Seam {
+        Seam {
+            from_ms,
+            to_ms,
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_seam_reads_as_what_happened() {
+        let mut out = String::from("stale");
+        let update = |from: &str, to: &str| SeamKind::Update {
+            from: from.into(),
+            to: to.into(),
+        };
+        seam_label(&mut out, &seam(0, None, update("0.21.0", "0.22.0")));
+        assert_eq!(out, "Updated v0.21.0 \u{2192} v0.22.0");
+        seam_label(&mut out, &seam(0, None, update("0.21.0", "0.21.0")));
+        assert_eq!(out, "Reinstalled v0.21.0");
+        seam_label(&mut out, &seam(0, None, SeamKind::Elevated));
+        assert_eq!(out, "Restarted as administrator");
+    }
+
+    #[test]
+    fn a_narrow_gap_is_one_dashed_line_and_one_off_the_chart_is_none() {
+        let rect = Rect::new(10.0, 0.0, 300.0, 60.0);
+        let axis = TimeAxis::DEFAULT;
+        let line = Color::rgba(1.0, 0.0, 0.0, 1.0);
+        let wash = Color::rgba(0.0, 1.0, 0.0, 1.0);
+        // Half a second, half an hour ago: well under a DIP there.
+        let old = seam(
+            3_600_000 - 1_800_000,
+            Some(3_600_000 - 1_799_500),
+            SeamKind::Elevated,
+        );
+        // Older than the span: off the left edge.
+        let gone = seam(-10_000, Some(-9_000), SeamKind::Elevated);
+        // Still open, the newest sample its start: at the right edge.
+        let open = seam(3_600_000, None, SeamKind::Elevated);
+        let seams = [gone, old, open];
+        let mut dl = DisplayList::new();
+        paint_seams(&mut dl, rect, &axis, 3_600_000, &seams, (line, wash));
+        let mut xs = Vec::new();
+        for c in dl.cmds() {
+            match c {
+                DrawCmd::FillRect { rect: r, color } if *color == line => {
+                    assert!(r.y >= rect.y && r.bottom() <= rect.bottom());
+                    if !xs.contains(&r.x) {
+                        xs.push(r.x);
+                    }
+                }
+                DrawCmd::FillRect { color, .. } if *color == wash => panic!("no wash"),
+                _ => {}
+            }
+        }
+        let mid = f32::midpoint(axis.x(rect, 1_800_000.0), axis.x(rect, 1_799_500.0)).floor();
+        assert_eq!(xs, [mid, rect.right() - 1.0]);
+        // The crosshair on the old seam finds it, and on the open one, the newest.
+        let at = seam_at(&seams, rect, &axis, 3_600_000, 1_799_750.0);
+        assert_eq!(at, Some(&seams[1]));
+        assert_eq!(
+            seam_at(&seams, rect, &axis, 3_600_000, 0.0),
+            Some(&seams[2])
+        );
+        assert_eq!(seam_at(&seams, rect, &axis, 3_600_000, 60_000.0), None);
     }
 }

@@ -60,7 +60,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use ot_core::usage::{fade, Frame};
-use ot_core::{ProgramId, Usage};
+use ot_core::{ProgramId, Seam, Usage};
 use ot_model::{Bytes, ProcessKey};
 use ot_paint::{Color, DisplayList, HAlign, Point, Rect, VAlign};
 
@@ -496,6 +496,8 @@ pub(crate) struct UsageChart {
     rows_key: Option<(u64, ChartMode, u32)>,
     /// The usage's newest moment at the last build.
     now_ms: i64,
+    /// Where restarts joined the record ([`Self::set_seams`]).
+    seams: Vec<Seam>,
     poly: Vec<Point>,
     cum: Vec<f32>,
     /// The bands' edges as drawn, smoothed.
@@ -872,6 +874,14 @@ impl UsageChart {
     #[must_use]
     pub fn marking(&self) -> bool {
         self.crosshair.is_some()
+    }
+
+    /// Mark `seams`, where restarts joined the record, the timeline's. Copied only
+    /// when they change, which is rarely.
+    pub fn set_seams(&mut self, seams: &[Seam]) {
+        if self.seams[..] != *seams {
+            self.seams = seams.to_vec();
+        }
     }
 
     /// Lay the chart out in `rect` and place the history in it on `time`. `outside`
@@ -1754,6 +1764,8 @@ impl UsageChart {
             *dim = unmatched || self.hover_band.is_some_and(|h| h != b);
         }
         self.paint_bands(dl, dim, theme);
+        let colors = charts::seam_colors(theme);
+        sparkline::paint_seams(dl, self.plot, &self.time, self.now_ms, &self.seams, colors);
         if self.style == ChartLegend::Inline {
             self.place_labels(usage, theme.small.size);
             self.paint_labels(dl, usage, selected, dim, theme);
@@ -2095,7 +2107,10 @@ impl UsageChart {
         let mut text = std::mem::take(&mut self.text);
         c.ago(&mut ago);
         buf.clear();
-        if let Some(p) = marked {
+        let seam = sparkline::seam_at(&self.seams, plot, &self.time, self.now_ms, c.age_ms);
+        if let Some(seam) = seam {
+            sparkline::seam_label(buf, seam);
+        } else if let Some(p) = marked {
             self.value(buf, p.sum());
         }
         charts::readout(&mut text, buf, &ago, c.side);

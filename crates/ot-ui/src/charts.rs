@@ -5,6 +5,8 @@
 //! pointer is over any chart of a group, the group
 //! snaps it to that chart's nearest plotted point and every chart marks that age
 //! with a hairline and a dot; charts with a label band read out their value there.
+//! Charts with a label band also mark where a restart joined the record
+//! ([`ChartGroup::set_seams`]), and read out what it was while the line is on one.
 //!
 //! A frame goes: [`ChartGroup::begin`] with the number of charts, a
 //! [`ChartGroup::build`] for each, [`ChartGroup::snap`], then a
@@ -13,7 +15,7 @@
 
 use std::time::Instant;
 
-use ot_core::{Series, Timeline};
+use ot_core::{Seam, Series, Timeline};
 use ot_model::Bytes;
 use ot_paint::{Color, DisplayList, Point, Rect};
 
@@ -294,6 +296,10 @@ pub(crate) struct ChartGroup {
     scratch: sparkline::Scratch,
     ago: String,
     readout: String,
+    /// Where restarts joined the record, and the newest sample their ages are
+    /// measured from when the axis has no clock.
+    seams: Vec<Seam>,
+    seams_newest: i64,
 }
 
 impl ChartGroup {
@@ -386,6 +392,28 @@ impl ChartGroup {
         }
     }
 
+    /// Mark the `seams` of the timeline whose newest sample is at `newest_ms` on the
+    /// charts with a label band. Copied only when they change, which is rarely.
+    pub fn set_seams(&mut self, seams: &[Seam], newest_ms: i64) {
+        if self.seams[..] != *seams {
+            self.seams = seams.to_vec();
+        }
+        self.seams_newest = newest_ms;
+    }
+
+    /// [`ChartGroup::set_seams`] for `timeline`.
+    pub fn set_seams_of(&mut self, timeline: &Timeline) {
+        let newest = timeline.cpu_total.latest().map_or(0, |s| s.at_unix_ms);
+        self.set_seams(timeline.seams(), newest);
+    }
+
+    /// The seam the crosshair at `age_ms` is on, in a chart over `rect` on the
+    /// group's axis.
+    #[must_use]
+    pub fn seam_at(&self, rect: Rect, age_ms: f32) -> Option<&Seam> {
+        sparkline::seam_at(&self.seams, rect, &self.axis, self.seams_newest, age_ms)
+    }
+
     /// Move the charts to a new frame's axis, keeping where they are and how they
     /// are scaled: a frame where only the clock moved.
     pub fn set_axis(&mut self, axis: TimeAxis) {
@@ -412,8 +440,22 @@ impl ChartGroup {
         plot.paint(dl, &style, &self.axis, &mut self.scratch);
         let band = self.bands[i];
         if !band.is_empty() {
+            self.paint_seams(dl, rect, theme);
             sparkline::paint_axis(dl, rect, band, &self.axis, theme.small, theme.text_dim);
         }
+    }
+
+    /// Mark the group's seams across `rect`, a chart on the group's axis drawn
+    /// outside it.
+    pub fn paint_seams(&self, dl: &mut DisplayList, rect: Rect, theme: &Theme) {
+        sparkline::paint_seams(
+            dl,
+            rect,
+            &self.axis,
+            self.seams_newest,
+            &self.seams,
+            seam_colors(theme),
+        );
     }
 
     /// Place chart `i` in `area`, scaled against `max`, with a label band `band_h`
@@ -454,6 +496,9 @@ impl ChartGroup {
         // paints just that ([`ChartGroup::repaint`]).
         dl.begin_layer(i as u32);
         plot.paint(dl, style, &self.axis, &mut self.scratch);
+        if !band.is_empty() {
+            self.paint_seams(dl, plot.rect(), theme);
+        }
         let Some(c) = self.crosshair else {
             if !band.is_empty() {
                 sparkline::paint_axis(
@@ -472,7 +517,11 @@ impl ChartGroup {
         let point = plot.paint_crosshair(dl, c.age_ms, style, &self.axis);
         if !band.is_empty() {
             buf.clear();
-            if let Some(p) = &point {
+            if let Some(seam) = self.seam_at(plot.rect(), c.age_ms) {
+                // On a seam the line joins two samples a restart apart: say so,
+                // rather than a value read off that line.
+                sparkline::seam_label(buf, seam);
+            } else if let Some(p) = &point {
                 point_value(buf, value, p);
             }
             c.ago(&mut self.ago);
@@ -482,6 +531,14 @@ impl ChartGroup {
         }
         point
     }
+}
+
+/// A seam's dashed line and the wash across its gap.
+pub(crate) fn seam_colors(theme: &Theme) -> (Color, Color) {
+    (
+        theme.text_dim.with_alpha(0.55),
+        theme.text_dim.with_alpha(0.045),
+    )
 }
 
 /// The standard look for a series drawn in `color`.
@@ -629,6 +686,102 @@ mod tests {
         assert!(g.hover(Some(Point::new(290.0, 20.0))));
         assert!(g.hover(None));
         assert_eq!(g.hover_age(), None);
+    }
+
+    /// Twenty seconds of samples, a ten-second gap an update left, then ten more.
+    fn updated() -> (Series, Vec<Seam>) {
+        let mut s = Series::new(Retention::raw(100));
+        for t in (0..=20).chain(30..=40) {
+            s.push(t * 1000, 50.0);
+        }
+        let seam = Seam {
+            from_ms: 20_000,
+            to_ms: Some(30_000),
+            kind: ot_core::SeamKind::Update {
+                from: "0.21.0".into(),
+                to: "0.21.1".into(),
+            },
+        };
+        (s, vec![seam])
+    }
+
+    /// The fills in `color`, left to right.
+    fn fills(dl: &DisplayList, color: Color) -> Vec<Rect> {
+        let mut r: Vec<Rect> = dl
+            .cmds()
+            .iter()
+            .filter_map(|c| match c {
+                ot_paint::DrawCmd::FillRect { rect, color: c } if *c == color => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        r.sort_by(|a, b| a.x.total_cmp(&b.x));
+        r
+    }
+
+    #[test]
+    fn a_restart_is_marked_on_the_charts_with_a_time_band_and_read_out() {
+        let (s, seams) = updated();
+        let areas = [
+            Rect::new(0.0, 0.0, 300.0, 74.0),
+            Rect::new(0.0, 100.0, 150.0, 30.0),
+        ];
+        let mut g = ChartGroup::default();
+        g.set_seams(&seams, 40_000);
+        g.begin(2, TimeAxis::DEFAULT);
+        g.build(0, areas[0], AXIS_BAND_H, &s, 100.0);
+        g.build(1, areas[1], 0.0, &s, 100.0);
+        g.snap();
+        let theme = Theme::dark();
+        let (line, wash) = seam_colors(&theme);
+        let st = style(theme.cpu, &theme);
+        let mut buf = String::new();
+
+        let mut dl = DisplayList::new();
+        let _ = g.paint(0, &mut dl, &st, percent_value, &theme, &mut buf);
+        let plot = g.plot(0).rect();
+        let (left, right) = (
+            TimeAxis::DEFAULT.x(plot, 20_000.0),
+            TimeAxis::DEFAULT.x(plot, 10_000.0),
+        );
+        let washed = fills(&dl, wash);
+        assert_eq!(washed.len(), 1, "{washed:?}");
+        assert!((washed[0].x - left).abs() < 1e-3 && (washed[0].right() - right).abs() < 1e-3);
+        let dashes = fills(&dl, line);
+        assert!(dashes
+            .iter()
+            .all(|d| (d.w - 1.0).abs() < 1e-6 && d.h <= 3.0));
+        assert!(dashes
+            .iter()
+            .all(|d| d.y >= plot.y && d.bottom() <= plot.bottom()));
+        let xs: std::collections::BTreeSet<i32> = dashes.iter().map(|d| d.x as i32).collect();
+        assert_eq!(xs.len(), 2, "a dashed line at each end of the gap: {xs:?}");
+
+        let mut dl = DisplayList::new();
+        let _ = g.paint(1, &mut dl, &st, percent_value, &theme, &mut buf);
+        assert!(
+            fills(&dl, wash).is_empty() && fills(&dl, line).is_empty(),
+            "a mini chart stays clean"
+        );
+
+        // On the first sample after the update, the readout says what happened.
+        assert!(g.hover(Some(Point::new(right + 1.0, 20.0))));
+        assert_eq!(g.hover_age(), Some(10_000.0));
+        let mut dl = DisplayList::new();
+        let _ = g.paint(0, &mut dl, &st, percent_value, &theme, &mut buf);
+        let t = texts(&dl);
+        assert_eq!(t.len(), 1);
+        assert!(
+            t[0].starts_with("Updated v0.21.0 \u{2192} v0.21.1 \u{b7} "),
+            "{t:?}"
+        );
+        assert!(t[0].ends_with("10s ago"), "{t:?}");
+        // Two samples on, the value again.
+        let x = TimeAxis::DEFAULT.x(plot, 8_000.0);
+        assert!(g.hover(Some(Point::new(x, 20.0))));
+        let mut dl = DisplayList::new();
+        let _ = g.paint(0, &mut dl, &st, percent_value, &theme, &mut buf);
+        assert!(texts(&dl)[0].starts_with("50% "), "{:?}", texts(&dl));
     }
 
     fn texts(dl: &DisplayList) -> Vec<&str> {

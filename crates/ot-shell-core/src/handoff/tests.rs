@@ -225,7 +225,8 @@ fn a_damaged_or_unknown_handoff_is_refused() {
     bytes[8..12].copy_from_slice(&(handoff::FORMAT + 1).to_le_bytes());
     fs::write(&path, &bytes).unwrap();
     let why = refused(&dir, SystemTime::now());
-    assert!(why.contains("written by v0.1.0 in format 2"), "{why}");
+    let named = format!("written by v0.1.0 in format {}", handoff::FORMAT + 1);
+    assert!(why.contains(&named), "{why}");
 }
 
 #[test]

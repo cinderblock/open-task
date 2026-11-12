@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use ot_core::{Feed, Player, RecordHeader, Recorder, Recording, Sampler, SamplerConfig};
+use ot_core::{Feed, Player, RecordHeader, Recorder, Recording, Sampler, SamplerConfig, SeamKind};
 use ot_model::ProcessKey;
 use ot_paint::Point;
 use ot_probe::{
@@ -1278,7 +1278,15 @@ fn carry_on(app: &mut App, options: &ShellOptions, platform: &Arc<dyn Platform>)
             timeline,
             usage,
         } => {
-            app.adopt_history(timeline, usage);
+            let seam = if options.handoff_from.is_some() {
+                SeamKind::Elevated
+            } else {
+                SeamKind::Update {
+                    from: meta.app_version.clone(),
+                    to: options.version.to_owned(),
+                }
+            };
+            app.adopt_history(timeline, usage, seam);
             // A restart as administrator is the same version: nothing to say.
             (meta.app_version != options.version)
                 .then(|| format!("The charts carried on from v{}.", meta.app_version))

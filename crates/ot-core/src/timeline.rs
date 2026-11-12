@@ -490,11 +490,21 @@ impl Timeline {
     }
 
     /// Mark a restart after the newest sample held, for the reason `kind`; the
-    /// next sample closes the gap. Nothing to mark on an empty timeline.
-    pub fn add_seam(&mut self, kind: SeamKind) {
+    /// next sample closes the gap. Nothing to mark on an empty timeline. A
+    /// version longer than a version is cut short.
+    pub fn add_seam(&mut self, mut kind: SeamKind) {
         let Some(last) = self.cpu_total.latest() else {
             return;
         };
+        if let SeamKind::Update { from, to } = &mut kind {
+            for v in [from, to] {
+                let mut end = v.len().min(MAX_SEAM_VERSION);
+                while !v.is_char_boundary(end) {
+                    end -= 1;
+                }
+                v.truncate(end);
+            }
+        }
         if self.seams.len() == MAX_SEAMS {
             self.seams.remove(0);
         }
@@ -1215,7 +1225,14 @@ mod tests {
         assert!(t.seams().is_empty(), "nothing to mark yet");
         t.observe(&snap(1, 1.0, 1));
         t.observe(&snap(2, 1.0, 1));
-        t.add_seam(SeamKind::Elevated);
+        t.add_seam(SeamKind::Update {
+            from: "\u{e9}".repeat(40),
+            to: "1".into(),
+        });
+        let SeamKind::Update { from, .. } = &t.seams()[0].kind else {
+            panic!("{:?}", t.seams());
+        };
+        assert_eq!(from.len(), 64, "cut short, on a character");
         assert_eq!(t.seams()[0].to_ms, None);
         assert_eq!(t.seams()[0].end_ms(), 2000);
         t.observe(&snap(9, 1.0, 1));

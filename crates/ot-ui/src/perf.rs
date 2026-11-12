@@ -842,6 +842,7 @@ impl PerfPage {
             self.minis.push((first, self.slots.len() - first));
         }
         self.plan_detail(&f, snap, tl, theme);
+        self.charts.set_seams_of(tl);
         self.charts.begin(self.slots.len(), self.axis);
         for (i, s) in self.slots.iter().enumerate() {
             let series = series(tl, s.line).unwrap_or(&self.empty);
@@ -1304,6 +1305,7 @@ impl PerfPage {
             width: 1.0,
         };
         s.total.paint(dl, &style, &self.axis, &mut self.scratch);
+        self.charts.paint_seams(dl, rect, theme);
         if self.charts.crosshair().is_none() {
             let small = theme.small;
             sparkline::paint_axis(dl, rect, s.band, &self.axis, small, theme.text_dim);
@@ -1347,7 +1349,9 @@ impl PerfPage {
             let style = charts::style(theme.text, theme);
             let point = s.total.paint_crosshair(dl, c.age_ms, &style, &self.axis);
             buf.clear();
-            if let Some(p) = point {
+            if let Some(seam) = self.charts.seam_at(s.total.rect(), c.age_ms) {
+                sparkline::seam_label(buf, seam);
+            } else if let Some(p) = point {
                 charts::point_value(buf, fmt, &p);
             }
             let mut ago = String::with_capacity(16);
