@@ -1,8 +1,8 @@
 # History handoff across an update restart
 
-> **Status:** released in v0.21.0 (2026-11-10 6:50 PM PST, 02:50Z; tag on
-> `901f6f8`). Update path verified end to end; the administrator restart only
-> unit tested · **Started:** 2026-11-10 · **Branch:** `master` (shared
+> **Status:** v0.21.0 released the handoff; v0.22.0 (2026-11-11 5:49 PM PST,
+> 01:49Z) the seam, sleep and no-samples marks. Not run for real: a restart as
+> administrator end to end, and a real sleep · **Started:** 2026-11-10 · **Branch:** `master` (shared
 > working tree; only this thread's files are staged)
 
 ## Goal
@@ -250,8 +250,10 @@ Steps:
    we add the sleep/resume marks before we release? cancel in progress release
    if you can". No release run had started (nothing pushed or tagged).
 7. [x] Sleep/resume marks (below).
-8. [ ] **[current]** Checks on all targets, then push and release v0.22.0 (the
-   user's "ok" stands for v0.22.0 with these marks in it).
+8. [x] Released v0.22.0 (2026-11-11 5:49 PM PST, 01:49Z; tag on `02cf28f`):
+   CI run 43136121697 green on all six jobs, Release run 43136637661 green,
+   signature verified ("Trusted comment: open-task v0.22.0"), Windows setup
+   checksum OK.
 
 ### Sleep and resume marks
 
