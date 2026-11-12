@@ -701,6 +701,14 @@ holds up the update: the closing app waits for it for two seconds at most. The
 Updates card on the Settings page says which version the charts carried on from, or
 why they started empty.
 
+The charts mark where an update (or a restart as administrator, which hands the
+history on the same way) joined the record: a faint dashed line at each end of the
+gap, or one line where the gap is too narrow to show, on the charts with time labels
+(the main window's CPU and memory, the Performance page's large charts, the History).
+With the pointer on one, the readout says what it was, `Updated v0.21.0 → v0.21.1 ·
+12m ago`, in place of a value read off the line that spans the gap. The marks scroll
+off with the history they sit in, and the next update carries them on.
+
 By default open-task checks when it starts and then once a day, and only says so.
 Settings has three switches, each building on the one before: **Check for updates
 automatically** (on), **Download updates automatically** (off), and **Install updates
@@ -825,12 +833,13 @@ To try the updater against a local copy of a release, build with
 `OT_UPDATE_FEED=http://127.0.0.1:8000/releases` and `OT_UPDATE_PUBLIC_KEY` set to a
 throwaway minisign public key; only a binary built that way is affected.
 
-The history an update hands on (`ot_core::handoff`) is a binary format, and the new
-version reads only the format it was built with. Any change to what it holds, the
-`ot-model` process facts included, must bump `ot_core::handoff::FORMAT`: the test
+The history an update hands on (`ot_core::handoff`) is a binary format: a build
+writes `ot_core::handoff::FORMAT` and reads the formats in `READS`. Any change to what
+it holds, the `ot-model` process facts included, must bump `FORMAT`: the test
 `the_payload_layout_is_pinned` fails until it is, and
 `OT_BLESS=1 cargo test -p ot-core handoff` pins the new layout
-(`crates/ot-core/testdata/handoff-v<N>.bin`; keep the old files, which must be refused).
+(`crates/ot-core/testdata/handoff-v<N>.bin`). Keep the old files: each must still be
+read while its format is in `READS`, and refused once it is not.
 
 ## License
 

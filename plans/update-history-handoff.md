@@ -231,10 +231,45 @@ Decisions:
 
 Steps:
 
-1. [ ] `ot-core`: `Seam`, `Timeline` keeps and trims them; format 2; tests.
-2. [ ] `ot-ui`: `ChartGroup` and the History chart draw seams; readout; tests.
-3. [ ] Shell: the successor adds its seam (update or administrator).
-4. [ ] README, checks, release.
+1. [x] `ot-core`: `Seam`, `Timeline` keeps and trims them; format 2; tests
+   (`a77209e`).
+2. [x] `ot-ui`: `ChartGroup` (and Performance's stacked network charts, outside
+   it) and the History chart draw seams; readout; tests (`a7c1537`).
+3. [x] Shell: the successor adds its seam (update or administrator), in
+   `carry_on` through `App::adopt_history` (`a7c1537`).
+4. [x] README.
+5. [x] Looked at it in a real window (2026-11-11 4:33 PM PST, 00:33Z): the
+   Linux release build with the GTK plugin on a private Xvfb, carrying on from a
+   seeded handoff file (scratch program `scratchpad/seed`: 10 min of history, an
+   earlier update 2 min back). Both seams drew (the earlier one narrow, the fresh
+   restart as a washed gap) on Performance's CPU chart, the main window's CPU and
+   memory cards and the History; hovering the earlier one read
+   `2m 08s ago · Updated v0.21.0 → v0.21.1`. `handoff.log` on Linux:
+   `carried on from v0.21.1's history, written 0.7 s before ...`.
+6. [ ] **[current]** Checks on all targets; push and release on the user's say.
+
+Findings:
+
+- `theme.text_dim.with_alpha(0.07)` is exactly the dark theme's `grid` color, so a
+  wash at that alpha looked like (and in tests, counted as) grid lines; the wash
+  is 0.045.
+- Two restarts with no sample between them (an update, then at once a restart as
+  administrator) leave two open seams from the same sample; the next sample
+  closes both. A file with an open seam before a closed one, or two open ones
+  from different samples, is refused.
+- **Xvfb runs in WSL must `unset WAYLAND_DISPLAY` and set `GDK_BACKEND=x11`.**
+  WSL exports `WAYLAND_DISPLAY=wayland-0`, and GTK prefers Wayland, so with only
+  `DISPLAY=:97` set the window went to WSLg (the user's desktop) and Xvfb stayed
+  empty (`import` wrote a 290-byte blank PNG). Three ~11 s runs did that before
+  it was caught.
+- A Linux build needs the toolkit plugin beside it:
+  `cargo build --release -p ot-shell-gtk` puts `libot_shell_gtk.so` in
+  `target/release`; without it the app says "GTK: not in this build" and runs
+  headless.
+- The app keeps only its history setting's span (here about 5 min): a seam
+  further back than that is trimmed with the samples, as it should be.
+- A seam's versions are cut to 64 bytes when added: the reader refuses longer
+  ones, and a refusal would cost the whole history.
 
 ## Open questions for the user
 
