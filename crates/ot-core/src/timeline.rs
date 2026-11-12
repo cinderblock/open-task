@@ -20,7 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ot_model::Tick;
 
 use crate::handoff::{
-    BucketV1, DiskSeriesV1, OpenBucketV1, PairSeriesV1, SeriesV1, TierV1, TimelineV1,
+    BucketV1, DiskSeriesV1, OpenBucketV1, PairSeriesV1, SeamKindV2, SeamV2, SeriesV1, TierV1,
+    TimelineV1,
 };
 use crate::history::Ring;
 use crate::snapshot::Snapshot;
@@ -400,6 +401,43 @@ pub struct GpuSeries {
     pub dedicated: Series,
 }
 
+/// Where the record breaks because the app restarted and carried its history on
+/// ([`crate::handoff`]). The charts join the samples either side of a restart with
+/// a line, as they would two samples a second apart; a seam says the line spans a
+/// gap, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seam {
+    /// The last sample before the restart, ms since the Unix epoch.
+    pub from_ms: i64,
+    /// The first sample after it; `None` until that arrives.
+    pub to_ms: Option<i64>,
+    pub kind: SeamKind,
+}
+
+/// Why the app restarted at a [`Seam`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeamKind {
+    /// An update, from one version to another (the same one, for a reinstall).
+    Update { from: String, to: String },
+    /// Restarted as administrator.
+    Elevated,
+}
+
+impl Seam {
+    /// The gap's end: the first sample after it, or while that has not arrived,
+    /// its start.
+    #[must_use]
+    pub fn end_ms(&self) -> i64 {
+        self.to_ms.unwrap_or(self.from_ms)
+    }
+}
+
+/// The most seams a timeline keeps: more restarts than any history could show
+/// apart. The oldest go first.
+pub const MAX_SEAMS: usize = 64;
+/// The longest version a seam names; a longer one is not a version.
+const MAX_SEAM_VERSION: usize = 64;
+
 /// All system-wide series the UI graphs.
 #[derive(Debug, Clone)]
 pub struct Timeline {
@@ -422,6 +460,8 @@ pub struct Timeline {
     pub battery_rate: Series,
     retention: Retention,
     last_tick: Option<Tick>,
+    /// Oldest first.
+    seams: Vec<Seam>,
 }
 
 impl Timeline {
@@ -438,6 +478,49 @@ impl Timeline {
             battery_rate: Series::new(retention.clone()),
             retention,
             last_tick: None,
+            seams: Vec::new(),
+        }
+    }
+
+    /// Where the record breaks for a restart, oldest first: those whose gap ends
+    /// within the history held.
+    #[must_use]
+    pub fn seams(&self) -> &[Seam] {
+        &self.seams
+    }
+
+    /// Mark a restart after the newest sample held, for the reason `kind`; the
+    /// next sample closes the gap. Nothing to mark on an empty timeline.
+    pub fn add_seam(&mut self, kind: SeamKind) {
+        let Some(last) = self.cpu_total.latest() else {
+            return;
+        };
+        if self.seams.len() == MAX_SEAMS {
+            self.seams.remove(0);
+        }
+        self.seams.push(Seam {
+            from_ms: last.at_unix_ms,
+            to_ms: None,
+            kind,
+        });
+    }
+
+    /// Close the open seams at `at`, the first sample after them, and let go of
+    /// those whose gap ended before the oldest sample held.
+    fn tend_seams(&mut self, at: Option<i64>) {
+        if self.seams.is_empty() {
+            return;
+        }
+        if let Some(at) = at {
+            for s in self.seams.iter_mut().rev() {
+                if s.to_ms.is_some() {
+                    break;
+                }
+                s.to_ms = Some(at.max(s.from_ms));
+            }
+        }
+        if let Some(oldest) = self.cpu_total.oldest_ms() {
+            self.seams.retain(|s| s.end_ms() >= oldest);
         }
     }
 
@@ -456,6 +539,7 @@ impl Timeline {
             s.set_retention(retention.clone());
         }
         self.retention = retention;
+        self.tend_seams(None);
     }
 
     /// Every series, for the ones that apply to all alike.
@@ -526,6 +610,7 @@ impl Timeline {
             self.record(snap, at - interval.clamp(1, at.max(1)));
         }
         self.record(snap, at);
+        self.tend_seams(Some(at));
 
         // A device that is gone takes its history with it. An empty list is more
         // likely a failed read than every disk (or every adapter) vanishing at once,
@@ -868,7 +953,67 @@ impl Timeline {
             battery_rate: series(dto.battery_rate)?,
             retention: retention.clone(),
             last_tick: None,
+            seams: Vec::new(),
         })
+    }
+
+    pub(crate) fn seams_to_handoff(&self) -> Vec<SeamV2> {
+        self.seams
+            .iter()
+            .map(|s| SeamV2 {
+                from_ms: s.from_ms,
+                to_ms: s.to_ms,
+                kind: match &s.kind {
+                    SeamKind::Update { from, to } => SeamKindV2::Update {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    SeamKind::Elevated => SeamKindV2::Elevated,
+                },
+            })
+            .collect()
+    }
+
+    /// Take on the seams a handoff carried: in order, each gap's end after its
+    /// start and only the newest still open (two restarts with no sample between
+    /// leave two, from the same sample), versions short enough to be ones. Those
+    /// that ended before the oldest sample held are let go.
+    pub(crate) fn restore_seams(&mut self, dto: Vec<SeamV2>) -> Result<(), String> {
+        if dto.len() > MAX_SEAMS {
+            return Err(format!("{} seams", dto.len()));
+        }
+        let mut after = i64::MIN;
+        let mut open = false;
+        for s in &dto {
+            let ordered = if open {
+                s.to_ms.is_none() && s.from_ms == after
+            } else {
+                s.from_ms >= after && s.to_ms.is_none_or(|t| t >= s.from_ms)
+            };
+            if !ordered {
+                return Err("seams out of order".into());
+            }
+            after = s.to_ms.unwrap_or(s.from_ms);
+            open = s.to_ms.is_none();
+            if let SeamKindV2::Update { from, to } = &s.kind {
+                if from.len() > MAX_SEAM_VERSION || to.len() > MAX_SEAM_VERSION {
+                    return Err("a seam's version is too long".into());
+                }
+            }
+        }
+        self.seams = dto
+            .into_iter()
+            .map(|s| Seam {
+                from_ms: s.from_ms,
+                to_ms: s.to_ms,
+                kind: match s.kind {
+                    SeamKindV2::Update { from, to } => SeamKind::Update { from, to },
+                    SeamKindV2::Elevated => SeamKind::Elevated,
+                },
+            })
+            .collect();
+        self.tend_seams(None);
+        Ok(())
     }
 }
 
@@ -1061,6 +1206,43 @@ mod tests {
         let mut t = Timeline::new(Retention::raw(10));
         t.observe(&snap(7, 1.0, 1));
         assert_eq!(t.cpu_total.latest().map(|s| s.at_unix_ms), Some(7000));
+    }
+
+    #[test]
+    fn a_seam_spans_the_gap_and_scrolls_off_with_the_history() {
+        let mut t = Timeline::new(Retention::raw(10));
+        t.add_seam(SeamKind::Elevated);
+        assert!(t.seams().is_empty(), "nothing to mark yet");
+        t.observe(&snap(1, 1.0, 1));
+        t.observe(&snap(2, 1.0, 1));
+        t.add_seam(SeamKind::Elevated);
+        assert_eq!(t.seams()[0].to_ms, None);
+        assert_eq!(t.seams()[0].end_ms(), 2000);
+        t.observe(&snap(9, 1.0, 1));
+        let seam = &t.seams()[0];
+        assert_eq!((seam.from_ms, seam.to_ms), (2000, Some(9000)));
+        // Ten raw samples held: the gap's end goes at the eleventh after it.
+        for tick in 10..=18 {
+            t.observe(&snap(tick, 1.0, 1));
+        }
+        assert_eq!(t.seams().len(), 1);
+        t.observe(&snap(19, 1.0, 1));
+        assert_eq!(t.seams(), []);
+    }
+
+    #[test]
+    fn seams_are_capped_and_a_shorter_retention_lets_old_ones_go() {
+        let mut t = Timeline::new(Retention::raw(1000));
+        for tick in 1..=(MAX_SEAMS as u64 + 10) {
+            t.observe(&snap(tick, 1.0, 1));
+            t.add_seam(SeamKind::Elevated);
+        }
+        assert_eq!(t.seams().len(), MAX_SEAMS);
+        assert_eq!(t.seams()[0].from_ms, 11_000, "the oldest went first");
+        // The last five samples held: the gaps that end at them, and the one
+        // still open after the newest.
+        t.set_retention(Retention::raw(5));
+        assert_eq!(t.seams().len(), 6, "{:?}", t.seams());
     }
 
     fn tiered() -> Retention {

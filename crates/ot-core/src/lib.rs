@@ -38,6 +38,7 @@ pub use record::{RecordProgress, RecordStats, RecordingProbe};
 pub use sampler::{Sampler, SamplerConfig};
 pub use snapshot::Snapshot;
 pub use timeline::{
-    AdapterSeries, Bucket, DiskSeries, History, Resolution, Retention, Sample, Series, Timeline,
+    AdapterSeries, Bucket, DiskSeries, History, Resolution, Retention, Sample, Seam, SeamKind,
+    Series, Timeline,
 };
 pub use usage::{Frame, ProcessUsage, ProgramId, Seen, Usage};

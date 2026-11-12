@@ -201,6 +201,41 @@ not that important". Read as yes to both, the second kept low-key (`2395905`):
    when a waiting handoff was refused. Shown in the card's note line, which a
    copy that cannot update itself still uses for that instead.
 
+## Seam marks on the charts (approved 2026-11-11: "do it")
+
+Claude proposed, the user said "do it": mark where a handoff joined two
+instances' records, faintly, on the full-size charts only.
+
+Decisions:
+
+1. **Where they live**: `Timeline::seams()`, a short list (at most 64) of
+   `Seam { from_ms, to_ms, kind }`: the last sample before the restart, the first
+   one after (filled in when it arrives), and why (`Update { from, to }`, or
+   `Elevated`). A seam goes when its `to_ms` is older than the oldest sample held,
+   so they scroll off with the history. The successor adds one after adopting
+   (`App::adopt_history`), and later handoffs carry them along.
+2. **Format 2** adds the seams after format 1's payload. Format 2 builds still
+   read format 1 files (no seams), so the first update from 0.21.0 keeps its
+   history *and* gets its mark. This replaces "a build reads only `FORMAT`": a
+   build reads the formats it lists (`READS`), each pinned by a fixture in
+   `crates/ot-core/testdata/`.
+3. **Drawing**: a dashed hairline at the gap (both ends if they are more than a
+   couple of DIPs apart, with a faint fill between), on the charts that have a
+   time band (main window CPU and memory, Performance detail charts, History).
+   Mini charts and Summary cards stay clean.
+4. **Hover**: while the crosshair is on a seam, the readout says what it was:
+   `Updated v0.21.0 → v0.21.1 · 12m ago`, or `Restarted as administrator`, in
+   place of the value.
+5. **Sleep and resume marks**: not in this change; the user was asked and did not
+   say. Logged as a possible follow-up.
+
+Steps:
+
+1. [ ] `ot-core`: `Seam`, `Timeline` keeps and trims them; format 2; tests.
+2. [ ] `ot-ui`: `ChartGroup` and the History chart draw seams; readout; tests.
+3. [ ] Shell: the successor adds its seam (update or administrator).
+4. [ ] README, checks, release.
+
 ## Open questions for the user
 
 None open.

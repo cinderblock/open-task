@@ -7,8 +7,8 @@
 //! are the shell's business; this module is the format.
 //!
 //! The two builds can differ, so the format says which build wrote it and which
-//! layout its payload has. A build reads only the payload layout it knows,
-//! [`FORMAT`]; anything else is refused with [`Error::UnknownFormat`], and the
+//! layout its payload has. A build writes [`FORMAT`] and reads the layouts in
+//! [`READS`]; anything else is refused with [`Error::UnknownFormat`], and the
 //! caller starts fresh. Nothing in the file is trusted: every count, id and order
 //! is checked before any of it reaches the app ([`Error::Invalid`]).
 //!
@@ -28,7 +28,8 @@
 //! format a file came from, even one it cannot read. The payload is postcard,
 //! which is not self-describing: its layout is the structs below, and **any change
 //! to them, or to the `ot-model` types they hold, must bump [`FORMAT`]**. The test
-//! `the_payload_layout_is_pinned` fails until it is bumped.
+//! `the_payload_layout_is_pinned` fails until it is bumped. An older layout stays
+//! readable while its structs stay: each is pinned by a file in `testdata/`.
 
 use std::fmt;
 
@@ -41,10 +42,14 @@ use crate::usage::Usage;
 
 /// The first eight bytes of every handoff file.
 pub const MAGIC: &[u8; 8] = b"OTHANDOF";
-/// The payload layout this build writes and the only one it reads.
+/// The payload layout this build writes.
 ///
 /// - 1: the first: the timeline's series and the usage history.
-pub const FORMAT: u32 = 1;
+/// - 2: format 1's, then the timeline's seams (where earlier restarts joined
+///   the record).
+pub const FORMAT: u32 = 2;
+/// The payload layouts this build reads.
+pub const READS: [u32; 2] = [1, 2];
 /// The largest payload a reader will decompress. An hour of a busy machine's
 /// history is a few megabytes; a day, a few tens.
 const MAX_RAW: u32 = 256 << 20;
@@ -91,7 +96,9 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "written by v{app_version} in format {format}, which this build \
-                 (format {FORMAT}) does not read"
+                 (formats {}-{}) does not read",
+                READS[0],
+                READS[READS.len() - 1]
             ),
             Self::Corrupt(why) => write!(f, "the file is damaged: {why}"),
             Self::Invalid(why) => write!(f, "the history in it is not consistent: {why}"),
@@ -149,25 +156,39 @@ pub fn meta(bytes: &[u8]) -> Result<Meta, Error> {
 /// Any reason the file cannot be used; the caller should start fresh.
 pub fn decode(bytes: &[u8], retention: &Retention) -> Result<(Meta, Timeline, Usage), Error> {
     let (meta, body) = split(bytes)?;
-    if meta.format != FORMAT {
+    if !READS.contains(&meta.format) {
         return Err(Error::UnknownFormat {
             format: meta.format,
             app_version: meta.app_version,
         });
     }
     let payload = unpack(&body)?;
-    let history: HistoryV1 =
-        postcard::from_bytes(&payload).map_err(|e| Error::Corrupt(e.to_string()))?;
-    let timeline = Timeline::from_handoff(history.timeline, retention).map_err(Error::Invalid)?;
+    let corrupt = |e: postcard::Error| Error::Corrupt(e.to_string());
+    let history = if meta.format == 1 {
+        let v1: HistoryV1 = postcard::from_bytes(&payload).map_err(corrupt)?;
+        HistoryV2 {
+            timeline: v1.timeline,
+            usage: v1.usage,
+            seams: Vec::new(),
+        }
+    } else {
+        postcard::from_bytes(&payload).map_err(corrupt)?
+    };
+    let mut timeline =
+        Timeline::from_handoff(history.timeline, retention).map_err(Error::Invalid)?;
+    timeline
+        .restore_seams(history.seams)
+        .map_err(Error::Invalid)?;
     let usage = Usage::from_handoff(history.usage).map_err(Error::Invalid)?;
     Ok((meta, timeline, usage))
 }
 
 /// The uncompressed payload for `timeline` and `usage`: what the layout test pins.
 fn payload(timeline: &Timeline, usage: &Usage) -> Vec<u8> {
-    let history = HistoryV1 {
+    let history = HistoryV2 {
         timeline: timeline.to_handoff(),
         usage: usage.to_handoff(),
+        seams: timeline.seams_to_handoff(),
     };
     // Serializing plain structs into a Vec cannot fail.
     postcard::to_allocvec(&history).unwrap_or_default()
@@ -196,7 +217,7 @@ fn split(bytes: &[u8]) -> Result<(Meta, Body<'_>), Error> {
         written_unix_ms,
         pid,
     };
-    if format != FORMAT {
+    if !READS.contains(&format) {
         // The rest may be laid out differently; the header is all that is sure.
         return Ok((
             meta,
@@ -291,12 +312,35 @@ fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-// The payload, format 1. Every change here bumps FORMAT (see the module docs).
+// The payload. Every change here bumps FORMAT (see the module docs); a struct a
+// format still in READS uses stays as it is.
 
+/// Format 1's payload.
 #[derive(Debug, Serialize, Deserialize)]
 struct HistoryV1 {
     timeline: TimelineV1,
     usage: UsageV1,
+}
+
+/// Format 2's payload: format 1's, then the seams.
+#[derive(Debug, Serialize, Deserialize)]
+struct HistoryV2 {
+    timeline: TimelineV1,
+    usage: UsageV1,
+    seams: Vec<SeamV2>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SeamV2 {
+    pub from_ms: i64,
+    pub to_ms: Option<i64>,
+    pub kind: SeamKindV2,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum SeamKindV2 {
+    Update { from: String, to: String },
+    Elevated,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

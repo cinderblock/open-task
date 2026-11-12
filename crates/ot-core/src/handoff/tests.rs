@@ -12,6 +12,7 @@ use ot_model::{Bytes, Percent, ProcessKey, Tick, Watts};
 
 use super::*;
 use crate::snapshot::Snapshot;
+use crate::timeline::{Seam, SeamKind};
 use crate::usage::Frame;
 
 /// A billion cycles.
@@ -155,6 +156,29 @@ fn session(steps: u64) -> (Timeline, Usage) {
     (timeline, usage)
 }
 
+/// A session `steps` seconds long that an update joined at step 100 (a 5 s gap
+/// after it) and a restart as administrator at the very end, the sample after it
+/// not yet in.
+fn seamed(steps: u64) -> (Timeline, Usage) {
+    let (mut timeline, mut usage) = session(100);
+    timeline.add_seam(SeamKind::Update {
+        from: "0.21.0".into(),
+        to: "0.21.1".into(),
+    });
+    for step in 105..=steps {
+        let snap = machine(step, step + 1, 1000);
+        timeline.observe(&snap);
+        usage.observe(&snap);
+    }
+    timeline.add_seam(SeamKind::Elevated);
+    (timeline, usage)
+}
+
+/// Step `step`'s time, in ms since the Unix epoch.
+fn at_ms(step: i64) -> i64 {
+    i64::try_from(T0).unwrap() + step * 1000
+}
+
 fn history(series: &crate::timeline::Series) -> Vec<crate::timeline::Bucket> {
     series.history().collect()
 }
@@ -193,6 +217,7 @@ fn assert_same(a: &(Timeline, Usage), b: &(Timeline, Usage)) {
     assert_eq!(totals(&a.1), totals(&b.1));
     assert_eq!(a.1.faded_out(), b.1.faded_out());
     assert_eq!(a.1.programs(), b.1.programs());
+    assert_eq!(a.0.seams(), b.0.seams());
 }
 
 fn round_trip(timeline: &Timeline, usage: &Usage) -> (Timeline, Usage) {
@@ -212,7 +237,8 @@ fn round_trip(timeline: &Timeline, usage: &Usage) -> (Timeline, Usage) {
 
 #[test]
 fn a_round_trip_keeps_everything() {
-    let (timeline, usage) = session(300);
+    let (timeline, usage) = seamed(300);
+    assert_eq!(timeline.seams().len(), 2);
     assert!(
         usage.faded_out().iter().any(|&t| t > 0.0),
         "some history faded out"
@@ -228,6 +254,46 @@ fn a_round_trip_keeps_everything() {
         payload(&restored.0, &restored.1),
         "it writes the same bytes again"
     );
+}
+
+#[test]
+fn seams_carry_on_and_the_next_sample_closes_the_open_one() {
+    let (timeline, usage) = seamed(150);
+    let (mut next, _) = round_trip(&timeline, &usage);
+    assert_eq!(
+        next.seams(),
+        [
+            Seam {
+                from_ms: at_ms(100),
+                to_ms: Some(at_ms(105)),
+                kind: SeamKind::Update {
+                    from: "0.21.0".into(),
+                    to: "0.21.1".into()
+                },
+            },
+            Seam {
+                from_ms: at_ms(150),
+                to_ms: None,
+                kind: SeamKind::Elevated,
+            },
+        ]
+    );
+    // A pass with no rates is no sample.
+    next.observe(&machine(153, 1, 0));
+    assert_eq!(next.seams()[1].to_ms, None);
+    next.observe(&machine(154, 2, 1000));
+    assert_eq!(next.seams()[1].to_ms, Some(at_ms(154)));
+}
+
+#[test]
+fn seams_go_with_the_history_they_mark() {
+    let (mut timeline, _) = seamed(110);
+    assert_eq!(timeline.seams().len(), 2);
+    // The retention keeps 10 minutes of 60 s buckets: run past it.
+    for step in 111..=900 {
+        timeline.observe(&machine(step, step + 1, 1000));
+    }
+    assert_eq!(timeline.seams(), []);
 }
 
 #[test]
@@ -372,19 +438,20 @@ fn a_payload_damaged_past_the_checksum_is_refused_or_harmless() {
 }
 
 /// A file with `history` as its payload.
-fn forged(history: &HistoryV1) -> Vec<u8> {
+fn forged(history: &HistoryV2) -> Vec<u8> {
     frame(&postcard::to_allocvec(history).unwrap(), "x", 0, 0)
 }
 
-fn dto() -> HistoryV1 {
-    let (timeline, usage) = session(60);
-    HistoryV1 {
+fn dto() -> HistoryV2 {
+    let (timeline, usage) = seamed(120);
+    HistoryV2 {
         timeline: timeline.to_handoff(),
         usage: usage.to_handoff(),
+        seams: timeline.seams_to_handoff(),
     }
 }
 
-fn refused(change: impl FnOnce(&mut HistoryV1)) -> String {
+fn refused(change: impl FnOnce(&mut HistoryV2)) -> String {
     let mut h = dto();
     change(&mut h);
     match decode(&forged(&h), &retention()) {
@@ -416,6 +483,24 @@ fn what_would_trip_the_app_is_refused() {
         };
         h.usage.procs.push(again);
     });
+    refused(|h| h.seams.reverse());
+    refused(|h| h.seams[0].to_ms = Some(h.seams[0].from_ms - 1));
+    refused(|h| h.seams[0].to_ms = None);
+    refused(|h| {
+        h.seams[0].kind = SeamKindV2::Update {
+            from: "9".repeat(65),
+            to: "1".into(),
+        };
+    });
+    refused(|h| {
+        h.seams = (0..65)
+            .map(|i| SeamV2 {
+                from_ms: i,
+                to_ms: Some(i),
+                kind: SeamKindV2::Elevated,
+            })
+            .collect();
+    });
     refused(|h| h.timeline.cpu_total.raw.reverse());
     refused(|h| h.timeline.cpu_total.tiers[0].bucket_ms = 0);
     refused(|h| h.timeline.cpu_total.tiers[0].closed.reverse());
@@ -442,7 +527,7 @@ impl SeriesV1 {
 
 // The layout pin. `testdata/handoff-v<FORMAT>.bin` is a file of the current
 // format; `OT_BLESS=1 cargo test -p ot-core handoff` writes it. Older ones stay,
-// to prove they are refused.
+// to prove they are still read (while in READS) or refused.
 
 fn testdata(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -452,7 +537,7 @@ fn testdata(name: &str) -> PathBuf {
 
 #[test]
 fn the_payload_layout_is_pinned() {
-    let (timeline, usage) = session(150);
+    let (timeline, usage) = seamed(150);
     let path = testdata(&format!("handoff-v{FORMAT}.bin"));
     if std::env::var_os("OT_BLESS").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -471,21 +556,39 @@ fn the_payload_layout_is_pinned() {
 }
 
 #[test]
-fn every_older_format_is_refused() {
+fn every_older_format_is_read_while_listed_and_refused_after() {
     let current = format!("handoff-v{FORMAT}.bin");
+    let mut older = 0;
     for entry in std::fs::read_dir(testdata("")).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with("handoff-v") || name == current {
             continue;
         }
+        older += 1;
         let bytes = std::fs::read(entry.path()).unwrap();
-        assert!(
-            matches!(
-                decode(&bytes, &retention()),
-                Err(Error::UnknownFormat { .. })
-            ),
-            "{name}"
-        );
+        let format = meta(&bytes).unwrap().format;
+        let decoded = decode(&bytes, &retention());
+        if READS.contains(&format) {
+            let (_, t, _) = decoded.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!t.cpu_total.is_empty(), "{name}");
+        } else {
+            assert!(
+                matches!(decoded, Err(Error::UnknownFormat { .. })),
+                "{name}"
+            );
+        }
     }
+    assert!(older > 0, "format 1's file is kept");
+}
+
+#[test]
+fn format_1_carries_on_without_seams() {
+    let bytes = std::fs::read(testdata("handoff-v1.bin")).unwrap();
+    let (meta, mut t, _) = decode(&bytes, &retention()).unwrap();
+    assert_eq!(meta.format, 1);
+    assert_eq!(t.seams(), []);
+    // The successor marks its own restart, as it does after a format 2 file.
+    t.add_seam(SeamKind::Elevated);
+    assert_eq!(t.seams().len(), 1);
 }
