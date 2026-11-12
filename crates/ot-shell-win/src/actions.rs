@@ -48,6 +48,10 @@ impl ot_shell_core::Platform for WinPlatform {
     fn local_time(&self, at: std::time::SystemTime) -> Option<String> {
         crate::clock::local_time(at)
     }
+
+    fn time_asleep(&self) -> Option<std::time::Duration> {
+        crate::clock::time_asleep()
+    }
 }
 
 /// Show a popup menu built from `nodes`, submenus and check marks included,

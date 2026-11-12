@@ -401,10 +401,11 @@ pub struct GpuSeries {
     pub dedicated: Series,
 }
 
-/// Where the record breaks because the app restarted and carried its history on
-/// ([`crate::handoff`]). The charts join the samples either side of a restart with
-/// a line, as they would two samples a second apart; a seam says the line spans a
-/// gap, and why.
+/// Where the record breaks: the app restarted and carried its history on
+/// ([`crate::handoff`]), or went [`GAP_MS`] or more without a sample (the
+/// computer slept, or the app was held up). The charts join the samples either
+/// side with a line, as they would two samples a second apart; a seam says the
+/// line spans a gap, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seam {
     /// The last sample before the restart, ms since the Unix epoch.
@@ -414,13 +415,19 @@ pub struct Seam {
     pub kind: SeamKind,
 }
 
-/// Why the app restarted at a [`Seam`].
+/// Why the record breaks at a [`Seam`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeamKind {
     /// An update, from one version to another (the same one, for a reinstall).
     Update { from: String, to: String },
     /// Restarted as administrator.
     Elevated,
+    /// The computer slept: most of the gap, by its own count of the time it
+    /// spent asleep ([`Timeline::set_time_asleep`]).
+    Asleep,
+    /// No samples for [`GAP_MS`] or more, for no reason the timeline knows: the
+    /// app was frozen or held up, or slept on a computer that does not count it.
+    NoSamples,
 }
 
 impl Seam {
@@ -437,6 +444,10 @@ impl Seam {
 pub const MAX_SEAMS: usize = 64;
 /// The longest version a seam names; a longer one is not a version.
 const MAX_SEAM_VERSION: usize = 64;
+/// A stretch this long between two samples is a gap the charts mark
+/// ([`SeamKind::Asleep`], [`SeamKind::NoSamples`]): seven times the slowest
+/// update speed, so no setting makes one.
+pub const GAP_MS: i64 = 30_000;
 
 /// All system-wide series the UI graphs.
 #[derive(Debug, Clone)]
@@ -462,6 +473,10 @@ pub struct Timeline {
     last_tick: Option<Tick>,
     /// Oldest first.
     seams: Vec<Seam>,
+    /// The computer's time asleep since it started, as last told
+    /// ([`Timeline::set_time_asleep`]), and as it was at the newest sample.
+    asleep_ms: Option<i64>,
+    asleep_at_newest: Option<i64>,
 }
 
 impl Timeline {
@@ -479,7 +494,45 @@ impl Timeline {
             retention,
             last_tick: None,
             seams: Vec::new(),
+            asleep_ms: None,
+            asleep_at_newest: None,
         }
+    }
+
+    /// How long the computer has spent asleep since it started, as the OS counts
+    /// it (`None` where it does not): told before each snapshot, so a gap in the
+    /// samples can say whether the computer slept through it.
+    pub fn set_time_asleep(&mut self, total: Option<std::time::Duration>) {
+        self.asleep_ms = total.and_then(|d| i64::try_from(d.as_millis()).ok());
+    }
+
+    /// Mark a gap of [`GAP_MS`] or more from the newest sample to one at `at`,
+    /// unless a restart already marks it (an open seam, which `at` will close).
+    fn mark_gap(&mut self, at: i64) {
+        let Some(last) = self.cpu_total.latest().map(|s| s.at_unix_ms) else {
+            return;
+        };
+        let gap = at - last;
+        if gap < GAP_MS || self.seams.last().is_some_and(|s| s.to_ms.is_none()) {
+            return;
+        }
+        let slept = match (self.asleep_at_newest, self.asleep_ms) {
+            (Some(before), Some(now)) => now - before,
+            _ => 0,
+        };
+        let kind = if 2 * slept >= gap {
+            SeamKind::Asleep
+        } else {
+            SeamKind::NoSamples
+        };
+        if self.seams.len() == MAX_SEAMS {
+            self.seams.remove(0);
+        }
+        self.seams.push(Seam {
+            from_ms: last,
+            to_ms: Some(at),
+            kind,
+        });
     }
 
     /// Where the record breaks for a restart, oldest first: those whose gap ends
@@ -619,8 +672,10 @@ impl Timeline {
             let interval = i64::try_from(snap.interval.as_millis()).unwrap_or(i64::MAX);
             self.record(snap, at - interval.clamp(1, at.max(1)));
         }
+        self.mark_gap(at);
         self.record(snap, at);
         self.tend_seams(Some(at));
+        self.asleep_at_newest = self.asleep_ms;
 
         // A device that is gone takes its history with it. An empty list is more
         // likely a failed read than every disk (or every adapter) vanishing at once,
@@ -964,6 +1019,8 @@ impl Timeline {
             retention: retention.clone(),
             last_tick: None,
             seams: Vec::new(),
+            asleep_ms: None,
+            asleep_at_newest: None,
         })
     }
 
@@ -979,6 +1036,8 @@ impl Timeline {
                         to: to.clone(),
                     },
                     SeamKind::Elevated => SeamKindV2::Elevated,
+                    SeamKind::Asleep => SeamKindV2::Asleep,
+                    SeamKind::NoSamples => SeamKindV2::NoSamples,
                 },
             })
             .collect()
@@ -1019,6 +1078,8 @@ impl Timeline {
                 kind: match s.kind {
                     SeamKindV2::Update { from, to } => SeamKind::Update { from, to },
                     SeamKindV2::Elevated => SeamKind::Elevated,
+                    SeamKindV2::Asleep => SeamKind::Asleep,
+                    SeamKindV2::NoSamples => SeamKind::NoSamples,
                 },
             })
             .collect();
@@ -1245,6 +1306,55 @@ mod tests {
         assert_eq!(t.seams().len(), 1);
         t.observe(&snap(19, 1.0, 1));
         assert_eq!(t.seams(), []);
+    }
+
+    #[test]
+    fn a_stretch_without_samples_is_marked_and_says_if_the_computer_slept() {
+        let mut t = Timeline::new(Retention::raw(100));
+        let asleep = |t: &mut Timeline, s: u64| t.set_time_asleep(Some(Duration::from_secs(s)));
+        asleep(&mut t, 500);
+        t.observe(&snap(1, 1.0, 1));
+        // A slow pass, short of a gap.
+        t.observe(&snap(30, 1.0, 1));
+        assert_eq!(t.seams(), []);
+        // An hour, 3500 s of it asleep.
+        asleep(&mut t, 4000);
+        t.observe(&snap(3630, 1.0, 1));
+        // Two minutes, none of it asleep: held up.
+        t.observe(&snap(3750, 1.0, 1));
+        // And where the OS does not count sleep, the same.
+        t.set_time_asleep(None);
+        t.observe(&snap(3800, 1.0, 1));
+        assert_eq!(
+            t.seams(),
+            [
+                Seam {
+                    from_ms: 30_000,
+                    to_ms: Some(3_630_000),
+                    kind: SeamKind::Asleep,
+                },
+                Seam {
+                    from_ms: 3_630_000,
+                    to_ms: Some(3_750_000),
+                    kind: SeamKind::NoSamples,
+                },
+                Seam {
+                    from_ms: 3_750_000,
+                    to_ms: Some(3_800_000),
+                    kind: SeamKind::NoSamples,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restart_that_takes_long_is_one_seam_not_two() {
+        let mut t = Timeline::new(Retention::raw(100));
+        t.observe(&snap(1, 1.0, 1));
+        t.add_seam(SeamKind::Elevated);
+        t.observe(&snap(100, 1.0, 1));
+        assert_eq!(t.seams().len(), 1);
+        assert_eq!(t.seams()[0].kind, SeamKind::Elevated);
     }
 
     #[test]

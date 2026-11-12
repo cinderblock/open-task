@@ -814,7 +814,8 @@ pub fn seam_at<'a>(
 }
 
 /// What a readout says on a seam, into `out`: `Updated v0.21.0 → v0.21.1`,
-/// `Reinstalled v0.21.0`, or `Restarted as administrator`.
+/// `Reinstalled v0.21.0`, `Restarted as administrator`, `Asleep for 2h 13m`, or
+/// `No samples for 45s`.
 pub fn seam_label(out: &mut String, seam: &Seam) {
     out.clear();
     match &seam.kind {
@@ -829,6 +830,14 @@ pub fn seam_label(out: &mut String, seam: &Seam) {
             out.push_str(to);
         }
         SeamKind::Elevated => out.push_str("Restarted as administrator"),
+        SeamKind::Asleep => {
+            out.push_str("Asleep for ");
+            crate::format::push_span(out, seam.end_ms() - seam.from_ms);
+        }
+        SeamKind::NoSamples => {
+            out.push_str("No samples for ");
+            crate::format::push_span(out, seam.end_ms() - seam.from_ms);
+        }
     }
 }
 
@@ -1588,6 +1597,10 @@ mod tests {
         assert_eq!(out, "Reinstalled v0.21.0");
         seam_label(&mut out, &seam(0, None, SeamKind::Elevated));
         assert_eq!(out, "Restarted as administrator");
+        seam_label(&mut out, &seam(0, Some(7_980_000), SeamKind::Asleep));
+        assert_eq!(out, "Asleep for 2h 13m");
+        seam_label(&mut out, &seam(10_000, Some(55_000), SeamKind::NoSamples));
+        assert_eq!(out, "No samples for 45s");
     }
 
     #[test]

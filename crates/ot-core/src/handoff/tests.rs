@@ -286,6 +286,27 @@ fn seams_carry_on_and_the_next_sample_closes_the_open_one() {
 }
 
 #[test]
+fn gaps_carry_on_with_what_they_were() {
+    let (mut timeline, mut usage) = session(100);
+    // Asleep for a minute, then held up for 40 s.
+    for (tick, step, asleep) in [
+        (102, 101, 10),
+        (103, 160, 70),
+        (104, 200, 70),
+        (105, 201, 70),
+    ] {
+        timeline.set_time_asleep(Some(Duration::from_secs(asleep)));
+        let snap = machine(step, tick, 1000);
+        timeline.observe(&snap);
+        usage.observe(&snap);
+    }
+    let kinds: Vec<_> = timeline.seams().iter().map(|s| s.kind.clone()).collect();
+    assert_eq!(kinds, [SeamKind::Asleep, SeamKind::NoSamples]);
+    let (next, _) = round_trip(&timeline, &usage);
+    assert_eq!(next.seams(), timeline.seams());
+}
+
+#[test]
 fn seams_go_with_the_history_they_mark() {
     let (mut timeline, _) = seamed(110);
     assert_eq!(timeline.seams().len(), 2);

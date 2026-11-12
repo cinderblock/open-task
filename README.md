@@ -709,6 +709,14 @@ With the pointer on one, the readout says what it was, `Updated v0.21.0 → v0.2
 12m ago`, in place of a value read off the line that spans the gap. The marks scroll
 off with the history they sit in, and the next update carries them on.
 
+The same marks show where the samples stopped for 30 seconds or more, which no update
+speed does by itself. When the computer slept through most of the gap, by its own
+count of the time it spent asleep (Windows' interrupt time against its unbiased
+interrupt time, Linux's boot-time clock against its monotonic one), the readout says
+`Asleep for 2h 13m`; otherwise `No samples for 45s`, as when the app was held up. A
+computer whose "sleep" is Modern Standby may count that time as awake, and its gaps
+read as no samples.
+
 By default open-task checks when it starts and then once a day, and only says so.
 Settings has three switches, each building on the one before: **Check for updates
 automatically** (on), **Download updates automatically** (off), and **Install updates

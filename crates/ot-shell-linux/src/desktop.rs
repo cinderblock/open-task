@@ -226,11 +226,47 @@ impl ot_shell_core::Platform for LinuxPlatform {
     fn launch(&self, command_line: &str, directory: Option<&str>) -> Result<(), String> {
         launch(command_line, directory)
     }
+
+    fn time_asleep(&self) -> Option<std::time::Duration> {
+        time_asleep()
+    }
+}
+
+/// How long the computer has spent suspended since it started: the boot-time
+/// clock counts that, the monotonic clock does not, and both start at boot.
+fn time_asleep() -> Option<std::time::Duration> {
+    let read = |clock| {
+        let mut t = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: writes the timespec, which lives across the call.
+        (unsafe { libc::clock_gettime(clock, &raw mut t) } == 0).then(|| {
+            std::time::Duration::new(
+                u64::try_from(t.tv_sec).unwrap_or(0),
+                u32::try_from(t.tv_nsec).unwrap_or(0),
+            )
+        })
+    };
+    // The monotonic clock first, so the difference never comes out negative.
+    let awake = read(libc::CLOCK_MONOTONIC)?;
+    let all = read(libc::CLOCK_BOOTTIME)?;
+    Some(all.saturating_sub(awake))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_asleep_is_counted_and_never_goes_back() {
+        let a = time_asleep().expect("Linux counts it");
+        let b = time_asleep().unwrap();
+        assert!(
+            b + std::time::Duration::from_millis(1) >= a,
+            "{a:?} then {b:?}"
+        );
+    }
 
     #[test]
     fn command_lines_split_like_a_shell() {

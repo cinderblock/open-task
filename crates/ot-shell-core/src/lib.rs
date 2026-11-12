@@ -156,6 +156,13 @@ pub trait Platform: Send + Sync {
         let _ = at;
         None
     }
+
+    /// How long the computer has spent asleep (suspended or hibernated) since it
+    /// started, by the OS's own count, so a gap in the samples can say whether it
+    /// slept through it. `None` where the OS does not keep one.
+    fn time_asleep(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// Wakes the host's UI thread from another thread; the host then calls
@@ -652,6 +659,13 @@ impl Shell {
             cpu: snap.cpu.total.get(),
             memory,
         });
+        // Before the snapshot, so a gap it ends can tell sleep from a stall. A
+        // replay's gaps are the recording's: nothing to say about them.
+        let asleep = match feed {
+            Feed::Live(_) => self.platform.time_asleep(),
+            Feed::Replay(_) => None,
+        };
+        self.app.set_time_asleep(asleep);
         let mut changed = self.app.set_snapshot(snap);
         changed |= match feed {
             Feed::Replay(player) => self

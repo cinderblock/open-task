@@ -7,6 +7,23 @@ use windows::Win32::System::Time::{
     FileTimeToSystemTime, GetTimeZoneInformation, SystemTimeToFileTime,
     SystemTimeToTzSpecificLocalTime, TIME_ZONE_INFORMATION,
 };
+use windows::Win32::System::WindowsProgramming::{QueryInterruptTime, QueryUnbiasedInterruptTime};
+
+/// How long the computer has spent asleep or hibernated since it started: the
+/// interrupt time counts that, the unbiased interrupt time does not, and both
+/// count from the same start in 100 ns units.
+pub(crate) fn time_asleep() -> Option<std::time::Duration> {
+    let mut unbiased = 0u64;
+    // SAFETY: both write a u64 that lives across the call. The unbiased count
+    // is read first, so the difference never comes out negative.
+    let all = unsafe {
+        QueryUnbiasedInterruptTime(&raw mut unbiased).ok().ok()?;
+        QueryInterruptTime()
+    };
+    Some(std::time::Duration::from_nanos(
+        all.saturating_sub(unbiased).saturating_mul(100),
+    ))
+}
 
 /// 100 ns intervals from 1601-01-01 (`FILETIME`'s epoch) to the Unix epoch.
 const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
@@ -101,6 +118,17 @@ mod tests {
         assert_eq!(abbreviation(&name("Pacific Standard Time"), -480), "PST");
         assert_eq!(abbreviation(&name(""), 330), "UTC+05:30");
         assert_eq!(abbreviation(&name("Tokyo"), 540), "UTC+09:00");
+    }
+
+    #[test]
+    fn time_asleep_is_counted_and_never_goes_back() {
+        let a = time_asleep().expect("Windows counts it");
+        let b = time_asleep().unwrap();
+        // A millisecond of slack: the two counters are read one after the other.
+        assert!(
+            b + std::time::Duration::from_millis(1) >= a,
+            "{a:?} then {b:?}"
+        );
     }
 
     #[test]

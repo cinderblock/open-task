@@ -45,8 +45,8 @@ pub const MAGIC: &[u8; 8] = b"OTHANDOF";
 /// The payload layout this build writes.
 ///
 /// - 1: the first: the timeline's series and the usage history.
-/// - 2: format 1's, then the timeline's seams (where earlier restarts joined
-///   the record).
+/// - 2: format 1's, then the timeline's seams (where earlier restarts, and
+///   stretches without samples, broke the record).
 pub const FORMAT: u32 = 2;
 /// The payload layouts this build reads.
 pub const READS: [u32; 2] = [1, 2];
@@ -341,6 +341,8 @@ pub(crate) struct SeamV2 {
 pub(crate) enum SeamKindV2 {
     Update { from: String, to: String },
     Elevated,
+    Asleep,
+    NoSamples,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

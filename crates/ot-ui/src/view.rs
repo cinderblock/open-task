@@ -1523,6 +1523,13 @@ impl App {
 
     /// Offer the newest snapshot. Returns true if it was new and a repaint is due.
     /// While paused it is recorded but not shown, and no repaint is due.
+    /// How long the computer has spent asleep since it started, as the OS counts
+    /// it, told before each snapshot: a gap the snapshot ends is then marked as
+    /// sleep or as no samples ([`Timeline::set_time_asleep`]).
+    pub fn set_time_asleep(&mut self, total: Option<std::time::Duration>) {
+        self.timeline.set_time_asleep(total);
+    }
+
     pub fn set_snapshot(&mut self, snap: Arc<Snapshot>) -> bool {
         self.full_due = true;
         if snap.is_empty() || (!self.snap.is_empty() && snap.tick == self.snap.tick) {

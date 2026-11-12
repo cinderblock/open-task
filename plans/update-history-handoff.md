@@ -246,7 +246,33 @@ Steps:
    memory cards and the History; hovering the earlier one read
    `2m 08s ago · Updated v0.21.0 → v0.21.1`. `handoff.log` on Linux:
    `carried on from v0.21.1's history, written 0.7 s before ...`.
-6. [ ] **[current]** Checks on all targets; push and release on the user's say.
+6. [x] User, 2026-11-11: "ok" to releasing v0.22.0, then before it started: "can
+   we add the sleep/resume marks before we release? cancel in progress release
+   if you can". No release run had started (nothing pushed or tagged).
+7. [x] Sleep/resume marks (below).
+8. [ ] **[current]** Checks on all targets, then push and release v0.22.0 (the
+   user's "ok" stands for v0.22.0 with these marks in it).
+
+### Sleep and resume marks
+
+- **From the data, not from power events.** `Timeline::observe` marks any
+  stretch of `GAP_MS` (30 s) or more between two samples, seven times the
+  slowest update speed (4 s), unless an open restart seam already covers it.
+  Works on every platform, in replays, and for stalls that are not sleep.
+- **Sleep told apart by the OS's own count** of time asleep since boot,
+  `Platform::time_asleep`, read by the shell before each live snapshot
+  (`App::set_time_asleep` → `Timeline::set_time_asleep`): Windows
+  `QueryInterruptTime − QueryUnbiasedInterruptTime` (the unbiased one excludes
+  sleep and hibernation), Linux `CLOCK_BOOTTIME − CLOCK_MONOTONIC`. Half the gap
+  or more asleep → `SeamKind::Asleep` ("Asleep for 2h 13m"), else
+  `SeamKind::NoSamples` ("No samples for 45s"). Replays pass `None`.
+- **Not used: `WM_POWERBROADCAST`.** It needs a window and misses Modern
+  Standby on many machines; the counters need neither. Caveat kept in the
+  README: Modern Standby may count as awake, so those gaps read "No samples".
+- Format 2 was not released yet, so `SeamKindV2` gained `Asleep` and
+  `NoSamples` at its end without a bump; the v2 fixture's bytes did not change.
+- Not tested end to end: a real sleep (it would need the machine to sleep).
+  The counters are read in tests on both platforms; the rest is unit tested.
 
 Findings:
 

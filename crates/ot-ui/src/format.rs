@@ -122,6 +122,18 @@ pub fn bytes_of(out: &mut String, used: Bytes, total: Bytes) {
     let _ = write!(out, "{a:.1} / {b:.1} {}", UNITS[u]);
 }
 
+/// A length of time, appended to `out`, in its two largest units: `45s`,
+/// `2m 05s`, `2h 13m`, `3d 04h`.
+pub fn push_span(out: &mut String, ms: i64) {
+    let s = ms.max(0) / 1000;
+    let _ = match (s / 86_400, s / 3600 % 24, s / 60 % 60, s % 60) {
+        (0, 0, 0, s) => write!(out, "{s}s"),
+        (0, 0, m, s) => write!(out, "{m}m {s:02}s"),
+        (0, h, m, _) => write!(out, "{h}h {m:02}m"),
+        (d, h, _, _) => write!(out, "{d}d {h:02}h"),
+    };
+}
+
 /// Task Manager's up time: `d:hh:mm:ss`, e.g. `3:04:12:09`.
 pub fn uptime(out: &mut String, secs: u64) {
     out.clear();
@@ -323,6 +335,20 @@ pub fn ago(out: &mut String, ms: f32, fields: AgoFields) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_span_is_its_two_largest_units() {
+        let span = |ms| {
+            let mut out = String::from("for ");
+            push_span(&mut out, ms);
+            out
+        };
+        assert_eq!(span(45_400), "for 45s");
+        assert_eq!(span(125_000), "for 2m 05s");
+        assert_eq!(span(7_980_000), "for 2h 13m");
+        assert_eq!(span(273_600_000), "for 3d 04h");
+        assert_eq!(span(-5), "for 0s");
+    }
 
     fn s(f: impl FnOnce(&mut String)) -> String {
         let mut b = String::new();
